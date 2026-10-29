@@ -41,6 +41,7 @@ import {
 import { markGitRestorePointExpired } from "./services/git-restore-point-storage.js";
 import { subscribeAllCompanyLiveEvents } from "./services/live-events.js";
 import { DELIVERY_QUEUES } from "./services/delivery-work-notifications.js";
+import { ownerCommentIntakeService, parseOwnerCommentIntakeBackfillFrom } from "./services/owner-comment-intake.js";
 import { registerBudgetEnforcementWork, registerCostAccountingWork } from "./services/budget-enforcement-worker.js";
 import { caseHandoffDeliveryService } from "./services/case-handoff-delivery.js";
 import { registerScheduledWork } from "./services/scheduled-work.js";
@@ -1397,6 +1398,24 @@ async function startServerWithDatabaseTeardown(
   server.on("close", accountingWorker.stop);
   skillSourceSync.start(deliveryWork);
   const caseHandoffDeliveries = caseHandoffDeliveryService(db as any, { heartbeat: environmentLeaseCleanupHeartbeat });
+  const ownerCommentIntake = ownerCommentIntakeService(db as any, {
+    wakeup: environmentLeaseCleanupHeartbeat.wakeup,
+    initialBackfillFrom: parseOwnerCommentIntakeBackfillFrom(process.env.PAPERCLIP_OWNER_COMMENT_INTAKE_BACKFILL_FROM),
+  });
+  let nextOwnerCommentIntakeAt: number | null = null;
+  deliveryWork.register(DELIVERY_QUEUES.ownerCommentIntake, {
+    retryMs: 5_000,
+    run: async signal => {
+      await ownerCommentIntake.sweepPending(signal);
+      nextOwnerCommentIntakeAt = await ownerCommentIntake.nextRunAt();
+    },
+    hasPending: async () => {
+      const pending = await ownerCommentIntake.hasPending();
+      nextOwnerCommentIntakeAt = await ownerCommentIntake.nextRunAt();
+      return pending;
+    },
+    nextRunAt: () => nextOwnerCommentIntakeAt,
+  });
   deliveryWork.register(DELIVERY_QUEUES.caseHandoffs, {
     retryMs: 5_000,
     run: signal => caseHandoffDeliveries.sweepPending(signal),

@@ -16,6 +16,14 @@ import type { PluginEventBus } from "./plugin-event-bus.js";
 import { instanceSettingsService } from "./instance-settings.js";
 
 const PLUGIN_EVENT_SET: ReadonlySet<string> = new Set(PLUGIN_EVENT_TYPES);
+const OWNER_COMMENT_INTAKE_SOURCE_ACTIONS: ReadonlySet<string> = new Set([
+  "issue.comment_added",
+  "issue.document_annotation_thread_created",
+  "issue.document_annotation_comment_added",
+  "issue.document_annotation_thread_reopened",
+  "issue.document_updated",
+  "issue.work_product_updated",
+]);
 const ACTIVITY_ACTION_TO_PLUGIN_EVENT: Readonly<Record<string, PluginEventType>> = {
   issue_comment_added: "issue.comment.created",
   issue_comment_created: "issue.comment.created",
@@ -181,6 +189,9 @@ export async function persistActivity(db: Db, input: LogActivityInput) {
   const [activity] = input.entityType === "issue"
     ? await db.transaction(async tx => {
       await notifyDeliveryWork(tx, DELIVERY_QUEUES.mcpEvents, `task:${input.entityId}`);
+      if (OWNER_COMMENT_INTAKE_SOURCE_ACTIONS.has(input.action)) {
+        await notifyDeliveryWork(tx, DELIVERY_QUEUES.ownerCommentIntake, `company:${input.companyId}`);
+      }
       return insert(tx as unknown as Db);
     })
     : await insert(db);

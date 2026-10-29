@@ -88,6 +88,7 @@ export const DELIVERY_QUEUES = {
   terminalWorkspaces: "terminal-workspaces",
   routineSchedules: "routine-schedules",
   issueMonitors: "issue-monitors",
+  ownerCommentIntake: "owner-comment-intake",
   caseHandoffs: "case-handoffs",
   nativeCheckpointExpiration: "native-checkpoint-expiration",
 } as const;
