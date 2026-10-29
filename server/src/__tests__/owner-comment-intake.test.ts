@@ -76,6 +76,45 @@ describeEmbeddedPostgres("owner-comment intake reconciliation", () => {
 
   afterAll(async () => { await temporaryDb?.cleanup(); });
 
+  it("reproduces the source/activity crash window for a committed annotation", async () => {
+    await db.insert(companies).values({ id: companyId, name: "Intake fixture", issuePrefix: `INT${companyId.slice(0, 5).toUpperCase()}` });
+    await db.insert(agents).values({ id: assigneeAgentId, companyId, name: "Assignee", role: "engineer", status: "idle", adapterType: "codex_local" });
+    await db.insert(issues).values({ id: issueId, companyId, identifier: issueIdentifier, title: "Intake fixture", status: "in_progress", assigneeAgentId });
+
+    const document = (await documentService(db).upsertIssueDocument({
+      issueId,
+      key: "plan",
+      title: "Plan",
+      format: "markdown",
+      body: "Alpha selected text omega",
+    })).document;
+    const thread = await documentAnnotationService(db).createThread(
+      issueId,
+      "plan",
+      annotationInput(document.latestRevisionId!, document.latestRevisionNumber),
+      { actorType: "user", actorId: ownerUserId, userId: ownerUserId },
+    );
+    const sourceCommentId = thread.comments[0]!.id;
+
+    // The route calls logActivity only after createThread has committed. Model a process
+    // failure at that boundary by deliberately omitting the later activity write.
+    expect(await db.select().from(documentAnnotationComments).where(eq(documentAnnotationComments.id, sourceCommentId))).toHaveLength(1);
+    expect(await db.select().from(activityLog).where(eq(activityLog.companyId, companyId))).toHaveLength(0);
+
+    const intake = ownerCommentIntakeService(db, {
+      wakeup: async (_agentId, input) => {
+        wakeupCalls.push({ agentId: _agentId, input });
+        return { id: randomUUID() } as any;
+      },
+      initialBackfillFrom: new Date(OWNER_COMMENT_INTAKE_BACKFILL_FROM),
+      now: () => now,
+    });
+    await intake.sweepPending();
+
+    expect(await intake.getDisposition(companyId, "document_annotation", sourceCommentId)).toBeNull();
+    expect(wakeupCalls).toHaveLength(0);
+  });
+
   it("reconciles issue, document, artifact-review, reply, reopen, and edit activity once across restart", async () => {
     expect(OWNER_COMMENT_INTAKE_BACKFILL_FROM).toBe("2026-10-29T02:30:00.000Z");
     await db.insert(companies).values({ id: companyId, name: "Intake fixture", issuePrefix: `INT${companyId.slice(0, 5).toUpperCase()}` });
