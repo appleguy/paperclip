@@ -319,6 +319,46 @@ describe("codex remote environment diagnostics", () => {
     expect(runAdapterExecutionTargetProcess).toHaveBeenCalledTimes(2);
   });
 
+  it("probes official npm codex.js executables rather than falsely skipping custom commands", async () => {
+    const command = "/Volumes/NVM/Paperclip/tools/codex-0.166.0/node_modules/@openai/codex/bin/codex.js";
+    runAdapterExecutionTargetProcess.mockResolvedValueOnce(versionProbeResult("codex-cli 0.166.0\n"));
+
+    const result = await testEnvironment({
+      companyId: "company-1",
+      adapterType: "codex_local",
+      config: { engine: "cli", command, model: "gpt-6.1-terra" },
+      executionTarget: sandboxTarget(),
+      environmentName: "QA Daytona",
+    });
+
+    expect(result.status).toBe("pass");
+    expect(result.checks.some((check) => check.code === "codex_cli_version_compatible")).toBe(true);
+    expect(result.checks.some((check) => check.code === "codex_hello_probe_passed")).toBe(true);
+    expect(result.checks.some((check) => check.code === "codex_hello_probe_skipped_custom_command")).toBe(false);
+    expect(runAdapterExecutionTargetProcess).toHaveBeenCalledTimes(2);
+    expect(runAdapterExecutionTargetProcess.mock.calls[0]?.[2]).toBe(command);
+    expect(runAdapterExecutionTargetProcess.mock.calls[1]?.[2]).toBe(command);
+  });
+
+  it("rejects a pre-0.166 Terra CLI without sending a model request", async () => {
+    const command = "/Volumes/NVM/Paperclip/tools/codex-0.164.0/bin/codex";
+    runAdapterExecutionTargetProcess.mockResolvedValueOnce(versionProbeResult("codex-cli 0.164.0\n"));
+
+    const result = await testEnvironment({
+      companyId: "company-1",
+      adapterType: "codex_local",
+      config: { engine: "cli", command, model: "gpt-6.1-terra" },
+      executionTarget: sandboxTarget(),
+      environmentName: "QA Daytona",
+    });
+
+    expect(result.status).toBe("fail");
+    expect(result.checks.some((check) => check.code === "codex_cli_version_incompatible")).toBe(true);
+    expect(result.checks.some((check) => check.code === "codex_hello_probe_skipped_cli_version")).toBe(true);
+    expect(runAdapterExecutionTargetProcess).toHaveBeenCalledTimes(1);
+    expect(runAdapterExecutionTargetProcess.mock.calls[0]?.[3]).toEqual(["--version"]);
+  });
+
   it("skips the version probe for models without a verified floor", async () => {
     const result = await testEnvironment({
       companyId: "company-1",
