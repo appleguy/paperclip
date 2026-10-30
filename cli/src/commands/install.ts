@@ -185,6 +185,23 @@ export async function smokePayload(payloadPath: string, expectedVersion: string,
   }
 }
 
+/** Restore native library aliases omitted by npm's bundled-dependency tarballs. */
+export async function hydrateEmbeddedPostgresSymlinks(payloadPath: string, runCommand: CommandRunner): Promise<boolean> {
+  const nativeName = `${process.platform}-${process.arch}`;
+  const roots = [
+    path.join(payloadPath, "node_modules", "@embedded-postgres", nativeName),
+    path.join(payloadPath, "node_modules", "@paperclipai", "server", "node_modules", "@embedded-postgres", nativeName),
+  ];
+  for (const root of roots) {
+    const manifest = path.join(root, "native", "pg-symlinks.json");
+    const helper = path.join(root, "scripts", "hydrate-symlinks.js");
+    if (!fs.existsSync(manifest) || !fs.existsSync(helper)) continue;
+    await runCommand(process.execPath, [helper], { cwd: root, maxBuffer: 1024 * 1024 });
+    return true;
+  }
+  return false;
+}
+
 export async function installNpmPayload(
   version: string,
   runCommand: CommandRunner,
@@ -256,6 +273,7 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
   const payloadPath = payloadPathFor(paths, "git", identifier);
   if (fs.existsSync(payloadPath)) {
     const metadata = JSON.parse(fs.readFileSync(path.join(payloadPath, "node_modules", "paperclipai", "package.json"), "utf8")) as { version: string };
+    await hydrateEmbeddedPostgresSymlinks(payloadPath, runCommand);
     await smokePayload(payloadPath, metadata.version, runCommand);
     return { payloadPath, reused: true, version: metadata.version };
   }
@@ -336,6 +354,7 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       throw new Error(`Git install packaging produced ${workspaceTarballs.length} workspace tarballs; expected ${workspacePackages.length}.`);
     }
     await runCommand("npm", ["install", "--prefix", stagedPayload, path.join(stagingRoot, cliTarball), ...workspaceTarballs.map((entry) => path.join(stagingRoot, entry)), "--no-audit", "--no-fund"], { cwd: stagingRoot, maxBuffer: 32 * 1024 * 1024 });
+    await hydrateEmbeddedPostgresSymlinks(stagedPayload, runCommand);
     await smokePayload(stagedPayload, metadata.version, runCommand);
     fs.renameSync(stagedPayload, payloadPath);
     return { payloadPath, reused: false, version: metadata.version };
