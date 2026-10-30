@@ -41,6 +41,8 @@ describe("managed install commands", () => {
       ...ORIGINAL_ENV,
       HOME: path.join(root, "home"),
       PAPERCLIP_HOME: path.join(root, "home", ".paperclip"),
+      PAPERCLIP_INSTANCE_ID: "install-command-isolated-tests",
+      PAPERCLIP_SHIM_PATH: path.join(root, "home", ".local", "bin", "paperclipai"),
       PATH: "/usr/bin:/bin",
       SHELL: "/bin/bash",
     };
@@ -313,6 +315,7 @@ describe("managed install commands", () => {
       expect(fs.existsSync(paths.shimPath)).toBe(true);
     });
     await uninstallCommand({
+      userHomeDir: process.env.HOME!,
       detectServiceManager: vi.fn(async () => ({
         supported: true as const,
         manager: {
@@ -393,7 +396,10 @@ describe("managed install commands", () => {
     fs.mkdirSync(paths.cliRoot, { recursive: true });
     fs.writeFileSync(unrelatedFile, "keep");
 
-    await expect(uninstallCommand()).rejects.toThrow("unverified install store");
+    await expect(uninstallCommand({ userHomeDir: process.env.HOME!, detectServiceManager: vi.fn(async () => ({
+      supported: true as const,
+      manager: { status: vi.fn(async () => ({ installed: false, active: false })) } as never,
+    })) })).rejects.toThrow("unverified install store");
     expect(fs.readFileSync(unrelatedFile, "utf8")).toBe("keep");
   });
 
@@ -415,7 +421,10 @@ describe("managed install commands", () => {
 
     await withInstallStoreLock(
       async () => {
-        await expect(uninstallCommand()).rejects.toThrow("already running");
+        await expect(uninstallCommand({ userHomeDir: process.env.HOME!, detectServiceManager: vi.fn(async () => ({
+          supported: true as const,
+          manager: { status: vi.fn(async () => ({ installed: false, active: false })) } as never,
+        })) })).rejects.toThrow("already running");
       },
       paths,
     );
