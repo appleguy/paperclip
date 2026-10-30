@@ -10633,55 +10633,62 @@ export function issueRoutes(
       }
 
       const { actor, annotationActor } = annotationActorInput(req);
-      const referenceSummaryBefore =
-        await issueReferencesSvc.listIssueReferenceSummary(issue.id);
-      const thread = await documentAnnotationsSvc.createThread(
-        issue.id,
-        keyParsed.data,
-        req.body,
-        annotationActor,
-      );
-      const firstComment = thread.comments[0];
-      if (firstComment)
-        await issueReferencesSvc.syncAnnotationComment(firstComment.id);
-      const referenceSummaryAfter =
-        await issueReferencesSvc.listIssueReferenceSummary(issue.id);
-      const referenceDiff = issueReferencesSvc.diffIssueReferenceSummary(
-        referenceSummaryBefore,
-        referenceSummaryAfter,
-      );
+      const publications: ActivityPublication[] = [];
+      const thread = await db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const referenceSummaryBefore =
+          await issueReferencesSvc.listIssueReferenceSummary(issue.id, txDb);
+        const thread = await documentAnnotationsSvc.createThread(
+          issue.id,
+          keyParsed.data,
+          req.body,
+          annotationActor,
+          txDb,
+        );
+        const firstComment = thread.comments[0];
+        if (firstComment)
+          await issueReferencesSvc.syncAnnotationComment(firstComment.id, txDb);
+        const referenceSummaryAfter =
+          await issueReferencesSvc.listIssueReferenceSummary(issue.id, txDb);
+        const referenceDiff = issueReferencesSvc.diffIssueReferenceSummary(
+          referenceSummaryBefore,
+          referenceSummaryAfter,
+        );
 
-      await logActivity(db, {
-        companyId: issue.companyId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        agentId: actor.agentId,
-        runId: actor.runId,
-        agentApiKeyId: actor.agentApiKeyId,
-        action: "issue.document_annotation_thread_created",
-        entityType: "issue",
-        entityId: issue.id,
-        details: {
-          key: thread.documentKey,
-          documentKey: thread.documentKey,
-          documentId: thread.documentId,
-          threadId: thread.id,
-          commentId: firstComment?.id ?? null,
-          revisionNumber: thread.currentRevisionNumber,
-          quote: thread.selectedText.slice(0, 240),
-          ...summarizeIssueReferenceActivityDetails({
-            addedReferencedIssues: referenceDiff.addedReferencedIssues.map(
-              summarizeIssueRelationForActivity,
-            ),
-            removedReferencedIssues: referenceDiff.removedReferencedIssues.map(
-              summarizeIssueRelationForActivity,
-            ),
-            currentReferencedIssues: referenceDiff.currentReferencedIssues.map(
-              summarizeIssueRelationForActivity,
-            ),
-          }),
-        },
+        await logActivity(txDb, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.document_annotation_thread_created",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            key: thread.documentKey,
+            documentKey: thread.documentKey,
+            documentId: thread.documentId,
+            threadId: thread.id,
+            commentId: firstComment?.id ?? null,
+            revisionNumber: thread.currentRevisionNumber,
+            quote: thread.selectedText.slice(0, 240),
+            ...summarizeIssueReferenceActivityDetails({
+              addedReferencedIssues: referenceDiff.addedReferencedIssues.map(
+                summarizeIssueRelationForActivity,
+              ),
+              removedReferencedIssues: referenceDiff.removedReferencedIssues.map(
+                summarizeIssueRelationForActivity,
+              ),
+              currentReferencedIssues: referenceDiff.currentReferencedIssues.map(
+                summarizeIssueRelationForActivity,
+              ),
+            }),
+          },
+        }, publications);
+        return thread;
       });
+      for (const publication of publications) publishActivity(publication);
 
       res.status(201).json(thread);
     },
@@ -10751,52 +10758,59 @@ export function issueRoutes(
       }
 
       const { actor, annotationActor } = annotationActorInput(req);
-      const referenceSummaryBefore =
-        await issueReferencesSvc.listIssueReferenceSummary(issue.id);
-      const comment = await documentAnnotationsSvc.addComment(
-        issue.id,
-        keyParsed.data,
-        req.params.threadId as string,
-        req.body,
-        annotationActor,
-      );
-      await issueReferencesSvc.syncAnnotationComment(comment.id);
-      const referenceSummaryAfter =
-        await issueReferencesSvc.listIssueReferenceSummary(issue.id);
-      const referenceDiff = issueReferencesSvc.diffIssueReferenceSummary(
-        referenceSummaryBefore,
-        referenceSummaryAfter,
-      );
+      const publications: ActivityPublication[] = [];
+      const comment = await db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const referenceSummaryBefore =
+          await issueReferencesSvc.listIssueReferenceSummary(issue.id, txDb);
+        const comment = await documentAnnotationsSvc.addComment(
+          issue.id,
+          keyParsed.data,
+          req.params.threadId as string,
+          req.body,
+          annotationActor,
+          txDb,
+        );
+        await issueReferencesSvc.syncAnnotationComment(comment.id, txDb);
+        const referenceSummaryAfter =
+          await issueReferencesSvc.listIssueReferenceSummary(issue.id, txDb);
+        const referenceDiff = issueReferencesSvc.diffIssueReferenceSummary(
+          referenceSummaryBefore,
+          referenceSummaryAfter,
+        );
 
-      await logActivity(db, {
-        companyId: issue.companyId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        agentId: actor.agentId,
-        runId: actor.runId,
-        agentApiKeyId: actor.agentApiKeyId,
-        action: "issue.document_annotation_comment_added",
-        entityType: "issue",
-        entityId: issue.id,
-        details: {
-          key: keyParsed.data,
-          documentKey: keyParsed.data,
-          threadId: comment.threadId,
-          commentId: comment.id,
-          bodySnippet: comment.body.slice(0, 120),
-          ...summarizeIssueReferenceActivityDetails({
-            addedReferencedIssues: referenceDiff.addedReferencedIssues.map(
-              summarizeIssueRelationForActivity,
-            ),
-            removedReferencedIssues: referenceDiff.removedReferencedIssues.map(
-              summarizeIssueRelationForActivity,
-            ),
-            currentReferencedIssues: referenceDiff.currentReferencedIssues.map(
-              summarizeIssueRelationForActivity,
-            ),
-          }),
-        },
+        await logActivity(txDb, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.document_annotation_comment_added",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            key: keyParsed.data,
+            documentKey: keyParsed.data,
+            threadId: comment.threadId,
+            commentId: comment.id,
+            bodySnippet: comment.body.slice(0, 120),
+            ...summarizeIssueReferenceActivityDetails({
+              addedReferencedIssues: referenceDiff.addedReferencedIssues.map(
+                summarizeIssueRelationForActivity,
+              ),
+              removedReferencedIssues: referenceDiff.removedReferencedIssues.map(
+                summarizeIssueRelationForActivity,
+              ),
+              currentReferencedIssues: referenceDiff.currentReferencedIssues.map(
+                summarizeIssueRelationForActivity,
+              ),
+            }),
+          },
+        }, publications);
+        return comment;
       });
+      for (const publication of publications) publishActivity(publication);
 
       res.status(201).json(comment);
     },
@@ -10828,40 +10842,48 @@ export function issueRoutes(
         return;
       }
       const { actor, annotationActor } = annotationActorInput(req);
-      const threadBefore = await documentAnnotationsSvc.getThreadForIssueDocument(
-        issue.id,
-        keyParsed.data,
-        req.params.threadId as string,
-      );
-      const thread = await documentAnnotationsSvc.updateThread(
-        issue.id,
-        keyParsed.data,
-        req.params.threadId as string,
-        req.body,
-        annotationActor,
-      );
-      if (threadBefore && threadBefore.status !== thread.status) await logActivity(db, {
-        companyId: issue.companyId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        agentId: actor.agentId,
-        runId: actor.runId,
-        agentApiKeyId: actor.agentApiKeyId,
-        action:
-          thread.status === "resolved"
-            ? "issue.document_annotation_thread_resolved"
-            : "issue.document_annotation_thread_reopened",
-        entityType: "issue",
-        entityId: issue.id,
-        details: {
-          key: thread.documentKey,
-          documentKey: thread.documentKey,
-          documentId: thread.documentId,
-          threadId: thread.id,
-          status: thread.status,
-          ...(thread.status === "open" ? { reopenedAt: thread.updatedAt.toISOString() } : {}),
-        },
+      const publications: ActivityPublication[] = [];
+      const thread = await db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const transactionAnnotations = documentAnnotationService(txDb);
+        const threadBefore = await transactionAnnotations.getThreadForIssueDocument(
+          issue.id,
+          keyParsed.data,
+          req.params.threadId as string,
+        );
+        const thread = await transactionAnnotations.updateThread(
+          issue.id,
+          keyParsed.data,
+          req.params.threadId as string,
+          req.body,
+          annotationActor,
+          txDb,
+        );
+        if (threadBefore && threadBefore.status !== thread.status) await logActivity(txDb, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action:
+            thread.status === "resolved"
+              ? "issue.document_annotation_thread_resolved"
+              : "issue.document_annotation_thread_reopened",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            key: thread.documentKey,
+            documentKey: thread.documentKey,
+            documentId: thread.documentId,
+            threadId: thread.id,
+            status: thread.status,
+            ...(thread.status === "open" ? { reopenedAt: thread.updatedAt.toISOString() } : {}),
+          },
+        }, publications);
+        return thread;
       });
+      for (const publication of publications) publishActivity(publication);
       res.json(thread);
     },
   );

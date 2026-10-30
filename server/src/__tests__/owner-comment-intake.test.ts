@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agentWakeupRequests,
@@ -13,6 +13,7 @@ import {
   documentAnnotationThreads,
   documentRevisions,
   documents,
+  type Db,
   issueComments,
   issueDocuments,
   issueWorkProducts,
@@ -20,7 +21,9 @@ import {
 } from "@paperclipai/db";
 import { documentAnnotationService } from "../services/document-annotations.js";
 import { documentService } from "../services/documents.js";
-import { logActivity } from "../services/activity-log.js";
+import { logActivity, type ActivityPublication } from "../services/activity-log.js";
+import { DELIVERY_QUEUES, subscribeDeliveryWork } from "../services/delivery-work-notifications.js";
+import { issueReferenceService } from "../services/issue-references.js";
 import { ownerCommentIntakeService, OWNER_COMMENT_INTAKE_BACKFILL_FROM, parseOwnerCommentIntakeBackfillFrom } from "../services/owner-comment-intake.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -113,6 +116,177 @@ describeEmbeddedPostgres("owner-comment intake reconciliation", () => {
 
     expect(await intake.getDisposition(companyId, "document_annotation", sourceCommentId)).toBeNull();
     expect(wakeupCalls).toHaveLength(0);
+  });
+
+  it("keeps annotation creation and replies atomic with intake activity and recovers once across duplicates and restart", async () => {
+    now = new Date(Date.now() + 60_000);
+    await db.insert(companies).values({ id: companyId, name: "Intake fixture", issuePrefix: `INT${companyId.slice(0, 5).toUpperCase()}` });
+    await db.insert(agents).values({ id: assigneeAgentId, companyId, name: "Assignee", role: "engineer", status: "idle", adapterType: "codex_local" });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: ownerUserId, status: "active", membershipRole: "owner" });
+    await db.insert(issues).values({ id: issueId, companyId, identifier: issueIdentifier, title: "Intake fixture", status: "in_progress", assigneeAgentId });
+    const document = (await documentService(db).upsertIssueDocument({
+      issueId, key: "plan", title: "Plan", format: "markdown", body: "Alpha selected text omega",
+    })).document;
+    const annotations = documentAnnotationService(db);
+    const references = issueReferenceService(db);
+    const settled = vi.fn();
+    const unsubscribe = subscribeDeliveryWork(db, DELIVERY_QUEUES.ownerCommentIntake, settled);
+    const publications: ActivityPublication[] = [];
+    const wakeup = async (agentId: string, input: Record<string, any>) => {
+      wakeupCalls.push({ agentId, input });
+      const [wake] = await db.insert(agentWakeupRequests).values({
+        companyId, agentId, source: input.source, triggerDetail: input.triggerDetail, reason: input.reason,
+        payload: input.payload, requestedByActorType: input.requestedByActorType,
+        requestedByActorId: input.requestedByActorId, idempotencyKey: input.idempotencyKey, status: "queued",
+      }).returning();
+      return wake;
+    };
+    const intake = ownerCommentIntakeService(db, {
+      wakeup,
+      initialBackfillFrom: new Date(OWNER_COMMENT_INTAKE_BACKFILL_FROM),
+      now: () => now,
+    });
+
+    try {
+      await expect(db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const thread = await annotations.createThread(
+          issueId, "plan", annotationInput(document.latestRevisionId!, document.latestRevisionNumber),
+          { actorType: "user", actorId: ownerUserId, userId: ownerUserId }, txDb,
+        );
+        const comment = thread.comments[0]!;
+        await references.syncAnnotationComment(comment.id, txDb);
+        await logActivity(txDb, {
+          companyId, actorType: "user", actorId: ownerUserId,
+          action: "issue.document_annotation_thread_created", entityType: "issue", entityId: issueId,
+          details: { key: "plan", documentKey: "plan", documentId: thread.documentId, threadId: thread.id, commentId: comment.id },
+        }, publications);
+        throw new Error("injected before outer commit");
+      })).rejects.toThrow("injected before outer commit");
+
+      expect(await db.select().from(documentAnnotationComments).where(eq(documentAnnotationComments.companyId, companyId))).toHaveLength(0);
+      expect(await db.select().from(documentAnnotationThreads).where(eq(documentAnnotationThreads.companyId, companyId))).toHaveLength(0);
+      expect(await db.select().from(activityLog).where(and(
+        eq(activityLog.companyId, companyId), eq(activityLog.action, "issue.document_annotation_thread_created"),
+      ))).toHaveLength(0);
+      await intake.sweepPending();
+      expect(wakeupCalls).toHaveLength(0);
+
+      const createdAtNotifications = settled.mock.calls.length;
+      let threadId = "";
+      let threadCommentId = "";
+      const createPublications: ActivityPublication[] = [];
+      await db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const referenceSummaryBefore = await references.listIssueReferenceSummary(issueId, txDb);
+        const thread = await annotations.createThread(
+          issueId, "plan", annotationInput(document.latestRevisionId!, document.latestRevisionNumber),
+          { actorType: "user", actorId: ownerUserId, userId: ownerUserId }, txDb,
+        );
+        const comment = thread.comments[0]!;
+        threadId = thread.id;
+        threadCommentId = comment.id;
+        await references.syncAnnotationComment(comment.id, txDb);
+        const referenceSummaryAfter = await references.listIssueReferenceSummary(issueId, txDb);
+        const referenceDiff = references.diffIssueReferenceSummary(referenceSummaryBefore, referenceSummaryAfter);
+        await logActivity(txDb, {
+          companyId, actorType: "user", actorId: ownerUserId,
+          action: "issue.document_annotation_thread_created", entityType: "issue", entityId: issueId,
+          details: {
+            key: thread.documentKey, documentKey: thread.documentKey, documentId: thread.documentId,
+            threadId: thread.id, commentId: comment.id,
+            addedReferencedIssues: referenceDiff.addedReferencedIssues,
+            removedReferencedIssues: referenceDiff.removedReferencedIssues,
+            currentReferencedIssues: referenceDiff.currentReferencedIssues,
+          },
+        }, createPublications);
+      });
+      expect(settled).toHaveBeenCalledTimes(createdAtNotifications + 1);
+      expect(createPublications).toHaveLength(1);
+      expect(await db.select().from(documentAnnotationComments).where(eq(documentAnnotationComments.id, threadCommentId))).toHaveLength(1);
+      expect(await db.select().from(activityLog).where(and(
+        eq(activityLog.companyId, companyId), eq(activityLog.action, "issue.document_annotation_thread_created"),
+      ))).toHaveLength(1);
+      await intake.sweepPending();
+      expect(wakeupCalls).toHaveLength(1);
+
+      const replyInput = { body: "Please also check this reply." };
+      await expect(db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const comment = await annotations.addComment(
+          issueId, "plan", threadId, replyInput,
+          { actorType: "user", actorId: ownerUserId, userId: ownerUserId }, txDb,
+        );
+        await references.syncAnnotationComment(comment.id, txDb);
+        await logActivity(txDb, {
+          companyId, actorType: "user", actorId: ownerUserId,
+          action: "issue.document_annotation_comment_added", entityType: "issue", entityId: issueId,
+          details: { key: "plan", documentKey: "plan", threadId: comment.threadId, commentId: comment.id },
+        }, publications);
+        throw new Error("injected before reply commit");
+      })).rejects.toThrow("injected before reply commit");
+      expect(await db.select().from(documentAnnotationComments).where(eq(documentAnnotationComments.threadId, threadId))).toHaveLength(1);
+      expect(await db.select().from(activityLog).where(and(
+        eq(activityLog.companyId, companyId), eq(activityLog.action, "issue.document_annotation_comment_added"),
+      ))).toHaveLength(0);
+
+      const replyNotifications = settled.mock.calls.length;
+      let replyCommentId = "";
+      const replyPublications: ActivityPublication[] = [];
+      await db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const referenceSummaryBefore = await references.listIssueReferenceSummary(issueId, txDb);
+        const comment = await annotations.addComment(
+          issueId, "plan", threadId, replyInput,
+          { actorType: "user", actorId: ownerUserId, userId: ownerUserId }, txDb,
+        );
+        replyCommentId = comment.id;
+        await references.syncAnnotationComment(comment.id, txDb);
+        const referenceSummaryAfter = await references.listIssueReferenceSummary(issueId, txDb);
+        const referenceDiff = references.diffIssueReferenceSummary(referenceSummaryBefore, referenceSummaryAfter);
+        await logActivity(txDb, {
+          companyId, actorType: "user", actorId: ownerUserId,
+          action: "issue.document_annotation_comment_added", entityType: "issue", entityId: issueId,
+          details: {
+            key: "plan", documentKey: "plan", threadId: comment.threadId, commentId: comment.id,
+            addedReferencedIssues: referenceDiff.addedReferencedIssues,
+            removedReferencedIssues: referenceDiff.removedReferencedIssues,
+            currentReferencedIssues: referenceDiff.currentReferencedIssues,
+          },
+        }, replyPublications);
+      });
+      expect(settled).toHaveBeenCalledTimes(replyNotifications + 1);
+      expect(replyPublications).toHaveLength(1);
+      expect(await db.select().from(documentAnnotationComments).where(eq(documentAnnotationComments.id, replyCommentId))).toHaveLength(1);
+      await intake.sweepPending();
+      expect(wakeupCalls).toHaveLength(2);
+
+      const duplicateActivityInput = {
+        companyId, actorType: "user" as const, actorId: ownerUserId,
+        entityType: "issue", entityId: issueId,
+      };
+      await logActivity(db, {
+        ...duplicateActivityInput, action: "issue.document_annotation_thread_created",
+        details: { key: "plan", documentKey: "plan", threadId, commentId: threadCommentId },
+      });
+      await logActivity(db, {
+        ...duplicateActivityInput, action: "issue.document_annotation_comment_added",
+        details: { key: "plan", documentKey: "plan", threadId, commentId: replyCommentId },
+      });
+      const restarted = ownerCommentIntakeService(db, {
+        wakeup,
+        initialBackfillFrom: new Date(OWNER_COMMENT_INTAKE_BACKFILL_FROM),
+        now: () => now,
+      });
+      await restarted.sweepPending();
+      await restarted.sweepPending();
+      expect(wakeupCalls).toHaveLength(2);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toHaveLength(2);
+      expect((await restarted.getDisposition(companyId, "document_annotation", threadCommentId))?.details).toMatchObject({ status: "routed", sourceTrust: null });
+      expect((await restarted.getDisposition(companyId, "document_annotation", replyCommentId))?.details).toMatchObject({ status: "routed", sourceTrust: null });
+    } finally {
+      unsubscribe();
+    }
   });
 
   it("reconciles issue, document, artifact-review, reply, reopen, and edit activity once across restart", async () => {
