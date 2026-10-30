@@ -418,10 +418,14 @@ export function Costs({
       previous as ProviderQuotaResult[] | undefined,
       incoming as ProviderQuotaResult[],
     ),
-    enabled: !!selectedCompanyId && mainTab === "providers",
+    enabled: !!selectedCompanyId && mainTab === "providers" && !(Array.isArray(sentinelData?.pools) && sentinelData.pools.length > 0),
     refetchInterval: 300_000,
     staleTime: 60_000,
   });
+
+  // Quota Sentinel is the primary subscription allowance display.
+  // Avoid competing native quota labels and permissions errors when it has data.
+  const preferSentinelQuota = Array.isArray(sentinelData?.pools) && sentinelData.pools.length > 0;
 
   const byProvider = useMemo(() => {
     const map = new Map<string, CostByProviderModel[]>();
@@ -1044,18 +1048,18 @@ export function Costs({
         </TabsContent>
 
         <TabsContent value="providers" className="mt-4 space-y-4">
-          <Card>
+          <Card data-testid="quota-sentinel-panel">
             <CardHeader>
               <CardTitle>Subscription quota across providers</CardTitle>
               <CardDescription>
                 Quota Sentinel · polled every 30 minutes · read-only subscription allowance (not API spend)
-                {sentinelData?.observedAt ? ` · observed \${new Date(sentinelData.observedAt).toLocaleString()}` : ""}
+                {sentinelData?.observedAt ? ` · observed ${new Date(sentinelData.observedAt).toLocaleString("en-US", { timeZone: "America/Los_Angeles", year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" })}` : ""}
                 {sentinelData?.stale ? " · STALE snapshot" : ""}
               </CardDescription>
             </CardHeader>
             <CardContent>
               {sentinelLoading ? <p className="text-sm text-muted-foreground">Loading quota snapshot…</p>
-                : sentinelError || !sentinelData ? <p role="status" className="text-sm text-muted-foreground">Quota Sentinel data unavailable. Provider usage is not assumed to be zero.</p>
+                : sentinelError || !Array.isArray(sentinelData?.pools) ? <p role="status" className="text-sm text-muted-foreground">Quota Sentinel data unavailable. Provider usage is not assumed to be zero.</p>
                 : <div className="grid gap-4 md:grid-cols-3">
                     {(["antigravity", "codex", "claude"] as const).map(provider => (
                       <div key={provider} className="space-y-3">
@@ -1064,13 +1068,13 @@ export function Costs({
                           <div key={p.pool} className="space-y-1 text-sm">
                             <div className="flex justify-between gap-3">
                               <span>{p.pool}</span>
-                              <span className="tabular-nums">{p.usedPercent == null ? "Unknown" : `\${p.usedPercent.toFixed(1)}% used`}</span>
+                              <span className="tabular-nums">{p.usedPercent == null ? "Unknown" : `${p.usedPercent.toFixed(1)}% used`}</span>
                             </div>
                             <div className="h-2 rounded bg-muted overflow-hidden">
-                              {p.usedPercent != null && <div className="h-full bg-primary" style={{ width: `\${p.usedPercent}%` }} />}
+                              {p.usedPercent != null && <div className="h-full bg-primary" style={{ width: `${p.usedPercent}%` }} />}
                             </div>
                             <p className="text-xs text-muted-foreground">
-                              {p.resetsAt ? `Resets \${new Date(p.resetsAt).toLocaleString()}` : "Reset unknown"}
+                              {p.resetsAt ? `Resets ${new Date(p.resetsAt).toLocaleString("en-US", { timeZone: "America/Los_Angeles", year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" })}` : "Reset unknown"}
                               {" · "}{p.state.replaceAll("_", " ")}
                             </p>
                           </div>
@@ -1103,12 +1107,12 @@ export function Costs({
                           weekSpendCents={weekSpendByProvider.get(provider) ?? 0}
                           windowRows={windowSpendByProvider.get(provider) ?? []}
                           showDeficitNotch={deficitNotchByProvider.get(provider) ?? false}
-                          quotaAccounts={quotaData?.filter(account => account.provider === provider)}
-                      quotaRequestFailed={Boolean(quotaFetchError)}
-                      quotaWindows={quotaWindowsByProvider.get(provider) ?? []}
-                          quotaError={quotaErrorsByProvider.get(provider) ?? null}
-                          quotaSource={quotaSourcesByProvider.get(provider) ?? null}
-                          quotaLoading={quotaLoading}
+                          quotaAccounts={preferSentinelQuota ? [] : quotaData?.filter(account => account.provider === provider)}
+                      quotaRequestFailed={!preferSentinelQuota && Boolean(quotaFetchError)}
+                      quotaWindows={preferSentinelQuota ? [] : quotaWindowsByProvider.get(provider) ?? []}
+                          quotaError={preferSentinelQuota ? null : quotaErrorsByProvider.get(provider) ?? null}
+                          quotaSource={preferSentinelQuota ? null : quotaSourcesByProvider.get(provider) ?? null}
+                          quotaLoading={!preferSentinelQuota && quotaLoading}
                         />
                       ))}
                     </div>
@@ -1126,12 +1130,12 @@ export function Costs({
                       weekSpendCents={weekSpendByProvider.get(provider) ?? 0}
                       windowRows={windowSpendByProvider.get(provider) ?? []}
                       showDeficitNotch={deficitNotchByProvider.get(provider) ?? false}
-                      quotaAccounts={quotaData?.filter(account => account.provider === provider)}
-                      quotaRequestFailed={Boolean(quotaFetchError)}
-                      quotaWindows={quotaWindowsByProvider.get(provider) ?? []}
-                      quotaError={quotaErrorsByProvider.get(provider) ?? null}
-                      quotaSource={quotaSourcesByProvider.get(provider) ?? null}
-                      quotaLoading={quotaLoading}
+                      quotaAccounts={preferSentinelQuota ? [] : quotaData?.filter(account => account.provider === provider)}
+                      quotaRequestFailed={!preferSentinelQuota && Boolean(quotaFetchError)}
+                      quotaWindows={preferSentinelQuota ? [] : quotaWindowsByProvider.get(provider) ?? []}
+                      quotaError={preferSentinelQuota ? null : quotaErrorsByProvider.get(provider) ?? null}
+                      quotaSource={preferSentinelQuota ? null : quotaSourcesByProvider.get(provider) ?? null}
+                      quotaLoading={!preferSentinelQuota && quotaLoading}
                     />
                   </TabsContent>
                 ))}

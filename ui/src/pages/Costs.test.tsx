@@ -30,6 +30,7 @@ const costsApiMocks = vi.hoisted(() => ({
   byBiller: vi.fn(),
   windowSpend: vi.fn(),
   quotaWindows: vi.fn(),
+  quotaSentinel: vi.fn(),
   dataQuality: vi.fn(),
   retryAccounting: vi.fn(),
 }));
@@ -370,6 +371,41 @@ describe("Shared Costs surfaces", () => {
     expect(container.textContent).not.toContain("1200%");
     expect(container.textContent).not.toContain("of monthly budget consumed");
     expect(costsApiMocks.summary).toHaveBeenLastCalledWith("company-1", undefined, undefined);
+    queryClient.clear();
+  });
+
+  it("uses three-provider Sentinel readings rather than conflicting native account quota errors", async () => {
+    for (const mock of Object.values(costsApiMocks)) mock.mockResolvedValue([]);
+    costsApiMocks.summary.mockResolvedValue({ spendCents: 0, budgetCents: 0, pricingComplete: true });
+    costsApiMocks.quotaSentinel.mockResolvedValue({
+      source: "quota-sentinel",
+      observedAt: "2026-10-30T22:30:00Z",
+      stale: false,
+      pools: [
+        { provider: "antigravity", pool: "3p:weekly", usedPercent: 76.8, resetsAt: "2026-11-04T04:14:42Z", state: "behind_pace" },
+        { provider: "codex", pool: "weekly", usedPercent: 18, resetsAt: "2026-11-05T10:04:17Z", state: "behind_pace" },
+        { provider: "claude", pool: "weekly", usedPercent: 0, resetsAt: "2026-11-06T11:00:00Z", state: "need_trend" },
+        { provider: "claude", pool: "session", usedPercent: null, resetsAt: null, state: "unknown" },
+      ],
+    });
+    costsApiMocks.quotaWindows.mockResolvedValue([
+      { provider: "anthropic", ok: false, windows: [], source: "managed-connection", error: "Subscription quota is currently unavailable" },
+      { provider: "openai", ok: true, windows: [{ label: "5h limit", usedPercent: 18, resetsAt: "2026-11-05T10:04:17Z" }], source: "managed-connection" },
+    ]);
+    const row = { model: "claude-sonnet-5-5", provider: "anthropic", biller: "anthropic", billingType: "subscription_included", costCents: 0, inputTokens: 20, cachedInputTokens: 0, outputTokens: 10, eventCount: 1, apiRunCount: 0, subscriptionRunCount: 1, subscriptionInputTokens: 20, subscriptionCachedInputTokens: 0, subscriptionOutputTokens: 10 };
+    costsApiMocks.byProvider.mockResolvedValue([row, { ...row, provider: "openai", biller: "openai" }]);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    root = createRoot(container);
+    await act(async () => root.render(<MemoryRouter initialEntries={["/?tab=providers"]}><QueryClientProvider client={queryClient}><Costs /></QueryClientProvider></MemoryRouter>));
+    await act(async () => vi.waitFor(() => expect(container.querySelector('[data-testid="quota-sentinel-panel"]')?.textContent).toContain("76.8% used")));
+    const panel = container.querySelector('[data-testid="quota-sentinel-panel"]')!;
+    expect(panel.textContent).toContain("ChatGPT / Codex");
+    expect(panel.textContent).toContain("Claude");
+    expect(panel.textContent).toContain("Nov 6, 2026");
+    expect(panel.textContent).toContain("3:00 AM PST");
+    expect(panel.textContent).toContain("Unknown");
+    expect(container.textContent).not.toContain("Subscription quota is currently unavailable");
+    expect(container.textContent).not.toContain("5h limit");
     queryClient.clear();
   });
 
