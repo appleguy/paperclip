@@ -6,6 +6,7 @@ import {
   type CommandRunner,
   installCommand,
   installGitPayload,
+  hydrateEmbeddedPostgresSymlinks,
   resolveGitHubRef,
   resolveGitInstallRequest,
   resolveGitInstallWorkspacePackages,
@@ -99,6 +100,20 @@ describe("managed install commands", () => {
       .rejects.toThrow("Re-run with --yes");
 
     expect(runCommand).not.toHaveBeenCalled();
+  });
+
+  it("hydrates a bundled Postgres native package before activation", async () => {
+    const payload = path.join(root, "candidate");
+    const native = path.join(payload, "node_modules", "@embedded-postgres", `${process.platform}-${process.arch}`);
+    fs.mkdirSync(path.join(native, "scripts"), { recursive: true });
+    fs.mkdirSync(path.join(native, "native"), { recursive: true });
+    fs.writeFileSync(path.join(native, "native", "pg-symlinks.json"), "[]");
+    fs.writeFileSync(path.join(native, "scripts", "hydrate-symlinks.js"), "// test fixture\n");
+    const runCommand = vi.fn(async () => ({ stdout: "", stderr: "" }));
+    expect(await hydrateEmbeddedPostgresSymlinks(payload, runCommand)).toBe(true);
+    expect(runCommand).toHaveBeenCalledWith(process.execPath, [path.join(native, "scripts", "hydrate-symlinks.js")], expect.objectContaining({ cwd: native }));
+    expect(await hydrateEmbeddedPostgresSymlinks(path.join(root, "missing"), runCommand)).toBe(false);
+    expect(runCommand).toHaveBeenCalledOnce();
   });
 
   it("reuses a SHA-keyed git payload without downloading or rebuilding", async () => {
