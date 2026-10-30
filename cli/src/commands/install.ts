@@ -88,6 +88,29 @@ export function resolveGitInstallWorkspacePackages(checkoutPath: string): Releas
   return ordered;
 }
 
+export function reconcileStagedWorkspaceVersions(sourcePackageDir: string, stagedPackageDir: string, workspaceVersions: Record<string, string>): boolean {
+  const source = JSON.parse(fs.readFileSync(path.join(sourcePackageDir, "package.json"), "utf8")) as Record<string, Record<string, string>>;
+  const stagedPath = path.join(stagedPackageDir, "package.json");
+  const staged = JSON.parse(fs.readFileSync(stagedPath, "utf8")) as Record<string, Record<string, string>>;
+  let changed = false;
+  for (const section of ["dependencies", "optionalDependencies", "peerDependencies"]) {
+    for (const [name, specifier] of Object.entries(source[section] ?? {})) {
+      if (typeof specifier !== "string" || !specifier.startsWith("workspace:")) continue;
+      const version = workspaceVersions[name];
+      if (!version) throw new Error(`Missing workspace version for ${name} in ${sourcePackageDir}`);
+      const range = specifier.slice("workspace:".length);
+      const resolved = `${range === "^" || range === "~" ? range : ""}${version}`;
+      if (staged[section]?.[name] !== resolved) {
+        staged[section] ??= {};
+        staged[section][name] = resolved;
+        changed = true;
+      }
+    }
+  }
+  if (changed) fs.writeFileSync(stagedPath, `${JSON.stringify(staged, null, 2)}\n`);
+  return changed;
+}
+
 export function assertSupportedNodeVersion(): void {
   if (!isSupportedNodeVersion(process.versions.node)) {
     throw new Error(`Installing or updating Paperclip requires Node.js ${MINIMUM_NODE_VERSION} or newer (found ${process.version} at ${process.execPath}). Put a supported Node bin directory first on PATH and run 'npx paperclipai@latest install --yes' to re-pin an existing managed install.`);
@@ -185,7 +208,6 @@ export async function smokePayload(payloadPath: string, expectedVersion: string,
   }
 }
 
-/** Restore native library aliases omitted by npm's bundled-dependency tarballs. */
 export async function hydrateEmbeddedPostgresSymlinks(payloadPath: string, runCommand: CommandRunner): Promise<boolean> {
   const nativeName = `${process.platform}-${process.arch}`;
   const roots = [
@@ -262,8 +284,6 @@ function gitBuildEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   // Source builds need devDependencies (esbuild, typescript); ambient NODE_ENV=production
   // makes pnpm/npm omit them, so the checkout build must not inherit it.
   delete env.NODE_ENV;
-  // The runner release packager stages binaries from checkout/runner/target.
-  // An inherited CARGO_TARGET_DIR sends cargo output elsewhere and breaks staging.
   delete env.CARGO_TARGET_DIR;
   return env;
 }
@@ -305,24 +325,20 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     await runCommand("corepack", ["pnpm", "install", "--frozen-lockfile"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
-    // The runner publishes the issue-thread viewer alongside its compiled runtime.
-    // Build that declared artifact before the literal file-copy bundler runs.
     await runCommand("corepack", ["pnpm", "--filter", "@paperclipai/paperclip-runner", "run", "build:issue-thread"],
       { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
-    // Bundled server packaging reads server/ui-dist, but the normal build does
-    // not invoke its prepack hook. Prepare the UI explicitly before bundling.
     await runCommand("corepack", ["pnpm", "--filter", "@paperclipai/server", "run", "prepare:ui-dist"],
       { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
-    // The server package includes skills, which live at the repository root.
-    // Assemble that declared package file before prepare-bundled-package.
     const rootSkills = path.join(checkoutPath, "skills");
     if (fs.existsSync(rootSkills)) {
       fs.cpSync(rootSkills, path.join(checkoutPath, "server", "skills"), { recursive: true });
     }
     const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
-    // Optional adapter skill directories may be omitted from Git archives.
-    // The bundling helper copies declared files literally, unlike npm pack.
+    const workspaceVersions = Object.fromEntries(workspacePackages.map((entry) => [
+      entry.name,
+      (JSON.parse(fs.readFileSync(path.join(checkoutPath, entry.dir, "package.json"), "utf8")) as { version: string }).version,
+    ]));
     for (const workspacePackage of workspacePackages) {
       const packageDir = path.join(checkoutPath, workspacePackage.dir);
       const packageFiles = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")).files as string[] | undefined;
@@ -337,15 +353,12 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       if (bundledDependencies.length > 0) {
         const stagedPackage = path.join(stagingRoot, `workspace-package-${index}`);
         await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "prepare-bundled-package.mjs"), packageDir, stagedPackage], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
-        // Artifacts were built in the full workspace. The stripped bundle lacks
-        // the monorepo scripts; re-running prepack here is invalid and unsafe.
+        reconcileStagedWorkspaceVersions(packageDir, stagedPackage, workspaceVersions);
         await runCommand("npm", ["pack", stagedPackage, "--ignore-scripts", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
       } else {
         await runCommand("corepack", ["pnpm", "--dir", workspacePackage.dir, "pack", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
       }
     }
-    // pnpm pack translates workspace:* dependency ranges to publishable versions.
-    // npm pack would preserve workspace:* and produce an unresolvable CLI tarball.
     await runCommand("corepack", ["pnpm", "--dir", "cli", "pack", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
     const tarballs = fs.readdirSync(stagingRoot).filter((entry) => entry.endsWith(".tgz"));
     const cliTarball = tarballs.find((entry) => entry === `paperclipai-${metadata.version}.tgz`);

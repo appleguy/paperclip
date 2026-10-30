@@ -7,6 +7,7 @@ import {
   installCommand,
   installGitPayload,
   hydrateEmbeddedPostgresSymlinks,
+  reconcileStagedWorkspaceVersions,
   resolveGitHubRef,
   resolveGitInstallRequest,
   resolveGitInstallWorkspacePackages,
@@ -100,6 +101,28 @@ describe("managed install commands", () => {
       .rejects.toThrow("Re-run with --yes");
 
     expect(runCommand).not.toHaveBeenCalled();
+  });
+
+  it("corrects stale workspace versions emitted by a pinned checkout helper", () => {
+    const source = path.join(root, "src");
+    const staged = path.join(root, "staged");
+    fs.mkdirSync(source);
+    fs.mkdirSync(staged);
+    fs.writeFileSync(path.join(source, "package.json"), JSON.stringify({
+      version: "0.3.1", dependencies: {
+        "@paperclipai/plugin-sdk": "workspace:*", "@paperclipai/shared": "workspace:^",
+      },
+    }));
+    fs.writeFileSync(path.join(staged, "package.json"), JSON.stringify({
+      version: "0.3.1", dependencies: {
+        "@paperclipai/plugin-sdk": "0.3.1", "@paperclipai/shared": "^0.3.1",
+      },
+    }));
+    const versions = { "@paperclipai/plugin-sdk": "1.0.0", "@paperclipai/shared": "0.3.1" };
+    expect(reconcileStagedWorkspaceVersions(source, staged, versions)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(path.join(staged, "package.json"), "utf8")).dependencies)
+      .toEqual({ "@paperclipai/plugin-sdk": "1.0.0", "@paperclipai/shared": "^0.3.1" });
+    expect(reconcileStagedWorkspaceVersions(source, staged, versions)).toBe(false);
   });
 
   it("hydrates a bundled Postgres native package before activation", async () => {
