@@ -9,6 +9,7 @@ import { accountingIntegrityService } from "../services/accounting-integrity.js"
 import { costDataQualityReport } from "../services/cost-data-quality.js";
 import { billingReconciliationService } from "../services/billing-reconciliation.js";
 import { adjustCostSchema, importBillingInvoiceSchema, repairAccountingSchema, retryAccountingSchema } from "@paperclipai/shared";
+import { readFile } from "node:fs/promises";
 import { Router } from "express";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
@@ -326,6 +327,47 @@ export function costRoutes(
     if (!(await assertCompanyCostReadAllowed(req, res, companyId))) return;
     const rows = await costs.windowSpend(companyId);
     res.json(rows);
+  });
+
+  // Local process-only Quota Sentinel snapshot. No provider calls or credentials.
+  router.get("/companies/:companyId/costs/quota-sentinel", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    assertBoard(req);
+    const company = await companies.getById(companyId);
+    if (!company) {
+      res.status(404).json({ error: "Company not found" });
+      return;
+    }
+    // The single-company local installation supplies this file; never disclose raw provider data.
+    const snapshotPath = process.env.PAPERCLIP_QUOTA_SENTINEL_STATUS_PATH
+      ?? "/Volumes/NVM/Paperclip/knowledge/raw/model-routing/quota_pacing_status.json";
+    try {
+      const raw = JSON.parse(await readFile(snapshotPath, "utf8")) as Record<string, any>;
+      const observedAt = typeof raw.observed_at === "string" ? raw.observed_at : null;
+      const ageMs = observedAt ? Date.now() - Date.parse(observedAt) : NaN;
+      const pools: Array<{ provider: string; pool: string; usedPercent: number | null; resetsAt: string | null; state: string }> = [];
+      for (const provider of ["antigravity", "codex", "claude"]) {
+        const forecasts = raw.providers?.[provider]?.forecasts;
+        if (!forecasts || typeof forecasts !== "object") continue;
+        for (const [pool, value] of Object.entries(forecasts)) {
+          if (!value || typeof value !== "object") continue;
+          const item = value as Record<string, unknown>;
+          pools.push({
+            provider,
+            pool,
+            usedPercent: typeof item.used_pct === "number" && Number.isFinite(item.used_pct)
+              ? Math.max(0, Math.min(100, item.used_pct)) : null,
+            resetsAt: typeof item.reset_at === "string" ? item.reset_at : null,
+            state: typeof item.state === "string" ? item.state : "unknown",
+          });
+        }
+      }
+      res.setHeader("Cache-Control", "private, no-store");
+      res.json({ source: "quota-sentinel", observedAt, stale: !Number.isFinite(ageMs) || ageMs < 0 || ageMs > 3_900_000, pools });
+    } catch {
+      res.status(503).json({ error: "Quota Sentinel snapshot unavailable" });
+    }
   });
 
   router.get("/companies/:companyId/costs/quota-windows", async (req, res) => {

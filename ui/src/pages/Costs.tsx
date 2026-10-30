@@ -403,6 +403,14 @@ export function Costs({
     staleTime: 10_000,
   });
 
+  const { data: sentinelData, isLoading: sentinelLoading, isError: sentinelError } = useQuery({
+    queryKey: ["quota-sentinel", companyId],
+    queryFn: () => costsApi.quotaSentinel(companyId),
+    enabled: !!selectedCompanyId && mainTab === "providers",
+    refetchInterval: 60_000,
+    staleTime: 30_000,
+  });
+
   const { data: quotaData, isLoading: quotaLoading, error: quotaFetchError } = useQuery({
     queryKey: queryKeys.usageQuotaWindows(companyId),
     queryFn: () => costsApi.quotaWindows(companyId),
@@ -1036,6 +1044,42 @@ export function Costs({
         </TabsContent>
 
         <TabsContent value="providers" className="mt-4 space-y-4">
+          <Card>
+            <CardHeader>
+              <CardTitle>Subscription quota across providers</CardTitle>
+              <CardDescription>
+                Quota Sentinel · polled every 30 minutes · read-only subscription allowance (not API spend)
+                {sentinelData?.observedAt ? ` · observed \${new Date(sentinelData.observedAt).toLocaleString()}` : ""}
+                {sentinelData?.stale ? " · STALE snapshot" : ""}
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              {sentinelLoading ? <p className="text-sm text-muted-foreground">Loading quota snapshot…</p>
+                : sentinelError || !sentinelData ? <p role="status" className="text-sm text-muted-foreground">Quota Sentinel data unavailable. Provider usage is not assumed to be zero.</p>
+                : <div className="grid gap-4 md:grid-cols-3">
+                    {(["antigravity", "codex", "claude"] as const).map(provider => (
+                      <div key={provider} className="space-y-3">
+                        <h3 className="font-semibold">{provider === "codex" ? "ChatGPT / Codex" : provider === "claude" ? "Claude" : "Antigravity"}</h3>
+                        {sentinelData.pools.filter(p => p.provider === provider).map(p => (
+                          <div key={p.pool} className="space-y-1 text-sm">
+                            <div className="flex justify-between gap-3">
+                              <span>{p.pool}</span>
+                              <span className="tabular-nums">{p.usedPercent == null ? "Unknown" : `\${p.usedPercent.toFixed(1)}% used`}</span>
+                            </div>
+                            <div className="h-2 rounded bg-muted overflow-hidden">
+                              {p.usedPercent != null && <div className="h-full bg-primary" style={{ width: `\${p.usedPercent}%` }} />}
+                            </div>
+                            <p className="text-xs text-muted-foreground">
+                              {p.resetsAt ? `Resets \${new Date(p.resetsAt).toLocaleString()}` : "Reset unknown"}
+                              {" · "}{p.state.replaceAll("_", " ")}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    ))}
+                  </div>}
+            </CardContent>
+          </Card>
           {showCustomPrompt ? (
             <p className="text-sm text-muted-foreground">Select a start and end date to load data.</p>
           ) : (

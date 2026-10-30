@@ -54,6 +54,8 @@ export const costsApi = {
     api.get<FinanceEvent[]>(`/companies/${companyId}/costs/finance-events${dateParamsWithLimit(from, to, limit)}`),
   windowSpend: (companyId: string) =>
     api.get<CostWindowSpendRow[]>(`/companies/${companyId}/costs/window-spend`),
+  quotaSentinel: (companyId: string) =>
+    api.get<{ source: string; observedAt: string | null; stale: boolean; pools: Array<{ provider: string; pool: string; usedPercent: number | null; resetsAt: string | null; state: string }> }>(`/companies/\${companyId}/costs/quota-sentinel`),
   quotaWindows: (companyId: string) =>
     api.get<ProviderQuotaResult[]>(`/companies/${companyId}/costs/quota-windows`),
 };
