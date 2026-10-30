@@ -188,7 +188,8 @@ export async function onboardingFirstTask(input: OnboardingFirstTaskInput): Prom
   ].join("\n");
   await page.getByTestId("question-other-answer-composer").last().locator('[contenteditable="true"],textarea').first().fill([
     `I have one task in mind. Propose exactly one child task named "${title}" and wait for my approval before creating it or doing its work.`,
-    "After approval, assign it to yourself and let its own Paperclip execution produce the result. Then verify and link its saved document and downloadable file in this onboarding conversation and complete both tasks.",
+    "After approval, assign it to yourself and let its own Paperclip execution produce the result. After it finishes, verify its saved document and published attachment.",
+    "In your final reply in this onboarding conversation, include actual Markdown links to the child task, its saved document, and connection-proof.json. Copy the published attachment's returned contentPath or downloadPath into the file link URL, including its actual attachment ID. A backticked filename, document key, or path is not a clickable link. Obtain the real references from the child's saved results; do not invent IDs or URLs. Then complete both tasks.",
     "When you create the child, copy the entire brief between BEGIN CHILD BRIEF and END CHILD BRIEF VERBATIM into create_task.description. Preserve every step, tool name, parameter instruction, and exact encoded input. Do not summarize or paraphrase it.",
     "BEGIN CHILD BRIEF",
     childBrief,
