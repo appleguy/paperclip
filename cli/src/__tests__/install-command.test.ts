@@ -140,7 +140,7 @@ describe("managed install commands", () => {
         if (args.includes("pack")) {
           const destination = args[args.indexOf("--pack-destination") + 1];
           const packageDir = args[args.indexOf("--dir") + 1];
-          const packageName = packageDir === "server" ? "paperclipai-server" : "paperclipai-shared";
+          const packageName = packageDir === "server" ? "paperclipai-server" : packageDir === "cli" ? "paperclipai" : "paperclipai-shared";
           fs.writeFileSync(path.join(destination, `${packageName}-0.3.1.tgz`), "package");
         }
         return { stdout: "", stderr: "" };
@@ -171,15 +171,18 @@ describe("managed install commands", () => {
     expect(manifest?.payloadPath).toContain(path.join("git", sha.slice(0, 12)));
     expect(runCommand.mock.calls.filter(([command, args]) => command === "curl" && args.includes("--output"))).toHaveLength(1);
     expect(runCommand.mock.calls.filter(([command, args]) => command === "corepack" && args[1] === "install")).toHaveLength(1);
-    expect(runCommand.mock.calls.filter(([command, args]) => command === "corepack" && args.includes("pack"))).toHaveLength(2);
+    expect(runCommand.mock.calls.filter(([command, args]) => command === "corepack" && args.includes("pack"))).toHaveLength(3);
     expect(runCommand.mock.calls.filter(([command, args]) => command === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs"))).toHaveLength(1);
-    expect(runCommand.mock.calls.filter(([command, args]) => command === "npm" && args[0] === "pack")).toHaveLength(2);
+    const npmPackCalls = runCommand.mock.calls.filter(([command, args]) => command === "npm" && args[0] === "pack");
+    expect(npmPackCalls).toHaveLength(1);
+    expect(npmPackCalls.find(([, args]) => args[1]?.includes("workspace-package-"))?.[1]).toContain("--ignore-scripts");
     const installCall = runCommand.mock.calls.find(([command, args]) => command === "npm" && args[0] === "install");
     expect(installCall?.[1].filter((arg) => arg.endsWith(".tgz"))).toHaveLength(4);
   });
 
   it("builds git checkouts with NODE_ENV cleared so ambient production mode keeps devDependencies", async () => {
     process.env.NODE_ENV = "production";
+    process.env.CARGO_TARGET_DIR = "/tmp/foreign-cargo-target";
     const sha = "d".repeat(40);
     const runCommand = createGitCheckoutRunCommand(sha);
     await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths())).resolves.toMatchObject({ version: "0.3.1", reused: false });
@@ -188,11 +191,13 @@ describe("managed install commands", () => {
       file === "corepack" ||
       (file === "npm" && args[0] === "pack") ||
       (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")));
-    expect(buildCalls).toHaveLength(9);
+    expect(buildCalls).toHaveLength(11);
+    expect(buildCalls.some(([file, args]) => file === "corepack" && args.includes("build:issue-thread"))).toBe(true);
     for (const call of buildCalls) {
       const env = call[2]?.env;
       expect(env, `${call[0]} ${call[1].join(" ")} must run with an explicit env`).toBeDefined();
       expect(env, `${call[0]} ${call[1].join(" ")} must not inherit NODE_ENV`).not.toHaveProperty("NODE_ENV");
+      expect(env, `${call[0]} ${call[1].join(" ")} must not inherit foreign Cargo output`).not.toHaveProperty("CARGO_TARGET_DIR");
     }
     const uiPackCall = buildCalls.find(([file, , options]) => file === "corepack" && options?.env?.PAPERCLIP_RELEASE_REUSE_UI_DIST === "1");
     expect(uiPackCall).toBeDefined();
@@ -222,6 +227,11 @@ describe("managed install commands", () => {
   it("includes child-process stderr in command failures", async () => {
     await expect(runCommandWithDiagnostics(process.execPath, ["-e", "process.stderr.write('unsupported workspace dependency\\n'); process.exit(1)"]))
       .rejects.toThrow("unsupported workspace dependency");
+  });
+
+  it("preserves a bounded build stdout tail on otherwise opaque failures", async () => {
+    await expect(runCommandWithDiagnostics(process.execPath, ["-e", "process.stdout.write('WORKSPACE_BUILD_MARKER\\n'); process.exit(1)"]))
+      .rejects.toThrow("WORKSPACE_BUILD_MARKER");
   });
 
   it("installs through the shim, reports provenance, and uninstalls without deleting user data", async () => {

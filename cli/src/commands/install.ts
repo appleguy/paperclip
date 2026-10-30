@@ -48,8 +48,12 @@ export async function runCommandWithDiagnostics(
     const stderr = error && typeof error === "object" && "stderr" in error && typeof error.stderr === "string"
       ? error.stderr.trim()
       : "";
-    if (!stderr || (error instanceof Error && error.message.includes(stderr))) throw error;
-    throw new Error(`${error instanceof Error ? error.message : String(error)}\n${stderr}`, { cause: error });
+    const stdout = error && typeof error === "object" && "stdout" in error && typeof error.stdout === "string"
+      ? error.stdout.trim() : "";
+    const message = error instanceof Error ? error.message : String(error);
+    const diagnostics = [stderr && !message.includes(stderr) ? stderr : "", stdout ? `Build stdout tail:\n${stdout.slice(-6000)}` : ""].filter(Boolean);
+    if (diagnostics.length === 0) throw error;
+    throw new Error(`${message}\n${diagnostics.join("\n")}`, { cause: error });
   }
 }
 
@@ -241,6 +245,9 @@ function gitBuildEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   // Source builds need devDependencies (esbuild, typescript); ambient NODE_ENV=production
   // makes pnpm/npm omit them, so the checkout build must not inherit it.
   delete env.NODE_ENV;
+  // The runner release packager stages binaries from checkout/runner/target.
+  // An inherited CARGO_TARGET_DIR sends cargo output elsewhere and breaks staging.
+  delete env.CARGO_TARGET_DIR;
   return env;
 }
 
@@ -280,8 +287,31 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     await runCommand("corepack", ["pnpm", "install", "--frozen-lockfile"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+    // The runner publishes the issue-thread viewer alongside its compiled runtime.
+    // Build that declared artifact before the literal file-copy bundler runs.
+    await runCommand("corepack", ["pnpm", "--filter", "@paperclipai/paperclip-runner", "run", "build:issue-thread"],
+      { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+    // Bundled server packaging reads server/ui-dist, but the normal build does
+    // not invoke its prepack hook. Prepare the UI explicitly before bundling.
+    await runCommand("corepack", ["pnpm", "--filter", "@paperclipai/server", "run", "prepare:ui-dist"],
+      { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
+    // The server package includes skills, which live at the repository root.
+    // Assemble that declared package file before prepare-bundled-package.
+    const rootSkills = path.join(checkoutPath, "skills");
+    if (fs.existsSync(rootSkills)) {
+      fs.cpSync(rootSkills, path.join(checkoutPath, "server", "skills"), { recursive: true });
+    }
     const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
+    // Optional adapter skill directories may be omitted from Git archives.
+    // The bundling helper copies declared files literally, unlike npm pack.
+    for (const workspacePackage of workspacePackages) {
+      const packageDir = path.join(checkoutPath, workspacePackage.dir);
+      const packageFiles = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")).files as string[] | undefined;
+      if (workspacePackage.name !== "@paperclipai/server" && packageFiles?.includes("skills") && !fs.existsSync(path.join(packageDir, "skills"))) {
+        fs.mkdirSync(path.join(packageDir, "skills"), { recursive: true });
+      }
+    }
     for (const [index, workspacePackage] of workspacePackages.entries()) {
       const packageDir = path.join(checkoutPath, workspacePackage.dir);
       const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { bundleDependencies?: string[]; bundledDependencies?: string[] };
@@ -289,12 +319,16 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       if (bundledDependencies.length > 0) {
         const stagedPackage = path.join(stagingRoot, `workspace-package-${index}`);
         await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "prepare-bundled-package.mjs"), packageDir, stagedPackage], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
-        await runCommand("npm", ["pack", stagedPackage, "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
+        // Artifacts were built in the full workspace. The stripped bundle lacks
+        // the monorepo scripts; re-running prepack here is invalid and unsafe.
+        await runCommand("npm", ["pack", stagedPackage, "--ignore-scripts", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
       } else {
         await runCommand("corepack", ["pnpm", "--dir", workspacePackage.dir, "pack", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
       }
     }
-    await runCommand("npm", ["pack", "--pack-destination", stagingRoot], { cwd: path.join(checkoutPath, "cli"), env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
+    // pnpm pack translates workspace:* dependency ranges to publishable versions.
+    // npm pack would preserve workspace:* and produce an unresolvable CLI tarball.
+    await runCommand("corepack", ["pnpm", "--dir", "cli", "pack", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
     const tarballs = fs.readdirSync(stagingRoot).filter((entry) => entry.endsWith(".tgz"));
     const cliTarball = tarballs.find((entry) => entry === `paperclipai-${metadata.version}.tgz`);
     const workspaceTarballs = tarballs.filter((entry) => entry !== cliTarball);
