@@ -394,8 +394,6 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
   }
 
   const deployedPackagePath = resolve(destinationDir, "package.json");
-  // The workspace may contain independently versioned packages (e.g. plugin-sdk
-  // 1.0.0). A parent's own version is not valid for every workspace:* dependency.
   const packageManifestPath = resolve(sourceRoot, "scripts/release-package-manifest.json");
   const workspaceVersions = {};
   if (existsSync(packageManifestPath)) {
