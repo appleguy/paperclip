@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "defaultMode": "auto",
+    "allow": [
+      "Edit(*)",
+      "Edit Block(*)",
+      "Start Terminal Process(*)",
+      "Bash(*)"
+    ]
+  }
+}
