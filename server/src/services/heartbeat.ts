@@ -525,7 +525,6 @@ import { environmentRunOrchestrator } from "./environment-run-orchestrator.js";
 
 import {
   clearHeartbeatRunRuntimeStatus,
-  sweepExpiredHeartbeatRunRuntimeStatuses,
 } from "./heartbeat-run-runtime-status.js";
 
 import { resolveAndRetainRunTrustPreset } from "./run-trust-preset.js";
@@ -4026,7 +4025,6 @@ export function heartbeatService(
 
     decorateActiveRunStatus: decorateHeartbeatRunRuntimeStatus,
     recordRuntimeProgress: recordCurrentHeartbeatRunRuntimeProgress,
-    sweepExpiredRuntimeStatuses: sweepExpiredHeartbeatRunRuntimeStatuses,
 
     getRunReadAccess,
     getRunLogAccess,
