@@ -41,6 +41,7 @@ import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useCompany } from "../context/CompanyContext";
 import { useDateRange, PRESET_KEYS, PRESET_LABELS } from "../hooks/useDateRange";
 import { retainQuotaWindows } from "../lib/quota-refresh";
+import { quotaPaceLabel } from "@/lib/quota-pace-labels";
 import { queryKeys } from "../lib/queryKeys";
 import { billingTypeDisplayName, cn, formatCents, formatTokens, providerDisplayName } from "../lib/utils";
 import { Button } from "@/components/ui/button";
@@ -1065,7 +1066,7 @@ export function Costs({
             <CardHeader>
               <CardTitle>Subscription quota across providers</CardTitle>
               <CardDescription>
-                Quota Sentinel · polled every 30 minutes · read-only subscription allowance (not API spend)
+                Quota Sentinel · polled every 30 minutes · allowance, not API spend · pace is recent consumption speed
                 {sentinelData?.observedAt ? ` · observed ${new Date(sentinelData.observedAt).toLocaleString("en-US", { timeZone: "America/Los_Angeles", year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" })}` : ""}
                 {sentinelData?.stale ? " · STALE snapshot" : ""}
               </CardDescription>
@@ -1088,7 +1089,7 @@ export function Costs({
                             </div>
                             <p className="text-xs text-muted-foreground">
                               {p.resetsAt ? `Resets ${new Date(p.resetsAt).toLocaleString("en-US", { timeZone: "America/Los_Angeles", year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" })}` : "Reset unknown"}
-                              {" · "}{p.state.replaceAll("_", " ")}
+                              {" · "}{quotaPaceLabel(p.state)}
                             </p>
                           </div>
                         ))}

@@ -1,4 +1,5 @@
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { quotaPaceLabel } from "@/lib/quota-pace-labels";
 
 interface AntigravityPool {
   pool: string;
@@ -42,7 +43,7 @@ export function AntigravityQuotaCard({
       <CardHeader>
         <CardTitle>Antigravity subscription quota</CardTitle>
         <CardDescription>
-          Live quota from Quota Sentinel, independent of Paperclip cost events.
+          Live quota from Quota Sentinel, independent of Paperclip cost events. Pace describes recent consumption speed, not total weekly progress.
           {observedAt && !Number.isNaN(Date.parse(observedAt))
             ? ` Observed ${pacificFormat.format(new Date(observedAt))}.`
             : ""}
@@ -79,7 +80,7 @@ export function AntigravityQuotaCard({
                 {resetsAt && !Number.isNaN(Date.parse(resetsAt))
                   ? `Resets ${pacificFormat.format(new Date(resetsAt))}`
                   : "Reset unknown"}
-                {" · "}{state.replaceAll("_", " ")}
+                {" · "}{quotaPaceLabel(state)}
               </p>
             </div>
           ))

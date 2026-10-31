@@ -42,6 +42,8 @@ describe("standalone subscription quotas", () => {
     expect(calls).toEqual(["/api/companies", "/api/companies/company-123/costs/quota-sentinel"]);
     expect(document.body.textContent).toContain("Third-party · weekly");
     expect(document.body.textContent).toContain("76.8% used");
+    expect(document.body.textContent).toContain("recent rate below goal");
+    expect(document.body.textContent).not.toContain("behind pace");
     expect(document.body.textContent).toContain("Nov 3, 2026");
     expect(document.body.textContent).toContain("ChatGPT / Codex");
     expect(document.body.textContent).toContain("Claude");

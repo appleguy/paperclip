@@ -400,6 +400,7 @@ describe("Shared Costs surfaces", () => {
     await act(async () => vi.waitFor(() => expect(antigravityTab?.getAttribute("data-state")).toBe("active")));
     expect(container.querySelectorAll('[data-testid="antigravity-quota-card"]')).toHaveLength(1);
     expect(container.textContent).toContain("Resets Nov 3, 8:14 PM PST");
+    expect(container.textContent).toContain("recent rate below goal");
     queryClient.clear();
   });
 

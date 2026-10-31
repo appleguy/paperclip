@@ -52,13 +52,16 @@ summary{cursor:pointer}
 <p id="status" role="status" aria-live="polite">Checking your subscription usage…</p>
 </header>
 <div id="cards" aria-live="polite"></div>
-<footer>Read-only. Existing Quota Sentinel collects a snapshot every 30 minutes; this page checks that snapshot every minute. Unknown allowance readings are never treated as zero. No inference is sent by viewing or refreshing this page.</footer>
+<footer>Read-only. Existing Quota Sentinel collects a snapshot every 30 minutes; this page checks that snapshot every minute. Unknown allowance readings are never treated as zero. Pace labels describe the recent usage rate, not how much of the week has elapsed. No inference is sent by viewing or refreshing this page.</footer>
 </main>
 <script>
 (function(){
 "use strict";
 var labels={antigravity:"Antigravity",codex:"ChatGPT / Codex",claude:"Claude"};
 var pools={"3p:5h":"Third-party · 5-hour","3p:weekly":"Third-party · weekly","gemini-argon-wtu:weekly":"Gemini Argon · weekly","gemini:5h":"Gemini · 5-hour","gemini:weekly":"Gemini · weekly",session:"Session",weekly:"Weekly"};
+// These labels describe the RECENT rate of quota consumption (up to 48h), not
+// whether cumulative weekly usage is ahead of an even-use schedule.
+var paceLabels={behind_pace:"recent rate below goal",ahead_of_pace:"recent rate above goal",on_pace:"recent rate near goal",need_trend:"recent trend unmeasured",reset_imminent_underused:"reset soon, allowance left",exhausted_early:"allowance exhausted early",target_reached:"target reached",reset_due:"reset due",unknown:"usage or reset unknown"};
 var zone=new Intl.DateTimeFormat("en-US",{timeZone:"America/Los_Angeles",month:"short",day:"numeric",year:"numeric",hour:"numeric",minute:"2-digit",timeZoneName:"short"});
 var cards=document.getElementById("cards"), status=document.getElementById("status"), refresh=document.getElementById("refresh"), costs=document.getElementById("costs-link");
 var busy=false;
@@ -84,7 +87,7 @@ function render(data){
    var meter=el("div","meter"),used=typeof item.usedPercent==="number"&&Number.isFinite(item.usedPercent)?Math.min(100,Math.max(0,item.usedPercent)):null;
    meter.setAttribute("role","progressbar");meter.setAttribute("aria-label",labels[provider]+" "+(pools[item.pool]||item.pool||"Other"));meter.setAttribute("aria-valuemin","0");meter.setAttribute("aria-valuemax","100");
    if(used!=null){meter.setAttribute("aria-valuenow",String(used));var fill=el("div","fill");fill.style.width=used+"%";meter.append(fill)}
-   pool.append(head,meter,el("p","reset","Resets "+when(item.resetsAt)+(item.state?" · "+String(item.state).replaceAll("_"," "):"")));
+   pool.append(head,meter,el("p","reset","Resets "+when(item.resetsAt)+(item.state?" · "+(paceLabels[item.state]||String(item.state).replaceAll("_"," ")):"")));
    section.append(pool);
   });
   cards.append(section);
