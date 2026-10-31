@@ -1055,6 +1055,12 @@ export function Costs({
         </TabsContent>
 
         <TabsContent value="providers" className="mt-4 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
+            <span className="text-muted-foreground">Quota allowances are separate from Paperclip inference costs.</span>
+            <a className="underline underline-offset-4" href="/subscription-quotas.html">
+              Open live subscription-only dashboard
+            </a>
+          </div>
           <Card data-testid="quota-sentinel-panel">
             <CardHeader>
               <CardTitle>Subscription quota across providers</CardTitle>

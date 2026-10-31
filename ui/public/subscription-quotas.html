@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#101115">
+<title>Subscription quotas | Paperclip</title>
+<style>
+:root{color-scheme:dark;font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#101115;color:#f4f5f7}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh}
+main{max-width:900px;margin:auto;padding:24px clamp(16px,4vw,36px) 70px}
+nav{display:flex;align-items:center;gap:12px;justify-content:space-between;margin-bottom:30px}
+a{color:#bed7ff;text-decoration:none}a:hover{text-decoration:underline}
+.wordmark{font-size:12px;letter-spacing:.1em;font-weight:700;color:#aab2be}
+h1{font-size:clamp(28px,7vw,40px);line-height:1.15;margin:0 0 9px;font-weight:680;letter-spacing:-.03em}
+.intro{color:#aeb5c0;font-size:14px;margin:0 0 18px}
+.actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:0 0 16px}
+button{font:inherit;font-weight:600;cursor:pointer;border:1px solid #55606b;border-radius:11px;background:#262b33;color:#f4f5f7;padding:9px 15px;min-height:42px}
+button:disabled{opacity:.65;cursor:wait}
+#status{font-size:13px;color:#b8c5d2;min-height:22px}
+#status.fail{color:#ffc7a3}
+#cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,255px),1fr));gap:14px;margin-top:20px}
+section{border:1px solid #343943;border-radius:16px;background:#1a1d23;padding:19px 18px;min-height:180px}
+h2{font-size:20px;margin:0 0 4px;font-weight:640}
+.note{color:#aeb5c0;font-size:12px;margin:0 0 22px}
+.pool{margin:0 0 21px}
+.pool:last-child{margin-bottom:0}
+.poolhead{display:flex;justify-content:space-between;align-items:baseline;gap:10px;font-size:14px}
+.poolhead span:first-child{color:#e1e6ee}
+.poolhead strong{font-weight:650;font-variant-numeric:tabular-nums;white-space:nowrap}
+.meter{background:#313843;border-radius:5px;height:8px;margin:9px 0 7px;overflow:hidden}
+.fill{background:#7fa8f9;height:100%;border-radius:5px}
+.reset{color:#aeb5c0;font-size:12px;line-height:1.45}
+footer{border-top:1px solid #343943;color:#a2adbc;padding-top:17px;margin-top:25px;font-size:12px}
+details{margin-top:12px;font-size:12px;color:#b8c5d2}
+summary{cursor:pointer}
+@media(max-width:520px){main{padding-top:18px}nav{margin-bottom:23px}.intro{margin-bottom:16px}}
+</style>
+</head>
+<body>
+<main>
+<nav><span class="wordmark">SCOTT'S AGENTS · PAPERCLIP</span><a id="costs-link" href="/SCO/activity/costs?tab=providers">Costs &amp; Providers</a></nav>
+<header>
+<h1>Subscription quotas</h1>
+<p class="intro">Antigravity, ChatGPT / Codex and Claude. These are provider allowances, not estimated token bills.</p>
+<div class="actions">
+<button id="refresh" type="button">Refresh now</button>
+<a href="/">Paperclip home</a>
+</div>
+<p id="status" role="status" aria-live="polite">Checking your subscription usage…</p>
+</header>
+<div id="cards" aria-live="polite"></div>
+<footer>Read-only. Existing Quota Sentinel collects a snapshot every 30 minutes; this page checks that snapshot every minute. Unknown allowance readings are never treated as zero. No inference is sent by viewing or refreshing this page.</footer>
+</main>
+<script>
+(function(){
+"use strict";
+var labels={antigravity:"Antigravity",codex:"ChatGPT / Codex",claude:"Claude"};
+var pools={"3p:5h":"Third-party · 5-hour","3p:weekly":"Third-party · weekly","gemini-argon-wtu:weekly":"Gemini Argon · weekly","gemini:5h":"Gemini · 5-hour","gemini:weekly":"Gemini · weekly",session:"Session",weekly:"Weekly"};
+var zone=new Intl.DateTimeFormat("en-US",{timeZone:"America/Los_Angeles",month:"short",day:"numeric",year:"numeric",hour:"numeric",minute:"2-digit",timeZoneName:"short"});
+var cards=document.getElementById("cards"), status=document.getElementById("status"), refresh=document.getElementById("refresh"), costs=document.getElementById("costs-link");
+var busy=false;
+function when(value){if(typeof value!=="string")return "unknown";var d=new Date(value);return Number.isNaN(d.getTime())?"unknown":zone.format(d)}
+function el(tag,cls,value){var n=document.createElement(tag);if(cls)n.className=cls;if(value!=null)n.textContent=value;return n}
+function resultText(message,fail){status.textContent=message;status.className=fail?"fail":""}
+async function json(path){
+ var response=await fetch(path,{credentials:"same-origin",cache:"no-store",headers:{"Accept":"application/json"}});
+ if(!response.ok){var e=new Error(response.status===401?"Sign in to Paperclip, then reopen this page.":"Quota request failed (HTTP "+response.status+").");e.status=response.status;throw e}
+ return await response.json();
+}
+function render(data){
+ if(!data||data.source!=="quota-sentinel"||!Array.isArray(data.pools))throw new Error("Quota snapshot has an unexpected format.");
+ cards.replaceChildren();
+ ["antigravity","codex","claude"].forEach(function(provider){
+  var section=el("section"),title=el("h2",null,labels[provider]),subtitle=el("p","note",provider==="antigravity"?"Gemini and third-party allowances":provider==="codex"?"ChatGPT subscription quota":"Claude subscription quota");
+  section.append(title,subtitle);
+  var found=data.pools.filter(function(v){return v&&v.provider===provider});
+  if(found.length===0)section.append(el("p","reset","Provider reading unavailable."));
+  found.forEach(function(item){
+   var pool=el("div","pool"),head=el("div","poolhead");
+   head.append(el("span",null,pools[item.pool]||item.pool||"Other"),el("strong",null,typeof item.usedPercent==="number"&&Number.isFinite(item.usedPercent)?item.usedPercent.toFixed(1)+"% used":"Unknown"));
+   var meter=el("div","meter"),used=typeof item.usedPercent==="number"&&Number.isFinite(item.usedPercent)?Math.min(100,Math.max(0,item.usedPercent)):null;
+   meter.setAttribute("role","progressbar");meter.setAttribute("aria-label",labels[provider]+" "+(pools[item.pool]||item.pool||"Other"));meter.setAttribute("aria-valuemin","0");meter.setAttribute("aria-valuemax","100");
+   if(used!=null){meter.setAttribute("aria-valuenow",String(used));var fill=el("div","fill");fill.style.width=used+"%";meter.append(fill)}
+   pool.append(head,meter,el("p","reset","Resets "+when(item.resetsAt)+(item.state?" · "+String(item.state).replaceAll("_"," "):"")));
+   section.append(pool);
+  });
+  cards.append(section);
+ });
+ resultText("Quota Sentinel · observed "+when(data.observedAt)+(data.stale?" · STALE reading":" · live snapshot"),!!data.stale);
+}
+async function update(){
+ if(busy)return;busy=true;refresh.disabled=true;refresh.textContent="Refreshing…";
+ try{
+  var companies=await json("/api/companies");
+  if(!Array.isArray(companies)||companies.length===0)throw new Error("No Paperclip company is available for this account.");
+  var company=companies.find(function(c){return c.issuePrefix==="SCO"})||companies[0];
+  if(!company||typeof company.id!=="string")throw new Error("Paperclip company identity unavailable.");
+  costs.href="/"+encodeURIComponent(company.issuePrefix||"SCO")+"/activity/costs?tab=providers";
+  var data=await json("/api/companies/"+encodeURIComponent(company.id)+"/costs/quota-sentinel");
+  render(data);
+ }catch(err){
+  resultText((err&&err.message)||"Unable to load quota.",true);
+  if(!cards.children.length)cards.append(el("section",null,"Quota information cannot be displayed. You may need to sign in to Paperclip first."));
+ }finally{busy=false;refresh.disabled=false;refresh.textContent="Refresh now"}
+}
+refresh.addEventListener("click",update);
+document.addEventListener("visibilitychange",function(){if(!document.hidden)update()});
+window.addEventListener("pageshow",function(e){if(e.persisted)update()});
+update();window.setInterval(function(){if(!document.hidden)update()},60000);
+})();
+</script>
+</body>
+</html>

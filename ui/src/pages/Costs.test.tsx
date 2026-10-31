@@ -390,6 +390,7 @@ describe("Shared Costs surfaces", () => {
     root = createRoot(container);
     await act(async () => root.render(<MemoryRouter initialEntries={["/?tab=providers"]}><QueryClientProvider client={queryClient}><Costs /></QueryClientProvider></MemoryRouter>));
     await act(async () => vi.waitFor(() => expect(container.querySelector('[data-testid="antigravity-quota-card"]')?.textContent).toContain("76.8% used")));
+    expect(container.querySelector('a[href="/subscription-quotas.html"]')).not.toBeNull();
     expect(container.textContent).toContain("Third-party · weekly");
     expect(container.textContent).toContain("Gemini · weekly");
     expect(container.querySelector('[data-testid="antigravity-quota-card"]')?.textContent).not.toContain("$0.00");
