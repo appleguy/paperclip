@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "defaultMode": "auto",
+    "allow": [
+      "Edit(*)",
+      "mcp__Desktop_Commander__*",
+      "Bash(*)"
+    ]
+  }
+}
