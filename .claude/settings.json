@@ -3,8 +3,7 @@
     "defaultMode": "auto",
     "allow": [
       "Edit(*)",
-      "Edit Block(*)",
-      "Start Terminal Process(*)",
+      "mcp__Desktop_Commander__*",
       "Bash(*)"
     ]
   }
