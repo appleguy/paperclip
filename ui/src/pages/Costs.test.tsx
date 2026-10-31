@@ -374,6 +374,34 @@ describe("Shared Costs surfaces", () => {
     queryClient.clear();
   });
 
+  it("shows Antigravity quota even when no provider cost events exist", async () => {
+    for (const mock of Object.values(costsApiMocks)) mock.mockResolvedValue([]);
+    costsApiMocks.summary.mockResolvedValue({ spendCents: 0, budgetCents: 0, pricingComplete: true });
+    costsApiMocks.quotaSentinel.mockResolvedValue({
+      source: "quota-sentinel",
+      observedAt: "2026-10-31T03:39:37Z",
+      stale: false,
+      pools: [
+        { provider: "antigravity", pool: "3p:weekly", usedPercent: 76.85, resetsAt: "2026-11-04T04:14:42Z", state: "behind_pace" },
+        { provider: "antigravity", pool: "gemini:weekly", usedPercent: 0, resetsAt: "2026-11-06T23:04:15Z", state: "need_trend" },
+      ],
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    root = createRoot(container);
+    await act(async () => root.render(<MemoryRouter initialEntries={["/?tab=providers"]}><QueryClientProvider client={queryClient}><Costs /></QueryClientProvider></MemoryRouter>));
+    await act(async () => vi.waitFor(() => expect(container.querySelector('[data-testid="antigravity-quota-card"]')?.textContent).toContain("76.8% used")));
+    expect(container.textContent).toContain("Third-party · weekly");
+    expect(container.textContent).toContain("Gemini · weekly");
+    expect(container.querySelector('[data-testid="antigravity-quota-card"]')?.textContent).not.toContain("$0.00");
+    const antigravityTab = [...container.querySelectorAll('[role="tab"]')].find(tab => tab.textContent?.includes("Antigravity"));
+    expect(antigravityTab).toBeDefined();
+    await act(async () => antigravityTab!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 })));
+    await act(async () => vi.waitFor(() => expect(antigravityTab?.getAttribute("data-state")).toBe("active")));
+    expect(container.querySelectorAll('[data-testid="antigravity-quota-card"]')).toHaveLength(1);
+    expect(container.textContent).toContain("Resets Nov 3, 8:14 PM PST");
+    queryClient.clear();
+  });
+
   it("uses three-provider Sentinel readings rather than conflicting native account quota errors", async () => {
     for (const mock of Object.values(costsApiMocks)) mock.mockResolvedValue([]);
     costsApiMocks.summary.mockResolvedValue({ spendCents: 0, budgetCents: 0, pricingComplete: true });

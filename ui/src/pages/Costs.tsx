@@ -35,6 +35,7 @@ import { Identity } from "../components/Identity";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { PageTabBar } from "../components/PageTabBar";
 import { ProviderQuotaCard } from "../components/ProviderQuotaCard";
+import { AntigravityQuotaCard } from "../components/AntigravityQuotaCard";
 import { StatusBadge } from "../components/StatusBadge";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useCompany } from "../context/CompanyContext";
@@ -521,7 +522,11 @@ export function Costs({
     return map;
   }, [preset, spendData, byProvider]);
 
-  const providers = useMemo(() => Array.from(byProvider.keys()), [byProvider]);
+  // A provider may have subscription quota even with zero Paperclip cost events.
+  // Antigravity is a subscription source, not a cost-ledger provider.
+  const providers = useMemo(() => {
+    return ["antigravity", ...Array.from(byProvider.keys()).filter(key => key !== "antigravity")];
+  }, [byProvider]);
   const billers = useMemo(() => Array.from(byBiller.keys()), [byBiller]);
 
   const effectiveProvider =
@@ -537,7 +542,7 @@ export function Costs({
   }, [effectiveBiller, activeBiller]);
 
   const providerTabItems = useMemo(() => {
-    const providerKeys = Array.from(byProvider.keys());
+    const providerKeys = providers;
     const allTokens = providerKeys.reduce(
       (sum, provider) => sum + (byProvider.get(provider)?.reduce((acc, row) => acc + row.inputTokens + row.cachedInputTokens + row.outputTokens, 0) ?? 0),
       0,
@@ -563,10 +568,12 @@ export function Costs({
       },
       ...providerKeys.map((provider) => ({
         value: provider,
-        label: <ProviderTabLabel provider={provider} rows={byProvider.get(provider) ?? []} />,
+        label: provider === "antigravity"
+          ? <span>Antigravity <span className="text-xs text-muted-foreground">Quota</span></span>
+          : <ProviderTabLabel provider={provider} rows={byProvider.get(provider) ?? []} />,
       })),
     ];
-  }, [byProvider]);
+  }, [byProvider, providers]);
 
   const billerTabItems = useMemo(() => {
     const billerKeys = Array.from(byBiller.keys());
@@ -1096,7 +1103,16 @@ export function Costs({
                     <p className="text-sm text-muted-foreground">No cost events in this period.</p>
                   ) : (
                     <div className="grid gap-4 md:grid-cols-2">
-                      {providers.map((provider) => (
+                      {providers.map((provider) => provider === "antigravity" ? (
+                        <AntigravityQuotaCard
+                          key="antigravity"
+                          pools={sentinelData?.pools?.filter(p => p.provider === "antigravity") ?? []}
+                          observedAt={sentinelData?.observedAt}
+                          stale={sentinelData?.stale}
+                          loading={sentinelLoading}
+                          error={sentinelError}
+                        />
+                      ) : (
                         <ProviderQuotaCard
                           key={provider}
                           provider={provider}
@@ -1121,6 +1137,15 @@ export function Costs({
 
                 {providers.map((provider) => (
                   <TabsContent key={provider} value={provider} className="mt-4">
+                    {provider === "antigravity" ? (
+                      <AntigravityQuotaCard
+                        pools={sentinelData?.pools?.filter(p => p.provider === "antigravity") ?? []}
+                        observedAt={sentinelData?.observedAt}
+                        stale={sentinelData?.stale}
+                        loading={sentinelLoading}
+                        error={sentinelError}
+                      />
+                    ) : (
                     <ProviderQuotaCard
                       provider={provider}
                       rows={byProvider.get(provider) ?? []}
@@ -1137,6 +1162,7 @@ export function Costs({
                       quotaSource={preferSentinelQuota ? null : quotaSourcesByProvider.get(provider) ?? null}
                       quotaLoading={!preferSentinelQuota && quotaLoading}
                     />
+                    )}
                   </TabsContent>
                 ))}
               </Tabs>
