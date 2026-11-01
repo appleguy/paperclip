@@ -7,6 +7,7 @@ import { resolvePaperclipInstanceId, resolvePaperclipInstanceRoot } from "../con
 import { detectServiceManager, type ServiceManager, type ServiceStatus } from "../services/service-manager.js";
 import { ensureServiceShim } from "../onboard-service.js";
 import { buildLocalHealthUrl } from "../utils/health-url.js";
+import { resolveCommandContext } from "./client/common.js";
 
 type CommonOptions = { instance?: string; json?: boolean };
 type HealthResult = { ok: boolean; serverVersion: string | null; error?: string };
@@ -156,10 +157,37 @@ export async function restartManagedService(input: { instanceId?: string; expect
     const detection = await detectServiceManager({ instanceId });
     if (!detection.supported) throw new Error(detection.reason);
     const before = await detection.manager.status();
-    const intent = await writeHotRestartIntent(before, instanceId, input.waitForDrain ?? false);
-    await detection.manager.restart();
-    const health = await waitForHealth(instanceId, resolveRestartExpectedVersion(input.expectedVersion));
-    return { status: await detection.manager.status(), health, report: await waitForRestartReport(instanceId, intent.requestedAt) };
+    if (!before.pid) throw new Error("Cannot restart: supervisor did not report a server pid.");
+    const apiBase = healthUrl(instanceId).replace(/\/api\/health$/, "");
+    const api = resolveCommandContext({ apiBase }).api;
+    const hold = await api.post<{ ownerId?: string; startedAt?: string; expiresAt?: string }>("/api/instance/task-drain", { purpose: "idle", ttlMs: 300_000 });
+    const ownerId = typeof hold?.ownerId === "string" && hold.ownerId.length > 0 ? hold.ownerId : null;
+    let signalled = false;
+    try {
+      if (!ownerId || typeof hold?.startedAt !== "string" || typeof hold.expiresAt !== "string") {
+        throw new Error("Restart refused: task admission fence was not established.");
+      }
+      const state = await api.get<{
+        serverPid?: number; ownerId?: string; startedAt?: string; expiresAt?: string; draining?: boolean;
+        pendingWakes?: number;
+        upgradeReadiness?: { blockingRuns?: number; pendingWakes?: number; truncated?: boolean; draining?: boolean };
+      }>("/api/instance/task-drain?upgradeReadiness=1");
+      const readiness = state?.upgradeReadiness;
+      if (!state || state.serverPid !== before.pid || state.ownerId !== hold.ownerId ||
+          state.startedAt !== hold.startedAt || state.expiresAt !== hold.expiresAt || state.draining !== true ||
+          !Number.isFinite(Date.parse(state.expiresAt ?? "")) || Date.parse(state.expiresAt ?? "") - Date.now() < 120_000 ||
+          state.pendingWakes !== 0 || readiness?.pendingWakes !== 0 || readiness.blockingRuns !== 0 ||
+          readiness.truncated !== false || readiness.draining !== true) {
+        throw new Error("Restart refused: active or unverified work cannot be safely adopted. Allow it to finish and retry; --wait does not interrupt runs.");
+      }
+      const intent = await writeHotRestartIntent(before, instanceId, false);
+      signalled = true;
+      await detection.manager.restart();
+      const health = await waitForHealth(instanceId, resolveRestartExpectedVersion(input.expectedVersion));
+      return { status: await detection.manager.status(), health, report: await waitForRestartReport(instanceId, intent.requestedAt) };
+    } finally {
+      if (!signalled && ownerId) await api.delete(`/api/instance/task-drain?ownerId=${encodeURIComponent(ownerId)}`);
+    }
   });
 }
 
@@ -211,8 +239,8 @@ export function registerServiceCommands(program: Command): void {
     });
   }
 
-  common(service.command("restart").description("Hot-restart the service while preserving active agent runs"))
-    .option("--wait", "Wait for active runs to drain instead of adopting them", false)
+  common(service.command("restart").description("Restart only when active work is verifiably recoverable"))
+    .option("--wait", "Require active non-recoverable runs to finish before retrying", false)
     .option("--expected-version <version>", "Require the restarted server to report this version")
     .action(async (opts) => output(await restartManagedService({ instanceId: opts.instance, expectedVersion: opts.expectedVersion, waitForDrain: opts.wait }), opts.json));
 

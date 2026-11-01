@@ -800,6 +800,14 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         continue;
       }
 
+      // A detached process group does not detach its stdio or transfer the
+      // adapter's result parser to this controller. Liveness alone therefore
+      // cannot establish adoption of a legacy local child.
+      if (run.runtimeMode === "legacy") {
+        classify(candidate, "skipped", "legacy_process_output_not_reattached", patch);
+        continue;
+      }
+
       const resultJson = mergeHotRestartAdoptionResultJson(
         parseObject(run.resultJson),
         {

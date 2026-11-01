@@ -312,7 +312,7 @@ export function instanceSettingsRoutes(db: Db, pluginWorkers?: PluginWorkerManag
     if (req.query.upgradeReadiness === "1") {
       // This covers all companies and must not expose instance-wide work to a member.
       assertCanManageInstanceSettings(req);
-      res.json({ ...heartbeat.getTaskDrainStatus(), upgradeReadiness: await heartbeat.readUpgradeReadiness() });
+      res.json({ ...heartbeat.getTaskDrainStatus(), serverPid: process.pid, upgradeReadiness: await heartbeat.readUpgradeReadiness() });
       return;
     }
     if (req.query.idleSleepSafety === "1") {
