@@ -150,6 +150,15 @@ try {
   })();
   if (browserEnabled) browser = await openRollingDeploymentBrowser({ origin: proxy.origin, root, taskTitle: task.title,
     taskPath: `/issues/${task.id}`, omittedAssets });
+  await check("Unready replacement leaves the healthy server serving", async () => {
+    const unready = await startRollingDeploymentProcess({ root, name: "unready", repositoryRoot,
+      databaseUrl: database!.connectionString, ingressOrigin: proxy!.origin,
+      sharedEnvironment: { ...sharedEnvironment, PAPERCLIP_EPHEMERAL_SERVER: "true", PAPERCLIP_DECISION_SIGNING_SECRET: "" } });
+    processes.push(unready);
+    await assert.rejects(unready.waitForReady(), /exited before readiness/);
+    assert.equal((await api(proxy!.origin, `/issues/${task.id}`)).id, task.id);
+    assert.equal((await api(a.origin, `/issues/${task.id}`)).id, task.id);
+  });
   const b = await start("B");
   await check("B reads acknowledged task while A is alive", async () => {
     assert.equal((await api(b.origin, `/issues/${task.id}`)).title, task.title);
@@ -185,7 +194,7 @@ try {
       while (storageProxy!.heldUploads < 1 && Date.now() < deadline) await delay(25);
       assert.equal(storageProxy!.heldUploads, 1);
       proxy!.routeTo(b.origin);
-      stopping = a.stop();
+      stopping = a.stop({ requireGraceful: true });
       await delay(100);
       assert.equal(acknowledged, false);
       storageProxy!.resumeUploads();
@@ -198,7 +207,7 @@ try {
   });
   proxy.routeTo(b.origin);
   await delay(500);
-  await a.stop();
+  await a.stop({ requireGraceful: true });
   await rm(a.home, { recursive: true, force: true });
   await delay(1_000);
   report.handoffElapsedMs = Math.round(performance.now() - switchedAt);
@@ -261,7 +270,7 @@ try {
       if (fixture.seeded) assert.equal((await api(b.origin, `${route}?path=AGENTS.md`)).content, "Durable original");
     }
   });
-  await b.stop(); await rm(b.home, { recursive: true, force: true });
+  await b.stop({ requireGraceful: true }); await rm(b.home, { recursive: true, force: true });
   const c = await start("C", false); proxy.routeTo(c.origin);
   await check("Fresh C restores files after both homes are deleted, even with adoption opt-in disabled", async () => {
     assert.equal((await api(c.origin, `${fileRoute}?path=reference.txt`)).content, content);
