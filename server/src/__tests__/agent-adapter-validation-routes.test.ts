@@ -450,6 +450,9 @@ describe("agent routes adapter validation", () => {
       }
       const invalid = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/companies/company-1/adapters/paperclip_runner/models?provider=acpx_codex"));
       expect(invalid.status).toBe(422);
+      const nativeAntigravity = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/companies/company-1/adapters/paperclip_runner/models?provider=antigravity_headless"));
+      expect(nativeAntigravity.status).toBe(200);
+      expect(nativeAntigravity.body).toEqual([]);
     } finally { list.mockRestore(); refresh.mockRestore(); }
   });
 

@@ -41,6 +41,7 @@ export type QualifiedPaperclipRunnerAcpxAgent =
 type AdmittedPaperclipRunnerAcpxAgent = QualifiedPaperclipRunnerAcpxAgent | AcpxQualificationCandidate | "antigravity";
 
 export type PaperclipRunnerProviderProfile =
+  | { provider: "antigravity_headless"; backend: "antigravity_headless"; model: null }
   | { provider: "muse"; backend: "muse_external"; model: null; museBindingId: string }
   | { provider: "grok_bot"; backend: "grok_bot_mcp"; model: null; externalBindingId: string }
   | { provider: "openai_dot"; backend: "openai_dot_mcp"; model: null; dotBindingId: string }
@@ -76,6 +77,7 @@ export type PaperclipRunnerProviderProfile =
     };
 
 export type PaperclipRunnerNativeProviderInput =
+  | { provider: "antigravity_headless"; model: null; homeMode: "preconfigured" }
   | { provider: "muse"; model: null; museBinding: import("../../vendor/paperclip-runner/index.js").MuseBindingSnapshot }
   | { provider: "grok_bot"; model: null; dotBinding: import("../../vendor/paperclip-runner/index.js").DotBindingSnapshot }
   | { provider: "openai_dot"; model: null; dotBinding: import("../../vendor/paperclip-runner/index.js").DotBindingSnapshot }
@@ -415,6 +417,12 @@ export function resolvePaperclipRunnerProviderProfile(
 ): PaperclipRunnerProviderProfile {
   const config = asRecord(adapterConfig);
   const candidate = config.provider ?? "codex";
+  if (candidate === "antigravity_headless") {
+    if (optionalString(config.model) || (config.homeMode !== undefined && config.homeMode !== "preconfigured") || (config.lifecycleMode !== undefined && config.lifecycleMode !== "per_turn") || [config.acpxAgent, config.modelReasoningEffort, config.reasoningEffort, config.effort, config.acpxPermissionMode].some(value => value !== undefined && value !== null)) {
+      throw new PaperclipRunnerProviderProfileError("paperclip_runner_antigravity_headless_config_invalid", "Native Antigravity headless requires per-turn lifecycle and the preconfigured subscription; model, effort and ACPX settings are unsupported.");
+    }
+    return { provider: "antigravity_headless", backend: "antigravity_headless", model: null };
+  }
   if (!isPaperclipRunnerProvider(candidate)) {
     throw new PaperclipRunnerProviderProfileError(
       "paperclip_runner_provider_unsupported",
@@ -641,7 +649,7 @@ export function resolvePaperclipRunnerNativeProviderInput(input: {
     throw new PaperclipRunnerProviderProfileError("paperclip_runner_home_mode_invalid", "homeMode must be isolated or preconfigured");
   }
   const preconfigured = config.homeMode === "preconfigured";
-  if (preconfigured && profile.provider !== "codex" && !(profile.provider === "acpx" && ["claude", "codex"].includes(profile.acpxAgent))) {
+  if (preconfigured && profile.provider !== "codex" && profile.provider !== "antigravity_headless" && !(profile.provider === "acpx" && ["claude", "codex"].includes(profile.acpxAgent))) {
     throw new PaperclipRunnerProviderProfileError("paperclip_runner_home_mode_unsupported", "Preconfigured home supports native Codex and ACPX Claude only");
   }
   if (preconfigured && profile.provider === "acpx" && config.acpxPermissionMode !== undefined && config.acpxPermissionMode !== "approve-all") {
@@ -656,6 +664,7 @@ export function resolvePaperclipRunnerNativeProviderInput(input: {
       "Paperclip Runner provider changed after this run selected its native backend.",
     );
   }
+  if (profile.provider === "antigravity_headless") return { provider: "antigravity_headless", model: null, homeMode: "preconfigured" };
   if (profile.provider === "muse") {
     if (!input.museBinding || input.museBinding.bindingId !== profile.museBindingId) throw new PaperclipRunnerProviderProfileError("paperclip_runner_muse_binding_unavailable", "Muse binding must be resolved by the server after normal admission.");
     return { provider: "muse", model: null, museBinding: input.museBinding };

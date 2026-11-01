@@ -1963,7 +1963,7 @@ export function agentRoutes(
     ) {
       return input.nextAdapterConfig;
     }
-    if (["openai_dot", "muse"].includes(String(input.nextAdapterConfig.provider))) return input.nextAdapterConfig;
+    if (["openai_dot", "muse", "antigravity_headless"].includes(String(input.nextAdapterConfig.provider))) return input.nextAdapterConfig;
     const defaults = paperclipRunnerTransitionConfig(input.previousAdapterType, input.previousAdapterConfig.model, input.nextAdapterConfig.provider);
     if (!["claude_local", "codex_local", "opencode_local", "pi_local", "grok_local"].includes(input.previousAdapterType)
       && !isPaperclipRunnerProvider(input.nextAdapterConfig.provider)) {
@@ -3138,6 +3138,10 @@ export function agentRoutes(
     }
     if (type === "opencode_local" && provider === "openrouter") {
       res.json(await listOpenRouterModels(refresh));
+      return;
+    }
+    if (type === "paperclip_runner" && provider === "antigravity_headless") {
+      res.json([]);
       return;
     }
     if (type === "paperclip_runner" && provider && !isPaperclipRunnerProvider(provider)) {

@@ -48,6 +48,7 @@ export type NativeRuntimeResolution =
         backend:
           | "codex_app_server"
           | "opencode_server"
+          | "antigravity_headless"
           | "claude_managed_agents_api"
           | "aws_agentcore_harness_api"
           | "acpx_runtime"
@@ -259,7 +260,7 @@ export function resolveHeartbeatRuntimeMode(input: {
     kind: "native",
     resolverVersion: NATIVE_RUNTIME_RESOLVER_VERSION,
     reason: "explicit_paperclip_runner",
-    provider: resolution.profile.backend === "opencode_server"
+    provider: resolution.profile.backend === "antigravity_headless" ? "antigravity_headless" : resolution.profile.backend === "opencode_server"
       ? "opencode"
       : resolution.profile.backend === "claude_managed_agents_api"
         ? "claude_managed"
@@ -315,7 +316,7 @@ export function resolveHeartbeatNativeRuntimeMode(input: {
         );
       }
       const driverKind = input.persisted.driverKind;
-      const backend = driverKind === "opencode_server"
+      const backend = driverKind === "antigravity_headless" ? "antigravity_headless" : driverKind === "opencode_server"
         ? "opencode_server"
         : driverKind === "claude_managed_agents_api"
           ? "claude_managed_agents_api"

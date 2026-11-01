@@ -158,6 +158,7 @@ import {
 } from "../../vendor/paperclip-runner/index.js";
 import { adapterExecutionTargetEnablesSandboxDuplexBridge, type AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { createNativeSshCommandRunner } from "./native-ssh-command-runner.js";
+import { bindAntigravityHeadlessLease } from "./antigravity-headless-authority.js";
 import { discoverRemoteExecutable, parseRemoteExecutableCandidate } from "./codex-model-fallback.js";
 export { parseRemoteExecutableCandidate } from "./codex-model-fallback.js";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
@@ -1872,6 +1873,7 @@ function nativeProviderSessionScope(execution: NativeExecutionInput) {
       };
     case "codex":
     case "opencode":
+    case "antigravity_headless":
       // These local providers have no separate persisted profile id. Company,
       // agent, and workspace bind their credential/session context; mutable
       // model and permission settings remain in nativeSessionConfigDigest so
@@ -6055,6 +6057,7 @@ function canonicalJson(value: unknown): string {
 
 function runnerProviderStateFilename(execution: NativeExecutionInput): string {
   switch (execution.provider.kind) {
+    case "antigravity_headless": return "antigravity-provider-state.json";
     case "muse": return "muse-provider-state.json";
     case "grok_bot":
     case "openai_dot":
@@ -6091,6 +6094,7 @@ export function providerSessionIdentityFromDurableProviderState(input: {
     providerSessionIdentity: null,
   });
   switch (input.execution.provider.kind) {
+    case "antigravity_headless":
     case "muse":
     case "grok_bot":
     case "openai_dot":
@@ -9300,9 +9304,29 @@ async function executePaperclipNativeSessionWithinScope(
       input.db,
       input.execution.binding,
     ));
+    let antigravityBackend: ReturnType<typeof createNativeSessionBackend> | undefined;
+    if (input.execution.schema === "paperclip.native-execution-input.v11" && input.backend === undefined) {
+      if (!input.useRunnerd || input.runnerExecutionTarget?.kind === "remote" || input.restartRecovery) throw new Error("antigravity_native_requires_fresh_local_runner");
+      const cli = process.env.PAPERCLIP_ANTIGRAVITY_CLI?.trim();
+      if (!cli || !cli.startsWith("/")) throw new Error("antigravity_native_cli_not_configured");
+      const binding = input.execution.binding;
+      const {environmentLeaseId,generation,admit,withAdmission} = await bindAntigravityHeadlessLease(input.db, {
+        companyId: binding.companyId, runId: binding.runId, issueId: binding.issueId,
+        executionWorkspaceId: binding.executionWorkspaceId, leaseOwner, attempt, assertControllerActive,
+      });
+      const parent = resolve(resolvePaperclipInstanceRoot(), "runtime", "paperclip-runner", "antigravity");
+      mkdirSync(parent, { recursive: true, mode: 0o700 });
+      antigravityBackend = createNativeSessionBackend(input.execution, { antigravityAuthority: {
+        identity: { runId: binding.runId, sessionId: input.execution.session.normalizedSessionId!, companyId: binding.companyId, issueId: binding.issueId, agentId: binding.agentId },
+        runnerInstanceId: effectiveRunnerInstanceId, environmentLeaseId, turnId: randomUUID(), itemId: randomUUID(),
+        bindingId: randomUUID(), bindingGeneration: generation, cwd: input.execution.workspace.cwd!,
+        stateDirectory: join(parent, randomUUID()), runnerBinary: resolvePaperclipRunnerBinary(), executable: cli,
+        verifiedVersion: "1.4.12", env: process.env, admit, withAdmission,
+      } });
+    }
     let remoteWarmRecoveryPending = remoteWarmRecovery !== undefined;
     let runnerdBackend =
-      input.useRunnerd && input.backend === undefined
+      antigravityBackend ?? (input.useRunnerd && input.backend === undefined
         ? await timeController("backend_setup", () => createRunnerdBackend({
             ...input,
             controllerPersistence: input.runnerExecutionTarget?.kind === "remote" ? {
@@ -9327,7 +9351,7 @@ async function executePaperclipNativeSessionWithinScope(
             trace,
             toolTrace,
           }))
-        : null;
+        : null);
     if (remoteWarmRecovery) {
       await remoteWarmRecovery.revalidate(leaseOwner);
       const recovered = await runnerdBackend?.recoverSession?.(remoteWarmRecovery.checkpoint, {
@@ -9522,7 +9546,8 @@ async function executePaperclipNativeSessionWithinScope(
               }
               if (session && session === existingWarmSession) remoteWarmRecoveryPending = false;
               if (session && input.managedAiCredentialHome) {
-                managedCredentialSession = runnerdBackend?.bindManagedSession(session) ?? session;
+                managedCredentialSession = runnerdBackend && "bindManagedSession" in runnerdBackend && typeof runnerdBackend.bindManagedSession === "function"
+                  ? runnerdBackend.bindManagedSession(session) : session;
               }
               releaseRegisteredGoalController();
               liveQuestions.close();
