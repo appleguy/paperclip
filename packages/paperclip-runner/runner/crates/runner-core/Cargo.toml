@@ -57,3 +57,5 @@ path = "src/bin/fake-acpx-sidecar.rs"
 [[bin]]
 name = "fake-stdio-mcp"
 path = "src/bin/fake-stdio-mcp.rs"
+[target.'cfg(target_os = "macos")'.dependencies]
+libproc = "=0.14.11"

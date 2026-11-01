@@ -12,6 +12,8 @@ pub mod acpx_sidecar_transport;
 pub mod aws_agentcore_provider;
 pub mod claude_managed_provider;
 pub mod codex_provider;
+#[cfg(unix)]
+pub mod codex_shared_socket;
 mod codex_startup_trust;
 mod configured_environment;
 mod credential_observer;

@@ -177,6 +177,12 @@ pub(crate) enum ProviderStartupObservation {
         process_id: u32,
         process_group_id: u32,
     },
+    Attached {
+        socket_path: PathBuf,
+        daemon_generation: String,
+        thread_id: String,
+        codex_home: PathBuf,
+    },
     Failed {
         stage: ProviderStartupStage,
         child_exit: Option<ProcessExitFact>,
@@ -403,6 +409,26 @@ fn default_approval_policy() -> String {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SharedDaemonConfig {
+    pub socket_path: PathBuf,
+    pub daemon_generation: String,
+    pub thread_id: String,
+    pub codex_home: PathBuf,
+    #[serde(default)]
+    pub peer: Option<ExpectedPeer>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExpectedPeer {
+    pub pid: u32,
+    pub start_seconds: u64,
+    pub start_microseconds: u64,
+    pub executable: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexProviderConfig {
     pub provider: String,
@@ -430,6 +456,8 @@ pub struct CodexProviderConfig {
     // Older sessions retain their standalone task envelope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_daemon: Option<SharedDaemonConfig>,
 }
 
 /// Explicit per-turn skill selection. The controller resolves assigned skill
@@ -480,6 +508,31 @@ impl CodexProviderConfig {
     }
 
     pub fn validate(&self) -> Result<(), LocalRunnerError> {
+        if let Some(shared) = &self.shared_daemon {
+            if self.provider != "codex"
+                || !self.read_only
+                || !shared.socket_path.is_absolute()
+                || !shared.codex_home.is_absolute()
+                || shared.daemon_generation.is_empty()
+                || shared.daemon_generation.len() > 240
+                || shared.thread_id.is_empty()
+                || shared.thread_id.len() > 240
+                || self.provider_session_id.as_deref() != Some(shared.thread_id.as_str())
+                || !self.args.is_empty()
+                || !self.instructions.is_empty()
+                || self.model.is_some()
+                || shared.peer.as_ref().is_none_or(|peer| {
+                    peer.pid == 0
+                        || peer.executable.as_os_str().is_empty()
+                        || !peer.executable.is_absolute()
+                        || peer.start_microseconds >= 1_000_000
+                })
+            {
+                return Err(LocalRunnerError::invalid(
+                    "invalid read-only shared daemon configuration",
+                ));
+            }
+        }
         if !matches!(
             self.conversation_mode.as_deref(),
             None | Some("task" | "prepared")
@@ -566,6 +619,36 @@ impl CodexProviderConfig {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod shared_mode_guard_tests {
+    use super::*;
+    #[test]
+    fn shared_attachment_never_uses_owned_process_startup() {
+        let config: CodexProviderConfig = serde_json::from_value(json!({
+            "provider": "codex", "driver": "codex_app_server", "providerVersion": "test",
+            "command": "/not/executed", "cwd": "/", "readOnly": true, "providerSessionId": "t", "sharedDaemon": {
+                "socketPath": "/not/connected", "daemonGeneration": "g", "threadId": "t", "codexHome": "/", "peer":{"pid":1,"startSeconds":1,"startMicroseconds":0,"executable":"/bin/example"}
+            }
+        })).unwrap();
+        assert!(CodexProvider::start_with_tools_observed(
+            &config,
+            [],
+            Some("t"),
+            1,
+            None,
+            None,
+            &mut |_| Ok(())
+        )
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("read-only executor path"));
+        let mut metadata_only = config.clone();
+        metadata_only.shared_daemon.as_mut().unwrap().peer = None;
+        assert!(metadata_only.validate().is_err());
     }
 }
 
@@ -965,6 +1048,11 @@ impl CodexProvider {
         observe: &mut dyn FnMut(ProviderStartupObservation) -> Result<(), LocalRunnerError>,
     ) -> Result<Self, LocalRunnerError> {
         config.validate()?;
+        if config.shared_daemon.is_some() {
+            return Err(LocalRunnerError::invalid(
+                "shared daemon requires the read-only executor path",
+            ));
+        }
         if config.provider == "codex"
             && std::env::var("PAPERCLIP_RUNNER_HOME_MODE").as_deref() != Ok("preconfigured")
         {
@@ -4358,6 +4446,7 @@ done
             read_only: false,
             include_skill_instructions: None,
             conversation_mode: None,
+            shared_daemon: None,
         };
         let mut provider = CodexProvider::start(&config, None).unwrap();
         provider.start_turn("First turn", &config.cwd).unwrap();
@@ -4746,6 +4835,7 @@ done
             read_only: false,
             include_skill_instructions: None,
             conversation_mode: None,
+            shared_daemon: None,
         };
         let mut spawned = None;
         let mut failure = None;
@@ -4770,6 +4860,9 @@ done
                 ProviderStartupObservation::Failed { stage, child_exit } => {
                     failure = Some((stage, child_exit));
                     Ok(())
+                }
+                ProviderStartupObservation::Attached { .. } => {
+                    panic!("owned startup cannot attach a shared daemon")
                 }
             },
         )
@@ -4867,6 +4960,7 @@ done
             read_only: false,
             include_skill_instructions: None,
             conversation_mode: None,
+            shared_daemon: None,
         };
         config.include_skill_instructions = Some(true);
         assert_eq!(

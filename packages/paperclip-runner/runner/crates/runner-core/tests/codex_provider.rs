@@ -73,6 +73,7 @@ fn provider_config(directory: &Path, switches: &[&str]) -> CodexProviderConfig {
         read_only: false,
         include_skill_instructions: None,
         conversation_mode: None,
+        shared_daemon: None,
     }
 }
 
