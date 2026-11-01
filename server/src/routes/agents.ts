@@ -15,6 +15,7 @@ import { createAgentLifecycle } from "../services/agent-lifecycle.js";
 import { isAgentSetupDraft } from "../modules/agent-lifecycle/index.js";
 
 import { agentIdentityService } from "../services/agent-identity.js";
+import { listExternalOpenCodeActivity } from "../services/external-opencode-activity.js";
 import { aiConnectionRouterService, poolMemberRuntimeConfig } from "../services/ai-connection-router.js";
 import { connectionIntentService } from "../services/connection-intents.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
@@ -3935,6 +3936,18 @@ export function agentRoutes(
       res.json(annotateConnectorSkills(withAssignedSkillVersions(snapshot, nextAdapterConfig), connectorAssignments));
     },
   );
+
+  // Advisory external activity never enters heartbeatRuns or agent status.
+  router.get("/companies/:companyId/external-activity", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    if (Object.keys(req.query).length > 0) {
+      res.status(400).json({ error: "External activity takes no query parameters" });
+      return;
+    }
+    res.setHeader("Cache-Control", "private, no-store");
+    res.json(await listExternalOpenCodeActivity(companyId));
+  });
 
   router.get("/companies/:companyId/agents", async (req, res) => {
     const companyId = req.params.companyId as string;
