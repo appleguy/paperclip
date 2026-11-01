@@ -35,11 +35,11 @@ it("binds a real claimed lease to a real Runner and rejects stale and foreign au
   if(provider.provider!=="antigravity_headless")throw new Error("native provider mismatch");
   const execution=buildNativeExecutionInput({companyId,agentId,runId,issue:{id:issueId,identifier:"I",title:"Task",description:null,workMode:"standard"},taskPrompt:"task",workspace:{id:workspaceId,cwd:root,repoUrl:null,repoRef:null,branchName:null},normalizedSessionId:sessionId,...provider,completionContract:{id:"c",sha256:"abc",schemaVersion:"v1",contract:{revision:"1",objective:"task",criteria:[{id:"c",requirement:"done"}]}},runtimeContext:nativeRuntimeContextFixture()});
   const log=join(root,"writes");writeFileSync(log,"");
-  const fake=join(root,"fake-agy");writeFileSync(fake,`#!${process.execPath}\nif(process.argv.includes('--version')){process.stdout.write('1.4.12');process.exit(0)};process.stdout.write(JSON.stringify({event:'init',conversation_id:'new-native',init:{cwd:process.cwd(),permission_mode:'request-review'}})+'\\n');let s='';process.stdin.on('data',d=>{s+=d;if(s.includes('\\n')){require('node:fs').appendFileSync(${JSON.stringify(log)},'write\\n');process.stdout.write(JSON.stringify({event:'result',result:{conversation_id:'new-native',status:'SUCCESS',response:'fake'}})+'\\n');s='';}});`,{mode:0o700});
+  const fake=join(root,"fake-agy");writeFileSync(fake,`#!${process.execPath}\nif(process.argv.includes('--version')){process.stdout.write('1.4.12');process.exit(0)};if(process.argv[process.argv.indexOf('--conversation')+1]!=='new-native')process.exit(4);process.stdout.write(JSON.stringify({event:'init',conversation_id:'new-native',init:{cwd:process.cwd(),permission_mode:'request-review'}})+'\\n');let s='';process.stdin.on('data',d=>{s+=d;if(s.includes('\\n')){require('node:fs').appendFileSync(${JSON.stringify(log)},'write\\n');process.stdout.write(JSON.stringify({event:'result',result:{conversation_id:'new-native',status:'SUCCESS',response:'fake'}})+'\\n');s='';}});`,{mode:0o700});
   const identity={companyId,agentId,issueId,runId,sessionId};
-  const options={identity,runnerInstanceId:"runner",environmentLeaseId:authority.environmentLeaseId,turnId:"turn",itemId:"item",bindingId:"binding",bindingGeneration:authority.generation,cwd:root,stateDirectory:join(root,"state"),runnerBinary:resolve(import.meta.dirname,"../../../../packages/paperclip-runner/runner/target/debug/paperclip-runnerd"),executable:fake,verifiedVersion:"1.4.12",env:{PATH:process.env.PATH},admit:authority.admit,withAdmission:authority.withAdmission};
+  const options={identity:{...identity},conversationId:"new-native",runnerInstanceId:"runner",environmentLeaseId:authority.environmentLeaseId,turnId:"turn",itemId:"item",bindingId:"binding",bindingGeneration:authority.generation,cwd:root,stateDirectory:join(root,"state"),runnerBinary:resolve(import.meta.dirname,"../../../../packages/paperclip-runner/runner/target/debug/paperclip-runnerd"),executable:fake,verifiedVersion:"1.4.12",env:{PATH:process.env.PATH},admit:authority.admit,withAdmission:authority.withAdmission};
   expect(()=>createNativeSessionBackend(execution,{antigravityAuthority:{...options,identity:{...identity,companyId:randomUUID()}}})).toThrow(/authority/);
-  const backend=createNativeSessionBackend(execution,{antigravityAuthority:options});session=await backend.openSession({identity,workingDirectory:root});
+  const backend=createNativeSessionBackend(execution,{antigravityAuthority:options});options.identity.runId="foreign";options.conversationId="foreign-native";session=await backend.openSession({identity,workingDirectory:root});expect((await session.snapshot()).providerSessionId).toBe("new-native");options.identity.runId=identity.runId;options.conversationId="new-native";
   const events:string[]=[];const stream=(async()=>{for await(const e of session!.events())events.push(e.eventType);})();
   await session.startTurn({message:{role:"user",text:"fixture"}});await vi.waitFor(()=>expect(events).toContain("item.completed"),{timeout:10000});
   expect(await session.result()).toBeNull();await session.close({reason:"test"});await stream;session=undefined;
@@ -47,10 +47,11 @@ it("binds a real claimed lease to a real Runner and rejects stale and foreign au
   const staleBackend=createNativeSessionBackend(execution,{antigravityAuthority:{...options,stateDirectory:join(root,"stale-state"),withAdmission:check}});
   session=await staleBackend.openSession({identity,workingDirectory:root});
   await db.update(nativeRunFinalizations).set({controllerGeneration:2}).where(eq(nativeRunFinalizations.runId,runId));
-  const staleStart=session.startTurn({message:{role:"user",text:"must not write"}}).catch(()=>undefined);
-  await vi.waitFor(()=>expect(check).toHaveBeenCalled(),{timeout:10000});
+  const staleStart=session.startTurn({message:{role:"user",text:"must not write"}});
+  await expect(staleStart).rejects.toThrow("antigravity_native_lease_lost");
+  expect(check).toHaveBeenCalled();
   expect(readFileSync(log,"utf8")).toBe("write\n");
-  await session.close({reason:"stale"}).catch(()=>{});session=undefined;await staleStart;
+  await session.close({reason:"stale"}).catch(()=>{});session=undefined;
   expect(await authority.admit()).toBe(false);
   await db.update(environmentLeases).set({status:"released"}).where(eq(environmentLeases.id,leaseId));await expect(bindAntigravityHeadlessLease(db,leaseInput)).rejects.toThrow();
  } finally {if(session)await session.close({reason:"cleanup"}).catch(()=>{});await db.$client.end();await database.cleanup();rmSync(root,{recursive:true,force:true});}
