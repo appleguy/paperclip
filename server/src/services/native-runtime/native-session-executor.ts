@@ -1,4 +1,12 @@
 import { measureRunnerOperation, recordRunnerTimingReceipt } from "./runner-operation-timing.js";
+import {
+  assessCancelledNativeOwner, buildCancelledBridgeSettlementPlan, cancelledBridgeSettlementDigest,
+  consumePreparedCancelledIntent, exactCancelledClosedActivationMatches,
+  exactCancelledCleanupJournalMatches,
+  exactCancelledOwner, exactOwnerIdentityMatches, prepareExactCancelledRecoveryIntent,
+  reservePreparedCancelledIntent, type CancelledBridgeSettlement,
+} from "./cancelled-retained-cleanup-authority.js";
+import { getSecretProvider } from "../../secrets/provider-registry.js";
 import { notifyExternalAgentSettlement } from "../../modules/external-agents/index.js";
 import { notifyNativeResultCommit } from "../native-result-commit-notifications.js";
 import { releaseRetainedNativeSessionCleanup } from "../retained-native-session-cleanup-notifications.js";
@@ -85,6 +93,7 @@ import {
   constants,
   existsSync,
   fstatSync,
+  fsyncSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -196,6 +205,7 @@ import {
 } from "./native-runner-file-handoff.js";
 import { nativeRuntimeContractForProvider, nativeToolContractFingerprintForTarget } from "./native-session-resume.js";
 import { verifyRetainedMaintenanceNoLaunch } from "./native-maintenance-no-launch.js";
+import { readCancelledRecoveryEpoch, type CancelledResumeLineage } from "./cancelled-recovery-epoch.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { reportRunFailure } from "../run-failure-report.js";
 import {
@@ -3080,9 +3090,25 @@ export async function reconcileRetainedNativeSessionCleanup(
   return outcome;
 }
 
+/** Board-only caller; the HTTP boundary cannot supply receipts, PIDs or proof.
+ * The exact cancelled owner is deliberately excluded from automatic cleanup. */
+export async function reconcileCancelledRetainedNativeSessionCleanup(
+  db: Db,
+  input: { companyId: string; runId: string; requestId: string; expectedFingerprint: string; actorId: string },
+): Promise<NativeCleanupOutcome> {
+  if (input.companyId !== exactCancelledOwner.companyId || input.runId !== exactCancelledOwner.runId ||
+      input.expectedFingerprint !== exactCancelledOwner.sourceFingerprint || !input.actorId.trim() ||
+      !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(input.requestId)) {
+    return { status: "not_eligible", runId: input.runId };
+  }
+  return inspectRetainedNativeSessionCleanup(db, input, input)
+    .finally(() => drainRetainedRunnerdMaintenanceOperations());
+}
+
 async function inspectRetainedNativeSessionCleanup(
   db: Db,
   input: { companyId: string; runId: string },
+  cancelled?: { requestId: string; expectedFingerprint: string; actorId: string },
 ): Promise<NativeCleanupOutcome> {
   const denied = () => new Error("native_cleanup_maintenance_unproven");
   const leaseOwner = `native-cleanup:${randomUUID()}`;
@@ -3114,7 +3140,11 @@ async function inspectRetainedNativeSessionCleanup(
       requestId: string;
     } | null;
     providerPid: number;
+    originalRunnerPid: number;
     providerSessionId: string;
+    semanticToolResults?: CancelledBridgeSettlement[];
+    resumeLineage?: CancelledResumeLineage;
+    cancelledIntentRoot?: string;
     identity: {
       runnerInstanceId: string;
       environmentLeaseId: string;
@@ -3144,7 +3174,7 @@ async function inspectRetainedNativeSessionCleanup(
         .for("update", { noWait: true })
         .limit(1)
         .then((rows) => rows[0]);
-      const run = row
+      const run = row && !cancelled
         ? await withReleasedNativeRunProcess(tx as unknown as Db, row)
         : row;
       if (
@@ -3153,14 +3183,15 @@ async function inspectRetainedNativeSessionCleanup(
         !run.nativeIssueId ||
         !run.nativeSessionId ||
         !run.runnerInstanceId ||
-        !["succeeded", "failed"].includes(run.status) ||
+        (cancelled ? !exactOwnerIdentityMatches(run) : !["succeeded", "failed"].includes(run.status)) ||
         !run.finishedAt ||
         process.platform === "win32" ||
-        !Number.isSafeInteger(run.processPid) || Number(run.processPid) <= 0 ||
-        run.processGroupId !== run.processPid
+        (!cancelled && (!Number.isSafeInteger(run.processPid) || Number(run.processPid) <= 0 ||
+          run.processGroupId !== run.processPid))
       )
         return null;
-      if (!cleanupProcessAbsent(run.processPid)) return defer("process_exit");
+      const originalRunnerPid = cancelled ? exactCancelledOwner.runnerPid : run.processPid!;
+      if (!cleanupProcessAbsent(originalRunnerPid)) return defer("process_exit");
       const execution = parseNativeExecutionInput(
         record(run.runnerProfileJson).nativeExecutionInput,
       );
@@ -3168,9 +3199,8 @@ async function inspectRetainedNativeSessionCleanup(
       const errorCode = run.errorCode ?? failure.errorCode;
       const error = run.error ?? failure.error;
       if (
-        !["adapter_failed", "provider_transport_failed"].includes(String(errorCode)) ||
-        error !==
-          "provider_transport_failed: runner did not durably suspend before checkpoint" ||
+        (!cancelled && (!["adapter_failed", "provider_transport_failed"].includes(String(errorCode)) ||
+          error !== "provider_transport_failed: runner did not durably suspend before checkpoint")) ||
         execution.binding.companyId !== run.companyId ||
         execution.binding.agentId !== run.agentId ||
         execution.binding.issueId !== run.nativeIssueId ||
@@ -3212,9 +3242,9 @@ async function inspectRetainedNativeSessionCleanup(
         !coordinator.assessmentId ||
         !coordinator.decisionId ||
         coordinator.nextAttemptAt ||
-        coordinator.recoveryHistory.some(
+        (!cancelled && coordinator.recoveryHistory.some(
           (event) => event.kind === "native_cleanup_runner_epoch",
-        )
+        ))
       )
         return null;
       if (coordinator.leaseOwner && coordinator.leaseExpiresAt && coordinator.leaseExpiresAt > new Date()) {
@@ -3248,9 +3278,11 @@ async function inspectRetainedNativeSessionCleanup(
         .limit(1);
       if (environment.length) return defer("environment_release");
       const root = scopedRunnerdStateRoot(execution);
+      if (cancelled && root !== exactCancelledOwner.stateDirectory) return null;
       const maintenanceHistory = coordinator.recoveryHistory.filter(
         (event) => event.kind === "native_cleanup_maintenance",
       );
+      const isCancelledResume = !!cancelled && coordinator.recoveryHistory.some((event) => event.kind === "native_cleanup_runner_epoch");
       const archiveHistory = coordinator.recoveryHistory.filter(
         (event) => event.kind === "native_cleanup_source_archive",
       );
@@ -3272,7 +3304,7 @@ async function inspectRetainedNativeSessionCleanup(
         const prepared = archiveHistory[0]!;
         const archived = archiveHistory[1];
         if (
-          maintenanceHistory.length ||
+          (maintenanceHistory.length && !isCancelledResume) ||
           archiveHistory.length > 2 ||
           prepared.version !== 1 ||
           prepared.phase !== "prepared" ||
@@ -3341,7 +3373,7 @@ async function inspectRetainedNativeSessionCleanup(
       const archiveRootIdentity = sourceArchive
         ? cleanupArchiveRootIdentity(sourceDirectory)
         : null;
-      if (sourceArchive) {
+      if (sourceArchive && !isCancelledResume) {
         const scopeEntries = readdirSync(runnerdStateBase());
         if (
           scopeEntries.length > 4096 ||
@@ -3369,14 +3401,28 @@ async function inspectRetainedNativeSessionCleanup(
             identity[key] &&
             source.runner[key] === identity[key],
         ) ||
-        source.runner.lifecycle !== "ready" ||
-        source.provider.lifecycle !== "turn_active" ||
+        source.runner.lifecycle !== (cancelled ? "recoverable_failure" : "ready") ||
+        source.provider.lifecycle !== (cancelled ? "session_open" : "turn_active") ||
         record(source.provider.config).provider !== "codex" ||
         record(source.provider.config).command !== "codex" ||
         record(source.provider.config).cwd !== execution.workspace.cwd ||
         !Array.isArray(source.control.committedEvents)
       )
         return null;
+      let semanticToolResults: CancelledBridgeSettlement[] | undefined;
+      if (cancelled) {
+        if (assessCancelledNativeOwner({run, expectedFingerprint: cancelled.expectedFingerprint,
+            stateDirectory: sourceDirectory, apiToolReceipts: record(run.resultJson).apiToolReceipts,
+          }).code !== "ready_for_authorized_staging") return null;
+        const results = await buildCancelledBridgeSettlementPlan({
+          pending: record(source.provider.toolBridge).pending,
+          apiToolReceipts: record(run.resultJson).apiToolReceipts,
+          resolveEncryptedResult: async (material) => JSON.parse(await getSecretProvider("local_encrypted")
+            .resolveVersion({ material: record(material), externalRef: null })),
+        });
+        if (!results || results.length !== 3) return null;
+        semanticToolResults = results;
+      }
       const providerEvents = source.control.committedEvents
         .map((entry) => record(record(record(entry).envelope).payload))
         .filter((event) =>
@@ -3402,6 +3448,9 @@ async function inspectRetainedNativeSessionCleanup(
       )
         return null;
       if (!cleanupProcessAbsent(provider.processId)) return defer("process_exit");
+      if (cancelled && (provider.processId !== exactCancelledOwner.providerPid ||
+          provider.providerSessionId !== exactCancelledOwner.providerSessionId ||
+          identity.environmentLeaseId !== exactCancelledOwner.environmentLeaseId)) return null;
       const persisted = await tx
         .select()
         .from(heartbeatRunEvents)
@@ -3424,7 +3473,7 @@ async function inspectRetainedNativeSessionCleanup(
         .limit(20);
       if (
         persisted.length >= 20 ||
-        !retainedNativeCleanupJournalMatches({
+        !(cancelled ? exactCancelledCleanupJournalMatches : retainedNativeCleanupJournalMatches)({
           run,
           execution,
           accepted: result,
@@ -3476,7 +3525,22 @@ async function inspectRetainedNativeSessionCleanup(
           };
         }
       }
-      if (maintenanceHistory.length) {
+      let resumeLineage: CancelledResumeLineage | undefined;
+      if (isCancelledResume) {
+        if (!cancelled || !semanticToolResults || !sourceArchive?.completed || sourceArchive.fromCanonical || rootExists) return null;
+        const stage = coordinator.recoveryHistory.filter((entry) => entry.kind === "native_cleanup_maintenance" && entry.phase === "staged");
+        if (stage.length !== 1 || typeof stage[0]!.stagingName !== "string" || basename(stage[0]!.stagingName as string) !== stage[0]!.stagingName) return null;
+        const directory = resolve(runnerdStateBase(), stage[0]!.stagingName as string);
+        if (lstatSync(resolve(directory, CLEANUP_ACTIVATION_FILE), { throwIfNoEntry: false })) return null;
+        if (!retainedRunnerdMaintenanceIsIdle(directory)) return defer("maintenance_settlement");
+        resumeLineage = readCancelledRecoveryEpoch({
+          intentRoot: resolve(dirname(runnerdStateBase()), "board-cancelled-recovery"),
+          boardRequestId: cancelled.requestId, history: coordinator.recoveryHistory,
+          original: source, staged: cleanupStateSnapshot(directory), stagedDirectory: directory,
+          fullPlan: semanticToolResults,
+        }) ?? undefined;
+        if (!resumeLineage) return null;
+      } else if (maintenanceHistory.length) {
         if (
           maintenanceHistory.length !== 2 ||
           typeof maintenanceHistory[0]?.requestId !== "string"
@@ -3561,6 +3625,24 @@ async function inspectRetainedNativeSessionCleanup(
               },
             ]),
       ];
+      const cancelledIntentRoot = cancelled
+        ? resolve(dirname(runnerdStateBase()), "board-cancelled-recovery") : undefined;
+      if (cancelled && cancelledIntentRoot && !resumeLineage) {
+        // Preparing/reserving records authorization, never evidence of settlement.
+        // A partial attempt remains reserved until authenticated reconciliation.
+        const intent = prepareExactCancelledRecoveryIntent({
+          run, expectedFingerprint: cancelled.expectedFingerprint,
+          apiToolReceipts: record(run.resultJson).apiToolReceipts,
+          root: cancelledIntentRoot, stateDirectory: sourceDirectory, requestId: cancelled.requestId,
+        });
+        if (intent.code === "operator_required" ||
+            !reservePreparedCancelledIntent({root: cancelledIntentRoot, requestId: cancelled.requestId})) return null;
+        history.push({kind: "native_cleanup_board_authorization", version: 1,
+          requestId: cancelled.requestId, actorId: cancelled.actorId,
+          sourceFingerprint: source.fingerprint, requestLease: leaseOwner,
+          reconciledToolCallsDigest: cancelledBridgeSettlementDigest(semanticToolResults!),
+          authorizedAt: new Date().toISOString()});
+      }
       await tx
         .update(nativeRunFinalizations)
         .set({
@@ -3581,7 +3663,11 @@ async function inspectRetainedNativeSessionCleanup(
         sourceArchive,
         copySource,
         providerPid: provider.processId,
+        originalRunnerPid,
         providerSessionId: provider.providerSessionId,
+        semanticToolResults,
+        resumeLineage,
+        cancelledIntentRoot,
         identity: identity as {
           runnerInstanceId: string;
           environmentLeaseId: string;
@@ -3616,7 +3702,7 @@ async function inspectRetainedNativeSessionCleanup(
   }
   const owned = claim;
   let stagingDirectory: string | null = null;
-  let maintenanceStarted = !owned.sourceArchive;
+  let maintenanceStarted = !owned.sourceArchive || !!owned.resumeLineage;
   const archiveReference = owned.sourceArchive
     ? { sourceArchiveRequestId: owned.sourceArchive.intent.requestId }
     : {};
@@ -3638,13 +3724,21 @@ async function inspectRetainedNativeSessionCleanup(
       !lease.length ||
       !reservedScope ||
       executingRunnerdSessionScopes.get(reservedScope) !== leaseOwner ||
-      !cleanupProcessAbsent(owned.run.processPid) ||
+      !cleanupProcessAbsent(owned.originalRunnerPid) ||
       !cleanupProcessAbsent(owned.providerPid)
     )
       throw denied();
   };
   const authorize = async () => {
     await assertLease();
+    if (cancelled) {
+      const fresh = await db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, owned.run.id), eq(heartbeatRuns.companyId, owned.run.companyId),
+      )).limit(1).then((rows) => rows[0]);
+      if (!fresh || !exactOwnerIdentityMatches(fresh) ||
+          nativeSha256(record(fresh.resultJson).apiToolReceipts) !== nativeSha256(record(owned.run.resultJson).apiToolReceipts) ||
+          nativeSha256(fresh.runnerProfileJson) !== nativeSha256(owned.run.runnerProfileJson)) throw denied();
+    }
     if (
       cleanupStateSnapshot(owned.quarantine).fingerprint !==
         owned.source.fingerprint ||
@@ -3701,7 +3795,7 @@ async function inspectRetainedNativeSessionCleanup(
     owned.history = history;
   };
   try {
-    if (owned.sourceArchive) {
+    if (owned.sourceArchive && !owned.resumeLineage) {
       const archive = owned.sourceArchive;
       await assertLease();
       const sourceDirectory = archive.fromCanonical
@@ -3763,10 +3857,11 @@ async function inspectRetainedNativeSessionCleanup(
       maintenanceStarted = true;
     }
     await authorize();
-    const copy = mkdtempSync(
+    const copy = owned.resumeLineage?.stagedDirectory ?? mkdtempSync(
       resolve(runnerdStateBase(), `${basename(owned.root)}.cleanup-`),
     );
     stagingDirectory = copy;
+    if (!owned.resumeLineage) {
     chmodSync(copy, 0o700);
     for (const folder of ["runner", "control-plane"])
       mkdirSync(resolve(copy, folder), { mode: 0o700 });
@@ -3805,6 +3900,7 @@ async function inspectRetainedNativeSessionCleanup(
         true,
       ).fingerprint,
     });
+    }
     const proof = await settleRetainedRunnerdSession({
       requestId: leaseOwner,
       binding: {
@@ -3819,10 +3915,12 @@ async function inspectRetainedNativeSessionCleanup(
       stateDirectory: copy,
       activationDirectory: owned.root,
       sourceFingerprint:
-        owned.copySource?.snapshot.fingerprint ?? owned.source.fingerprint,
+        owned.resumeLineage?.priorRetiredEpoch.finalFingerprint as string ?? owned.copySource?.snapshot.fingerprint ?? owned.source.fingerprint,
       providerSessionId: owned.providerSessionId,
-      originalRunnerPid: owned.run.processPid!,
+      originalRunnerPid: owned.originalRunnerPid,
       originalProviderPid: owned.providerPid,
+      ...(owned.semanticToolResults ? {semanticToolResults: owned.resumeLineage?.semanticToolResults ?? owned.semanticToolResults} : {}),
+      ...(owned.resumeLineage ? {priorRetiredEpoch: owned.resumeLineage.priorRetiredEpoch as never} : {}),
       // The control-only provider resume still needs normal host discovery
       // and auth-file lookup. Inherit only the existing host allowlist.
       environment: buildNativeProviderEnvironment(
@@ -3852,6 +3950,18 @@ async function inspectRetainedNativeSessionCleanup(
         });
       },
     });
+    if (cancelled && (proof.stagedSourceFingerprint !== (owned.resumeLineage?.priorRetiredEpoch.finalFingerprint ?? owned.source.fingerprint) ||
+        proof.reconciledToolCallsDigest !== cancelledBridgeSettlementDigest(owned.resumeLineage?.semanticToolResults ?? owned.semanticToolResults!))) throw denied();
+    const reconciliationLineage = cancelled ? {
+      stagedSourceFingerprint: owned.source.fingerprint,
+      reconciledToolCallsDigest: cancelledBridgeSettlementDigest(owned.semanticToolResults!),
+      ...(owned.resumeLineage ? { resumedFromFingerprint: proof.stagedSourceFingerprint,
+        resumedToolCallsDigest: proof.reconciledToolCallsDigest,
+        resumedFromRequestId: owned.resumeLineage.priorRetiredEpoch.requestId } : {}),
+      nativeSessionId: owned.run.nativeSessionId,
+      runnerInstanceId: owned.run.runnerInstanceId,
+      providerSessionId: owned.providerSessionId,
+    } : {};
     // Commit intent before the filesystem handoff. A crash can then be
     // distinguished from an unattempted quarantine; never replay its source.
     if (
@@ -3878,9 +3988,10 @@ async function inspectRetainedNativeSessionCleanup(
         kind: "native_cleanup_maintenance",
         version: 1,
         phase: "activation_prepared",
+        ...reconciliationLineage,
         ...archiveReference,
         requestId: leaseOwner,
-        sourceFingerprint: proof.sourceFingerprint,
+        sourceFingerprint: cancelled ? owned.source.fingerprint : proof.sourceFingerprint,
         settledFingerprint: proof.settledFingerprint,
         settledProviderHomeFingerprint: settledHome.fingerprint,
         stagingName: basename(copy),
@@ -3896,11 +4007,12 @@ async function inspectRetainedNativeSessionCleanup(
       resolve(copy, CLEANUP_ACTIVATION_FILE),
       JSON.stringify({
         schema: "paperclip.native_cleanup_activation.v1",
+        ...reconciliationLineage,
         companyId: owned.run.companyId,
         issueId: owned.run.nativeIssueId,
         runId: owned.run.id,
         requestId: leaseOwner,
-        sourceFingerprint: proof.sourceFingerprint,
+        sourceFingerprint: cancelled ? owned.source.fingerprint : proof.sourceFingerprint,
         settledFingerprint: proof.settledFingerprint,
         settledProviderHomeFingerprint: settledHome.fingerprint,
       }),
@@ -3948,6 +4060,16 @@ async function inspectRetainedNativeSessionCleanup(
         renameSync(owned.root, archive);
       }
       renameSync(copy, owned.root);
+      if (cancelled) {
+        const directory = openSync(dirname(owned.root), constants.O_RDONLY);
+        try { fsyncSync(directory); } finally { closeSync(directory); }
+        if (!owned.cancelledIntentRoot || !consumePreparedCancelledIntent({
+          root: owned.cancelledIntentRoot, requestId: cancelled.requestId,
+          runId: owned.run.id, originalFingerprint: owned.source.fingerprint,
+          expectedReconciledToolCallsDigest: cancelledBridgeSettlementDigest(owned.semanticToolResults!),
+          settledProof: proof, resumeLineage: owned.resumeLineage,
+        })) throw denied();
+      }
       await notifyNativeFinalizationWork(tx, { companyId: owned.run.companyId, runId: owned.run.id });
       await tx
         .update(nativeRunFinalizations)
@@ -3960,9 +4082,10 @@ async function inspectRetainedNativeSessionCleanup(
               kind: "native_cleanup_maintenance",
               version: 1,
               phase: "settled",
+              ...reconciliationLineage,
               ...archiveReference,
               requestId: leaseOwner,
-              sourceFingerprint: proof.sourceFingerprint,
+              sourceFingerprint: cancelled ? owned.source.fingerprint : proof.sourceFingerprint,
               settledFingerprint: proof.settledFingerprint,
               settledProviderHomeFingerprint: settledHome.fingerprint,
               nativeSessionId: owned.run.nativeSessionId,
@@ -4183,7 +4306,8 @@ async function assertCleanupActivationCommitted(
     snapshot.fingerprint !== marker.settledFingerprint ||
     snapshot.runner.runId !== marker.runId ||
     snapshot.runner.lifecycle !== "suspended" ||
-    snapshot.provider.lifecycle !== "prepared" ||
+    (snapshot.provider.lifecycle !== "prepared" &&
+      !exactCancelledClosedActivationMatches(marker, record(receipt), snapshot.runner, snapshot.provider)) ||
     !Array.isArray(snapshot.control.committedEvents)
   )
     throw new NativeSessionCleanupQuarantinedError();

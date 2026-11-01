@@ -1681,6 +1681,19 @@ it("does not accept process exit without durable suspension", async () => {
   ).resolves.toBe(false);
 });
 
+it("does not accept suspended state when the suspension command failed", async () => {
+  const commands: Array<{ commandId: string; type: string; status: string }> = [];
+  await expect(runnerdRecoveryInternals.awaitRunnerSuspensionBarrier({
+    commands: () => commands,
+    queueSuspend: (commandId) => commands.push({ commandId, type: "runner.suspend", status: "failed" }),
+    readRunnerState: async () => ({ lifecycle: "suspended" }),
+    runnerHasExited: async () => true,
+    pump: () => undefined,
+    deadline: Date.now() + 10,
+    pollIntervalMs: 0,
+  })).resolves.toBe(false);
+});
+
 it("reserves a bounded suspension window after close preparation", () => {
   expect(runnerdRecoveryInternals.runnerCloseDeadlines(1_000, 10_000)).toEqual({
     preparationDeadline: 8_500,
@@ -4128,6 +4141,11 @@ it("controls a Codex session goal end to end through durable PRP v2", async () =
     ).resolves.toEqual({ goal: null });
   } finally {
     await bundle.transport.close();
+    const controlState = JSON.parse(await readFile(join(stateDirectory, "control-plane", "control-plane-state.json"), "utf8"));
+    const suspend = controlState.commands.find((command: { type: string }) => command.type === "runner.suspend");
+    expect(suspend).toMatchObject({ status: "completed", result: { commandId: suspend.commandId, status: "completed", commandType: "runner.suspend" } });
+    expect(controlState.ackedSourceSeq).toBe(controlState.committedEvents.at(-1)?.sourceSeq);
+    expect(JSON.parse(await readFile(join(stateDirectory, "runner", "runner-state.json"), "utf8"))).toMatchObject({ lifecycle: "suspended" });
     await rm(stateDirectory, { recursive: true, force: true });
   }
   expect(bundle.evidence()).toMatchObject({

@@ -65,6 +65,7 @@ import { httpLogger, errorHandler } from "./middleware/index.js";
 import { skillAccessRequestContext } from "./services/skill-access.js";
 import { actorMiddleware } from "./middleware/auth.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
+import { cancelledNativeCleanupRoutes } from "./routes/cancelled-native-cleanup.js";
 import { claudeNativePresenceRoutes } from "./routes/claude-native-presence.js";
 import { resolveClaudeNativeHostSettings } from "./services/claude-native-host-settings.js";
 import {
@@ -661,6 +662,7 @@ export async function createApp(
   const agentAvatars = agentAvatarRoutes();
   api.use(agentAvatars.router);
   api.use(boardMutationGuard());
+  api.use(cancelledNativeCleanupRoutes(db));
   api.use(claudeNativePresenceRoutes({
     resolveHostSettings: resolveClaudeNativeHostSettings,
   }));

@@ -82,6 +82,8 @@ function maintenanceReplaySnapshot(directory: string) {
 }
 
 it.each([
+  { alreadyEnded: true, appendFailure: false, semanticReceipts: true },
+  { alreadyEnded: true, appendFailure: false, semanticReceipts: true, interruptReceipt: true },
   { alreadyEnded: false, appendFailure: false },
   { alreadyEnded: true, appendFailure: false },
   { alreadyEnded: true, appendFailure: true },
@@ -107,7 +109,7 @@ it.each([
     terminalReplay: true,
   },
 ])(
-  "settles only retained control authority without starting another provider turn ($alreadyEnded/$appendFailure/$bareCodex/$epochFailure/$terminalReplay/$holdSpawned/$homeScoped/$missingHome/$unknownExit) startup-failure-proof=$startupFailureProof completed-ack=$completedTerminalAck retired-revocation=$finalRetirementRevocation",
+  "settles only retained control authority without starting another provider turn ($alreadyEnded/$appendFailure/$bareCodex/$epochFailure/$terminalReplay/$holdSpawned/$homeScoped/$missingHome/$unknownExit) startup-failure-proof=$startupFailureProof completed-ack=$completedTerminalAck retired-revocation=$finalRetirementRevocation semantic-receipts=$semanticReceipts interrupted=$interruptReceipt",
   async ({
     alreadyEnded,
     appendFailure,
@@ -121,6 +123,8 @@ it.each([
     missingHome,
     unknownExit,
     startupFailureProof,
+    semanticReceipts,
+    interruptReceipt,
   }) => {
     const replaySpyRestorers: Array<() => void> = [];
     const replayRetirements: ReturnType<typeof maintenanceReplaySnapshot>[] = [];
@@ -271,7 +275,7 @@ it.each([
           .update(await readFile(fixtureRunner))
           .digest("hex")}`,
       });
-      builder.queueCommand("turn.stop", {
+      if (!semanticReceipts) builder.queueCommand("turn.stop", {
         reason: "interrupted original close",
       });
       // The outbound-ACK row must reach its injected loss after retained event
@@ -279,7 +283,7 @@ it.each([
       // ACK deadline behind that commit queue and can time out without ever
       // sending the frame this row is meant to withhold. Maintenance queues its
       // own suspend after draining; the other rows keep the old pending command.
-      if (!missingHome && completedTerminalAck !== "completed") {
+      if (!semanticReceipts && !missingHome && completedTerminalAck !== "completed") {
         builder.queueCommand("runner.suspend", {});
       }
       // Match the retained production split: runner-owned unacknowledged
@@ -325,6 +329,27 @@ it.each([
       const providerBefore = JSON.parse(await readFile(providerFile, "utf8"));
       expect(providerBefore.pendingEvents).toEqual([]);
       expect(providerBefore.queuedEvents).toEqual([]);
+      const digest = (value: unknown) => createHash("sha256")
+        .update(durableControlPlane.durableRecoveryInternals.canonicalJson(value)).digest("hex");
+      const callsForReceipt = [
+        { callId: "read-call", operationId: "paperclip_api", input: { operationId: "GET /api/issues/one" } },
+        { callId: "write-call", operationId: "paperclip_api", input: { operationId: "POST /api/issues/one", body: { title: "saved" } } },
+      ];
+      const semanticToolResults = callsForReceipt.map((call, index) => ({
+        callId: call.callId, operationId: call.operationId, inputDigest: digest(call.input),
+        disposition: index === 0 ? "read_cancelled" as const : "completed_api_receipt" as const,
+        result: index === 0 ? { error: "recovery_read_cancelled" } : { id: "receipt-one" },
+        isError: index === 0,
+      }));
+      if (semanticReceipts) {
+        const tool = { operationId: "paperclip_api", version: 1, description: "API", inputSchema: { type: "object" }, responseSchema: { type: "object" } };
+        providerBefore.lifecycle = "closed";
+        providerBefore.activeProviderTurnId = null;
+        providerBefore.toolBridge = { ...providerBefore.toolBridge,
+          authorized: { paperclip_api: tool }, catalogOperations: [tool], catalogDigest: `sha256:${digest([tool])}`,
+          pending: Object.fromEntries(callsForReceipt.map((call) => [call.callId, call])), turnClosed: true,
+        };
+      }
       for (let index = 0; index < 128; index++) {
         providerBefore.pendingEvents.push({
           executorEventId: `codex_provider_${String(providerBefore.nextProviderEventSeq++).padStart(16, "0")}`,
@@ -405,7 +430,105 @@ it.each([
         appendEvent,
         recordEpoch,
         signal: maintenanceAbort.signal,
+        ...(semanticReceipts ? { semanticToolResults } : {}),
       };
+      if (semanticReceipts) {
+        for (const results of [
+          [], [semanticToolResults[0]!], [semanticToolResults[0]!, semanticToolResults[0]!],
+          [semanticToolResults[0]!, { ...semanticToolResults[1]!, inputDigest: "wrong" }],
+          [semanticToolResults[0]!, { ...semanticToolResults[1]!, disposition: "read_cancelled" as const, isError: true }],
+          [semanticToolResults[0]!, { ...semanticToolResults[1]!, callId: "unknown" }],
+        ]) {
+          await expect(settleRetainedRunnerdSession({ ...input, semanticToolResults: results }))
+            .rejects.toThrow("native_cleanup_maintenance_unproven");
+        }
+        expect(authorize).not.toHaveBeenCalled();
+        if (interruptReceipt) {
+          const originalAttach = DurablePrpControlPlane.prototype.attachWireConnection;
+          let boundary: ReturnType<typeof maintenanceReplaySnapshot> | undefined;
+          const attachSpy = vi.spyOn(DurablePrpControlPlane.prototype, "attachWireConnection")
+            .mockImplementation(function (this: DurablePrpControlPlane, wire) {
+              return originalAttach.call(this, {
+                sendJson(value) {
+                  if (!boundary) {
+                    const snapshot = maintenanceReplaySnapshot(copy);
+                    const commands = snapshot.control.commands.filter((command: { type: string }) => command.type === "semantic_tool.result");
+                    if (commands.length === 2 && commands[0].status === "completed" && commands[1].status === "pending" &&
+                        Object.keys(snapshot.provider.toolBridge.pending).join(",") === "write-call") {
+                      boundary = snapshot;
+                    }
+                  }
+                  if (boundary) {
+                    maintenanceAbort.abort(new Error("fixture controller loss"));
+                    return;
+                  }
+                  wire.sendJson(value);
+                },
+                close: (code) => wire.close(code),
+                onJson: (listener) => wire.onJson(listener),
+                onClose: (listener) => wire.onClose(listener),
+              });
+            });
+          replaySpyRestorers.push(() => attachSpy.mockRestore());
+          await expect(settleRetainedRunnerdSession(input)).rejects.toThrow();
+          attachSpy.mockRestore();
+          expect(boundary).toBeDefined();
+          const partial = maintenanceReplaySnapshot(copy);
+          expect(Object.keys(partial.provider.toolBridge.pending)).toEqual(["write-call"]);
+          expect(partial.provider.toolBridge.settledResults["read-call"].result.isError).toBe(true);
+          const commands = partial.control.commands.filter((command: { type: string }) => command.type === "semantic_tool.result");
+          expect(commands.map((command: { status: string }) => command.status)).toEqual(["completed", "pending"]);
+          const spawned = recordEpoch.mock.calls.map(([receipt]) => receipt).find((receipt) => receipt.phase === "spawned")!;
+          expect(dead(Number(spawned.pid))).toBe(true);
+          expect(dead(-Number(spawned.pid))).toBe(true);
+          const retired = recordEpoch.mock.calls.map(([receipt]) => receipt).find((receipt) => receipt.phase === "retired")!;
+          expect(retired.finalFingerprint).toBe(partial.fingerprint);
+          expect(partial.control.commands.filter((command: { status: string }) => command.status === "pending").map((command: { type: string }) => command.type)).toContain("semantic_tool.result");
+          const retryAuthorization = vi.fn(async () => {});
+          const retry = { ...input,
+            requestId: "maintenance-restart-request", sourceFingerprint: partial.fingerprint,
+            semanticToolResults: [semanticToolResults[1]!], signal: undefined, authorize: retryAuthorization,
+            priorRetiredEpoch: retired as Extract<Parameters<typeof settleRetainedRunnerdSession>[0]["priorRetiredEpoch"], { phase: "retired" }>,
+          };
+          for (const invalid of [
+            { ...retry, priorRetiredEpoch: undefined },
+            { ...retry, sourceFingerprint: "wrong-revision" },
+            { ...retry, priorRetiredEpoch: { ...retry.priorRetiredEpoch, finalFingerprint: "wrong-revision" } },
+            { ...retry, priorRetiredEpoch: { ...retry.priorRetiredEpoch, pid: process.pid, processGroupId: process.pid } },
+            { ...retry, priorRetiredEpoch: { ...retry.priorRetiredEpoch, requestId: "foreign-request" } },
+            { ...retry, semanticToolResults: [{ ...semanticToolResults[1]!, result: { id: "changed" } }] },
+            { ...retry, semanticToolResults: [{ ...semanticToolResults[1]!, inputDigest: "wrong" }] },
+          ]) await expect(settleRetainedRunnerdSession(invalid)).rejects.toThrow("native_cleanup_maintenance_unproven");
+          expect(retryAuthorization).not.toHaveBeenCalled();
+          const proof = await settleRetainedRunnerdSession(retry);
+          const resumed = maintenanceReplaySnapshot(copy);
+          expect(resumed.provider.toolBridge.pending).toEqual({});
+          expect(resumed.provider.toolBridge.settledResults["write-call"].result.result).toEqual({ id: "receipt-one" });
+          const resumedCommands = resumed.control.commands.filter((command: { type: string }) => command.type === "semantic_tool.result");
+          expect(resumedCommands.map((command: { commandId: string }) => command.commandId))
+            .toEqual(commands.map((command: { commandId: string }) => command.commandId));
+          expect(resumedCommands.map((command: { status: string }) => command.status)).toEqual(["completed", "completed"]);
+          expect(await Promise.all(files.map((file) => readFile(join(original, file))))).toEqual(bytes);
+          const methods = (await readFile(calls, "utf8")).trim().split("\n");
+          expect(methods.filter((method) => method === "turn/start")).toHaveLength(1);
+          expect(methods.filter((method) => method === "thread/resume")).toHaveLength(0);
+          await rename(copy, activated);
+          expect(retainedRunnerdCleanupProofIsCurrent(proof)).toBe(true);
+          return;
+        }
+        const proof = await settleRetainedRunnerdSession(input);
+        const settled = JSON.parse(await readFile(join(copy, "runner/codex-provider-state.json"), "utf8"));
+        expect(settled.toolBridge.pending).toEqual({});
+        expect(settled.toolBridge.settledResults["write-call"].result.result).toEqual({ id: "receipt-one" });
+        expect(settled.toolBridge.settledResults["read-call"].result.isError).toBe(true);
+        expect(await Promise.all(files.map((file) => readFile(join(original, file))))).toEqual(bytes);
+        const methods = (await readFile(calls, "utf8")).trim().split("\n");
+        expect(methods.filter((method) => method === "turn/start")).toHaveLength(1);
+        expect(methods.filter((method) => method === "thread/resume")).toHaveLength(0);
+        await rename(copy, activated);
+        expect(retainedRunnerdCleanupProofIsCurrent(proof)).toBe(true);
+        return;
+      }
       const close = vi.fn(async () => {
         throw new NativeSessionCloseUnrecoverableError();
       });

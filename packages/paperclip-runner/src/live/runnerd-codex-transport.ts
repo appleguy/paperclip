@@ -2065,6 +2065,8 @@ export interface RetainedRunnerdCleanupProof {
   readonly providerSessionId: string;
   readonly activationDirectory: string;
   readonly sourceFingerprint: string;
+  readonly stagedSourceFingerprint: string;
+  readonly reconciledToolCallsDigest: string | null;
   readonly settledFingerprint: string;
 }
 
@@ -2098,6 +2100,11 @@ export type RetainedRunnerdMaintenanceEpochReceipt = {
       processGroupAbsent: true;
       retiredAt: string;
       finalFingerprint: string;
+      originalRunnerPid: number;
+      originalProviderPid: number;
+      providerSessionId: string;
+      /** Provider events retained by this exact retired epoch, never kill authority. */
+      retainedProviderIdentities?: readonly { eventType: string; eventDigest: string; payloadDigest: string; processId: number }[];
     }
 );
 
@@ -2303,7 +2310,17 @@ function assertMaintenanceBinding(
   identity: DurableRecoveryIdentity,
   providerSessionId: string,
   allowRestoringOpen = false,
+  allowClosed = false,
+  allowedPendingCallIds: ReadonlySet<string> = new Set(),
 ) {
+  const bridge = record(state.provider.toolBridge);
+  const pendingCalls = record(bridge.pending);
+  const pendingCallIds = Object.keys(pendingCalls);
+  // Initial reconciliation validates the complete set. During settlement,
+  // acknowledged calls disappear one at a time; only an original subset may remain.
+  const pendingCallsAllowed = pendingCallIds.length === 0 ||
+    (bridge.turnClosed === true &&
+      pendingCallIds.every((callId) => allowedPendingCallIds.has(callId)));
   if (
     !recoveryIdentityMatches(record(state.control.identity), identity) ||
     !recoveryIdentityMatches(state.runner, identity) ||
@@ -2316,13 +2333,14 @@ function assertMaintenanceBinding(
     !Array.isArray(state.provider.queuedEvents) ||
     !Array.isArray(state.control.commands) ||
     !Array.isArray(state.control.committedEvents) ||
-    Object.keys(record(record(state.provider.toolBridge).pending)).length !==
-      0 ||
+    !pendingCallsAllowed ||
     state.provider.ambiguousTurnStartPending === true ||
     !(
-      allowRestoringOpen
-        ? ["turn_active", "prepared", "session_open"]
-        : ["turn_active", "prepared"]
+      allowClosed && bridge.turnClosed === true
+        ? ["turn_active", "prepared", "session_open", "closed"]
+        : allowRestoringOpen
+          ? ["turn_active", "prepared", "session_open"]
+          : ["turn_active", "prepared"]
     ).includes(String(state.provider.lifecycle))
   )
     throw maintenanceDenied();
@@ -2337,7 +2355,13 @@ export function retainedRunnerdCleanupProofIsCurrent(
   if (!pids || !pids.every(maintenanceProcessAbsent)) return false;
   try {
     const state = readMaintenanceState(proof.activationDirectory);
-    assertMaintenanceBinding(state, proof.identity, proof.providerSessionId);
+    assertMaintenanceBinding(
+      state,
+      proof.identity,
+      proof.providerSessionId,
+      false,
+      proof.reconciledToolCallsDigest !== null,
+    );
     return (
       state.fingerprint === proof.settledFingerprint &&
       state.runner.lifecycle === "suspended" &&
@@ -2367,6 +2391,21 @@ export interface RetainedRunnerdMaintenanceInput {
   runnerBinary?: string;
   environment?: NodeJS.ProcessEnv;
   sourceCodexHome?: string | null;
+  /** Exact server-derived results for pending API calls in an already-closed
+   * bridge. Reads may be cancelled; mutations require the completed receipt.
+   * The embedding server must derive these from authenticated run receipts. */
+  semanticToolResults?: readonly {
+    callId: string;
+    operationId: string;
+    inputDigest: string;
+    disposition: "completed_api_receipt" | "read_cancelled";
+    result: unknown;
+    isError: boolean;
+  }[];
+  /** Trusted, persisted retirement receipt for the immediately preceding
+   * maintenance epoch on this exact staged directory and fingerprint. The
+   * embedding server must authenticate it against its epoch journal. */
+  priorRetiredEpoch?: Extract<RetainedRunnerdMaintenanceEpochReceipt, { phase: "retired" }>;
   authorize: () => Promise<void>;
   appendEvent: (event: PrpEvent) => Promise<void>;
   recordEpoch: (
@@ -2405,26 +2444,94 @@ async function settleRetainedRunnerdSessionOwned(
   )
     throw maintenanceDenied();
   const initial = readMaintenanceState(root);
-  assertMaintenanceBinding(initial, input.identity, input.providerSessionId);
+  const semanticToolResults = input.semanticToolResults ?? [];
+  const bridge = record(initial.provider.toolBridge);
+  const pendingToolCalls = record(bridge.pending);
+  const originalCommands = initial.control.commands as Array<Record<string, unknown>>;
+  const pendingCommands = originalCommands.filter((command) => command.status === "pending");
+  const pendingResults = pendingCommands.filter((command) => command.type === "semantic_tool.result");
+  const prior = input.priorRetiredEpoch;
+  if (pendingResults.length > 0) {
+    if (!prior || prior.schema !== "paperclip.native_cleanup_runner_epoch.v1" || prior.phase !== "retired" ||
+        prior.requestId === input.requestId || !prior.requestId || !prior.launchId ||
+        resolve(prior.stateDirectory) !== root || prior.finalFingerprint !== initial.fingerprint ||
+        prior.originalRunnerPid !== input.originalRunnerPid || prior.originalProviderPid !== input.originalProviderPid ||
+        prior.providerSessionId !== input.providerSessionId ||
+        prior.processGroupAbsent !== true || !Number.isSafeInteger(prior.pid) || prior.pid <= 0 ||
+        prior.processGroupId !== prior.pid || !prior.processStartedAt || !prior.spawnedAt || !prior.retiredAt ||
+        !maintenanceProcessAbsent(prior.pid) || pendingCommands.some((command) =>
+          !["semantic_tool.result", "runner.drain"].includes(String(command.type))))
+      throw maintenanceDenied();
+  } else if (prior) {
+    throw maintenanceDenied();
+  }
+  const pendingResultCalls = new Set<string>();
+  for (const command of pendingResults) {
+    const payload = record(command.payload);
+    const callId = payload.callId;
+    if (typeof callId !== "string" || pendingResultCalls.has(callId) ||
+        command.commandId !== `command_reconcile_${createHash("sha256").update(`${prior!.requestId}\0${callId}`).digest("hex")}`)
+      throw maintenanceDenied();
+    pendingResultCalls.add(callId);
+  }
+  const allowedPendingCallIds = new Set(semanticToolResults.map((result) => result.callId));
+  let reconciledToolCallsDigest: string | null = null;
+  if (semanticToolResults.length > 0) {
+    const requiredCallIds = new Set([...Object.keys(pendingToolCalls), ...pendingResultCalls]);
+    if (bridge.turnClosed !== true || semanticToolResults.length !== requiredCallIds.size ||
+        allowedPendingCallIds.size !== semanticToolResults.length ||
+        [...requiredCallIds].some((callId) => !allowedPendingCallIds.has(callId)))
+      throw maintenanceDenied();
+    for (const result of semanticToolResults) {
+      const settled = record(record(bridge.settledResults)[result.callId]);
+      const call = record(pendingToolCalls[result.callId] ?? settled.call);
+      const callInput = record(call.input);
+      const method = typeof callInput.operationId === "string" ? callInput.operationId.split(" ", 1)[0] : "";
+      const readOnly = ["GET", "HEAD", "OPTIONS"].includes(method);
+      const mutation = ["POST", "PUT", "PATCH", "DELETE"].includes(method);
+      if (call.callId !== result.callId || call.operationId !== result.operationId ||
+          result.inputDigest !== commandDigest(call.input).slice("sha256:".length) ||
+          (result.disposition === "read_cancelled" ? (!readOnly || result.isError !== true) :
+            (!mutation || result.isError !== false)) ||
+          Buffer.byteLength(JSON.stringify(result.result) ?? "null") > 768 * 1024)
+        throw maintenanceDenied();
+      const expectedPayload = { callId: result.callId, operationId: result.operationId,
+        result: result.result, isError: result.isError };
+      const journaled = pendingResults.find((command) => record(command.payload).callId === result.callId);
+      if ((journaled && commandDigest(journaled.payload) !== commandDigest(expectedPayload)) ||
+          (!pendingToolCalls[result.callId] && commandDigest(settled.result) !== commandDigest(expectedPayload)))
+        throw maintenanceDenied();
+    }
+    reconciledToolCallsDigest = commandDigest(semanticToolResults).slice("sha256:".length);
+  } else if (Object.keys(pendingToolCalls).length !== 0) {
+    throw maintenanceDenied();
+  }
+  assertMaintenanceBinding(initial, input.identity, input.providerSessionId,
+    semanticToolResults.length > 0, semanticToolResults.length > 0, allowedPendingCallIds);
   if (initial.fingerprint !== input.sourceFingerprint)
     throw maintenanceDenied();
-  const originalCommands = initial.control.commands as Array<
-    Record<string, unknown>
-  >;
   if (
     originalCommands.some(
       (command) =>
         command.status === "pending" &&
+        !(prior && command.type === "semantic_tool.result") &&
         !["turn.stop", "runner.drain", "runner.suspend"].includes(
           String(command.type),
         ),
     )
   )
     throw maintenanceDenied();
+  if (semanticToolResults.length > 0 && pendingCommands.some((command) =>
+    command.type !== "semantic_tool.result" && !(prior && command.type === "runner.drain")))
+    throw maintenanceDenied();
   const retainedEvents = [
     ...(initial.runner.outbox as unknown[]).map((event) =>
       record(record(record(event).envelope).payload),
     ),
+    ...(initial.provider.pendingEvents as unknown[]).map(record),
+    ...(initial.provider.queuedEvents as unknown[]).map(record),
+  ];
+  const retainedProviderEvents = [
     ...(initial.provider.pendingEvents as unknown[]).map(record),
     ...(initial.provider.queuedEvents as unknown[]).map(record),
   ];
@@ -2451,10 +2558,12 @@ async function settleRetainedRunnerdSessionOwned(
     const identity = resolveRunnerdSessionIdentity(event.payload);
     // Replayed historical identities cannot grant authority to kill a PID
     // that may have since been reused by an unrelated process.
-    if (
-      identity.threadId !== input.providerSessionId ||
-      identity.processId !== input.originalProviderPid
-    )
+    const retiredIdentity = prior?.retainedProviderIdentities?.some((item) =>
+      item.eventType === event.eventType && item.eventDigest === commandDigest(event) && item.payloadDigest === commandDigest(event.payload) &&
+      item.processId === identity.processId && retainedProviderEvents.includes(event) &&
+      identity.processId !== null && maintenanceProcessAbsent(identity.processId));
+    if (identity.threadId !== input.providerSessionId ||
+        (identity.processId !== input.originalProviderPid && !retiredIdentity))
       throw maintenanceDenied();
   }
   const pids = new Set([input.originalRunnerPid, input.originalProviderPid]);
@@ -2464,6 +2573,7 @@ async function settleRetainedRunnerdSessionOwned(
   >();
   if (pids.size !== 2 || ![...pids].every(maintenanceProcessAbsent))
     throw maintenanceDenied();
+  if (prior) pids.add(prior.pid);
   const runnerBinary = input.runnerBinary ?? defaultCapabilityRunnerdBinary();
   const artifact = approvedRunnerArtifact(runnerBinary);
   const codexHome = resolve(root, "codex-home");
@@ -2547,9 +2657,18 @@ async function settleRetainedRunnerdSessionOwned(
     await authorize();
     if (![...pids].every(maintenanceProcessAbsent)) throw maintenanceDenied();
     const before = readMaintenanceState(root);
-    assertMaintenanceBinding(before, input.identity, input.providerSessionId);
     const terminalOnly = before.runner.pendingTerminalDelivery != null;
     const pendingTerminal = record(before.runner.pendingTerminalDelivery);
+    const epochRestoresProvider =
+      !terminalOnly && before.provider.lifecycle === "turn_active";
+    assertMaintenanceBinding(
+      before,
+      input.identity,
+      input.providerSessionId,
+      epochRestoresProvider,
+      semanticToolResults.length > 0,
+      allowedPendingCallIds,
+    );
     const completedTerminalOnly =
       terminalOnly &&
       completedTerminalEpochFingerprint === before.fingerprint &&
@@ -2569,8 +2688,6 @@ async function settleRetainedRunnerdSessionOwned(
       )
     )
       throw maintenanceDenied();
-    const epochRestoresProvider =
-      !terminalOnly && before.provider.lifecycle === "turn_active";
     const epochProviderPids = new Set<number>();
     const epochCompletedCommands = new Set(
       (before.control.commands as Array<Record<string, unknown>>)
@@ -2584,6 +2701,8 @@ async function settleRetainedRunnerdSessionOwned(
         (before.control.commands as Array<Record<string, unknown>>).some(
           (command) =>
             command.status === "pending" &&
+            !(prior && pendingResults.some((old) => old.commandId === command.commandId &&
+              commandDigest(old.payload) === commandDigest(command.payload))) &&
             !["runner.drain", "runner.suspend"].includes(String(command.type)),
         ))
     ) {
@@ -2639,8 +2758,11 @@ async function settleRetainedRunnerdSessionOwned(
                 identity.processId === null
               )
                 throw maintenanceDenied();
-              pids.add(identity.processId);
-              if (identity.processId !== input.originalProviderPid) {
+              const retiredReplay = prior?.retainedProviderIdentities?.some((item) =>
+                item.eventType === event.eventType && item.processId === identity.processId &&
+                item.payloadDigest === commandDigest(event.payload) && maintenanceProcessAbsent(identity.processId));
+              if (!retiredReplay) pids.add(identity.processId);
+              if (identity.processId !== input.originalProviderPid && !retiredReplay) {
                 const digest = commandDigest(event.payload);
                 const prior = providerProofs.get(identity.processId);
                 if (
@@ -2706,6 +2828,22 @@ async function settleRetainedRunnerdSessionOwned(
           reason: "exact retained authority cleanup",
         });
       }
+      if (!terminalOnly && semanticToolResults.length > 0) {
+        if (before.provider.lifecycle !== "closed")
+          core.queueCommand("session.close", {}, `command_close_${input.requestId.slice(0, 80)}`);
+        for (const result of semanticToolResults) {
+          if (pendingResultCalls.has(result.callId)) continue;
+          const commandId = `command_reconcile_${createHash("sha256")
+            .update(`${input.requestId}\0${result.callId}`)
+            .digest("hex")}`;
+          core.queueCommand("semantic_tool.result", {
+            callId: result.callId,
+            operationId: result.operationId,
+            result: result.result,
+            isError: result.isError,
+          }, commandId, true);
+        }
+      }
       await core.start();
       await authorize();
       epochIdentity.initialFingerprint = readMaintenanceState(root).fingerprint;
@@ -2764,7 +2902,7 @@ async function settleRetainedRunnerdSessionOwned(
       await bounded(input.recordEpoch(spawnedReceipt));
       await authorize();
       releaseSpawnAdmission();
-      let drainQueued = false;
+      let drainQueued = pending.some((command) => command.type === "runner.drain");
       while (!exited) {
         await authorize();
         const state = readMaintenanceState(root);
@@ -2773,6 +2911,8 @@ async function settleRetainedRunnerdSessionOwned(
           input.identity,
           input.providerSessionId,
           epochRestoresProvider,
+          semanticToolResults.length > 0,
+          allowedPendingCallIds,
         );
         const provider = providerDrainStateFromSnapshot(state.provider);
         if (!terminalOnly && !terminalQueued && provider.providerSettled) {
@@ -2830,6 +2970,19 @@ async function settleRetainedRunnerdSessionOwned(
           if (!maintenanceProcessAbsent(spawnedReceipt.pid))
             throw maintenanceDenied();
           const finalFingerprint = readMaintenanceState(root).fingerprint;
+          const retiredState = readMaintenanceState(root);
+          if (retiredState.fingerprint !== finalFingerprint) throw maintenanceDenied();
+          const retainedProviderIdentities = [
+            ...(retiredState.provider.pendingEvents as unknown[]).map(record),
+            ...(retiredState.provider.queuedEvents as unknown[]).map(record),
+          ].filter((event) => ["session.started", "session.resumed", "harness.ready"].includes(String(event.eventType)))
+            .map((event) => {
+              const identity = resolveRunnerdSessionIdentity(event.payload);
+              if (identity.threadId !== input.providerSessionId || identity.processId === null ||
+                  !maintenanceProcessAbsent(identity.processId)) throw maintenanceDenied();
+              return { eventType: String(event.eventType), eventDigest: commandDigest(event),
+                payloadDigest: commandDigest(event.payload), processId: identity.processId };
+            });
           await bounded(
             input.recordEpoch({
               ...spawnedReceipt,
@@ -2839,6 +2992,10 @@ async function settleRetainedRunnerdSessionOwned(
               processGroupAbsent: true,
               retiredAt: new Date().toISOString(),
               finalFingerprint,
+              originalRunnerPid: input.originalRunnerPid,
+              originalProviderPid: input.originalProviderPid,
+              providerSessionId: input.providerSessionId,
+              ...(retainedProviderIdentities.length ? { retainedProviderIdentities } : {}),
             }),
             Date.now() + 1_000,
             true,
@@ -2888,7 +3045,13 @@ async function settleRetainedRunnerdSessionOwned(
     // process exit, not permission to publish a reusable cleanup proof.
     await authorize();
     const settled = readMaintenanceState(root);
-    assertMaintenanceBinding(settled, input.identity, input.providerSessionId);
+    assertMaintenanceBinding(
+      settled,
+      input.identity,
+      input.providerSessionId,
+      false,
+      semanticToolResults.length > 0,
+    );
     if (settled.runner.lifecycle !== "suspended") throw maintenanceDenied();
     if (terminalOnly) {
       if (completedTerminalOnly) {
@@ -2999,7 +3162,9 @@ async function settleRetainedRunnerdSessionOwned(
       completedTerminalEpochFingerprint = settled.fingerprint;
     }
     if (
-      settled.provider.lifecycle === "prepared" &&
+      ["prepared", ...(semanticToolResults.length > 0 ? ["closed"] : [])].includes(
+        String(settled.provider.lifecycle),
+      ) &&
       settled.runner.pendingTerminalDelivery == null &&
       settled.runner.pendingProviderCleanup == null &&
       stopProven &&
@@ -3019,6 +3184,8 @@ async function settleRetainedRunnerdSessionOwned(
         providerSessionId: input.providerSessionId,
         activationDirectory: resolve(input.activationDirectory),
         sourceFingerprint: input.sourceFingerprint,
+        stagedSourceFingerprint: initial.fingerprint,
+        reconciledToolCallsDigest,
         settledFingerprint: settled.fingerprint,
       });
       retainedRunnerdCleanupProofs.set(proof, Object.freeze([...pids]));

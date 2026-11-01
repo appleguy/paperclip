@@ -70,6 +70,7 @@ export type {
   RunnerExecutionDriver,
   RunnerLaunchPreparer,
   DurableRecoveryIdentity,
+  RetainedRunnerdCleanupProof,
   DurablePrpCheckpoint,
   RunnerProcessHandle,
   RunnerProcessLaunchSpec,
@@ -137,6 +138,7 @@ export const applyNativeSessionGoalControl =
   runner.applyNativeSessionGoalControl;
 export const completeRetainedNativeSessionCleanup = runner.completeRetainedNativeSessionCleanup;
 export const settleRetainedRunnerdSession = runner.settleRetainedRunnerdSession;
+export const retainedRunnerdCleanupProofIsCurrent = runner.retainedRunnerdCleanupProofIsCurrent;
 export const retainedRunnerdMaintenanceIsIdle =
   runner.retainedRunnerdMaintenanceIsIdle;
 export const drainRetainedRunnerdMaintenanceOperations =

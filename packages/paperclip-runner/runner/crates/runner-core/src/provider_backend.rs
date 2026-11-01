@@ -4014,6 +4014,16 @@ impl CodexCommandExecutor {
             .state
             .as_mut()
             .ok_or_else(|| DurableRunnerError::invalid("Codex provider is not prepared"))?;
+        // Closing admission preserves pending calls for exact receipt settlement,
+        // without allowing a maintenance restart to admit fresh tool effects.
+        state
+            .tool_bridge
+            .settle_turn("provider_session_closed")
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!(
+                    "failed to close semantic tool admission with Codex session: {error}"
+                ))
+            })?;
         state.active_provider_turn_id = None;
         state.ambiguous_turn_start_pending = false;
         state.receipt_limit_diagnostic_emitted = false;
@@ -6862,6 +6872,104 @@ mod tests {
         assert!(restarted.provider.is_none());
         fs::remove_dir_all(directory).unwrap();
     }
+    #[test]
+    fn closing_session_seals_tool_admission_but_preserves_pending_calls() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-provider-session-close-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let operation = crate::provider_bridge::AuthorizedTool {
+            operation_id: "get_task_context".to_owned(),
+            version: 1,
+            description: "Read the active task context.".to_owned(),
+            input_schema: json!({"type": "object"}),
+            response_schema: json!({"type": "object"}),
+        };
+        let mut bridge = ProviderToolBridge::default();
+        bridge
+            .prepare(AuthorizedToolSet {
+                schema: TOOL_SET_SCHEMA.to_owned(),
+                schema_version: 1,
+                catalog_digest: authorized_tool_catalog_digest(std::slice::from_ref(&operation))
+                    .unwrap(),
+                operations: vec![operation],
+            })
+            .unwrap();
+        bridge
+            .begin_call(
+                "call-pending-close".to_owned(),
+                "get_task_context".to_owned(),
+                json!({}),
+            )
+            .unwrap();
+        let mut state = CodexProviderState::new(
+            CodexProviderConfig {
+                provider: "codex".to_owned(),
+                driver: "codex_app_server".to_owned(),
+                provider_version: "test".to_owned(),
+                command: PathBuf::from("codex"),
+                args: vec!["app-server".to_owned()],
+                cwd: std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                model: None,
+                provider_session_id: None,
+                instructions: String::new(),
+                approval_policy: "never".to_owned(),
+                externally_sandboxed: false,
+                read_only: false,
+                include_skill_instructions: None,
+                conversation_mode: None,
+            },
+            None,
+            bridge,
+        );
+        state.thread_id = Some("thread-close".to_owned());
+        state.lifecycle = "session_open".to_owned();
+        let mut executor = CodexCommandExecutor::new(&directory);
+        executor.state = Some(state);
+        executor.event_identity = Some(ProviderEventIdentity {
+            runner_instance_id: "runner-close".to_owned(),
+            run_id: "run-close".to_owned(),
+            normalized_session_id: "session-close".to_owned(),
+            turn_id: "turn-close".to_owned(),
+            item_id: "item-close".to_owned(),
+        });
+
+        let execution = executor.close_session().unwrap();
+
+        assert_eq!(execution.result["status"], "closed");
+        let state = executor.state.as_mut().unwrap();
+        assert_eq!(state.lifecycle, "closed");
+        assert!(state.tool_bridge.turn_closed());
+        assert_eq!(state.tool_bridge.pending_calls().count(), 1);
+        assert!(state
+            .tool_bridge
+            .begin_call(
+                "call-after-close".to_owned(),
+                "get_task_context".to_owned(),
+                json!({}),
+            )
+            .is_err());
+        let result = executor
+            .deliver_semantic_result(&json!({
+                "callId": "call-pending-close",
+                "operationId": "get_task_context",
+                "result": {"ok": false, "error": "recovery_read_cancelled"},
+                "isError": true,
+            }))
+            .unwrap();
+        assert_eq!(result.result["status"], "settled_after_turn");
+        let state = executor.state.as_ref().unwrap();
+        assert_eq!(state.tool_bridge.pending_calls().count(), 0);
+        assert!(state.tool_bridge.turn_closed());
+        assert!(executor.provider.is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
 }
 
 #[cfg(test)]
