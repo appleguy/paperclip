@@ -183,6 +183,7 @@ function ClassicSidebar({ children }: { children?: ReactNode }) {
               Cmd/Ctrl+K remains the keyboard path (command palette). */}
           <SidebarNavItem to="/search" label="Search" icon={Search} />
           <SidebarNavItem to="/dashboard" label="Dashboard" icon={LayoutDashboard} liveCount={liveRunCount} />
+          <SidebarNavItem to="/native-sessions" label="Native sessions" icon={MessagesSquare} />
           {canObserveNativeSessions && <SidebarNavItem to="/native-sessions/claude" label="Claude sessions" icon={MessagesSquare} />}
           {!combinedInboxTasks ? (
             <SidebarNavItem

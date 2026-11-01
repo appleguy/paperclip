@@ -109,6 +109,7 @@ export function CoordinatorSidebar({ children }: { children?: ReactNode }) {
             className="absolute right-3 top-1/2 -translate-y-1/2 rounded-md p-1 text-muted-foreground opacity-0 transition-opacity group-hover/coordinator-new:opacity-100 group-focus-within/coordinator-new:opacity-100 pointer-coarse:opacity-100 hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-ring"><Plus className="size-4" /></button>}
         </div>
         <SidebarNavItem className="design-sidebar-item" to="/decisions" label="Needs You" icon={Bell} badge={attention?.totalCount ?? 0} badgeLabel="decisions" />
+        <SidebarNavItem className="design-sidebar-item" to="/native-sessions" label="Native sessions" icon={MessageCircle} />
         {canObserveNativeSessions && <SidebarNavItem className="design-sidebar-item" to="/native-sessions/claude" label="Claude sessions" icon={MessageCircle} />}
         <Flyout open={moreOpen} onOpenChange={setMoreOpen}>
           <FlyoutTrigger asChild><button type="button" aria-label="More workspace pages" className="design-sidebar-item flex w-auto items-center gap-2.5 rounded-lg py-1.5 text-left transition-colors focus-visible:ring-2 focus-visible:ring-ring"><MoreHorizontal className="size-4 shrink-0" /><span className={rail ? SIDEBAR_RAIL_HIDDEN_LABEL : undefined}>More</span></button></FlyoutTrigger>
