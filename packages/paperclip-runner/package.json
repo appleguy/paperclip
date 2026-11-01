@@ -183,10 +183,12 @@
     "acpx": "0.13.1",
     "ajv": "^8.20.0",
     "json-schema-to-ts": "^3.1.1",
+    "node-pty": "1.2.0-beta.18",
     "opencode-ai": "1.18.34",
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1",
-    "smol-toml": "^1.9.1"
+    "smol-toml": "^1.9.1",
+    "ws": "8.22.0"
   },
   "peerDependencies": {
     "react": ">=18",
@@ -206,6 +208,7 @@
     "@types/node": "^24.0.0",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.5",
+    "@types/ws": "8.18.2",
     "@vitejs/plugin-react": "^4.7.0",
     "axe-core": "^4.12.1",
     "react": "^19.2.7",
