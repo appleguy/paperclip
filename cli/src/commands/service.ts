@@ -240,7 +240,7 @@ export function registerServiceCommands(program: Command): void {
   }
 
   common(service.command("restart").description("Restart only when active work is verifiably recoverable"))
-    .option("--wait", "Require active non-recoverable runs to finish before retrying", false)
+    .option("--wait", "Do not interrupt active runs; retry after they finish (does not wait)", false)
     .option("--expected-version <version>", "Require the restarted server to report this version")
     .action(async (opts) => output(await restartManagedService({ instanceId: opts.instance, expectedVersion: opts.expectedVersion, waitForDrain: opts.wait }), opts.json));
 

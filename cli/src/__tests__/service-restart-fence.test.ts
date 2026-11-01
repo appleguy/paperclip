@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { Command } from "commander";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
@@ -13,7 +14,7 @@ vi.mock("../services/service-manager.js", () => ({
     status: async () => ({ pid: 123, serviceName: "test" }), restart: mocks.restart,
   } }),
 }));
-import { restartManagedService } from "../commands/service.js";
+import { registerServiceCommands, restartManagedService } from "../commands/service.js";
 
 let previousHome: string | undefined;
 let tempHome: string;
@@ -33,6 +34,13 @@ afterEach(async () => {
   vi.unstubAllGlobals();
   if (previousHome === undefined) delete process.env.PAPERCLIP_HOME; else process.env.PAPERCLIP_HOME = previousHome;
   await fs.rm(tempHome, { recursive: true, force: true });
+});
+
+it("describes --wait as a refusal, not an automatic wait", () => {
+  const program = new Command();
+  registerServiceCommands(program);
+  const restart = program.commands.find(command => command.name() === "service")!.commands.find(command => command.name() === "restart")!;
+  expect(restart.helpInformation().replace(/\s+/g, " ")).toContain("Do not interrupt active runs; retry after they finish (does not wait)");
 });
 
 it("signals only after the owned fence and global readiness are verified", async () => {
