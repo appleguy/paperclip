@@ -1282,6 +1282,60 @@ export const providerDescriptorSchema = {
       ],
       "minimum": 1
     },
+    "processOwnership": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "owned_child"
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "kind",
+            "socketPath",
+            "daemonGeneration",
+            "threadId",
+            "codexHome"
+          ],
+          "properties": {
+            "kind": {
+              "const": "shared_daemon"
+            },
+            "socketPath": {
+              "type": "string",
+              "pattern": "^/[^\\u0000-\\u001f\\u007f]*$",
+              "maxLength": 4096
+            },
+            "codexHome": {
+              "type": "string",
+              "pattern": "^/[^\\u0000-\\u001f\\u007f]*$",
+              "maxLength": 4096
+            },
+            "daemonGeneration": {
+              "type": "string",
+              "pattern": "^(?=.*\\S)[^\\u0000-\\u001f\\u007f]+$",
+              "minLength": 1,
+              "maxLength": 1024
+            },
+            "threadId": {
+              "type": "string",
+              "pattern": "^(?=.*\\S)[^\\u0000-\\u001f\\u007f]+$",
+              "minLength": 1,
+              "maxLength": 240
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
     "agentProcessId": {
       "type": [
         "integer",
@@ -1389,6 +1443,87 @@ export const providerDescriptorSchema = {
     }
   },
   "allOf": [
+    {
+      "if": {
+        "required": [
+          "processOwnership"
+        ],
+        "properties": {
+          "processOwnership": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "const": "shared_daemon"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "provider": {
+            "const": "codex"
+          },
+          "driver": {
+            "const": "codex_app_server"
+          },
+          "executionKind": {
+            "const": "local_process"
+          }
+        },
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "processId"
+              ]
+            },
+            {
+              "required": [
+                "agentProcessId"
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "processOwnership"
+        ],
+        "properties": {
+          "processOwnership": {
+            "type": "object",
+            "properties": {
+              "kind": {
+                "const": "owned_child"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "processId"
+        ],
+        "properties": {
+          "processId": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "executionKind": {
+            "const": "local_process"
+          }
+        }
+      }
+    },
     {
       "if": {
         "required": [
