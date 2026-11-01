@@ -1,0 +1,1 @@
+ALTER TABLE "companies" ADD COLUMN "board_operator" jsonb DEFAULT '{"agentId":null,"routeAgentQuestions":false,"wakeOnRecoveryEscalation":false}'::jsonb NOT NULL;

@@ -22,6 +22,7 @@ import {
   issueDocuments,
   issueRelations,
   issueRecoveryActions,
+  issueThreadInteractions,
   issueTreeHolds,
   issues,
   nativeRunFinalizations,
@@ -231,6 +232,81 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     expect(resumed.resultJson).not.toHaveProperty("executionWait");
     expect(await adapter.cancelStaleQueuedRun({ ...f, now, expectedStatus: "queued" }))
       .toMatchObject({ outcome: "not_stale" });
+  });
+
+  describe("non-assignee wakes that are explicitly authorized", () => {
+    async function seedBoardFixture() {
+      const { companyId, agentId: assigneeId } = await seedCompanyAndAgent();
+      const boardId = randomUUID();
+      const strangerId = randomUUID();
+      await seedAgent({ id: boardId, companyId, name: "Board", role: "general" });
+      await seedAgent({ id: strangerId, companyId, name: "Stranger" });
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_review", assigneeAgentId: assigneeId });
+      return { companyId, assigneeId, boardId, strangerId, issueId };
+    }
+    const cancelOutcome = (companyId: string, runId: string) =>
+      createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+        runId, companyId, now: new Date(), expectedStatus: "queued",
+      });
+
+    it("runs the verified pending addressee, and cancels an unverified or resolved ask", async () => {
+      const f = await seedBoardFixture();
+      const [pending] = await db.insert(issueThreadInteractions).values({
+        companyId: f.companyId, issueId: f.issueId, kind: "ask_user_questions", status: "pending",
+        addresseeAgentId: f.boardId, createdByAgentId: f.assigneeId, payload: { version: 1 } as never,
+      }).returning();
+      const ctx = (interactionId: string) => ({
+        issueId: f.issueId, wakeReason: "interaction_pending", interactionId,
+      });
+
+      const ok = await seedRun({ companyId: f.companyId, agentId: f.boardId, contextSnapshot: ctx(pending!.id) });
+      expect(await cancelOutcome(f.companyId, ok)).toMatchObject({ outcome: "not_stale" });
+
+      // Same wake for an agent that is not the addressee.
+      const wrongAgent = await seedRun({ companyId: f.companyId, agentId: f.strangerId, contextSnapshot: ctx(pending!.id) });
+      expect(await cancelOutcome(f.companyId, wrongAgent)).toMatchObject({
+        outcome: "cancelled", errorCode: "issue_assignee_changed",
+      });
+
+      // A forged interaction id never authorizes the wake.
+      const forged = await seedRun({ companyId: f.companyId, agentId: f.boardId, contextSnapshot: ctx(randomUUID()) });
+      expect(await cancelOutcome(f.companyId, forged)).toMatchObject({ outcome: "cancelled" });
+
+      // Once answered the ask is no longer a reason to run a non-assignee.
+      await db.update(issueThreadInteractions).set({ status: "answered" }).where(eq(issueThreadInteractions.id, pending!.id));
+      const answered = await seedRun({ companyId: f.companyId, agentId: f.boardId, contextSnapshot: ctx(pending!.id) });
+      expect(await cancelOutcome(f.companyId, answered)).toMatchObject({ outcome: "cancelled" });
+    });
+
+    it("runs the configured Board operator for an active board-owned recovery action only", async () => {
+      const f = await seedBoardFixture();
+      await db.update(companies).set({
+        boardOperator: { agentId: f.boardId, routeAgentQuestions: false, wakeOnRecoveryEscalation: true },
+      }).where(eq(companies.id, f.companyId));
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, f.issueId));
+      const [action] = await db.insert(issueRecoveryActions).values({
+        companyId: f.companyId, sourceIssueId: f.issueId, kind: "deliberate_wait_without_target",
+        status: "active", ownerType: "board", cause: "deliberate_wait_without_target",
+        fingerprint: "fp", nextAction: "Inspect.",
+      }).returning();
+      const ctx = (recoveryActionId: string | undefined) => ({
+        issueId: f.issueId, wakeReason: "board_recovery_escalated", ...(recoveryActionId ? { recoveryActionId } : {}),
+      });
+
+      const ok = await seedRun({ companyId: f.companyId, agentId: f.boardId, contextSnapshot: ctx(action!.id) });
+      expect(await cancelOutcome(f.companyId, ok)).toMatchObject({ outcome: "not_stale" });
+
+      const notOperator = await seedRun({ companyId: f.companyId, agentId: f.strangerId, contextSnapshot: ctx(action!.id) });
+      expect(await cancelOutcome(f.companyId, notOperator)).toMatchObject({ outcome: "cancelled" });
+
+      const noAction = await seedRun({ companyId: f.companyId, agentId: f.boardId, contextSnapshot: ctx(undefined) });
+      expect(await cancelOutcome(f.companyId, noAction)).toMatchObject({ outcome: "cancelled" });
+
+      await db.update(issueRecoveryActions).set({ status: "resolved" }).where(eq(issueRecoveryActions.id, action!.id));
+      const resolved = await seedRun({ companyId: f.companyId, agentId: f.boardId, contextSnapshot: ctx(action!.id) });
+      expect(await cancelOutcome(f.companyId, resolved)).toMatchObject({ outcome: "cancelled" });
+    });
   });
 
   it("parks the same unstarted retry if cleanup becomes pending after promotion", async () => {

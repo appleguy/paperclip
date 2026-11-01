@@ -154,6 +154,12 @@ export type QueuedRunFacts = {
    * (`addresseeAgentId`) wake a non-assignee by design.
    */
   isPendingInteractionAddresseeWake?: boolean;
+  /**
+   * The run's agent is the company's configured Board operator and the wake
+   * names a still-active board-owned recovery action on this exact issue,
+   * verified under the issue lock.
+   */
+  isBoardOperatorRecoveryWake?: boolean;
   isAuthorizedSourceScopedRecovery: boolean;
   isNonAssigneeWorkspaceBusyRetry: boolean;
 
@@ -179,6 +185,7 @@ type OwnershipFacts = {
   isNonAssigneeWorkspaceBusyRetry: boolean;
   isInteractionWake?: boolean;
   isPendingInteractionAddresseeWake?: boolean;
+  isBoardOperatorRecoveryWake?: boolean;
   isCurrentReviewParticipant?: boolean;
   isAuthorizedSourceScopedRecovery?: boolean;
 };
@@ -195,6 +202,7 @@ function decideIssueOwnership(facts: OwnershipFacts): OwnershipOutcome {
   if (facts.isNonAssigneeWorkspaceBusyRetry) return "current_owner";
   if (facts.isInteractionWake) return "current_owner";
   if (facts.isPendingInteractionAddresseeWake) return "current_owner";
+  if (facts.isBoardOperatorRecoveryWake) return "current_owner";
   if (facts.isCurrentReviewParticipant) return "current_owner";
   if (facts.isAuthorizedSourceScopedRecovery) return "current_owner";
   return "reassigned";
@@ -583,6 +591,7 @@ export function decideQueuedRunStaleness(
     isNonAssigneeWorkspaceBusyRetry: facts.isNonAssigneeWorkspaceBusyRetry,
     isInteractionWake: facts.isInteractionWake,
     isPendingInteractionAddresseeWake: facts.isPendingInteractionAddresseeWake,
+    isBoardOperatorRecoveryWake: facts.isBoardOperatorRecoveryWake,
     isCurrentReviewParticipant:
       facts.reviewParticipant.isInReview &&
       facts.reviewParticipant.participantIsAgent &&
@@ -678,7 +687,9 @@ export function decideQueuedRunStaleness(
   const participantOutcome = decideReviewParticipant({
     ...facts.reviewParticipant,
     runAgentId: facts.runAgentId,
-    bypass: facts.wakeCommentIdPresent || facts.isPendingInteractionAddresseeWake === true,
+    bypass: facts.wakeCommentIdPresent
+      || facts.isPendingInteractionAddresseeWake === true
+      || facts.isBoardOperatorRecoveryWake === true,
   });
   if (participantOutcome === "participant_changed") {
     return {

@@ -1,3 +1,4 @@
+import { boardOperatorRecoveryService } from "./services/board-operator.js";
 import { registerSkillVersionRetentionWork } from "./services/skill-version-retention-work.js";
 import { registerDatabaseBackupWork } from "./services/database-backup-work.js";
 import { registerToolConnectionHealthWork } from "./services/tool-connection-health-work.js";
@@ -2037,6 +2038,16 @@ async function startServerWithDatabaseTeardown(
               const reconciled = await heartbeat.reconcileResolvedDependencyWakes();
               if (reconciled.healed > 0) {
                 logger.warn({ ...reconciled }, "periodic dependency-wake reconciliation restored task execution paths");
+              }
+            })
+            .then(async () => {
+              // Event-driven escalation: wake the company's Board operator once per
+              // board-owned recovery action (idempotent; no-op unless enabled).
+              const woken = await boardOperatorRecoveryService(db as any, {
+                wakeup: (agentId, opts) => heartbeat.wakeup(agentId, opts as any),
+              }).wakeForBoardOwnedRecoveryActions();
+              if (woken.woken > 0) {
+                logger.info({ ...woken }, "woke Board operator for board-owned recovery actions");
               }
             })
             .then(async () => {

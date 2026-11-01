@@ -22,6 +22,7 @@ export type {
 } from "./connection-intent.js";
 export type {
   Company,
+  BoardOperatorConfig,
   InteractionResolverGovernance,
   InteractionResolverKindGovernance,
 } from "./company.js";

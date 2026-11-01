@@ -734,6 +734,7 @@ export {
 
 export type {
   Company,
+  BoardOperatorConfig,
   InteractionResolverGovernance,
   InteractionResolverKindGovernance,
   GenerateSummarySlotRequest,
@@ -1830,6 +1831,7 @@ export {
 export {
   createCompanySchema,
   interactionResolverGovernanceSchema,
+  boardOperatorSchema,
   updateCompanySchema,
   updateCompanyBrandingSchema,
   feedbackTargetTypeSchema,

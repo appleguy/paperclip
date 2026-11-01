@@ -310,6 +310,37 @@ describe("decideQueuedRunStaleness", () => {
     });
   });
 
+  describe("Board operator recovery wake", () => {
+    const boardWakeFacts = (): QueuedRunFacts => ({
+      ...baseStalenessFacts(),
+      issueStatus: "blocked",
+      issueAssigneeAgentId: "assignee",
+      wakeReason: "board_recovery_escalated",
+    });
+
+    it("cancels a non-assignee recovery wake that is not the verified operator", () => {
+      expect(decideQueuedRunStaleness(boardWakeFacts(), NOW)).toMatchObject({
+        stale: true,
+        errorCode: "issue_assignee_changed",
+      });
+    });
+
+    it("lets the verified Board operator run on a blocked issue it does not own", () => {
+      expect(decideQueuedRunStaleness({
+        ...boardWakeFacts(),
+        isBoardOperatorRecoveryWake: true,
+      }, NOW)).toEqual({ stale: false });
+    });
+
+    it("still rejects a verified operator wake when the issue is terminal", () => {
+      expect(decideQueuedRunStaleness({
+        ...boardWakeFacts(),
+        issueStatus: "done",
+        isBoardOperatorRecoveryWake: true,
+      }, NOW)).toMatchObject({ stale: true, errorCode: "issue_terminal_status" });
+    });
+  });
+
   it.each([
     {
       name: "issue_not_found",

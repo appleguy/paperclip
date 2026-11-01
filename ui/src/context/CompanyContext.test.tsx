@@ -57,6 +57,7 @@ function makeCompany(id: string): Company {
     defaultResponsibleUserId: null,
     requireBoardApprovalForNewAgents: false,
     interactionResolverGovernance: {},
+    boardOperator: { agentId: null, routeAgentQuestions: false, wakeOnRecoveryEscalation: false },
     feedbackDataSharingEnabled: false,
     feedbackDataSharingConsentAt: null,
     feedbackDataSharingConsentByUserId: null,

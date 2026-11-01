@@ -35,6 +35,7 @@ import {
   type CompanyImportTransferStatus,
 } from "@paperclipai/shared/company-import-transfer";
 import { badRequest, conflict, forbidden, notFound, unprocessable } from "../errors.js";
+import { getInvokableBoardOperatorAgentId, normalizeBoardOperatorConfig } from "../services/board-operator.js";
 import { PORTABLE_ZIP_UPLOAD_LIMIT_BYTES } from "../http/body-limits.js";
 import { logger } from "../middleware/logger.js";
 import { validate } from "../middleware/validate.js";
@@ -1274,6 +1275,24 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
               : DEFAULT_FEEDBACK_DATA_SHARING_TERMS_VERSION,
         };
       }
+    }
+
+    if (req.actor.type !== "agent" && body.boardOperator !== undefined) {
+      // Board-only setting. Merge so a partial update never clears other
+      // switches, and require a real, invokable company agent to be named.
+      const merged = normalizeBoardOperatorConfig({
+        ...normalizeBoardOperatorConfig(existingCompany.boardOperator),
+        ...(body.boardOperator as Record<string, unknown>),
+      });
+      if (merged.agentId) {
+        const operatorId = await getInvokableBoardOperatorAgentId(db, companyId, merged);
+        if (!operatorId) {
+          throw unprocessable("boardOperator.agentId must reference an invokable agent in this company");
+        }
+      } else if (merged.routeAgentQuestions || merged.wakeOnRecoveryEscalation) {
+        throw unprocessable("boardOperator.agentId is required to enable question routing or recovery wakes");
+      }
+      body = { ...body, boardOperator: merged };
     }
 
     const transitionsToArchived =

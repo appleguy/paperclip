@@ -21,6 +21,12 @@ export const interactionResolverGovernanceSchema = z.object({
   request_item_verdicts: interactionResolverKindGovernanceSchema.optional(),
 }).strict().default({});
 
+export const boardOperatorSchema = z.object({
+  agentId: z.string().guid().nullable().optional(),
+  routeAgentQuestions: z.boolean().optional(),
+  wakeOnRecoveryEscalation: z.boolean().optional(),
+}).strict();
+
 export const createCompanySchema = z.object({
   name: z.string().min(1),
   description: z.string().optional().nullable(),
@@ -38,6 +44,7 @@ export const updateCompanySchema = objectWithoutDefaults(
       spentMonthlyCents: z.number().int().nonnegative().optional(),
       requireBoardApprovalForNewAgents: z.boolean().optional(),
       interactionResolverGovernance: interactionResolverGovernanceSchema.optional(),
+      boardOperator: boardOperatorSchema.optional(),
       feedbackDataSharingEnabled: z.boolean().optional(),
       feedbackDataSharingConsentAt: z.coerce.date().nullable().optional(),
       feedbackDataSharingConsentByUserId: z.string().min(1).nullable().optional(),

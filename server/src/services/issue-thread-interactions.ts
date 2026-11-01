@@ -119,6 +119,7 @@ import {
   publishActivity,
   type ActivityPublication,
 } from "./activity-log.js";
+import { resolveBoardOperatorQuestionRoute } from "./board-operator.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { getNativeReviewAssignment } from "./native-runtime/native-review-participant.js";
 import {
@@ -3566,17 +3567,53 @@ export function issueThreadInteractionService(
         .from(companies)
         .where(eq(companies.id, issue.companyId))
         .then((rows) => rows[0]?.interactionResolverGovernance ?? {});
-      const policy = resolveInteractionPolicy({
+      const hasToolAction =
+        data.kind === "request_confirmation" &&
+        data.payload.toolAction !== undefined;
+      const hasSecretProposal =
+        data.kind === "request_confirmation" &&
+        data.payload.secretProposal !== undefined;
+      let policy = resolveInteractionPolicy({
         kind: data.kind,
         requested: data.resolverPolicy,
         governance,
-        hasToolAction:
-          data.kind === "request_confirmation" &&
-          data.payload.toolAction !== undefined,
-        hasSecretProposal:
-          data.kind === "request_confirmation" &&
-          data.payload.secretProposal !== undefined,
+        hasToolAction,
+        hasSecretProposal,
       });
+      // Board-first routing: a plain agent question goes to the company's Board
+      // operator agent before any human. The operator escalates to the owner
+      // only for genuine pivots. Skipped when a company cap forces human-only,
+      // since the operator could not resolve such a card.
+      if (
+        actor.agentId &&
+        !data.addresseeAgentId &&
+        !data.addresseeUserId &&
+        !defaultAddresseeUserId
+      ) {
+        const route = await resolveBoardOperatorQuestionRoute(db, {
+          companyId: issue.companyId,
+          creatorAgentId: actor.agentId,
+          kind: data.kind,
+          requestedPolicy: data.resolverPolicy,
+          hasToolAction,
+          hasSecretProposal,
+          hasQualityReview: qualityItems.length > 0,
+        });
+        if (route) {
+          const routedPolicy = resolveInteractionPolicy({
+            kind: data.kind,
+            requested: "anyone",
+            governance,
+            hasToolAction,
+            hasSecretProposal,
+          });
+          if (routedPolicy.effectiveResolverPolicy !== "human_only") {
+            data.addresseeAgentId = route.addresseeAgentId;
+            data.resolverPolicy = "anyone";
+            policy = routedPolicy;
+          }
+        }
+      }
       const normalizedData = {
         ...data,
         resolverPolicy: policy.requestedResolverPolicy,

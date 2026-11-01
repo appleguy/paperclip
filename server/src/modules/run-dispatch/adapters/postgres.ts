@@ -24,6 +24,7 @@ import {
   projects,
 } from "@paperclipai/db";
 import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON } from "@paperclipai/shared";
+import { BOARD_RECOVERY_ESCALATED_WAKE_REASON } from "../../../services/board-operator.js";
 import { withAccountingTransaction } from "../../../services/accounting-transaction.js";
 import type { ActivityPublication } from "../../../services/activity-log.js";
 import { parseObject } from "../../../adapters/utils.js";
@@ -631,6 +632,27 @@ export function createPostgresRunDispatchAdapter(
             .then((rows) => Boolean(rows[0]))
         : false;
 
+    const boardRecoveryActionId = readNonEmptyString(context.recoveryActionId);
+    const isBoardOperatorRecoveryWake =
+      issue && wakeReason === BOARD_RECOVERY_ESCALATED_WAKE_REASON && boardRecoveryActionId
+        ? await dbOrTx
+            .select({ id: issueRecoveryActions.id })
+            .from(issueRecoveryActions)
+            .innerJoin(companies, eq(companies.id, issueRecoveryActions.companyId))
+            .where(
+              and(
+                eq(issueRecoveryActions.id, boardRecoveryActionId),
+                eq(issueRecoveryActions.companyId, input.companyId),
+                eq(issueRecoveryActions.sourceIssueId, issue.id),
+                eq(issueRecoveryActions.ownerType, "board"),
+                inArray(issueRecoveryActions.status, ["active", "escalated"]),
+                sql`${companies.boardOperator}->>'agentId' = ${input.agentId}`,
+              ),
+            )
+            .limit(1)
+            .then((rows) => Boolean(rows[0]))
+        : false;
+
     const retryReasonKind = classifyRetryReasonKind(retryReason);
     // Dependency edges can change after scheduled promotion without changing
     // the displayed status. Read them again under the queued/final issue lock.
@@ -659,6 +681,7 @@ export function createPostgresRunDispatchAdapter(
         || context.source === "connection_tools.refreshed",
       isInteractionWake,
       isPendingInteractionAddresseeWake,
+      isBoardOperatorRecoveryWake,
       isAuthorizedSourceScopedRecovery,
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
       resumeIntent,
