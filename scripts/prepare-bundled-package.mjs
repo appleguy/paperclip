@@ -12,6 +12,7 @@ const nativeTargets = ["linux-x64", "darwin-arm64", "darwin-x64"];
 export function materializePublishManifest(pkg, workspaceVersions = {}) {
   const publishConfig = pkg.publishConfig ?? {};
   const publishManifest = { ...pkg };
+  const stagedReleaseVersion = workspaceVersions[pkg.name] && workspaceVersions[pkg.name] !== pkg.version ? pkg.version : undefined;
 
   for (const key of ["main", "types", "exports", "bin"]) {
     if (publishConfig[key] !== undefined) publishManifest[key] = publishConfig[key];
@@ -24,7 +25,7 @@ export function materializePublishManifest(pkg, workspaceVersions = {}) {
         if (typeof specifier !== "string" || !specifier.startsWith("workspace:")) return [name, specifier];
         const range = specifier.slice("workspace:".length);
         const prefix = range === "^" || range === "~" ? range : "";
-        return [name, `${prefix}${workspaceVersions[name] ?? pkg.version}`];
+        return [name, `${prefix}${stagedReleaseVersion ?? workspaceVersions[name] ?? pkg.version}`];
       }),
     );
   }
