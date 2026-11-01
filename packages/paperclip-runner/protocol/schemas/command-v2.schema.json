@@ -3,47 +3,306 @@
   "$id": "https://paperclip.dev/schemas/prp/v2/command.schema.json",
   "title": "PRP v2 runner command",
   "type": "object",
-  "required": ["schema", "commandId", "controllerSeq", "type", "issuedAt", "payload"],
+  "required": [
+    "schema",
+    "commandId",
+    "controllerSeq",
+    "type",
+    "issuedAt",
+    "payload"
+  ],
   "properties": {
-    "schema": { "const": "paperclip.prp.command.v2" },
-    "commandId": { "type": "string", "minLength": 1, "maxLength": 160 },
-    "controllerSeq": { "type": "integer", "minimum": 1 },
+    "schema": {
+      "const": "paperclip.prp.command.v2"
+    },
+    "commandId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 160
+    },
+    "controllerSeq": {
+      "type": "integer",
+      "minimum": 1
+    },
     "type": {
       "enum": [
-        "run.prepare", "run.attach", "session.open", "turn.start", "turn.steer", "turn.interrupt", "turn.stop",
-        "request.resolve", "interaction.receipt", "semantic_tool.result", "session.snapshot", "session.close",
-        "session.budget.increase", "session.destroy", "run.cancel", "runner.drain", "runner.suspend", "runner.shutdown",
-        "session.goal.get", "session.goal.set", "session.goal.clear"
+        "run.prepare",
+        "run.attach",
+        "session.open",
+        "turn.start",
+        "turn.steer",
+        "turn.interrupt",
+        "turn.stop",
+        "request.resolve",
+        "interaction.receipt",
+        "semantic_tool.result",
+        "session.snapshot",
+        "session.close",
+        "session.budget.increase",
+        "session.destroy",
+        "run.cancel",
+        "runner.drain",
+        "runner.suspend",
+        "runner.shutdown",
+        "session.goal.get",
+        "session.goal.set",
+        "session.goal.clear",
+        "native_controller.observation"
       ]
     },
-    "issuedAt": { "type": "string", "format": "date-time" },
-    "deadlineAt": { "type": "string", "format": "date-time" },
+    "issuedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "deadlineAt": {
+      "type": "string",
+      "format": "date-time"
+    },
     "precondition": {
       "type": "object",
       "properties": {
-        "runnerState": { "type": "array", "items": { "type": "string" } },
-        "runState": { "type": "array", "items": { "type": "string" } },
-        "sessionState": { "type": "array", "items": { "type": "string" } },
-        "activeTurnId": { "type": ["string", "null"] }
+        "runnerState": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "runState": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "sessionState": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "activeTurnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
       },
       "additionalProperties": true
     },
-    "payload": { "type": "object", "additionalProperties": true }
+    "payload": {
+      "type": "object",
+      "additionalProperties": true
+    }
   },
   "allOf": [
     {
-      "if": { "properties": { "type": { "const": "session.goal.set" } } },
+      "if": {
+        "properties": {
+          "type": {
+            "const": "session.goal.set"
+          }
+        }
+      },
       "then": {
         "properties": {
           "payload": {
             "type": "object",
             "properties": {
-              "requestId": { "type": "string", "minLength": 1, "maxLength": 160 },
-              "objective": { "type": "string", "minLength": 1, "maxLength": 4000 },
-              "status": { "enum": ["active", "paused"] },
-              "tokenBudget": { "type": ["integer", "null"], "minimum": 1 }
+              "requestId": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 160
+              },
+              "objective": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4000
+              },
+              "status": {
+                "enum": [
+                  "active",
+                  "paused"
+                ]
+              },
+              "tokenBudget": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "minimum": 1
+              }
             },
             "additionalProperties": true
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "native_controller.observation"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "bindingId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "bindingGeneration": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "runId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "environmentLeaseId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "normalizedSessionId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "turnId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "conversationId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "processGeneration": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024
+                  },
+                  "action": {
+                    "const": "antigravity.native_result"
+                  },
+                  "dispatchEventId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "result": {
+                    "type": "object",
+                    "properties": {
+                      "status": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 160
+                      },
+                      "response": {
+                        "type": "string",
+                        "maxLength": 1048576
+                      },
+                      "numTurns": {
+                        "type": "integer",
+                        "minimum": 0
+                      }
+                    },
+                    "required": [
+                      "status"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "bindingId",
+                  "bindingGeneration",
+                  "runId",
+                  "environmentLeaseId",
+                  "normalizedSessionId",
+                  "turnId",
+                  "conversationId",
+                  "processGeneration",
+                  "action",
+                  "dispatchEventId",
+                  "result"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "bindingId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "bindingGeneration": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "runId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "environmentLeaseId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "normalizedSessionId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "turnId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "conversationId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "processGeneration": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024
+                  },
+                  "action": {
+                    "const": "antigravity.provider_exit"
+                  },
+                  "exitObserved": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "bindingId",
+                  "bindingGeneration",
+                  "runId",
+                  "environmentLeaseId",
+                  "normalizedSessionId",
+                  "turnId",
+                  "conversationId",
+                  "processGeneration",
+                  "action",
+                  "exitObserved"
+                ],
+                "additionalProperties": false
+              }
+            ]
           }
         }
       }

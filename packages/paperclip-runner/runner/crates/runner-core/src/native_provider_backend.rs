@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::acpx_provider_backend::{AcpxCommandExecutor, ACPX_PROVIDER_STATE_FILE};
+use crate::antigravity_provider::{AntigravityDispatchExecutor, ANTIGRAVITY_PROVIDER_STATE_FILE};
 use crate::credential_observer::CredentialObserver;
 use crate::durable::{
     Command, CommandExecution, CommandExecutor, DurableRunnerConfig, DurableRunnerError,
@@ -22,6 +23,7 @@ enum SelectedExecutor {
     Acpx(AcpxCommandExecutor),
     Managed(ManagedProviderCommandExecutor),
     Dot(ExternalCommandExecutor),
+    Antigravity(AntigravityDispatchExecutor),
 }
 
 impl CommandExecutor for SelectedExecutor {
@@ -31,6 +33,7 @@ impl CommandExecutor for SelectedExecutor {
             Self::Acpx(executor) => executor.can_reconcile_result_delivery(),
             Self::Managed(executor) => executor.can_reconcile_result_delivery(),
             Self::Dot(executor) => executor.can_reconcile_result_delivery(),
+            Self::Antigravity(executor) => executor.can_reconcile_result_delivery(),
         }
     }
 
@@ -40,6 +43,7 @@ impl CommandExecutor for SelectedExecutor {
             Self::Acpx(executor) => executor.retained_events(),
             Self::Managed(executor) => executor.retained_events(),
             Self::Dot(executor) => executor.retained_events(),
+            Self::Antigravity(executor) => executor.retained_events(),
         }
     }
     fn execute(&mut self, command: &Command) -> Result<CommandExecution, DurableRunnerError> {
@@ -48,6 +52,7 @@ impl CommandExecutor for SelectedExecutor {
             Self::Acpx(executor) => executor.execute(command),
             Self::Managed(executor) => executor.execute(command),
             Self::Dot(executor) => executor.execute(command),
+            Self::Antigravity(executor) => executor.execute(command),
         }
     }
 
@@ -57,6 +62,7 @@ impl CommandExecutor for SelectedExecutor {
             Self::Acpx(executor) => executor.poll_events(),
             Self::Managed(executor) => executor.poll_events(),
             Self::Dot(executor) => executor.poll_events(),
+            Self::Antigravity(executor) => executor.poll_events(),
         }
     }
 
@@ -66,6 +72,7 @@ impl CommandExecutor for SelectedExecutor {
             Self::Acpx(executor) => executor.rotate_authority(config),
             Self::Managed(executor) => executor.rotate_authority(config),
             Self::Dot(executor) => executor.rotate_authority(config),
+            Self::Antigravity(executor) => executor.rotate_authority(config),
         }
     }
 
@@ -75,6 +82,7 @@ impl CommandExecutor for SelectedExecutor {
             Self::Acpx(executor) => executor.maintain_backpressured_provider(),
             Self::Managed(executor) => executor.maintain_backpressured_provider(),
             Self::Dot(executor) => executor.maintain_backpressured_provider(),
+            Self::Antigravity(executor) => executor.maintain_backpressured_provider(),
         }
     }
 
@@ -84,6 +92,7 @@ impl CommandExecutor for SelectedExecutor {
             Self::Acpx(executor) => executor.acknowledge_events(count),
             Self::Managed(executor) => executor.acknowledge_events(count),
             Self::Dot(executor) => executor.acknowledge_events(count),
+            Self::Antigravity(executor) => executor.acknowledge_events(count),
         }
     }
 
@@ -95,6 +104,7 @@ impl CommandExecutor for SelectedExecutor {
             Self::Acpx(executor) => executor.reconcile_terminal_delivery(),
             Self::Managed(executor) => executor.reconcile_terminal_delivery(),
             Self::Dot(executor) => executor.reconcile_terminal_delivery(),
+            Self::Antigravity(executor) => executor.reconcile_terminal_delivery(),
         }
     }
 
@@ -104,6 +114,7 @@ impl CommandExecutor for SelectedExecutor {
             Self::Acpx(executor) => executor.shutdown(),
             Self::Managed(executor) => executor.shutdown(),
             Self::Dot(executor) => executor.shutdown(),
+            Self::Antigravity(executor) => executor.shutdown(),
         }
     }
 }
@@ -145,6 +156,7 @@ impl NativeProviderCommandExecutor {
                 MANAGED_PROVIDER_STATE_FILE,
                 DOT_PROVIDER_STATE_FILE,
                 MUSE_PROVIDER_STATE_FILE,
+                ANTIGRAVITY_PROVIDER_STATE_FILE,
                 "credential-observer-state.json",
             ]
             .iter()
@@ -164,7 +176,11 @@ impl NativeProviderCommandExecutor {
         let managed = self.state_dir.join(MANAGED_PROVIDER_STATE_FILE).exists();
         let dot = self.state_dir.join(DOT_PROVIDER_STATE_FILE).exists();
         let muse = self.state_dir.join(MUSE_PROVIDER_STATE_FILE).exists();
-        if [codex, acpx, managed, dot, muse]
+        let antigravity = self
+            .state_dir
+            .join(ANTIGRAVITY_PROVIDER_STATE_FILE)
+            .exists();
+        if [codex, acpx, managed, dot, muse, antigravity]
             .into_iter()
             .filter(|present| *present)
             .count()
@@ -174,7 +190,11 @@ impl NativeProviderCommandExecutor {
                 "runner state contains conflicting provider authorities",
             ));
         }
-        self.selected = if muse {
+        self.selected = if antigravity {
+            Some(SelectedExecutor::Antigravity(
+                AntigravityDispatchExecutor::restore(&self.state_dir, &self.config)?,
+            ))
+        } else if muse {
             Some(SelectedExecutor::Dot(ExternalCommandExecutor::with_codec(
                 &self.state_dir,
                 &self.config,
@@ -238,6 +258,13 @@ impl NativeProviderCommandExecutor {
                 .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
         }
         self.selected = Some(match kind {
+            "antigravity_headless" => {
+                SelectedExecutor::Antigravity(AntigravityDispatchExecutor::from_descriptor(
+                    &self.state_dir,
+                    &self.config,
+                    &payload["provider"],
+                )?)
+            }
             "muse" => SelectedExecutor::Dot(ExternalCommandExecutor::with_codec(
                 &self.state_dir,
                 &self.config,

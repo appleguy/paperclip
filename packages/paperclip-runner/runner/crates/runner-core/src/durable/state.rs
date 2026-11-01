@@ -90,9 +90,12 @@ impl Command {
                 "external provider operations require PRP v3",
             ));
         }
-        if schema_version == 1 && self.command_type.starts_with("session.goal.") {
+        if schema_version == 1
+            && (self.command_type.starts_with("session.goal.")
+                || self.command_type == "native_controller.observation")
+        {
             return Err(DurableRunnerError::invalid(
-                "session goal commands require the paperclip.prp.command.v2 schema",
+                "session goal and native controller commands require the paperclip.prp.command.v2 schema",
             ));
         }
         if self.command_id.is_empty()
@@ -157,6 +160,7 @@ impl Command {
                 | "session.goal.set"
                 | "session.goal.clear"
                 | "external_provider.operation"
+                | "native_controller.observation"
         ) {
             return Err(DurableRunnerError::invalid(format!(
                 "command type is not supported by PRP v{schema_version}"
@@ -587,13 +591,15 @@ impl DurableState {
         let emitted_at = current_timestamp()?;
         let schema_version = if event_type.starts_with("external_provider.") {
             3
-        } else if matches!(
-            event_type.as_str(),
-            "session.capabilities.updated"
-                | "session.goal.snapshot"
-                | "session.goal.updated"
-                | "session.goal.cleared"
-        ) {
+        } else if event_type.starts_with("native_controller.")
+            || matches!(
+                event_type.as_str(),
+                "session.capabilities.updated"
+                    | "session.goal.snapshot"
+                    | "session.goal.updated"
+                    | "session.goal.cleared"
+            )
+        {
             2
         } else {
             1

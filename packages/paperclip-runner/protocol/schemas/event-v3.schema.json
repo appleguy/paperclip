@@ -174,7 +174,8 @@
         "external_provider.operation_settled",
         "external_provider.input_available",
         "auth.credentials.updated",
-        "runtime.activity.recorded"
+        "runtime.activity.recorded",
+        "native_controller.dispatch_requested"
       ]
     },
     "schemaVersion": {
@@ -727,6 +728,85 @@
                 "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
               }
             },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "eventType": {
+            "const": "native_controller.dispatch_requested"
+          }
+        },
+        "required": [
+          "eventType"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "type": "object",
+            "properties": {
+              "binding": {
+                "type": "object",
+                "properties": {
+                  "bindingId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "bindingGeneration": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "runId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "environmentLeaseId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "normalizedSessionId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "turnId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  }
+                },
+                "required": [
+                  "bindingId",
+                  "bindingGeneration",
+                  "runId",
+                  "environmentLeaseId",
+                  "normalizedSessionId",
+                  "turnId"
+                ],
+                "additionalProperties": false
+              },
+              "text": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1048576
+              },
+              "inputDigest": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              }
+            },
+            "required": [
+              "binding",
+              "text",
+              "inputDigest"
+            ],
             "additionalProperties": false
           }
         }

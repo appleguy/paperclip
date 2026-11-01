@@ -88,6 +88,7 @@ const commandTypes = new Set([
   "interaction.receipt",
   "semantic_tool.result",
   "external_provider.operation",
+  "native_controller.observation",
   "session.snapshot",
   "session.goal.get",
   "session.goal.set",
@@ -2468,7 +2469,7 @@ export class DurablePrpControlPlane {
     }
     const controllerSeq = this.#store.state.commands.length + 1;
     const command: DurableRecoveryCoreCommand = {
-      schema: type === "external_provider.operation" ? "paperclip.prp.command.v3" : type.startsWith("session.goal.")
+      schema: type === "external_provider.operation" ? "paperclip.prp.command.v3" : type.startsWith("session.goal.") || type === "native_controller.observation"
         ? "paperclip.prp.command.v2"
         : "paperclip.prp.command.v1",
       commandId:

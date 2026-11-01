@@ -9,6 +9,7 @@ pub mod acpx_provider_checkpoint;
 pub mod acpx_provider_session;
 pub mod acpx_provider_state;
 pub mod acpx_sidecar_transport;
+pub mod antigravity_provider;
 pub mod aws_agentcore_provider;
 pub mod claude_managed_provider;
 pub mod codex_provider;

@@ -1,4 +1,5 @@
 import { describeRunnerdMuseDriver } from "../drivers/muse/runnerd-muse-driver.js";
+import { describeAntigravityHeadlessBackend } from "../drivers/antigravity/runnerd-antigravity-backend.js";
 import { createCodexTaskEnvelope } from "../contracts/codex.js";
 import { ACPX_CAPABILITY_PROFILES } from "../drivers/acpx/capability-profiles.js";
 import { NATIVE_EXECUTION_INPUT_SCHEMA, NATIVE_EXECUTION_INPUT_SCHEMA_V7, NATIVE_EXECUTION_INPUT_SCHEMA_V9, NATIVE_EXECUTION_INPUT_SCHEMA_V10 } from "../contracts/native-execution.js";
@@ -216,6 +217,7 @@ function createTransportBackedNativeSessionBackend(
 export function describeRunnerdNativeSessionBackend(
   input: NativeExecutionInput,
 ): Promise<NativeSessionBackendDescriptor> {
+  if (input.schema === "paperclip.native-execution-input.v11") return Promise.resolve(describeAntigravityHeadlessBackend());
   if (input.schema === "paperclip.native-execution-input.v6" || input.schema === "paperclip.native-execution-input.v8") {
     // External bots use the shared Rust bridge and retain their provider identity.
     const descriptor = input.schema === "paperclip.native-execution-input.v8"

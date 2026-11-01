@@ -47,7 +47,8 @@
         "session.goal.get",
         "session.goal.set",
         "session.goal.clear",
-        "external_provider.operation"
+        "external_provider.operation",
+        "native_controller.observation"
       ]
     },
     "issuedAt": {
@@ -516,6 +517,177 @@
           }
         },
         "type": "object"
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "native_controller.observation"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "bindingId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "bindingGeneration": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "runId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "environmentLeaseId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "normalizedSessionId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "turnId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "conversationId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "processGeneration": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024
+                  },
+                  "action": {
+                    "const": "antigravity.native_result"
+                  },
+                  "dispatchEventId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "result": {
+                    "type": "object",
+                    "properties": {
+                      "status": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 160
+                      },
+                      "response": {
+                        "type": "string",
+                        "maxLength": 1048576
+                      },
+                      "numTurns": {
+                        "type": "integer",
+                        "minimum": 0
+                      }
+                    },
+                    "required": [
+                      "status"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "bindingId",
+                  "bindingGeneration",
+                  "runId",
+                  "environmentLeaseId",
+                  "normalizedSessionId",
+                  "turnId",
+                  "conversationId",
+                  "processGeneration",
+                  "action",
+                  "dispatchEventId",
+                  "result"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "bindingId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "bindingGeneration": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "runId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "environmentLeaseId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "normalizedSessionId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "turnId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "conversationId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 240
+                  },
+                  "processGeneration": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1024
+                  },
+                  "action": {
+                    "const": "antigravity.provider_exit"
+                  },
+                  "exitObserved": {
+                    "const": true
+                  }
+                },
+                "required": [
+                  "bindingId",
+                  "bindingGeneration",
+                  "runId",
+                  "environmentLeaseId",
+                  "normalizedSessionId",
+                  "turnId",
+                  "conversationId",
+                  "processGeneration",
+                  "action",
+                  "exitObserved"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        }
       }
     }
   ],

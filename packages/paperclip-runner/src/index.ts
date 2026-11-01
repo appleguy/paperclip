@@ -20,6 +20,7 @@ export * from "./drivers/dot/dot-harness-driver.js";
 export { describeRunnerdNativeSessionBackend } from "./backends/codex-native-backend.js";
 export { createOpenCodeNativeSessionBackend } from "./backends/opencode-native-backend.js";
 export {
+  createAntigravityHeadlessBackend,
   createNativeSessionBackend,
   type NativeBackendFactoryOptions,
 } from "./backends/native-backend-factory.js";

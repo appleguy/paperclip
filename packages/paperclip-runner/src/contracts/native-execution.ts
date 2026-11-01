@@ -13,6 +13,7 @@ export const NATIVE_EXECUTION_INPUT_SCHEMA_V1 = "paperclip.native-execution-inpu
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V2 = "paperclip.native-execution-input.v2" as const;
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V3 = "paperclip.native-execution-input.v3" as const;
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V10 = "paperclip.native-execution-input.v10" as const;
+export const NATIVE_EXECUTION_INPUT_SCHEMA_V11 = "paperclip.native-execution-input.v11" as const;
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V9 = "paperclip.native-execution-input.v9" as const;
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V8 = "paperclip.native-execution-input.v8" as const;
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V6 = "paperclip.native-execution-input.v6" as const;
@@ -275,13 +276,20 @@ export interface NativeExecutionInputV10 extends Omit<NativeExecutionInputV9, "s
   provider: NativeProviderConfigV10;
 }
 
+/** Provider settings only; process identity and lease authority are supplied by the server. */
+export interface NativeExecutionInputV11 extends Omit<NativeExecutionInputV10, "schema" | "provider" | "session"> {
+  schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA_V11;
+  provider: { kind: "antigravity_headless"; model: null; cliVersion: "1.4.12" };
+  session: Omit<NativeExecutionInputV10["session"], "driverKind"> & { driverKind: "antigravity_headless" };
+}
+
 export interface NativeExecutionInputV8 extends Omit<NativeExecutionInputV6, "schema" | "provider" | "session"> {
   schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA_V8;
   provider: { kind: "muse"; model: null; binding: MuseBindingSnapshot; bridgeRevision: "muse-v1" };
   session: Omit<NativeExecutionInputV6["session"], "driverKind"> & { driverKind: "muse_external" };
 }
 
-export type NativeExecutionInput = NativeExecutionInputV1 | NativeExecutionInputV2 | NativeExecutionInputV3 | NativeExecutionInputV4 | NativeExecutionInputV5 | NativeExecutionInputV6 | NativeExecutionInputV7 | NativeExecutionInputV8 | NativeExecutionInputV9 | NativeExecutionInputV10;
+export type NativeExecutionInput = NativeExecutionInputV1 | NativeExecutionInputV2 | NativeExecutionInputV3 | NativeExecutionInputV4 | NativeExecutionInputV5 | NativeExecutionInputV6 | NativeExecutionInputV7 | NativeExecutionInputV8 | NativeExecutionInputV9 | NativeExecutionInputV10 | NativeExecutionInputV11;
 
 /** The only task data that may enter provider-visible model input. */
 export interface NativeModelEnvelopeV1 {
@@ -423,6 +431,20 @@ function parseMuseNativeExecutionInput(input: Record<string, unknown>): NativeEx
 
 export function parseNativeExecutionInput(value: unknown): NativeExecutionInput {
   const input = record(value, "input");
+  if (input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V11) {
+    const provider = record(input.provider, "input.provider");
+    exactKeys(provider, ["kind", "model", "cliVersion"], "input.provider");
+    const session = record(input.session, "input.session");
+    if (provider.kind !== "antigravity_headless" || provider.model !== null || provider.cliVersion !== "1.4.12" || session.driverKind !== "antigravity_headless" || typeof session.normalizedSessionId !== "string" || !session.normalizedSessionId || record(session.lifecyclePolicy, "input.session.lifecyclePolicy").mode !== "per_turn" || !Array.isArray(input.credentialBindings) || input.credentialBindings.length !== 0) {
+      throw new NativeExecutionInputError("Antigravity v11 requires the pinned headless provider, per-turn lifecycle, and no credential bindings");
+    }
+    const common = parseNativeExecutionInput({ ...input, schema: NATIVE_EXECUTION_INPUT_SCHEMA_V10,
+      provider: { kind: "codex", model: null, approvalPolicy: "never" },
+      session: { ...session, driverKind: "codex_app_server" } }) as NativeExecutionInputV10;
+    return { ...common, schema: NATIVE_EXECUTION_INPUT_SCHEMA_V11,
+      provider: { kind: "antigravity_headless", model: null, cliVersion: "1.4.12" },
+      session: { ...common.session, driverKind: "antigravity_headless" } };
+  }
   if (input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V8) return parseMuseNativeExecutionInput(input);
   if (input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V6) return parseExternalNativeExecutionInput(input);
   const isV10 = input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V10;
