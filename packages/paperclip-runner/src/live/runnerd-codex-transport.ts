@@ -61,6 +61,7 @@ import type {
 } from "../contracts/durable-recovery.js";
 import type { NativeRunIdentity, NativeTurnControlCapabilities } from "../contracts/types.js";
 import type { PrpEvent } from "../protocol/replay-contract.js";
+import { readProviderProcessOwnership } from "../protocol/provider-process-ownership.js";
 import { NativeSessionCloseUnrecoverableError } from "../contracts/native-session-backend.js";
 import type {
   HarnessSession,
@@ -1538,6 +1539,7 @@ export function resolveRunnerdSessionIdentity(input: unknown): {
   const started = record(input);
   const runtimeIdentity = record(started.runtimeIdentity);
   const descriptor = record(started.providerDescriptor);
+  const ownership = readProviderProcessOwnership(started);
   const processId =
     runtimeIdentity.processId ??
     runtimeIdentity.process_id ??
@@ -1553,7 +1555,7 @@ export function resolveRunnerdSessionIdentity(input: unknown): {
       ? undefined
       : started.providerSessionId);
   return {
-    processId: typeof processId === "number" ? processId : null,
+    processId: ownership?.kind === "shared_daemon" ? null : typeof processId === "number" ? processId : null,
     threadId:
       typeof threadId === "string" && threadId.length > 0 ? threadId : null,
     sessionId:
@@ -2659,8 +2661,16 @@ async function settleRetainedRunnerdSessionOwned(
     const before = readMaintenanceState(root);
     const terminalOnly = before.runner.pendingTerminalDelivery != null;
     const pendingTerminal = record(before.runner.pendingTerminalDelivery);
+    // A closed tool bridge can retain an idle, open native session. The Rust
+    // executor restores that exact session too, before closing it and applying
+    // the already-receipted results. It must prove its own generation and exit.
+    const closesRestoredIdleSession =
+      !terminalOnly && semanticToolResults.length > 0 &&
+      before.provider.lifecycle === "session_open" &&
+      before.provider.activeProviderTurnId == null &&
+      record(before.provider.toolBridge).turnClosed === true;
     const epochRestoresProvider =
-      !terminalOnly && before.provider.lifecycle === "turn_active";
+      !terminalOnly && (before.provider.lifecycle === "turn_active" || closesRestoredIdleSession);
     assertMaintenanceBinding(
       before,
       input.identity,
@@ -2824,19 +2834,19 @@ async function settleRetainedRunnerdSessionOwned(
         before.provider.activeProviderTurnId !== null &&
         before.provider.activeProviderTurnId !== undefined
       ) {
-        core.queueCommand("turn.stop", {
+        core.queueSettlementCommand("turn.stop", {
           reason: "exact retained authority cleanup",
         });
       }
       if (!terminalOnly && semanticToolResults.length > 0) {
         if (before.provider.lifecycle !== "closed")
-          core.queueCommand("session.close", {}, `command_close_${input.requestId.slice(0, 80)}`);
+          core.queueSettlementCommand("session.close", {}, `command_close_${input.requestId.slice(0, 80)}`);
         for (const result of semanticToolResults) {
           if (pendingResultCalls.has(result.callId)) continue;
           const commandId = `command_reconcile_${createHash("sha256")
             .update(`${input.requestId}\0${result.callId}`)
             .digest("hex")}`;
-          core.queueCommand("semantic_tool.result", {
+          core.queueSettlementCommand("semantic_tool.result", {
             callId: result.callId,
             operationId: result.operationId,
             result: result.result,
@@ -2917,7 +2927,7 @@ async function settleRetainedRunnerdSessionOwned(
         const provider = providerDrainStateFromSnapshot(state.provider);
         if (!terminalOnly && !terminalQueued && provider.providerSettled) {
           if (!drainQueued) {
-            core.queueCommand("runner.drain", {}, undefined, true);
+            core.queueSettlementCommand("runner.drain", {}, undefined, true);
             drainQueued = true;
           } else if (
             provider.pendingEventCount === 0 &&
@@ -2926,7 +2936,7 @@ async function settleRetainedRunnerdSessionOwned(
               (command) => command.status === "pending",
             )
           ) {
-            core.queueCommand("runner.suspend", {}, undefined, true);
+            core.queueSettlementCommand("runner.suspend", {}, undefined, true);
             terminalQueued = true;
           }
         }
@@ -3138,12 +3148,26 @@ async function settleRetainedRunnerdSessionOwned(
         command.type === "turn.stop" &&
         !epochCompletedCommands.has(command.commandId),
     );
+    const closes = (
+      settled.control.commands as Array<Record<string, unknown>>
+    ).filter(
+      (command) => command.type === "session.close" &&
+        !epochCompletedCommands.has(command.commandId),
+    );
     // A successful prior epoch must never cover an unidentified process from
     // a later startup. Prepared drain-only epochs cannot launch a provider;
     // every restoring epoch needs its own authenticated PID and exit proof.
     const stopProven = !epochRestoresProvider
       ? epochProviderPids.size === 0
-      : epochProviderPids.size === 1 &&
+      : closesRestoredIdleSession
+        ? epochProviderPids.size === 1 && stops.length === 0 &&
+          closes.length === 1 && closes.every((command) => {
+            const result = record(record(command.result).result);
+            return command.status === "completed" && result.status === "closed" &&
+              result.providerSessionId === input.providerSessionId &&
+              result.providerExitConfirmed === true;
+          })
+        : epochProviderPids.size === 1 &&
         stops.length > 0 &&
         stops.every(
           (command) =>
@@ -7176,6 +7200,9 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     }
     this.#providerIdentityEventType = event.eventType;
     const started = record(record(event.envelope.payload).payload);
+    if (readProviderProcessOwnership(started)?.kind === "shared_daemon") {
+      throw new Error("shared daemon session requires explicit admitted native binding");
+    }
     const runtimeIdentity = record(started.runtimeIdentity);
     const descriptor = record(started.providerDescriptor);
     const {

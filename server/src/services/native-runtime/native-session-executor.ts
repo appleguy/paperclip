@@ -3919,6 +3919,9 @@ async function inspectRetainedNativeSessionCleanup(
       providerSessionId: owned.providerSessionId,
       originalRunnerPid: owned.originalRunnerPid,
       originalProviderPid: owned.providerPid,
+      // Isolated integration fixtures supply their own exact Runner artifact.
+      ...(process.env.NODE_ENV === "test" && process.env.PAPERCLIP_TEST_RECOVERY_RUNNER_BINARY
+        ? { runnerBinary: process.env.PAPERCLIP_TEST_RECOVERY_RUNNER_BINARY } : {}),
       ...(owned.semanticToolResults ? {semanticToolResults: owned.resumeLineage?.semanticToolResults ?? owned.semanticToolResults} : {}),
       ...(owned.resumeLineage ? {priorRetiredEpoch: owned.resumeLineage.priorRetiredEpoch as never} : {}),
       // The control-only provider resume still needs normal host discovery

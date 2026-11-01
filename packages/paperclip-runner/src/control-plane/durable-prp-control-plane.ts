@@ -61,6 +61,8 @@ const maxFrameBytes = 1024 * 1024;
 // Secure frames hex-encode ciphertext. Reserve envelope/tag space as well.
 const maxCommandBytes = Math.floor((maxFrameBytes - 4 * 1024) / 2);
 const maxCommands = 500;
+const maxSettlementCommands = 32;
+const settlementCommandTypes = new Set(["turn.stop", "session.close", "semantic_tool.result", "runner.drain", "runner.suspend"]);
 class CommandJournalLimitError extends Error {
   constructor(readonly code: "command_payload_too_large" | "command_journal_full") {
     super(`Durable PRP command journal bound exceeded: ${code}.`);
@@ -414,7 +416,7 @@ function checkpointState(records: ReadonlyMap<string, string>) {
     .sort((a, b) => Number(a.slice(prefix.length)) - Number(b.slice(prefix.length)));
   const commandKeys = v2 ? keys("command:") : header.commands;
   const eventKeys = v2 ? keys("event:") : header.events;
-  if (!Array.isArray(commandKeys) || commandKeys.length > maxCommands
+  if (!Array.isArray(commandKeys) || commandKeys.length > maxCommands + maxSettlementCommands
     || !Array.isArray(eventKeys) || eventKeys.length > maxCommittedEventWindow
     || commandKeys.some(key => typeof key !== "string" || !/^command:\d+$/.test(key))
     || eventKeys.some(key => typeof key !== "string" || !/^event:\d+$/.test(key))
@@ -817,7 +819,8 @@ function isStoredCoreState(
     !isRecord(value.tickets) ||
     !isRecord(value.leases) ||
     !Array.isArray(commands) ||
-    commands.length > maxCommands ||
+    commands.length > maxCommands + maxSettlementCommands ||
+    commands.slice(maxCommands).some(command => !isRecord(command) || !settlementCommandTypes.has(String(command.type))) ||
     !Array.isArray(events) ||
     events.length > maxCommittedEventWindow ||
     !Number.isSafeInteger(value.ackedSourceSeq) ||
@@ -2386,6 +2389,27 @@ export class DurablePrpControlPlane {
     commandId?: string,
     deliverImmediately = false,
   ): DurableRecoveryCoreCommand {
+    return this.queueBoundedCommand(type, payload, commandId, deliverImmediately, false);
+  }
+
+  /** Capacity for already-authorized maintenance only; this grants no execution authority. */
+  queueSettlementCommand(
+    type: string,
+    payload: Record<string, unknown> = {},
+    commandId?: string,
+    deliverImmediately = false,
+  ): DurableRecoveryCoreCommand {
+    if (!settlementCommandTypes.has(type)) throw new Error("Durable PRP settlement command is invalid.");
+    return this.queueBoundedCommand(type, payload, commandId, deliverImmediately, true);
+  }
+
+  private queueBoundedCommand(
+    type: string,
+    payload: Record<string, unknown>,
+    commandId: string | undefined,
+    deliverImmediately: boolean,
+    settlement: boolean,
+  ): DurableRecoveryCoreCommand {
     this.#store.assertWritable();
     const transition = this.#store.state.warmTransition;
     if (transition && transition.phase !== "activated") {
@@ -2456,7 +2480,7 @@ export class DurablePrpControlPlane {
       status: "pending",
       result: null,
     };
-    if (this.#store.state.commands.length >= maxCommands)
+    if (this.#store.state.commands.length >= maxCommands + (settlement ? maxSettlementCommands : 0))
       throw new CommandJournalLimitError("command_journal_full");
     if (Buffer.byteLength(JSON.stringify(command)) > maxCommandBytes)
       throw new CommandJournalLimitError("command_payload_too_large");

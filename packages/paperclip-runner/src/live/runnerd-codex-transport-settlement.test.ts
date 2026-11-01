@@ -1490,6 +1490,8 @@ it.each([
       }
       const proof = await pendingProof.catch(
         async (error: unknown) => {
+          const failureEvidence = join(tmpdir(), `runnerd-maintenance-failure-${fixtureId}`);
+          await cp(copy, failureEvidence, { recursive: true });
           const runner = JSON.parse(
             await readFile(join(copy, "runner/runner-state.json"), "utf8"),
           );
@@ -1537,11 +1539,13 @@ it.each([
                 generation: provider.providerProcessGeneration,
               },
               commands: control.commands.map(
-                (command: { type: string; status: string }) => ({
+                (command: { type: string; status: string; result?: unknown }) => ({
                   type: command.type,
                   status: command.status,
+                  ...(command.status === "failed" ? { result: command.result } : {}),
                 }),
               ),
+              failureEvidence,
               committedCount: appendEvent.mock.calls.length,
               epochExits: recordEpoch.mock.calls
                 .map(([receipt]) => receipt)
