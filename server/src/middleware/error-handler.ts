@@ -8,7 +8,7 @@ import { getTelemetryClient } from "../telemetry.js";
 import { captureException } from "../sentry.js";
 import { COMPANY_IMPORT_API_PATH } from "../routes/company-import-paths.js";
 import { logger } from "./logger.js";
-import { isSecretSensitiveHttpRequest } from "./http-log-policy.js";
+import { isSecretSensitiveHttpRequest, isPrivateClaudeManagedHttpRequest } from "./http-log-policy.js";
 import {
   collectSensitiveStringValues,
   redactSensitiveValueOccurrences,
@@ -141,6 +141,14 @@ export function errorHandler(
   res: Response,
   _next: NextFunction,
 ) {
+  if (isPrivateClaudeManagedHttpRequest(req.originalUrl)) {
+    const status=err instanceof HttpError ? err.status : readZodIssues(err) || (err instanceof SyntaxError && "status" in err && err.status===400) ? 400 : 500;
+    if (status>=500) {
+      const safe=new Error("Claude managed request failed");
+      attachErrorContext(req,res,{message:safe.message,name:safe.name},safe);reportCrash(safe,req);
+    }
+    res.status(status).json({error:"Claude managed request failed"});return;
+  }
   if (err instanceof AgentLifecycleConflict) { res.status(409).json({ error: err.message }); return; }
   if (err instanceof HttpError) {
     const details =

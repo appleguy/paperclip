@@ -12,6 +12,15 @@ import { testAdapterEnvironmentSchema } from "@paperclipai/shared";
 import { createHttpLogger } from "../middleware/logger.js";
 
 describe("HTTP logger redaction", () => {
+  it.each([400,500])("omits private Claude managed terminal input and error echoes from %i logs and responses",async status=>{
+    const canary="private-claude-terminal-canary",chunks:string[]=[];
+    const stream=new Writable({write(chunk,_encoding,callback){chunks.push(chunk.toString());callback();}});
+    const app=express();app.use(createHttpLogger(pino({redact:[...HTTP_LOG_REDACT_PATHS]},stream)));app.use(express.json());
+    app.use((_req,_res,next)=>next(status===400?new HttpError(400,canary):new Error(canary)));app.use(errorHandler);
+    const response=await request(app).post("/api/companies/company/native-sessions/claude/managed/control/input").set("x-extra",canary).send({text:canary,unexpected:canary});
+    expect(response.status).toBe(status);expect(JSON.stringify({response:response.body,logs:chunks})).not.toContain(canary);
+    expect(JSON.parse(chunks.join("").trim()).reqBody).toBe("[REDACTED]");
+  });
   it.each([200, 400, 500])("keeps connector and observability credentials out of %i logs", async status => {
     const canaries = ["configuration-canary", "signing-canary", "client-canary", "bot-canary", "oauth-code-canary", "provider-echo-canary"];
     const chunks: string[] = [];

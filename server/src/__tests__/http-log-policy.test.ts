@@ -2,9 +2,17 @@ import { describe, expect, it } from "vitest";
 import {
   isPrivateWebhookHttpRequest,
   isPrivateMuseHttpRequest,
+  isPrivateClaudeManagedHttpRequest,
   isSecretSensitiveHttpRequest,
   shouldSilenceHttpSuccessLog,
 } from "../middleware/http-log-policy.js";
+
+it("protects managed Claude launch and terminal routes, including malformed and encoded paths",()=>{
+  for(const path of ["/api/companies/company/native-sessions/claude/managed","/api/companies/company/native-sessions/claude/managed/control/input?private=x","https://host/API/COMPANIES/company/NATIVE-SESSIONS/CLAUDE/MANAGED/control/interrupt","/api/companies/company/native-sessions/claude/%256danaged/control/input"]) {
+    expect(isPrivateClaudeManagedHttpRequest(path)).toBe(true);expect(isSecretSensitiveHttpRequest("POST",path)).toBe(true);
+  }
+  expect(isPrivateClaudeManagedHttpRequest("/api/companies/company/native-sessions/claude/managed-extra")).toBe(false);
+});
 
 describe("isPrivateWebhookHttpRequest", () => {
   it("protects the native webhook namespace, including rejected methods and query data", () => {
