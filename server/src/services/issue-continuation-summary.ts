@@ -107,7 +107,15 @@ function inferNextAction(issue: IssueSummaryInput, run: RunSummaryInput, previou
     return "Inspect the failed run, fix the cause, and resume from the most recent concrete action above.";
   }
   if (run.status === "cancelled") return "Confirm the cancellation reason before starting another run.";
-  return previousNextAction ?? "Resume implementation from the acceptance criteria, latest comments, and this summary.";
+  // The "wait for reviewer" next action is generated only while the issue is
+  // in_review. Carrying it into a later summary (issue back in todo/in_progress)
+  // would park the executor on a review that no longer exists, so the stale
+  // wait is discarded here and the issue falls back to the runnable default.
+  const carriedNextAction =
+    previousNextAction && WAITING_FOR_REVIEW_OR_APPROVAL_RE.test(previousNextAction)
+      ? null
+      : previousNextAction;
+  return carriedNextAction ?? "Resume implementation from the acceptance criteria, latest comments, and this summary.";
 }
 
 function bulletList(items: string[], empty: string) {

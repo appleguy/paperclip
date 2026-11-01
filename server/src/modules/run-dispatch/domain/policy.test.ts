@@ -273,6 +273,43 @@ describe("decideQueuedRunStaleness", () => {
     });
   });
 
+  describe("pending-interaction addressee wake", () => {
+    const addresseeFacts = (): QueuedRunFacts => ({
+      ...baseStalenessFacts(),
+      issueStatus: "in_review",
+      issueAssigneeAgentId: "assignee",
+      wakeReason: "interaction_pending",
+    });
+
+    it("cancels a non-assignee wake that is not a verified pending addressee", () => {
+      expect(decideQueuedRunStaleness(addresseeFacts(), NOW)).toMatchObject({
+        stale: true,
+        errorCode: "issue_assignee_changed",
+      });
+    });
+
+    it("lets the verified pending addressee run without owning the issue", () => {
+      expect(decideQueuedRunStaleness({
+        ...addresseeFacts(),
+        isPendingInteractionAddresseeWake: true,
+      }, NOW)).toEqual({ stale: false });
+    });
+
+    it("lets the verified addressee through a different in-review participant", () => {
+      const facts: QueuedRunFacts = {
+        ...addresseeFacts(),
+        reviewParticipant: { isInReview: true, hasParticipant: true, participantIsAgent: true,
+          participantAgentId: "other-reviewer", currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: "other-reviewer" } },
+      };
+      expect(decideQueuedRunStaleness(facts, NOW)).toMatchObject({
+        stale: true, errorCode: "issue_assignee_changed",
+      });
+      expect(decideQueuedRunStaleness({ ...facts, isPendingInteractionAddresseeWake: true }, NOW))
+        .toEqual({ stale: false });
+    });
+  });
+
   it.each([
     {
       name: "issue_not_found",

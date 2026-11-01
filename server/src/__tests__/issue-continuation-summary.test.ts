@@ -120,6 +120,46 @@ describe("issue continuation summaries", () => {
     expect(body).not.toContain(providerText);
   });
 
+  it("does not carry a stale in_review wait forward once the issue is runnable again", () => {
+    const issue = {
+      id: "issue-1", identifier: "TEST-2", title: "Resume after review wait",
+      description: null, priority: "high",
+    };
+    const run = {
+      id: "run-3", status: "succeeded", error: null, resultJson: { summary: "Did work." },
+    };
+    const agent = { id: "agent-1", name: "Agent", adapterType: "codex_local" };
+
+    const inReview = buildContinuationSummaryMarkdown({
+      issue: { ...issue, status: "in_review" }, run, agent,
+    });
+    expect(continuationSummaryParksExecutor(inReview)).toBe(true);
+
+    const resumed = buildContinuationSummaryMarkdown({
+      issue: { ...issue, status: "in_progress" }, run, agent, previousSummaryBody: inReview,
+    });
+    expect(continuationSummaryParksExecutor(resumed)).toBe(false);
+    expect(extractContinuationSummaryNextAction(resumed)).toBe(
+      "Resume implementation from the acceptance criteria, latest comments, and this summary.",
+    );
+
+    const stillInReview = buildContinuationSummaryMarkdown({
+      issue: { ...issue, status: "in_review" }, run, agent, previousSummaryBody: inReview,
+    });
+    expect(continuationSummaryParksExecutor(stillInReview)).toBe(true);
+  });
+
+  it("still carries a runnable next action across runs", () => {
+    const previous = ["# Continuation Summary", "", "## Next Action", "", "- Run the 128/256 attention adapter."].join("\n");
+    const body = buildContinuationSummaryMarkdown({
+      issue: { id: "i", identifier: "TEST-3", title: "t", description: null, status: "in_progress", priority: "low" },
+      run: { id: "r", status: "succeeded", error: null, resultJson: null },
+      agent: { id: "a", name: "A", adapterType: "codex_local" },
+      previousSummaryBody: previous,
+    });
+    expect(extractContinuationSummaryNextAction(body)).toBe("Run the 128/256 attention adapter.");
+  });
+
   it("does not park executor work when the next action is still runnable", () => {
     const body = [
       "# Continuation Summary",
