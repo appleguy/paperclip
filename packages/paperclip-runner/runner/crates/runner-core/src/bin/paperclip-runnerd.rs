@@ -505,6 +505,24 @@ fn run(args: &[String]) -> Result<(), LocalRunnerError> {
 }
 
 fn run_main(args: Vec<String>) -> ExitCode {
+    #[cfg(target_os = "macos")]
+    if args.len() == 2 && args[0] == "--inspect-codex-peer" {
+        return match paperclip_runner_core::codex_shared_socket::inspect_peer(std::path::Path::new(
+            &args[1],
+        )) {
+            Ok((peer, generation)) => {
+                println!(
+                    "{}",
+                    serde_json::json!({"peer": peer, "daemonGeneration": generation})
+                );
+                ExitCode::SUCCESS
+            }
+            Err(_) => {
+                eprintln!("paperclip-runnerd: shared peer inspection failed");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let diagnostics_directory = diagnostic_directory(&args);
     install_diagnostic_panic_hook(diagnostics_directory.clone());
     install_crypto_provider();

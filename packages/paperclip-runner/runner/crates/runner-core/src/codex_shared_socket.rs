@@ -109,6 +109,82 @@ pub enum SharedSocketError {
     Protocol,
 }
 
+/// Inspect the kernel-authenticated peer of an already listening local socket.
+/// This does not authorize its use or send any provider protocol messages.
+#[cfg(target_os = "macos")]
+pub fn inspect_peer(path: &Path) -> Result<(ExpectedPeer, String), SharedSocketError> {
+    use libproc::libproc::{
+        bsd_info::BSDInfo,
+        proc_pid::{pidinfo, pidpath},
+    };
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    if !path.is_absolute() {
+        return Err(SharedSocketError::InvalidInput);
+    }
+    let before = std::fs::symlink_metadata(path).map_err(|_| SharedSocketError::ConnectFailed)?;
+    let uid = rustix::process::geteuid().as_raw();
+    if !before.file_type().is_socket() || before.uid() != uid || before.mode() & 0o022 != 0 {
+        return Err(SharedSocketError::ConnectFailed);
+    }
+    let generation = format!(
+        "{}:{}:{}:{}",
+        before.dev(),
+        before.ino(),
+        before.ctime(),
+        before.ctime_nsec()
+    );
+    let stream = UnixStream::connect(path).map_err(|_| SharedSocketError::ConnectFailed)?;
+    stream
+        .set_nonblocking(true)
+        .map_err(|_| SharedSocketError::ConnectFailed)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .map_err(|_| SharedSocketError::ConnectFailed)?;
+    let guard = runtime.enter();
+    let stream =
+        tokio::net::UnixStream::from_std(stream).map_err(|_| SharedSocketError::ConnectFailed)?;
+    let credentials = stream
+        .peer_cred()
+        .map_err(|_| SharedSocketError::ConnectFailed)?;
+    let pid = credentials
+        .pid()
+        .filter(|pid| *pid > 0)
+        .ok_or(SharedSocketError::ConnectFailed)?;
+    if credentials.uid() != uid {
+        return Err(SharedSocketError::ConnectFailed);
+    }
+    let first = pidinfo::<BSDInfo>(pid, 0).map_err(|_| SharedSocketError::ConnectFailed)?;
+    let executable = pidpath(pid).map_err(|_| SharedSocketError::ConnectFailed)?;
+    let last = pidinfo::<BSDInfo>(pid, 0).map_err(|_| SharedSocketError::ConnectFailed)?;
+    let after = std::fs::symlink_metadata(path).map_err(|_| SharedSocketError::ConnectFailed)?;
+    if first.pbi_pid != pid as u32
+        || last.pbi_pid != pid as u32
+        || first.pbi_uid != uid
+        || last.pbi_uid != uid
+        || first.pbi_start_tvsec != last.pbi_start_tvsec
+        || first.pbi_start_tvusec != last.pbi_start_tvusec
+        || before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.ctime() != after.ctime()
+        || before.ctime_nsec() != after.ctime_nsec()
+    {
+        return Err(SharedSocketError::ConnectFailed);
+    }
+    drop(stream);
+    drop(guard);
+    drop(runtime);
+    Ok((
+        ExpectedPeer {
+            pid: pid as u32,
+            start_seconds: first.pbi_start_tvsec,
+            start_microseconds: first.pbi_start_tvusec,
+            executable: executable.into(),
+        },
+        generation,
+    ))
+}
+
 /// This callback is invoked only for an exact-thread approval request. Returning
 /// None leaves it unanswered. The caller must check turn and operation authority.
 pub type ApprovalAdmission = Arc<dyn Fn(&Value) -> Option<Value> + Send + Sync + 'static>;
