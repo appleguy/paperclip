@@ -1,4 +1,5 @@
 import { CoordinatorSidebar } from "./CoordinatorSidebar";
+import { useNativeSessionObserverAccess } from "../hooks/useNativeSessionObserverAccess";
 import { useCoordinatorWorkspaceEnabled } from "@/hooks/useCoordinatorWorkspaceEnabled";
 import {
   Inbox,
@@ -65,6 +66,7 @@ function ClassicSidebar({ children }: { children?: ReactNode }) {
   const [workOpen, setWorkOpen] = useState(true);
   const [organizationOpen, setOrganizationOpen] = useState(true);
   const { selectedCompanyId, selectedCompany } = useCompany();
+  const canObserveNativeSessions = useNativeSessionObserverAccess(selectedCompanyId);
   const { collapsed, peeking } = useSidebar();
   const { enabled: streamlinedUiEnabled } = useStreamlinedUiEnabled();
   const rail = collapsed && !peeking;
@@ -181,6 +183,7 @@ function ClassicSidebar({ children }: { children?: ReactNode }) {
               Cmd/Ctrl+K remains the keyboard path (command palette). */}
           <SidebarNavItem to="/search" label="Search" icon={Search} />
           <SidebarNavItem to="/dashboard" label="Dashboard" icon={LayoutDashboard} liveCount={liveRunCount} />
+          {canObserveNativeSessions && <SidebarNavItem to="/native-sessions/claude" label="Claude sessions" icon={MessagesSquare} />}
           {!combinedInboxTasks ? (
             <SidebarNavItem
               to="/inbox"
