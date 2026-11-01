@@ -35,6 +35,8 @@ struct State {
     binding: AntigravityBinding,
     phase: String,
     input_digest: Option<String>,
+    #[serde(default)]
+    dispatch_event_id: Option<String>,
     result: Option<Value>,
 }
 pub struct AntigravityDispatchExecutor {
@@ -55,6 +57,10 @@ impl AntigravityDispatchExecutor {
     ) -> Result<Self, DurableRunnerError> {
         if provider.get("controllerCapability").and_then(Value::as_str)
             != Some("antigravity-headless-dispatch.v1")
+            || provider
+                .get("observationCapability")
+                .and_then(Value::as_str)
+                != Some("antigravity-tool-observation.v1")
         {
             return Err(invalid("Antigravity controller capability unsupported"));
         }
@@ -139,8 +145,16 @@ impl AntigravityDispatchExecutor {
                     .map_err(|_| invalid("Antigravity state invalid"))?;
                 if state.schema != "paperclip.runner.antigravity-provider.v1"
                     || state.binding != binding
-                    || !["new", "prepared", "open", "offered", "observed", "closed"]
-                        .contains(&state.phase.as_str())
+                    || ![
+                        "new",
+                        "prepared",
+                        "open",
+                        "offered",
+                        "dispatched",
+                        "observed",
+                        "closed",
+                    ]
+                    .contains(&state.phase.as_str())
                 {
                     return Err(invalid("Antigravity state binding mismatch"));
                 }
@@ -151,6 +165,7 @@ impl AntigravityDispatchExecutor {
                 binding,
                 phase: "new".into(),
                 input_digest: None,
+                dispatch_event_id: None,
                 result: None,
             },
             Err(_) => return Err(invalid("Antigravity state unavailable")),
@@ -195,7 +210,7 @@ impl CommandExecutor for AntigravityDispatchExecutor {
             "run.prepare" => {
                 if command.payload.get("provider")
                     != Some(
-                        &json!({"kind":"antigravity_headless","conversationId":b.conversation_id,"processGeneration":b.process_generation,"bindingId":b.binding_id,"bindingGeneration":b.binding_generation,"startCommandId":b.start_command_id,"controllerCapability":"antigravity-headless-dispatch.v1"}),
+                        &json!({"kind":"antigravity_headless","conversationId":b.conversation_id,"processGeneration":b.process_generation,"bindingId":b.binding_id,"bindingGeneration":b.binding_generation,"startCommandId":b.start_command_id,"controllerCapability":"antigravity-headless-dispatch.v1","observationCapability":"antigravity-tool-observation.v1"}),
                     )
                 {
                     return Err(invalid("Antigravity prepare binding mismatch"));
@@ -205,7 +220,7 @@ impl CommandExecutor for AntigravityDispatchExecutor {
                     self.save()?;
                 }
                 Ok(CommandExecution::result(
-                    json!({"status":"prepared","controllerCapability":"antigravity-headless-dispatch.v1"}),
+                    json!({"status":"prepared","controllerCapability":"antigravity-headless-dispatch.v1","observationCapability":"antigravity-tool-observation.v1"}),
                 ))
             }
             "session.open" => {
@@ -267,6 +282,97 @@ impl CommandExecutor for AntigravityDispatchExecutor {
                 {
                     return Err(invalid("Antigravity result binding mismatch"));
                 }
+                if p["action"] == "antigravity.dispatch_written" {
+                    let fields = [
+                        "action",
+                        "bindingId",
+                        "bindingGeneration",
+                        "runId",
+                        "environmentLeaseId",
+                        "normalizedSessionId",
+                        "turnId",
+                        "conversationId",
+                        "processGeneration",
+                        "dispatchEventId",
+                    ];
+                    let id = p["dispatchEventId"]
+                        .as_str()
+                        .filter(|v| {
+                            !v.is_empty() && v.len() <= 240 && !v.chars().any(char::is_control)
+                        })
+                        .ok_or_else(|| invalid("Antigravity dispatch evidence invalid"))?;
+                    if p.as_object().map_or(true, |o| {
+                        o.len() != fields.len() || o.keys().any(|k| !fields.contains(&k.as_str()))
+                    }) {
+                        return Err(invalid("Antigravity dispatch evidence invalid"));
+                    }
+                    if self.state.phase == "offered" {
+                        self.state.phase = "dispatched".into();
+                        self.state.dispatch_event_id = Some(id.into());
+                        self.save()?;
+                    } else if self.state.phase != "dispatched"
+                        || self.state.dispatch_event_id.as_deref() != Some(id)
+                    {
+                        return Err(invalid("Antigravity dispatch evidence conflict"));
+                    }
+                    return Ok(CommandExecution::result(
+                        json!({"status":"written_consumption_unknown"}),
+                    ));
+                }
+                if p["action"] == "antigravity.tool_observation" {
+                    let fields = [
+                        "action",
+                        "bindingId",
+                        "bindingGeneration",
+                        "runId",
+                        "environmentLeaseId",
+                        "normalizedSessionId",
+                        "turnId",
+                        "conversationId",
+                        "processGeneration",
+                        "dispatchEventId",
+                        "observationId",
+                        "stepIndex",
+                        "state",
+                        "toolNameDigest",
+                    ];
+                    let hash = |v: &Value| {
+                        v.as_str().is_some_and(|v| {
+                            v.len() == 71
+                                && v.starts_with("sha256:")
+                                && v[7..]
+                                    .bytes()
+                                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+                        })
+                    };
+                    if self.state.phase != "dispatched"
+                        || p["dispatchEventId"].as_str() != self.state.dispatch_event_id.as_deref()
+                        || p.as_object().map_or(true, |o| {
+                            o.len() != fields.len()
+                                || o.keys().any(|k| !fields.contains(&k.as_str()))
+                        })
+                        || !p["dispatchEventId"].as_str().is_some_and(|v| {
+                            !v.is_empty() && v.len() <= 240 && !v.chars().any(char::is_control)
+                        })
+                        || !hash(&p["observationId"])
+                        || !hash(&p["toolNameDigest"])
+                        || !p["stepIndex"]
+                            .as_u64()
+                            .is_some_and(|v| v <= 9_007_199_254_740_991)
+                        || !["running", "completed", "failed", "other"]
+                            .contains(&p["state"].as_str().unwrap_or(""))
+                    {
+                        return Err(invalid("Antigravity tool observation invalid"));
+                    }
+                    return Ok(CommandExecution {
+                        result: json!({"status":"provider_observation_recorded","observationId":p["observationId"]}),
+                        events: vec![(
+                            "harness.diagnostic".into(),
+                            EventPriority::P1,
+                            json!({"code":"antigravity_tool_observation","authority":"provider_observation_only","commandId":command.command_id,"bindingId":b.binding_id,"bindingGeneration":b.binding_generation,"runId":b.run_id,"environmentLeaseId":b.environment_lease_id,"normalizedSessionId":b.session_id,"turnId":b.turn_id,"conversationId":b.conversation_id,"processGeneration":b.process_generation,"dispatchEventId":p["dispatchEventId"],"observationId":p["observationId"],"stepIndex":p["stepIndex"],"state":p["state"],"toolNameDigest":p["toolNameDigest"]}),
+                        )],
+                    });
+                }
                 if p["action"] == "antigravity.provider_exit" {
                     if p["exitObserved"] != true {
                         return Err(invalid("Antigravity exit unproven"));
@@ -291,7 +397,7 @@ impl CommandExecutor for AntigravityDispatchExecutor {
                 {
                     return Err(invalid("Antigravity result invalid"));
                 }
-                if self.state.phase == "offered" {
+                if self.state.phase == "offered" || self.state.phase == "dispatched" {
                     self.state.result = Some(result.clone());
                     self.state.phase = "observed".into();
                     self.save()?;

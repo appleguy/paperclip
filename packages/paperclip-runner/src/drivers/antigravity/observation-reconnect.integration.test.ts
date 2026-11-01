@@ -1,0 +1,36 @@
+import { createHash } from "node:crypto";
+import { mkdtemp, mkdir, rm, writeFile, readFile, open } from "node:fs/promises";
+import { join, resolve } from "node:path";
+import { expect, it, vi } from "vitest";
+import { DurablePrpControlPlane, spawnRunner, type RunnerProcessHandle } from "../../control-plane/durable-prp-control-plane.js";
+import { readRunnerdArtifactBinding } from "../../live/runnerd-codex-transport.js";
+import { launchRunnerdAntigravity, type RunnerdAntigravityPort } from "./runnerd-antigravity-port.js";
+import { normalizeAntigravityToolObservation } from "./native-tool-observation.js";
+import type { AntigravityHeadlessController } from "./headless-controller.js";
+
+it("replays one diagnostic after its acknowledgement is lost without rewriting native stdin",async()=>{
+ const root=await mkdtemp("/Volumes/NVM/AI_Agent_Runtime/tmp/agy-replay-"),fake=join(root,"agy"),writes=join(root,"writes");await writeFile(writes,"");
+ await writeFile(fake,`#!${process.execPath}\nif(process.argv.includes('--version')){process.stdout.write('1.4.12');process.exit(0)};process.stdout.write(JSON.stringify({event:'init',conversation_id:'native',init:{cwd:process.cwd(),permission_mode:'request-review'}})+'\\n');process.stdin.on('data',()=>{require('node:fs').appendFileSync(${JSON.stringify(writes)},'write\\n');process.stdout.write(JSON.stringify({event:'step_update',step_update:{conversation_id:'native',step_index:1,state:'running',step_type:'tool',tool_name:'read',text_delta:'secret'}})+'\\n')});`,{mode:0o700});
+ const journal=join(root,"journal"),runnerDir=join(root,"runner");await mkdir(journal,{mode:0o700});await mkdir(runnerDir,{mode:0o700});
+ const identity={runnerInstanceId:"runner",environmentLeaseId:"lease",runId:"run",normalizedSessionId:"session",turnId:"turn",itemId:"item"},binding={bindingId:"binding",bindingGeneration:1,runId:"run",environmentLeaseId:"lease",normalizedSessionId:"session",turnId:"turn"};
+ const binary=process.env.AGY_TEST_RUNNER_BINARY??resolve(import.meta.dirname,"../../../runner/target/debug/paperclip-runnerd"),artifact=readRunnerdArtifactBinding(binary);
+ let port:RunnerdAntigravityPort|undefined,controller:AntigravityHeadlessController|undefined,runner:RunnerProcessHandle|undefined,dispatchEventId="",commandId="",observationPayload:Record<string,unknown>|undefined;
+ let initialized!:()=>void;const ready=new Promise<void>(r=>{initialized=r;});const seen:Array<{sourceEventId:string;payload:unknown}>=[];let logicalEffects=0;const effectPath=join(root,"durable-effect.json");
+ const core=new DurablePrpControlPlane({stateDirectory:join(root,"control"),identity,expectedRunnerVersion:artifact.version,expectedRunnerDigest:artifact.digest,onCommittedEvent:async event=>{
+  if(event.eventType==="native_controller.dispatch_requested"){dispatchEventId=event.sourceEventId;port!.dispatch(event);core.queueCommand("native_controller.observation",{...binding,action:"antigravity.dispatch_written",conversationId:"native",processGeneration:controller!.generation,dispatchEventId},"written",true);}
+  if(event.eventType==="harness.diagnostic"&&event.payload.code==="antigravity_tool_observation"){const record=JSON.stringify({sourceEventId:event.sourceEventId,payload:event.payload});seen.push({sourceEventId:event.sourceEventId,payload:event.payload});try{const file=await open(effectPath,"wx",0o600);try{await file.writeFile(record);await file.sync();}finally{await file.close();}const dir=await open(root,"r");try{await dir.sync();}finally{await dir.close();}logicalEffects++;core.disconnectActiveRunner();throw new Error("fixture_ack_lost");}catch(error){if((error as NodeJS.ErrnoException).code!=="EEXIST")throw error;if(await readFile(effectPath,"utf8")!==record)throw new Error("conflicting diagnostic replay");}}
+ }});
+ try{await core.start();const launched=launchRunnerdAntigravity({core,executable:fake,verifiedVersion:"1.4.12",cwd:root,env:{PATH:process.env.PATH},journalDirectory:journal,conversationId:"native",...binding,admit:()=>true,onUncertain:()=>{},onEvent:event=>{
+  if(event.kind==="init"){initialized();return}if(event.kind!=="step")return;
+  const obs=normalizeAntigravityToolObservation({...binding,conversationId:"native",processGeneration:controller!.generation},event)!;const {schema,authority,observationId,...provenance}=obs;
+  commandId=`agy_tool_${observationId.slice(7)}`;observationPayload={...provenance,action:"antigravity.tool_observation",observationId,dispatchEventId};core.queueCommand("native_controller.observation",observationPayload,commandId,true);
+ }});port=launched.port;controller=launched.controller;await ready;
+ const ticket=core.issueBootstrapTicket(60000);await core.flushCheckpoint();runner=spawnRunner({connectUrl:core.connectUrl,stateDirectory:runnerDir,identity,ticket,runnerBinaryPath:binary,runnerVersion:artifact.version,runnerDigest:artifact.digest,maxOutboxBytes:1024*1024,p0ReserveBytes:64*1024,maxRuntimeMs:0,environment:{PATH:process.env.PATH}});
+ const wait=async(id:string)=>{await vi.waitFor(()=>expect(core.getCommand(id)?.status).toBe("completed"),{timeout:20000,interval:25});};
+ core.queueCommand("run.prepare",{provider:{kind:"antigravity_headless",conversationId:"native",processGeneration:controller.generation,bindingId:"binding",bindingGeneration:1,startCommandId:"start",controllerCapability:"antigravity-headless-dispatch.v1",observationCapability:"antigravity-tool-observation.v1"}},"prepare",true);await wait("prepare");core.queueCommand("session.open",{},"open",true);await wait("open");core.queueCommand("turn.start",{text:"fixture"},"start",true);await wait("start");
+ try { await vi.waitFor(()=>expect(seen.length).toBeGreaterThanOrEqual(2),{timeout:20000,interval:25}); } catch (error) { const state=JSON.parse(await readFile(join(runnerDir,"runner-state.json"),"utf8")); throw new Error(JSON.stringify({seen:seen.length,connections:core.activeRunnerConnectionCount(),commandStatus:core.getCommand(commandId)?.status,outboxCount:state.outbox?.length,ackedSourceSeq:state.ackedSourceSeq,runnerExit:runner?.child.exitCode}),{cause:error}); } await wait(commandId);
+ expect(seen[1]).toEqual(seen[0]);expect(seen[0]!.payload).toMatchObject({commandId,authority:"provider_observation_only",dispatchEventId});expect(JSON.parse(await readFile(effectPath,"utf8"))).toEqual(seen[0]);expect(logicalEffects).toBe(1);expect(await readFile(writes,"utf8")).toBe("write\n");expect(JSON.stringify(seen)).not.toContain("secret");
+ core.queueCommand("native_controller.observation",observationPayload!,commandId,true);expect(core.getCommand(commandId)?.status).toBe("completed");expect(await readFile(writes,"utf8")).toBe("write\n");
+ await port.closeOwned();await vi.waitFor(()=>expect(core.store.state.commands.some(c=>c.type==="native_controller.observation"&&c.status==="completed"&&(c.payload as Record<string,unknown>).action==="antigravity.provider_exit")).toBe(true),{timeout:15000});core.queueCommand("runner.shutdown",{},"shutdown",true);await wait("shutdown");expect((await runner.completion).code).toBe(0);runner=undefined;
+ }finally{if(controller)await controller.closeOwned().catch(()=>{});if(runner){runner.child.kill("SIGTERM");await runner.completion.catch(()=>{});}await core.stop();await rm(root,{recursive:true,force:true});}
+},60000);

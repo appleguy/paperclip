@@ -1,4 +1,5 @@
 import { mkdirSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import type { NativeRunIdentity, NativeSessionCapabilities } from "../../contracts/types.js";
 import type { NativeSession, NativeSessionBackend, OpenNativeSessionInput } from "../../contracts/native-session-backend.js";
@@ -7,12 +8,13 @@ import { DurablePrpControlPlane, spawnRunner, type RunnerProcessHandle } from ".
 import { readRunnerdArtifactBinding } from "../../live/runnerd-codex-transport.js";
 import { RunnerdAntigravityPort } from "./runnerd-antigravity-port.js";
 import { AntigravityHeadlessController } from "./headless-controller.js";
+import { normalizeAntigravityToolObservation, type AntigravityToolObservation } from "./native-tool-observation.js";
 
 const capabilities:NativeSessionCapabilities={resume:false,typedEvents:true,steering:false,interruption:false,structuredResult:false,dynamicTools:false,usage:false,providerTermination:"confirmed",unsupported:["automatic recovery","shared interactive remote control","approval responses","structured Paperclip completion","managed tool accounting","native tool ingress fencing"]};
 export function describeAntigravityHeadlessBackend() { return {kind:"runner" as const,name:"antigravity_headless",version:"1.4.12",capabilities}; }
 /** Explicitly admitted, single native conversation and one Runner turn. */
 export class RunnerdAntigravityBackend implements NativeSessionBackend {
-  private readonly options:{identity:NativeRunIdentity;runnerInstanceId:string;environmentLeaseId:string;turnId:string;itemId:string;bindingId:string;bindingGeneration:number;conversationId?:string;cwd:string;stateDirectory:string;runnerBinary:string;executable:string;verifiedVersion:string;env:NodeJS.ProcessEnv;admit:(sourceEventId:string)=>boolean | Promise<boolean>;withAdmission?:(sourceEventId:string,dispatch:()=>void)=>Promise<void>};
+  private readonly options:{identity:NativeRunIdentity;runnerInstanceId:string;environmentLeaseId:string;turnId:string;itemId:string;bindingId:string;bindingGeneration:number;conversationId?:string;cwd:string;stateDirectory:string;runnerBinary:string;executable:string;verifiedVersion:string;env:NodeJS.ProcessEnv;admit:(sourceEventId:string)=>boolean | Promise<boolean>;withAdmission?:(sourceEventId:string,dispatch:()=>void)=>Promise<void>;onToolObservation?:(observation:AntigravityToolObservation)=>void};
   constructor(options:RunnerdAntigravityBackend["options"]) { this.options={...options,identity:{...options.identity},env:{...options.env}}; }
   async descriptor(){return describeAntigravityHeadlessBackend();}
   async openSession(input:OpenNativeSessionInput):Promise<NativeSession>{
@@ -26,17 +28,17 @@ export class RunnerdAntigravityBackend implements NativeSessionBackend {
     const artifact=readRunnerdArtifactBinding(o.runnerBinary);
     const identity={runnerInstanceId:o.runnerInstanceId,environmentLeaseId:o.environmentLeaseId,runId:o.identity.runId,normalizedSessionId:o.identity.sessionId,turnId:o.turnId,itemId:o.itemId};
     let port:RunnerdAntigravityPort|undefined,controller:AntigravityHeadlessController|undefined,runner:RunnerProcessHandle|undefined;
-    const events:PrpEvent[]=[];const waiters=new Set<()=>void>();let closed=false;let failure:unknown;let admittedEvent:string | undefined;
+    const events:PrpEvent[]=[];const waiters=new Set<()=>void>();let closed=false;let failure:unknown;let admittedEvent:string | undefined;let nativeConversation:string|undefined;let providerDispatchAccepted=false;let dispatchSourceEventId:string|undefined;
     const wake=()=>{for(const waiter of waiters)waiter();waiters.clear();};
     let dispatchResolve!:()=>void,dispatchReject!:(error:unknown)=>void;
     const dispatchResult=new Promise<void>((resolve,reject)=>{dispatchResolve=resolve;dispatchReject=reject;});
     void dispatchResult.catch(()=>{});
     const core=new DurablePrpControlPlane({stateDirectory:join(o.stateDirectory,"control-plane"),identity,expectedRunnerVersion:artifact.version,expectedRunnerDigest:artifact.digest,
-      onCommittedEvent:async event=>{if(events.length>=4096)throw new Error("Antigravity event buffer full");if(event.eventType==="native_controller.dispatch_requested"){let dispatched=false;const dispatch=()=>{if(dispatched)throw new Error("Antigravity duplicate admission dispatch");dispatched=true;admittedEvent=event.sourceEventId;try{port!.dispatch(event);}finally{admittedEvent=undefined;}};try{if(o.withAdmission)await o.withAdmission(event.sourceEventId,dispatch);else{if(!await o.admit(event.sourceEventId))throw new Error("Antigravity server lease admission denied");dispatch();}if(!dispatched)throw new Error("Antigravity admission did not dispatch");dispatchResolve();}catch(error){dispatchReject(error);throw error;}}events.push(event);wake();}});
+      onCommittedEvent:async event=>{if(events.length>=4096)throw new Error("Antigravity event buffer full");if(event.eventType==="native_controller.dispatch_requested"){let dispatched=false;const dispatch=()=>{if(dispatched)throw new Error("Antigravity duplicate admission dispatch");dispatched=true;admittedEvent=event.sourceEventId;try{port!.dispatch(event);core.queueCommand("native_controller.observation",{action:"antigravity.dispatch_written",bindingId:o.bindingId,bindingGeneration:o.bindingGeneration,runId:o.identity.runId,environmentLeaseId:o.environmentLeaseId,normalizedSessionId:o.identity.sessionId,turnId:o.turnId,conversationId:nativeConversation,processGeneration:controller!.generation,dispatchEventId:event.sourceEventId},`agy_written_${createHash("sha256").update(event.sourceEventId).digest("hex")}`,true);providerDispatchAccepted=true;dispatchSourceEventId=event.sourceEventId;}finally{admittedEvent=undefined;}};try{if(o.withAdmission)await o.withAdmission(event.sourceEventId,dispatch);else{if(!await o.admit(event.sourceEventId))throw new Error("Antigravity server lease admission denied");dispatch();}if(!dispatched)throw new Error("Antigravity admission did not dispatch");dispatchResolve();}catch(error){dispatchReject(error);throw error;}}events.push(event);wake();}});
     const waitCommand=async(id:string)=>{const deadline=Date.now()+15000;while(Date.now()<deadline){input.signal?.throwIfAborted();const command=core.getCommand(id);if(command?.status==="completed")return command;if(command&&["failed","rejected","indeterminate"].includes(command.status))throw new Error(`Antigravity Runner command ${command.status}`);await new Promise(r=>setTimeout(r,25));}throw new Error("Antigravity Runner command outcome unknown");};
     try {
       await core.start();let initialized!:(conversationId:string)=>void;const ready=new Promise<string>(resolve=>{initialized=resolve;});
-      controller=AntigravityHeadlessController.launch({executable:o.executable,verifiedVersion:o.verifiedVersion,cwd:o.cwd,env:o.env,conversationId:o.conversationId,authorize:id=>id===admittedEvent,onUncertain:()=>{failure=new Error("Antigravity prompt outcome unknown");wake();},onEvent:event=>{if(event.kind==="init")initialized(event.conversationId);else if(port)port.observe(event);else throw new Error("Antigravity event before binding");}});
+      controller=AntigravityHeadlessController.launch({executable:o.executable,verifiedVersion:o.verifiedVersion,cwd:o.cwd,env:o.env,conversationId:o.conversationId,authorize:id=>id===admittedEvent,onUncertain:()=>{failure=new Error("Antigravity prompt outcome unknown");wake();},onEvent:event=>{if(event.kind==="init"){nativeConversation=event.conversationId;initialized(event.conversationId);}else if(port){port.observe(event);if(providerDispatchAccepted&&nativeConversation&&dispatchSourceEventId){const observation=normalizeAntigravityToolObservation({runId:o.identity.runId,environmentLeaseId:o.environmentLeaseId,normalizedSessionId:o.identity.sessionId,turnId:o.turnId,bindingId:o.bindingId,bindingGeneration:o.bindingGeneration,conversationId:nativeConversation,processGeneration:controller!.generation},event);if(observation){const {schema,observationId,authority,...provenance}=observation;core.queueCommand("native_controller.observation",{action:"antigravity.tool_observation",...provenance,observationId,dispatchEventId:dispatchSourceEventId},`agy_tool_${observationId.slice(7)}`,true);o.onToolObservation?.(observation);}}if(event.kind==="result")providerDispatchAccepted=false;}else throw new Error("Antigravity event before binding");}});
       let timer:ReturnType<typeof setTimeout>|undefined;
       let conversationId:string;
       try{conversationId=await Promise.race([ready,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error("Antigravity initialization timeout")),5000);})]);}finally{if(timer)clearTimeout(timer);}
@@ -46,10 +48,10 @@ export class RunnerdAntigravityBackend implements NativeSessionBackend {
       runner=spawnRunner({connectUrl:core.connectUrl,stateDirectory:runnerDir,identity,ticket,runnerBinaryPath:o.runnerBinary,runnerVersion:artifact.version,runnerDigest:artifact.digest,maxOutboxBytes:1024*1024,p0ReserveBytes:64*1024,maxRuntimeMs:0,environment:{PATH:process.env.PATH}});
       void runner.completion.then(()=>{if(!closed){failure=new Error("Antigravity Runner exited; outcome unknown");wake();}},()=>{if(!closed){failure=new Error("Antigravity Runner exit unknown");wake();}});
       const startCommandId="antigravity_start";
-      core.queueCommand("run.prepare",{provider:{kind:"antigravity_headless",conversationId,processGeneration:controller.generation,bindingId:o.bindingId,bindingGeneration:o.bindingGeneration,startCommandId,controllerCapability:"antigravity-headless-dispatch.v1"}},"antigravity_prepare",true);
+      core.queueCommand("run.prepare",{provider:{kind:"antigravity_headless",conversationId,processGeneration:controller.generation,bindingId:o.bindingId,bindingGeneration:o.bindingGeneration,startCommandId,controllerCapability:"antigravity-headless-dispatch.v1",observationCapability:"antigravity-tool-observation.v1"}},"antigravity_prepare",true);
       const prepared=await waitCommand("antigravity_prepare");
       const acknowledgement=prepared.result?.result;
-      if(!acknowledgement || typeof acknowledgement!=="object" || (acknowledgement as Record<string,unknown>).controllerCapability!=="antigravity-headless-dispatch.v1")throw new Error("Antigravity Runner capability not acknowledged");
+      if(!acknowledgement || typeof acknowledgement!=="object" || (acknowledgement as Record<string,unknown>).controllerCapability!=="antigravity-headless-dispatch.v1" || (acknowledgement as Record<string,unknown>).observationCapability!=="antigravity-tool-observation.v1")throw new Error("Antigravity Runner capability not acknowledged");
       core.queueCommand("session.open",{},"antigravity_open",true);await waitCommand("antigravity_open");
       let started=false;
       return {

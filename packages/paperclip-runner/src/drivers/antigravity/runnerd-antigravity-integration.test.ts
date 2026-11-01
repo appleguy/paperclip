@@ -27,7 +27,7 @@ it("drives an authenticated Runner through one fake native turn and proven close
     const ticket=core.issueBootstrapTicket(60_000); await core.flushCheckpoint();
     runner=spawnRunner({connectUrl:core.connectUrl,stateDirectory:runnerDir,identity,ticket,runnerBinaryPath:binary,runnerVersion:artifact.version,runnerDigest:artifact.digest,maxOutboxBytes:1024*1024,p0ReserveBytes:64*1024,maxRuntimeMs:0,environment:{PATH:process.env.PATH}});
     const wait=async(id:string)=>{await vi.waitFor(()=>{const c=core.getCommand(id);expect(c?.status).toBe("completed");},{timeout:15000,interval:25});return core.getCommand(id)!;};
-    core.queueCommand("run.prepare",{provider:{kind:"antigravity_headless",conversationId:"native",processGeneration:controller.generation,bindingId:"binding",bindingGeneration:1,startCommandId:"start",controllerCapability:"antigravity-headless-dispatch.v1"}},"prepare",true);await wait("prepare");
+    core.queueCommand("run.prepare",{provider:{kind:"antigravity_headless",conversationId:"native",processGeneration:controller.generation,bindingId:"binding",bindingGeneration:1,startCommandId:"start",controllerCapability:"antigravity-headless-dispatch.v1",observationCapability:"antigravity-tool-observation.v1"}},"prepare",true);await wait("prepare");
     core.queueCommand("session.open",{},"open",true);await wait("open");
     core.queueCommand("turn.start",{text:"hello"},"start",true);await wait("start");
     try { await vi.waitFor(()=>expect(events).toContain("harness.diagnostic"),{timeout:15000,interval:25}); }

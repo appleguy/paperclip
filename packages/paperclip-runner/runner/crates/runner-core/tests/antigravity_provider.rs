@@ -45,7 +45,7 @@ fn durable_single_turn_native_result_is_not_paperclip_completion() {
         assert!(e
             .execute(&command("turn.start", "start", json!({"text":"hello"})))
             .is_err());
-        let provider = json!({"kind":"antigravity_headless","conversationId":"native","processGeneration":"g","bindingId":"b","bindingGeneration":1,"startCommandId":"start","controllerCapability":"antigravity-headless-dispatch.v1"});
+        let provider = json!({"kind":"antigravity_headless","conversationId":"native","processGeneration":"g","bindingId":"b","bindingGeneration":1,"startCommandId":"start","controllerCapability":"antigravity-headless-dispatch.v1","observationCapability":"antigravity-tool-observation.v1"});
         e.execute(&command(
             "run.prepare",
             "prepare",
@@ -149,7 +149,7 @@ fn runner_selector_recovers_only_matching_lease() {
         reconnect_grace: None,
         max_runtime: Duration::from_secs(60),
     };
-    let provider = json!({"kind":"antigravity_headless","conversationId":"native","processGeneration":"g","bindingId":"b","bindingGeneration":1,"startCommandId":"start","controllerCapability":"antigravity-headless-dispatch.v1"});
+    let provider = json!({"kind":"antigravity_headless","conversationId":"native","processGeneration":"g","bindingId":"b","bindingGeneration":1,"startCommandId":"start","controllerCapability":"antigravity-headless-dispatch.v1","observationCapability":"antigravity-tool-observation.v1"});
     let mut executor = NativeProviderCommandExecutor::with_runner_config(&dir, &config);
     let mut unsupported = provider.clone();
     unsupported["controllerCapability"] = json!("unknown.v1");
@@ -158,6 +158,30 @@ fn runner_selector_recovers_only_matching_lease() {
             "run.prepare",
             "unsupported",
             json!({"provider":unsupported})
+        ))
+        .is_err());
+    let mut missing = provider.clone();
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("observationCapability");
+    assert!(executor
+        .execute(&command(
+            "run.prepare",
+            "missing",
+            json!({"provider":missing})
+        ))
+        .is_err());
+    let mut wrong = provider.clone();
+    wrong["observationCapability"] = json!("antigravity-tool-observation.v0");
+    assert!(executor
+        .execute(&command("run.prepare", "wrong", json!({"provider":wrong})))
+        .is_err());
+    assert!(executor
+        .execute(&command(
+            "turn.start",
+            "start",
+            json!({"text":"not dispatched"})
         ))
         .is_err());
     executor
@@ -204,4 +228,129 @@ fn native_observation_requires_v2_protocol() {
     assert!(request.validate().is_err());
     request.schema = "paperclip.prp.command.v2".into();
     assert!(request.validate().is_ok());
+}
+
+#[test]
+fn tool_observation_is_bound_redacted_and_never_terminal() {
+    let dir = std::path::PathBuf::from(format!(
+        "/Volumes/NVM/AI_Agent_Runtime/tmp/agy-tool-{}",
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let mut e = AntigravityDispatchExecutor::open(&dir, binding()).unwrap();
+    let provider = json!({"kind":"antigravity_headless","conversationId":"native","processGeneration":"g","bindingId":"b","bindingGeneration":1,"startCommandId":"start","controllerCapability":"antigravity-headless-dispatch.v1","observationCapability":"antigravity-tool-observation.v1"});
+    e.execute(&command(
+        "run.prepare",
+        "prepare",
+        json!({"provider":provider}),
+    ))
+    .unwrap();
+    e.execute(&command("session.open", "open", json!({})))
+        .unwrap();
+    let mut payload = json!({"action":"antigravity.tool_observation","bindingId":"b","bindingGeneration":1,"runId":"r","environmentLeaseId":"lease","normalizedSessionId":"s","turnId":"t","conversationId":"native","processGeneration":"g","dispatchEventId":"dispatch","observationId":format!("sha256:{}", "a".repeat(64)),"stepIndex":1,"state":"running","toolNameDigest":format!("sha256:{}", "b".repeat(64))});
+    assert!(e
+        .execute(&command(
+            "native_controller.observation",
+            "obs",
+            payload.clone()
+        ))
+        .is_err());
+    e.execute(&command(
+        "turn.start",
+        "start",
+        json!({"text":"private prompt"}),
+    ))
+    .unwrap();
+    assert!(e
+        .execute(&command(
+            "native_controller.observation",
+            "obs",
+            payload.clone()
+        ))
+        .is_err());
+    let written = json!({"action":"antigravity.dispatch_written","bindingId":"b","bindingGeneration":1,"runId":"r","environmentLeaseId":"lease","normalizedSessionId":"s","turnId":"t","conversationId":"native","processGeneration":"g","dispatchEventId":"dispatch"});
+    e.execute(&command(
+        "native_controller.observation",
+        "written",
+        written.clone(),
+    ))
+    .unwrap();
+    e.execute(&command(
+        "native_controller.observation",
+        "written",
+        written,
+    ))
+    .unwrap();
+    payload["dispatchEventId"] = json!("foreign");
+    assert!(e
+        .execute(&command(
+            "native_controller.observation",
+            "obs",
+            payload.clone()
+        ))
+        .is_err());
+    payload["dispatchEventId"] = json!("dispatch");
+    payload["bindingGeneration"] = json!(2);
+    assert!(e
+        .execute(&command(
+            "native_controller.observation",
+            "obs",
+            payload.clone()
+        ))
+        .is_err());
+    payload["bindingGeneration"] = json!(1);
+    payload["processGeneration"] = json!("foreign");
+    assert!(e
+        .execute(&command(
+            "native_controller.observation",
+            "obs",
+            payload.clone()
+        ))
+        .is_err());
+    payload["processGeneration"] = json!("g");
+    payload["arguments"] = json!("secret");
+    assert!(e
+        .execute(&command(
+            "native_controller.observation",
+            "obs",
+            payload.clone()
+        ))
+        .is_err());
+    payload.as_object_mut().unwrap().remove("arguments");
+    let observed = e
+        .execute(&command(
+            "native_controller.observation",
+            "obs",
+            payload.clone(),
+        ))
+        .unwrap();
+    assert_eq!(observed.events.len(), 1);
+    assert_eq!(observed.events[0].0, "harness.diagnostic");
+    assert_eq!(
+        observed.events[0].2["authority"],
+        "provider_observation_only"
+    );
+    assert_eq!(observed.events[0].2["commandId"], "obs");
+    assert!(!observed.events[0].2.to_string().contains("private prompt"));
+    drop(e);
+    let mut e = AntigravityDispatchExecutor::open(&dir, binding()).unwrap();
+    assert!(e
+        .execute(&command(
+            "native_controller.observation",
+            "obs",
+            payload.clone()
+        ))
+        .is_ok());
+    let exit = json!({"action":"antigravity.provider_exit","bindingId":"b","bindingGeneration":1,"runId":"r","environmentLeaseId":"lease","normalizedSessionId":"s","turnId":"t","conversationId":"native","processGeneration":"g","exitObserved":true});
+    e.execute(&command("native_controller.observation", "exit", exit))
+        .unwrap();
+    assert!(e
+        .execute(&command("native_controller.observation", "obs", payload))
+        .is_err());
+    std::fs::remove_dir_all(dir).unwrap();
 }
