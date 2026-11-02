@@ -62,7 +62,7 @@ export const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON =
 
 /** The caller holds the task-session row lock and has established settlement. */
 export async function retireSharedIdentity(tx: Parameters<Parameters<Db["transaction"]>[0]>[0], session: typeof agentTaskSessions.$inferSelect, nextRunId: string) {
-  const { codexSharedBootstrapV1: _bootstrap, ...params } = session.sessionParamsJson ?? {};
+  const { codexSharedBootstrapV1: _bootstrap, codexSharedGoalV1: _observation, ...params } = session.sessionParamsJson ?? {};
   await tx.update(agentTaskSessions).set({
     sessionParamsJson: { ...params, __paperclipSharedRunFence: nextRunId },
     sessionDisplayId: null,

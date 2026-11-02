@@ -19,7 +19,7 @@ it("rolls over only a settled created identity and leaves another issue alone",a
   expect(await attempt()).toBe(false);
   await db.update(agentTaskSessions).set({sessionParamsJson:{codexSharedBootstrapV1:bootstrap,codexSharedGoalV1:{observationEpoch:{state:"open"}}}}).where(eq(agentTaskSessions.id,sessionId));
   expect(await attempt()).toBe(false);
-  await db.update(agentTaskSessions).set({sessionParamsJson:{codexSharedBootstrapV1:bootstrap}}).where(eq(agentTaskSessions.id,sessionId));
+  await db.update(agentTaskSessions).set({sessionParamsJson:{codexSharedBootstrapV1:bootstrap,codexSharedGoalV1:{threadId:"old-thread",runId:oldRun,sourceGoalDigest:null,observationEpoch:{state:"open"}}}}).where(eq(agentTaskSessions.id,sessionId));
   await db.insert(agentSessionGoalActions).values({companyId,sessionId,requestId:"pending",action:"create",payloadJson:{}});
   expect(await attempt()).toBe(false);
   await db.update(agentSessionGoalActions).set({status:"completed"}).where(eq(agentSessionGoalActions.sessionId,sessionId));
