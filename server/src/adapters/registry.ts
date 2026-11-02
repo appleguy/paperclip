@@ -141,6 +141,7 @@ import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { assertExternalAdapterCodeAllowed } from "../services/adapter-code-policy.js";
 import { NativeEnvironmentProbeCleanupError } from "../vendor/paperclip-runner/index.js";
 import { processAdapter } from "./process/index.js";
+import { agyAdapter } from "./agy/index.js";
 import { httpAdapter } from "./http/index.js";
 import {
   DEFAULT_OPENCODE_RUNNER_MODEL,
@@ -986,6 +987,7 @@ function registerBuiltInAdapters() {
     cursorCloudAdapter,
     cursorLocalAdapter,
     geminiLocalAdapter,
+    agyAdapter,
     grokLocalAdapter,
     kimiLocalAdapter,
     hermesGatewayAdapter,
