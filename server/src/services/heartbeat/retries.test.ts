@@ -12,6 +12,8 @@ import * as legacy from "../heartbeat.js";
 import { createHeartbeatRunState } from "./run-state.js";
 import { pendingCaseHandoffForRun } from "./case-handoff-lifecycle.js";
 import * as extracted from "./retries.js";
+import { isLocalOpenCodeAdmissionDecline, localOpenCodeAdmissionRetryOptions } from "../local-opencode-admission-retry.js";
+import { legacyExecutionNeedsReconciliation } from "../legacy-execution-recovery.js";
 import type { HeartbeatRetryDependencies } from "./retries.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
@@ -65,6 +67,45 @@ function deferral() {
     projectWorkspaceId: "workspace", deferralAttempt: 0, wasIssueAssignee: true,
   });
 }
+
+describe("local OpenCode admission retry", () => {
+  const busy = {
+    errorCode: "adapter_failed", exitCode: 75,
+    error: "WRX80 admission declined (BUSY:GPU); no inference sent",
+    runnerProfileJson: { adapterDispatch: { adapterType: "opencode_local" } },
+    contextSnapshot: { executionRetryAccounting: { version: 1, failureRetries: 2, maxTurnContinuations: 0 } },
+  };
+  it("backs off six times, bounded below 30 minutes", () => {
+    expect(isLocalOpenCodeAdmissionDecline(busy)).toBe(true);
+    const opts = localOpenCodeAdmissionRetryOptions(busy, () => 1);
+    expect(opts).toEqual({ maxAttempts: 6, delayMs: 165_000 });
+    const totalMs = [60, 90, 150, 240, 360, 600].reduce((sum, ms) => sum + ms * 1.1, 0);
+    expect(totalMs).toBeLessThan(1800);
+  });
+  it("does not require a reconciliation hold after two proven admission declines", () => {
+    expect(legacyExecutionNeedsReconciliation({
+      ...busy, runtimeMode: "legacy", status: "failed", resultJson: null,
+    })).toBe(false);
+    expect(legacyExecutionNeedsReconciliation({
+      ...busy, runtimeMode: "legacy", status: "failed", resultJson: null,
+      exitCode: 1,
+    })).toBe(true);
+  });
+  it("recognizes all local host admission declines without broadening other failures", () => {
+    for (const error of [
+      "WRX80 admission declined (BUSY:external-engine); no inference sent",
+      "WRX80 admission declined (BUSY:other-model-or-loading); no inference sent",
+      "Mac Maya already serving another Paperclip run; no second request",
+      "Mac Pro Maya-L admission refused: Model not advertised",
+    ]) expect(isLocalOpenCodeAdmissionDecline({ ...busy, error })).toBe(true);
+  });
+  it("rejects non-local errors and post-dispatch failures", () => {
+    expect(isLocalOpenCodeAdmissionDecline({ ...busy, error: "Too many requests", exitCode: 1 })).toBe(false);
+    expect(isLocalOpenCodeAdmissionDecline({ ...busy, error: "WRX80 admission declined (BUSY:GPU); no inference sent", runnerProfileJson: { adapterDispatch: { adapterType: "claude_local" } } })).toBe(false);
+    expect(isLocalOpenCodeAdmissionDecline({ ...busy, exitCode: 1 })).toBe(false);
+    expect(isLocalOpenCodeAdmissionDecline({ ...busy, error: "unexpected Python traceback" })).toBe(false);
+  });
+});
 
 describe("heartbeat retry module callbacks", () => {
   it("preserves legacy helper and error-class identity", () => {

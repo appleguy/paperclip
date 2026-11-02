@@ -303,6 +303,7 @@ import {
   createAdapterExecutionControl,
 } from "./adapter-execution-control.js";
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
+import { localOpenCodeAdmissionRetryOptions } from "./local-opencode-admission-retry.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { StaleExecutionContinuationError } from "./execution-continuation.js";
@@ -986,7 +987,8 @@ export function heartbeatService(
       if (!run) return null;
       const agent = await getAgent(run.agentId);
       if (!agent || agent.companyId !== run.companyId) return null;
-      const result = await scheduleBoundedRetryForRun(run, agent);
+      const result = await scheduleBoundedRetryForRun(run, agent,
+        localOpenCodeAdmissionRetryOptions(run) ?? undefined);
       return result.outcome === "scheduled" ? result.run : null;
     },
     // Mirrors scheduleBoundedRetryForRun's transient budget check: a failed
@@ -994,7 +996,8 @@ export function heartbeatService(
     // attempt cannot be retried again through this lane.
     transientRetryBudgetSpent: (run) =>
       executionFailureRetryCount(run) >=
-      BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+      (localOpenCodeAdmissionRetryOptions(run, () => 0)?.maxAttempts ??
+        BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS),
   });
   const runDispatch = createRunDispatch(db);
   const {
