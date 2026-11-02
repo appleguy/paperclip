@@ -53,11 +53,8 @@ agent_preflight() {
   ref=$1
   label=$2
   "$CLI" agent get "$ref" --json 2>>"$EVIDENCE/preflight-errors.log" |
-    jq -e --arg id "$ref" \
-      '.id == $id and .adapterType == "opencode_local" and
-      (.status != "paused" and .status != "terminated") and
-      .runtimeConfig.heartbeat.wakeOnAssignment == true' >/dev/null ||
-    abort "$label is unavailable or not an assignment-triggered OpenCode agent"
+    jq -e --arg id "$ref" -f "$AREA/accept-agent-preflight.jq" >/dev/null ||
+    abort "$label is unavailable or lifecycle not ready for OpenCode assignment"
 }
 
 # Existing mode-600 server passwords never enter argv, stdout, evidence, or git.
