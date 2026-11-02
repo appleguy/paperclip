@@ -64,7 +64,7 @@ export class ClaudeNativePtyFactory implements ClaudeInteractivePtyFactory {
     if (!isAbsolute(input.executable) || !isAbsolute(input.cwd) || !env.HOME || !isAbsolute(env.HOME) || (env.CLAUDE_CONFIG_DIR && !isAbsolute(env.CLAUDE_CONFIG_DIR))) throw new Error("invalid Claude PTY launch scope");
     const executable=realpathSync(input.executable), cwd=realpathSync(input.cwd), home=resolve(env.HOME), config=resolve(env.CLAUDE_CONFIG_DIR ?? resolve(home,".claude"));
     const pty=module.spawn(input.executable,[...input.args],{name:"xterm-256color",cols:100,rows:32,cwd:input.cwd,env});
-    let exited=false, detached=false, stopped=false;
+    let exited=false, detached=false, stopped=false, stopSeenUncertain=false;
     let resolveExit!:()=>void;
     const exit=new Promise<void>(resolve=>{resolveExit=resolve;});
     pty.onExit(()=>{exited=true;resolveExit();});
@@ -84,16 +84,21 @@ export class ClaudeNativePtyFactory implements ClaudeInteractivePtyFactory {
     return {
       pid:pty.pid,generation,hasExited:()=>exited,launchScope:Object.freeze({pid:pty.pid,generation,executable,cwd,home,config,source:"parent-attested-launch-scope" as const}),
       writeInput(text) {
-        if (detached || stopped || exited) throw new Error("Claude PTY unavailable");
+        if (detached || stopped || exited || stopSeenUncertain) throw new Error("Claude PTY unavailable");
         if (typeof text!=="string" || Buffer.byteLength(text,"utf8")>65536) throw new Error("Claude PTY input too large");
         pty.write(text);
       },
       async detach(){ if(detached || stopped) throw new Error("Claude PTY unavailable"); detached=true; },
       async stop(){
+        // `stopped` latches only on a confirmed exit; an uncertain outcome stays retriable via `stopSeenUncertain`.
         if(detached || stopped) throw new Error("Claude PTY unavailable");
         if(exited) { stopped=true; return; }
-        if (!await verifyClaudePtyGeneration(pty.pid,generation)) throw new Error("Claude PTY process identity changed");
-        stopped=true;
+        if (!await verifyClaudePtyGeneration(pty.pid,generation)) {
+          // After an uncertain attempt a vanished process means the earlier signal worked: the stop goal is met.
+          if (stopSeenUncertain) { stopped=true; return; }
+          throw new Error("Claude PTY process identity changed");
+        }
+        const uncertain=(message:string)=>{ stopSeenUncertain=true; return new Error(message); };
         pty.kill("SIGTERM");
         const waitExit=async()=>{
           let timer:ReturnType<typeof setTimeout> | undefined;
@@ -101,10 +106,11 @@ export class ClaudeNativePtyFactory implements ClaudeInteractivePtyFactory {
           finally { if(timer) clearTimeout(timer); }
         };
         if (!await waitExit()) {
-          if (!await verifyClaudePtyGeneration(pty.pid,generation)) throw new Error("Claude PTY exit unconfirmed; process identity changed");
+          if (!await verifyClaudePtyGeneration(pty.pid,generation)) throw uncertain("Claude PTY exit unconfirmed; process identity changed");
           pty.kill("SIGKILL");
-          if (!await waitExit()) throw new Error("Claude PTY exit unconfirmed after SIGKILL");
+          if (!await waitExit()) throw uncertain("Claude PTY exit unconfirmed after SIGKILL");
         }
+        stopped=true;
       },
     };
   }

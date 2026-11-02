@@ -12,6 +12,14 @@ export type ClaudeInteractiveRunnerOptions = Omit<ClaudeInteractiveSessionOption
    * `scope.nativeSessionId` must equal `sessionId`. Absent: the session exposes no Paperclip tools. */
   mcp?:{scope:ClaudeNativeMcpScope;tools:readonly Readonly<Record<string,unknown>>[];dispatch:(scope:ClaudeNativeMcpScope,call:RunnerToolCall)=>Promise<unknown>};
 };
+/** Failed cleanup of a possibly-live owned process. The runner stays tracked here so the caller can retry
+ * `runner.stopOwnedProcess()` (retriable) instead of leaking the process with no handle. */
+export class ClaudeInteractiveCleanupUncertainError extends AggregateError {
+  constructor(cause:unknown, readonly runner:ClaudeInteractiveRunner) {
+    super([cause],"Claude hook identity unavailable and owned process cleanup is uncertain");
+    this.name="ClaudeInteractiveCleanupUncertainError";
+  }
+}
 export class ClaudeInteractiveRunner {
   private queue:Promise<void>=Promise.resolve();
   private detached=false;
@@ -24,12 +32,13 @@ export class ClaudeInteractiveRunner {
     let session:ClaudeInteractiveSession;
     try { session=await ClaudeInteractiveSession.launch({...rest,mcpBinding,ownedSdkInit:undefined}); }
     catch (error) { await mcpBinding?.close().catch(()=>{}); throw error; }
+    const runner=new ClaudeInteractiveRunner(session,options.sessionId,mcpBinding!==undefined);
     if (!session.hookStart || session.hookStart.sessionId!==options.sessionId || session.hookStart.event!=="SessionStart" || session.hookStart.peer!=="darwin-kernel-pid-uid-and-live-ancestry" || session.hookStart.namespace!=="parent-attested-launch-scope") {
-      try { await session.stopOwnedProcess(); }
-      catch (error) { throw new AggregateError([error],"Claude hook identity unavailable and owned process cleanup is uncertain"); }
+      try { await runner.stopOwnedProcess(); }
+      catch (error) { throw new ClaudeInteractiveCleanupUncertainError(error,runner); }
       throw new Error("Claude native hook identity unavailable; reconcile owned session");
     }
-    return new ClaudeInteractiveRunner(session,options.sessionId,mcpBinding!==undefined);
+    return runner;
   }
   private exclusive<T>(fn:()=>Promise<T>):Promise<T> {
     const next=this.queue.then(async()=>{if(this.detached)throw new Error("Claude interactive Runner detached");return fn();});
