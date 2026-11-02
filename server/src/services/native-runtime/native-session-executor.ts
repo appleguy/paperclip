@@ -6793,6 +6793,9 @@ export function nativeSessionFailureDisposition(
   sourceFailureCode?: ReturnType<typeof nativeSessionFailureSourceCode>,
 ) {
   const permanentFailure =
+    sourceFailureCode === "codex_shared_existing_session_requires_recovery" ||
+    sourceFailureCode === "codex_shared_grant_stale" ||
+    sourceFailureCode === "codex_shared_registration_unavailable" ||
     sourceFailureCode === "native_provider_runtime_missing" ||
     sourceFailureCode === "native_provider_model_rejected" ||
     sourceFailureCode === "native_provider_approval_required" ||
@@ -6848,6 +6851,9 @@ export function nativeSessionRecoveryProjection(input: {
 export function nativeSessionFailureSourceCode(
   error: unknown,
 ):
+  | "codex_shared_existing_session_requires_recovery"
+  | "codex_shared_grant_stale"
+  | "codex_shared_registration_unavailable"
   | "native_permission_declined"
   | "native_provider_terminal_failed"
   | "native_provider_approval_required"
@@ -6892,6 +6898,7 @@ export function nativeSessionFailureSourceCode(
   if (error instanceof NativeSessionCleanupQuarantinedError)
     return "native_session_cleanup_quarantined";
   const message = error instanceof Error ? error.message : String(error);
+  if (message === "codex_shared_existing_session_requires_recovery" || message === "codex_shared_grant_stale" || message === "codex_shared_registration_unavailable") return message;
   if (/classification=runtime_package_missing\)/.test(message))
     return "native_provider_runtime_missing";
   if (/native_provider_model_rejected/i.test(message))

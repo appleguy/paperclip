@@ -1662,10 +1662,19 @@ export function createHeartbeatRunState(db: Db) {
       throw new Error("opencode_shared_session_requires_lease");
     }
     if (existing) {
+      const sharedKeys = ["codexSharedBootstrapV1", "codexSharedGoalV1"] as const;
+      const previous = existing.sessionParamsJson ?? {};
+      const hasSharedIdentity = sharedKeys.some((key) => Object.hasOwn(previous, key));
+      // A late completion from the previous wake must not overwrite its successor.
+      if (hasSharedIdentity && existing.lastRunId !== input.lastRunId) return null;
+      const params = { ...(input.sessionParamsJson ?? {}) };
+      for (const key of sharedKeys) {
+        if (!Object.hasOwn(params, key) && Object.hasOwn(previous, key)) params[key] = previous[key];
+      }
       return tx
         .update(agentTaskSessions)
         .set({
-          sessionParamsJson: input.sessionParamsJson,
+          sessionParamsJson: hasSharedIdentity ? params : input.sessionParamsJson,
           sessionDisplayId: input.sessionDisplayId,
           lastRunId: input.lastRunId,
           lastError: input.lastError,
@@ -1752,6 +1761,9 @@ export function createHeartbeatRunState(db: Db) {
       if (sessions.some(({ params }) => params && Object.hasOwn(params, "opencodeSharedV2"))) {
         throw new Error("opencode_shared_session_requires_lease");
       }
+      if (sessions.some(({ params }) => params && (Object.hasOwn(params, "codexSharedBootstrapV1") || Object.hasOwn(params, "codexSharedGoalV1")))) {
+        throw new Error("codex_shared_session_requires_recovery");
+      }
       const goals = await tx.select({ id: agentTaskSessions.id }).from(agentTaskSessions)
         .where(and(...conditions, sql`${agentTaskSessions.goalStatus} is not null`, sql`${agentTaskSessions.goalStatus} <> 'complete'`)).limit(1);
       if (goals.length) await notifyExternalConversationSettlement(tx, { companyId });
@@ -1759,6 +1771,7 @@ export function createHeartbeatRunState(db: Db) {
       // COMMITTED. Keep the deletion predicate independently safe as well.
       return tx.delete(agentTaskSessions).where(and(...conditions,
         sql`not (coalesce(${agentTaskSessions.sessionParamsJson}, '{}'::jsonb) ? 'opencodeSharedV2')`,
+        sql`not (coalesce(${agentTaskSessions.sessionParamsJson}, '{}'::jsonb) ?| array['codexSharedBootstrapV1', 'codexSharedGoalV1'])`,
       )).returning().then((rows) => rows.length);
     });
   }

@@ -15814,3 +15814,9 @@ describe("HTTP Stop during remote runner staging", () => {
     } finally { release(); await outcome; await stopping; await bundle.transport.detachControllerForRestart?.().catch(() => {}); await temporary.cleanup(); await rm(root, { recursive: true, force: true }); }
   }, 120000);
 });
+
+it.each(["codex_shared_existing_session_requires_recovery", "codex_shared_grant_stale", "codex_shared_registration_unavailable"] as const)("does not retry deterministic shared Codex failure %s", (message) => {
+  const code = nativeSessionFailureSourceCode(new Error(message));
+  expect(code).toBe(message);
+  expect(nativeSessionFailureDisposition(1, new Date(), code)).toMatchObject({ phase: "terminal_failure", failureCode: message, nextAttemptAt: null });
+});

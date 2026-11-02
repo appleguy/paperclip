@@ -467,6 +467,18 @@ describePostgres("heartbeat run state database wiring", () => {
     expect((await state.listRuns(companyId)).map((row) => row.id)).toEqual([run.id]);
   });
 
+  it("preserves shared Codex identity through completion and rejects generic clears", async () => {
+    const { companyId, agent, issue, state } = await fixture();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "succeeded" }).returning();
+    const identity = { codexSharedBootstrapV1: { state: "created", threadId: "thread" }, codexSharedGoalV1: { runId: run.id } };
+    const input = { companyId, agentId: agent.id, adapterType: agent.adapterType, taskKey: issue.id, sessionParamsJson: identity, sessionDisplayId: "thread", lastRunId: run.id, lastError: null };
+    await state.upsertTaskSession(input);
+    const saved = await state.upsertTaskSession({ ...input, sessionParamsJson: { __paperclipConfiguredModel: "model" } });
+    expect(saved?.sessionParamsJson).toEqual({ ...identity, __paperclipConfiguredModel: "model" });
+    await expect(state.clearTaskSessions(companyId, agent.id, { taskKey: issue.id, expectedRunId: run.id })).rejects.toThrow("codex_shared_session_requires_recovery");
+    expect(await state.upsertTaskSession({ ...input, lastRunId: null })).toBeNull();
+  });
+
   it("subtracts prior cumulative usage while excluding the current run", async () => {
     const { companyId, agent, state } = await fixture();
     await db.insert(heartbeatRuns).values({
