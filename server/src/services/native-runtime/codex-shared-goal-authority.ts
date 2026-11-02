@@ -25,14 +25,14 @@ function validate(b: CodexSharedGoalBinding) {
 }
 
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
-/** nowait row locks lose to concurrent executor writes; the aborted transaction has no side effect (sends happen outside), so retry it briefly. */
-async function lockRetryTransaction<T>(db: Db, fn: (tx: Tx) => Promise<T>): Promise<T> {
+/** nowait row locks lose to concurrent executor writes; a transaction aborted before any external send has no side effect, so retry it briefly. `sendStarted` must report true once a send was issued: an unknown write is never retried. */
+async function lockRetryTransaction<T>(db: Db, fn: (tx: Tx) => Promise<T>, sendStarted: () => boolean = () => false): Promise<T> {
   for (let attempt = 0; ; attempt++) {
     try { return await db.transaction(fn); }
     catch (error) {
       const code = (error as { code?: unknown; cause?: { code?: unknown } })?.cause?.code ?? (error as { code?: unknown })?.code;
       const reason = String((error as { cause?: { message?: unknown } })?.cause?.message ?? (error as Error)?.message ?? "");
-      if (code !== "55P03" || !reason.includes("could not obtain lock") || attempt >= 5) throw error; // nowait losses only; lock_timeout keeps its bound
+      if (sendStarted() || code !== "55P03" || !reason.includes("could not obtain lock") || attempt >= 5) throw error; // nowait losses only; lock_timeout keeps its bound
       await new Promise(resolve => setTimeout(resolve, 30 * (attempt + 1)));
     }
   }
@@ -208,6 +208,7 @@ export const authorizeReservedCodexPausedGoal=authorizeReservedCodexGoalWrite;
 export async function withReservedCodexPausedGoalSend<T>(db:Db,b:CodexSharedGoalBinding,input:PausedWrite,send:()=>Promise<T>,timeoutMs=15_000):Promise<T> {
   validate(b);
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs<1 || timeoutMs>15_000) throw new Error("codex_shared_send_timeout_invalid");
+  let sent=false;
   return lockRetryTransaction(db, async tx=>{
     // Delegation rows can be held by a concurrent registration or revocation;
     // bound acquisition as well as the external send itself.
@@ -216,9 +217,9 @@ export async function withReservedCodexPausedGoalSend<T>(db:Db,b:CodexSharedGoal
     const scope={key:scopeKey(b,input),admission,open:true};
     let timer:ReturnType<typeof setTimeout>|undefined;
     try {
-      return await sendScope.run(scope,()=>Promise.race([send(),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error("codex_shared_send_outcome_unknown")),timeoutMs);})]));
+      return await sendScope.run(scope,()=>Promise.race([(sent=true,send()),new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error("codex_shared_send_outcome_unknown")),timeoutMs);})]));
     } finally {scope.open=false;if(timer)clearTimeout(timer);}
-  });
+  }, () => sent);
 }
 
 /** Same locked scope for activation (resume of a paused goal); the contract above rejects any other action carrying status "active". */

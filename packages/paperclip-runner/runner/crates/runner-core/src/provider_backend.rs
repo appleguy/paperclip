@@ -4237,8 +4237,13 @@ impl CodexCommandExecutor {
         } else {
             json!({"objective":goal.get("objective"),"status":goal.get("status"),"tokenBudget":goal.get("tokenBudget").unwrap_or(&Value::Null)})
         };
+        // Pause is the only write that may start from an active goal; every other write starts from the paused goal.
+        let pausing =
+            !activate && expected.get("status").and_then(Value::as_str) == Some("active");
+        let source_status = if pausing { "active" } else { "paused" };
         if projected != expected
-            || (!goal.is_null() && goal.get("status").and_then(Value::as_str) != Some("paused"))
+            || (!goal.is_null()
+                && goal.get("status").and_then(Value::as_str) != Some(source_status))
         {
             return Err(DurableRunnerError::invalid("shared goal source changed"));
         }
@@ -4310,7 +4315,7 @@ impl CodexCommandExecutor {
             .receive_notification(std::time::Duration::ZERO)
             .map_err(|_| DurableRunnerError::invalid("shared observation lost during readback"))?;
         let same_goal = |candidate: &SessionGoalSnapshot| {
-            if activate {
+            if activate || pausing {
                 // An active goal accrues usage immediately; identity is objective, status and budget.
                 candidate.objective == goal.objective
                     && candidate.status == goal.status
@@ -4333,7 +4338,7 @@ impl CodexCommandExecutor {
         };
         let mut strays: Vec<Value> = Vec::new();
         let (mut after_set_event, mut readback_event) = (after_set_event, readback_event);
-        if activate {
+        if activate || pausing {
             for slot in [&mut after_set_event, &mut readback_event] {
                 if slot.as_ref().is_some_and(|v| !matching_goal_event(v)) {
                     strays.extend(slot.take());
@@ -4359,7 +4364,7 @@ impl CodexCommandExecutor {
                 })? {
                 None => break,
                 Some(value) if matching_goal_event(&value) && index + 1 < MAX_EVENTS_PER_POLL => {}
-                Some(value) if activate => strays.push(value),
+                Some(value) if activate || pausing => strays.push(value),
                 Some(_) => return Err(DurableRunnerError::invalid("shared goal readback changed")),
             }
         }

@@ -980,26 +980,9 @@ export async function settleLiveRunnerGoalBeforeInterrupt(
     );
   }
 
+  // File a normal service action (row + revision bump) so a controller that reserves durable intent, such as shared Codex, finds it.
   const requestId = `interrupt_${randomUUID()}`;
-  const adapterControl = dispatchLiveRunnerGoalControl(binding, { requestId, action });
-  const nativeControl = adapterControl
-    ? null
-    : queueLiveRunnerPrpCommand({
-        ...binding,
-        type: action === "pause" ? "session.goal.set" : "session.goal.clear",
-        payload: action === "pause"
-          ? { requestId, status: "paused" }
-          : { requestId },
-        commandId: `goal_${requestId}`,
-      });
-  const completion = adapterControl?.completion ?? nativeControl?.completion ?? null;
-  if (!completion) {
-    throw new RunnerGoalActionError(
-      "runner_goal_live_controller_unavailable",
-      "The live agent goal controller is unavailable; the run was not interrupted.",
-    );
-  }
-  await completion;
+  await goals.act(binding.companyId, binding.issueId, { requestId, agentId: binding.agentId, expectedRevision: current.revision, action });
 
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
