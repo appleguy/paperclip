@@ -1,4 +1,5 @@
 import { createSharedCodexThreadConfig } from "./shared-codex-thread-config-builder.js";
+import { sharedThreadConfigViolation } from "./shared-codex-thread-config.js";
 import { describe, expect, it } from "vitest";
 import { createRunnerProviderLaunch, preparedRunnerLaunchWorkingDirectory, runnerLaunchRequirementsDigest, validatePreparedRunnerLaunch,
   runnerProviderLaunchRequirements, type RunnerProviderLaunchEnvironment, type RunnerProviderLaunchRequirements } from "./runner-provider-launch.js";
@@ -20,6 +21,20 @@ const environment: RunnerProviderLaunchEnvironment = {
 };
 
 describe("built-in provider launch preparation", () => {
+  it("exposes only the registered agent home alongside PATH", () => {
+    const base = { cwd: environment.cwd, readOnly: false, webSearchDisabled: true, networkAccess: false,
+      codexHome: "/private/home", codexExecutable: "/bin/sh", path: "/usr/bin:/bin" };
+    const absent = createSharedCodexThreadConfig(base) as any;
+    expect(absent.shell_environment_policy).toMatchObject({ inherit: "none", set: { PATH: base.path } });
+    expect(absent.shell_environment_policy.set).toEqual({ PATH: base.path });
+    const config = createSharedCodexThreadConfig({ ...base, agentHome: "/private/agent", runtimeReadRoots: ["/private/agent"] }) as any;
+    expect(config.shell_environment_policy.set).toEqual({ PATH: base.path, AGENT_HOME: "/private/agent" });
+    for (const profile of Object.values(config.permissions) as any[]) expect(profile.filesystem["/private/agent"]).toBe("read");
+    const policy = { cwd: base.cwd, readOnly: false, disableWebSearch: true };
+    expect(sharedThreadConfigViolation(config, policy)).toBeNull();
+    config.shell_environment_policy.set.SECRET = "value";
+    expect(sharedThreadConfigViolation(config, policy)).toBe("shell_environment_invalid");
+  });
   it("pins the explicitly attested shared daemon into readonly launch requirements",()=>{
     const shared={socketPath:"/private/socket",daemonGeneration:"generation",threadId:"thread",codexHome:"/private/home",peer:{pid:12,startSeconds:1,startMicroseconds:2,executable:"/private/codex"},writer:{runId:"run",normalizedSessionId:"session",runnerInstanceId:"runner",grantId:"grant",epoch:1,observationEpochId:"observation"}};
     const selected=runnerProviderLaunchRequirements({provider:"codex",sharedCodexDaemon:shared},requirements.identity,{permissions:"paperclip-runner-workspace-read-only"},null,"");

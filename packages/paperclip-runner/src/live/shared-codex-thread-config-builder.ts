@@ -14,6 +14,8 @@ export type SharedCodexThreadConfigPolicy = Readonly<{
   codexExecutable: string;
   /** Trusted command PATH; the only environment value the shell policy carries (never run-scoped credentials). */
   path: string;
+  /** Registered instruction working copy, exposed read-only to this thread. */
+  agentHome?: string;
   /** Server-registered run copy of instructions plus pinned instruction/skill bundle roots, all read-only. */
   instructionWorkingCopyRoot?: string;
   runtimeReadRoots?: readonly string[];
@@ -41,6 +43,7 @@ export function createSharedCodexThreadConfig(policy: SharedCodexThreadConfigPol
       ...(policy.runtimeReadRoots ?? []).map((root) => resolve(root)),
     ],
   }))));
+  if (policy.agentHome) config.shell_environment_policy.set.AGENT_HOME = policy.agentHome;
   // The launch environment flag would also switch the shell policy to inherit everything, so the admitted network setting is
   // applied to the profiles directly and the environment policy keeps inheriting nothing.
   for (const profile of Object.values(config.permissions as Record<string, { network: { enabled: boolean } }>)) profile.network.enabled = policy.networkAccess;

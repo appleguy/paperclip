@@ -79,7 +79,7 @@ export function sharedThreadConfigViolation(config: unknown, policy: { cwd: stri
     if (!isRecord(env) || Object.keys(env).some((key) => !SHELL_POLICY_KEYS.has(key)) || env.inherit !== "none") return "shell_environment_widened";
     if (env.ignore_default_excludes !== undefined && typeof env.ignore_default_excludes !== "boolean") return "shell_environment_invalid";
     if (env.include_only !== undefined && (!Array.isArray(env.include_only) || env.include_only.some((name) => typeof name !== "string"))) return "shell_environment_invalid";
-    if (env.set !== undefined && (!isRecord(env.set) || Object.values(env.set).some((value) => typeof value !== "string"))) return "shell_environment_invalid";
+    if (env.set !== undefined && (!isRecord(env.set) || Object.entries(env.set).some(([key, value]) => !["PATH", "AGENT_HOME"].includes(key) || typeof value !== "string"))) return "shell_environment_invalid";
   } else return "shell_environment_missing";
   return null;
 }
