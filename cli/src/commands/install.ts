@@ -88,6 +88,19 @@ export function resolveGitInstallWorkspacePackages(checkoutPath: string): Releas
   return ordered;
 }
 
+export function prepareGitInstallSkills(checkoutPath: string, workspacePackages: ReleasePackageEntry[]): void {
+  const sourceSkills = path.join(checkoutPath, "skills");
+  for (const workspacePackage of workspacePackages) {
+    const packageDir = path.join(checkoutPath, workspacePackage.dir);
+    const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { files?: string[] };
+    if (!packageJson.files?.includes("skills")) continue;
+    if (!fs.existsSync(sourceSkills)) throw new Error("Missing root skills directory in " + checkoutPath);
+    const targetSkills = path.join(packageDir, "skills");
+    fs.rmSync(targetSkills, { recursive: true, force: true });
+    fs.cpSync(sourceSkills, targetSkills, { recursive: true });
+  }
+}
+
 export function reconcileStagedWorkspaceVersions(sourcePackageDir: string, stagedPackageDir: string, workspaceVersions: Record<string, string>): boolean {
   const source = JSON.parse(fs.readFileSync(path.join(sourcePackageDir, "package.json"), "utf8")) as Record<string, Record<string, string>>;
   const stagedPath = path.join(stagedPackageDir, "package.json");
@@ -329,23 +342,13 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("corepack", ["pnpm", "--filter", "@paperclipai/server", "run", "prepare:ui-dist"],
       { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
-    const rootSkills = path.join(checkoutPath, "skills");
-    if (fs.existsSync(rootSkills)) {
-      fs.cpSync(rootSkills, path.join(checkoutPath, "server", "skills"), { recursive: true });
-    }
     const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
+    prepareGitInstallSkills(checkoutPath, workspacePackages);
     const workspaceVersions = Object.fromEntries(workspacePackages.map((entry) => [
       entry.name,
       (JSON.parse(fs.readFileSync(path.join(checkoutPath, entry.dir, "package.json"), "utf8")) as { version: string }).version,
     ]));
-    for (const workspacePackage of workspacePackages) {
-      const packageDir = path.join(checkoutPath, workspacePackage.dir);
-      const packageFiles = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")).files as string[] | undefined;
-      if (workspacePackage.name !== "@paperclipai/server" && packageFiles?.includes("skills") && !fs.existsSync(path.join(packageDir, "skills"))) {
-        fs.mkdirSync(path.join(packageDir, "skills"), { recursive: true });
-      }
-    }
     for (const [index, workspacePackage] of workspacePackages.entries()) {
       const packageDir = path.join(checkoutPath, workspacePackage.dir);
       const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { bundleDependencies?: string[]; bundledDependencies?: string[] };

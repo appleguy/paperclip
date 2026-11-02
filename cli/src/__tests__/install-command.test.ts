@@ -7,6 +7,7 @@ import {
   installCommand,
   installGitPayload,
   hydrateEmbeddedPostgresSymlinks,
+  prepareGitInstallSkills,
   reconcileStagedWorkspaceVersions,
   resolveGitHubRef,
   resolveGitInstallRequest,
@@ -125,6 +126,32 @@ describe("managed install commands", () => {
     expect(JSON.parse(fs.readFileSync(path.join(staged, "package.json"), "utf8")).dependencies)
       .toEqual({ "@paperclipai/plugin-sdk": "1.0.0", "@paperclipai/shared": "^0.3.1" });
     expect(reconcileStagedWorkspaceVersions(source, staged, versions)).toBe(false);
+  });
+
+  it("stages real skills for server and both local adapters", () => {
+    const checkout = path.join(root, "checkout");
+    const sourceSkills = path.join(checkout, "skills", "paperclip");
+    fs.mkdirSync(sourceSkills, { recursive: true });
+    fs.writeFileSync(path.join(sourceSkills, "SKILL.md"), "expected skill content");
+    const packages = [
+      { dir: "server", name: "@paperclipai/server" },
+      { dir: "packages/adapters/claude-local", name: "@paperclipai/adapter-claude-local" },
+      { dir: "packages/adapters/codex-local", name: "@paperclipai/adapter-codex-local" },
+    ];
+    for (const entry of packages) {
+      const target = path.join(checkout, entry.dir);
+      fs.mkdirSync(path.join(target, "skills"), { recursive: true });
+      fs.writeFileSync(path.join(target, "package.json"), JSON.stringify({ files: ["dist", "skills"] }));
+      fs.writeFileSync(path.join(target, "skills", "stale.txt"), "stale");
+    }
+    prepareGitInstallSkills(checkout, packages);
+    for (const entry of packages) {
+      const target = path.join(checkout, entry.dir, "skills");
+      expect(fs.readFileSync(path.join(target, "paperclip", "SKILL.md"), "utf8")).toBe("expected skill content");
+      expect(fs.existsSync(path.join(target, "stale.txt"))).toBe(false);
+    }
+    fs.rmSync(path.join(checkout, "skills"), { recursive: true });
+    expect(() => prepareGitInstallSkills(checkout, packages)).toThrow("Missing root skills directory");
   });
 
   it("hydrates a bundled Postgres native package before activation", async () => {
