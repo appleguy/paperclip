@@ -28,6 +28,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { issueService } from "../services/issues.ts";
 import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
 import { PaperclipRunnerToolAuthority } from "../services/native-runtime/paperclip-runner-tool-authority.js";
 
@@ -252,6 +253,31 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
     return { companyId, agentId, issueId, nextCheckAt };
   }
+
+  it("dedupes no-delta monitor comments server-side but accepts human-triggered updates", async () => {
+    const { companyId, issueId, agentId } = await seedFixture();
+    const initialRunId = randomUUID(), monitorRunId = randomUUID(), freshRunId = randomUUID();
+    await db.insert(heartbeatRuns).values([
+      { id: initialRunId, companyId, agentId, status: "succeeded",
+        contextSnapshot: { issueId, wakeReason: "issue_assigned" } },
+      { id: monitorRunId, companyId, agentId, status: "succeeded",
+        contextSnapshot: { issueId, wakeReason: "issue_monitor_due" } },
+      { id: freshRunId, companyId, agentId, status: "succeeded",
+        contextSnapshot: { issueId, wakeReason: "issue_monitor_due" } },
+    ]);
+    const svc = issueService(db);
+    const first = await svc.addComment(issueId, "No changes yet", { agentId, runId: initialRunId });
+    const duplicate = await svc.addComment(issueId, "Still no changes", { agentId, runId: monitorRunId });
+    expect(duplicate.id).toBe(first.id);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toHaveLength(1);
+
+    await db.insert(issueComments).values({
+      companyId, issueId, authorType: "user", authorUserId: "local-board", body: "The deploy finished.",
+    });
+    const published = await svc.addComment(issueId, "Deploy verified", { agentId, runId: freshRunId });
+    expect(published.id).not.toBe(first.id);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toHaveLength(3);
+  });
 
   it("coalesces unchanged monitor wakes with exponential backoff until human input", async () => {
     const { companyId, issueId, agentId } = await seedFixture();
