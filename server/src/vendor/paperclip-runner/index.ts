@@ -45,6 +45,9 @@ export type {
   NativeExecutionInputV9,
   NativeExecutionInputV10,
   NativeExecutionInputV11,
+  NativeExecutionInputV12,
+  NativeExecutionInputV13,
+  ClaudeInteractiveNativePort,
   MuseBindingSnapshot,
   DotBindingSnapshot,
   ExternalProviderPort,
@@ -61,6 +64,7 @@ export type {
   NativeRuntimeContextSnapshot,
   NativeSession,
   NativeSessionBackend,
+  OpenCodeSharedNativePort,
   NativeSessionGoalControl,
   OpenControlPlaneRunInput,
   PersistedNativeSession,
@@ -94,14 +98,15 @@ const sourceUrl = new URL(
 const runner = (await import(sourceUrl.href)) as RunnerModule;
 
 export const OpenCodeV2Shared = runner.OpenCodeV2Shared;
-export const startOpenCodeMcpBridge = runner.startOpenCodeMcpBridge;
-
 export const DurablePrpControlPlane = runner.DurablePrpControlPlane;
 export const decodeDurablePrpCheckpoint = runner.decodeDurablePrpCheckpoint;
 export const inspectDurablePrpCheckpointHeader = runner.inspectDurablePrpCheckpointHeader;
 export const RUNNER_PRP_PROTOCOL_MIN = runner.RUNNER_PRP_PROTOCOL_MIN;
 export const RUNNER_PRP_PROTOCOL_MAX = runner.RUNNER_PRP_PROTOCOL_MAX;
 export const runnerCodexDynamicToolsFit = runner.runnerCodexDynamicToolsFit;
+export const nativeSystemInstructions = runner.nativeSystemInstructions;
+export const codexSemanticToolSpecs = runner.codexSemanticToolSpecs;
+export const authorizedToolSetForProvider = runner.authorizedToolSetForProvider;
 export const inspectWarmRunTransition = runner.inspectWarmRunTransition;
 export const readRunnerdArtifactBinding = runner.readRunnerdArtifactBinding;
 export const readLinuxProcessStartedAt = runner.readLinuxProcessStartedAt;
@@ -131,9 +136,15 @@ export const opencodeRuntimeSessionDirectoryName =
 export const canonicalNativeRuntimeContextDigest =
   runner.canonicalNativeRuntimeContextDigest;
 export const createNativeSessionBackend = runner.createNativeSessionBackend;
+export const OpenCodeSharedNativeBackend = runner.OpenCodeSharedNativeBackend;
+export const PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA = runner.PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA;
+export const PRP_COMPLETION_TOOL_DESCRIPTION = runner.PRP_COMPLETION_TOOL_DESCRIPTION;
+export const startOpenCodeProviderProxy = runner.startOpenCodeProviderProxy;
 export const describeRunnerdNativeSessionBackend = runner.describeRunnerdNativeSessionBackend;
 export const createPaperclipRunnerAuthorizedToolSet =
   runner.createPaperclipRunnerAuthorizedToolSet;
+export const createSharedCodexThreadConfig = runner.createSharedCodexThreadConfig;
+export const sharedThreadConfigViolation = runner.sharedThreadConfigViolation;
 export const createRunnerdCodexTransport: (
   options?: import("@paperclipai/paperclip-runner").RunnerdCodexTransportOptions,
 ) => import("@paperclipai/paperclip-runner").RunnerdCodexTransport =
@@ -198,6 +209,7 @@ export const bundledRemoteRunnerBinary = runner.bundledRemoteRunnerBinary;
 
 export const externalOperationDigest = runner.externalOperationDigest;
 export const digestPaperclipSemanticContent = runner.digestPaperclipSemanticContent;
+export const startOpenCodeMcpBridge = runner.startOpenCodeMcpBridge;
 export const CONFIGURED_ENVIRONMENT_KEYS = runner.CONFIGURED_ENVIRONMENT_KEYS;
 export const GENERATED_RUNTIME_ENVIRONMENT_KEYS = runner.GENERATED_RUNTIME_ENVIRONMENT_KEYS;
 export const configuredEnvironmentProjection = runner.configuredEnvironmentProjection;

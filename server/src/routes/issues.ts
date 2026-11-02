@@ -1,4 +1,5 @@
 import { notifyNativeRecoveryNotices } from "../services/native-recovery-notice-notifications.js";
+import { startOpenCodeSharedHost } from "../services/native-runtime/opencode-shared-host.js";
 import { notifyNativeStatusReassessment } from "../services/native-status-reassessment-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "../services/unsafe-workspace-export-notifications.js";
 import { notifyChatInboundWakeNotices } from "../services/chat-inbound-wake-notice-notifications.js";
@@ -261,6 +262,7 @@ import { privateJsonEtag } from "../middleware/private-json-etag.js";
 import { createRequestPromiseMemo } from "../lib/request-promise-memo.js";
 import {
   assertBoard,
+  assertInstanceAdmin,
   assertCompanyAccess,
   getAccessibleResource,
   getActorInfo,
@@ -17014,6 +17016,26 @@ export function issueRoutes(
       res.json(await runRedactions.redactForIssue(issue.companyId, issue.id, result.queue));
     },
   );
+
+  router.post("/issues/:id/opencode-shared/empty-observation", async (req, res) => {
+    assertInstanceAdmin(req);
+    if (!req.actor.userId) throw forbidden("Board user context required");
+    const issue = await getAccessibleResource(req, res, getIssueById(req, req.params.id as string), "Issue not found");
+    if (!issue) return;
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    if (!z.object({}).strict().safeParse(req.body ?? {}).success) throw badRequest("Invalid observation request");
+    const executable = process.env.PAPERCLIP_OPENCODE_V2_EXECUTABLE;
+    const dataRoot = process.env.PAPERCLIP_OPENCODE_V2_DATA_ROOT;
+    if (!executable || !dataRoot) throw badRequest("OpenCode shared observation is not configured");
+    const actor = getActorInfo(req);
+    await logActivity(db, { companyId: issue.companyId, actorType: actor.actorType, actorId: actor.actorId, agentId: actor.agentId, runId: actor.runId, agentApiKeyId: actor.agentApiKeyId, action: "issue.opencode_empty_observation_requested", entityType: "issue", entityId: issue.id, details: { managed: false } });
+    const host = await startOpenCodeSharedHost({ executable, dataRoot });
+    let observation: Awaited<ReturnType<typeof host.createEmptyObservation>>;
+    try { observation = await host.createEmptyObservation(); }
+    finally { await host.shutdown(); }
+    await logActivity(db, { companyId: issue.companyId, actorType: actor.actorType, actorId: actor.actorId, agentId: actor.agentId, runId: actor.runId, agentApiKeyId: actor.agentApiKeyId, action: "issue.opencode_empty_observation_completed", entityType: "issue", entityId: issue.id, details: { sessionId: observation.sessionId, generation: observation.generation, managed: false } });
+    res.json({ issueId: issue.id, ...observation });
+  });
 
   router.get("/issues/:id/chat-handoffs", async (req, res) => {
     assertBoard(req);

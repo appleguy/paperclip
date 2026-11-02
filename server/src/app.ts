@@ -68,6 +68,7 @@ import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
 import { cancelledNativeCleanupRoutes } from "./routes/cancelled-native-cleanup.js";
 import { claudeNativePresenceRoutes } from "./routes/claude-native-presence.js";
 import { nativeSessionCatalogRoutes } from "./routes/native-session-catalog.js";
+import { claudeLiveSessions } from "./services/native-runtime/claude-native-live-sessions.js";
 import { resolveClaudeNativeHostSettings } from "./services/claude-native-host-settings.js";
 import {
   privateHostnameGuard,
@@ -666,7 +667,9 @@ export async function createApp(
   api.use(nativeSessionCatalogRoutes(db));
   api.use(cancelledNativeCleanupRoutes(db));
   api.use(claudeNativePresenceRoutes({
+    db,
     resolveHostSettings: resolveClaudeNativeHostSettings,
+    liveSessions: claudeLiveSessions,
   }));
   api.use("/health", health);
   api.use(openApiRoutes());

@@ -9,6 +9,8 @@ import { connectionManagementGuard, connectionRequestContext, connectionRequestU
 import { cancellationRequestId } from "../services/native-runtime/native-cancellation-request.js";
 import { agentHarnessType, isEnvironmentDriverSupportedForAdapter, normalizeClaudeRunnerOptions, type AgentConfigurationWarning, type AgentRunnerChoice } from "@paperclipai/shared";
 import { resolveNewAgentRunnerForCompany } from "../services/agent-runner-selection.js";
+import { readAgentEngineTelemetry } from "../services/agent-engine-telemetry.js";
+import { openCodeSessionIdFromRunLog, readNativeReasoning } from "../services/agent-native-reasoning.js";
 import { agentEnvironmentTestService } from "../services/agent-environment-test.js";
 import { qualifyAgentRunner } from "../services/agent-runner-qualification.js";
 import { createAgentLifecycle } from "../services/agent-lifecycle.js";
@@ -4199,6 +4201,18 @@ export function agentRoutes(
     res.json(await buildAgentDetail(agent));
   });
 
+  // Model-independent, authenticated inspector telemetry. Only registered provider
+  // adapters may read fixed engine endpoints; requests cannot choose a target.
+  router.get("/agents/:id/engine-telemetry", async (req, res) => {
+    const agent = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Agent not found");
+    if (!agent || !(await assertAgentReadAllowed(req, res, agent))) return;
+    if (!(await assertRunTelemetryReadAllowed(req, res, agent.companyId))) return;
+    const config = agent.adapterConfig as Record<string, unknown> | null;
+    const model = typeof config?.model === "string" ? config.model : "";
+    res.set("Cache-Control", "no-cache, no-store");
+    res.json(await readAgentEngineTelemetry(model));
+  });
+
   router.get("/agents/:id/configuration", async (req, res) => {
     const id = req.params.id as string;
     const agent = await svc.getById(id);
@@ -7697,6 +7711,27 @@ export function agentRoutes(
     } finally {
       res.off("close", cancelRead);
     }
+  });
+
+  // OpenCode emits tool calls into Paperclip logs but persists reasoning
+  // separately in local SQLite. Resolve the native session only from the
+  // authorized run's own log, never from a caller-supplied session identifier.
+  router.get("/heartbeat-runs/:runId/native-reasoning", async (req, res) => {
+    const runId = readHeartbeatRunId(req);
+    const run = await getAccessibleResource(req, res, heartbeat.getRunLogAccess(runId), "Heartbeat run not found");
+    if (!run) return;
+    if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
+    if (!(await assertRunReadAllowed(req, res, run))) return;
+    const fullRun = await heartbeat.getRun(runId);
+    const agent = fullRun?.agentId && fullRun.companyId === run.companyId ? await svc.getById(fullRun.agentId) : null;
+    const config = (agent?.adapterConfig ?? null) as Record<string, unknown> | null;
+    const model = typeof config?.model === "string" ? config.model : "";
+    const log = await heartbeat.readLog(run, { offset: 0, limitBytes: 16_384 });
+    const sessionId = openCodeSessionIdFromRunLog(log.content);
+    const result = readNativeReasoning(model, sessionId, fullRun?.startedAt ?? null, fullRun?.finishedAt ?? null);
+    const userOptions = await getCurrentUserRedactionOptions();
+    res.set("Cache-Control", "no-cache, no-store");
+    res.json(await runRedactions.redactForRun(run.companyId, run.id, redactCurrentUserValue(result, userOptions)));
   });
 
   router.get("/heartbeat-runs/:runId/workspace-operations", async (req, res) => {

@@ -64,6 +64,12 @@ export async function commitOpenCodeSharedLog(db: Db, binding: OpenCodeSharedBin
     const [liveLease] = await tx.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.runId, binding.runId), gt(nativeRunFinalizations.leaseExpiresAt, sql`clock_timestamp()`))).limit(1);
     if (!liveLease) throw new Error("opencode_shared_lease_lost");
     await appendHeartbeatRunEvent(tx as unknown as Db, { companyId: binding.companyId, agentId: binding.agentId, runId: binding.runId, eventType: "opencode.shared.log", stream: "system", payload: { opencodeSharedV2: { sessionId: binding.providerSessionId, generation: binding.generation, epoch: binding.epoch, previous: input.previous, next: input.next, item } } });
+    // Closed, coarse UI projection from pinned v2 durable tool events. Never
+    // attribute a shared-session event to the dispatched prompt or expose tool input.
+    const data = item.type === "log.synced" ? {} : record(item.data);
+    const toolFact = typeof data.id === "string" && data.id.length > 0 && typeof data.assistantMessageID === "string" && data.assistantMessageID.startsWith("msg_") && typeof data.executed === "boolean";
+    const progress = !toolFact ? null : item.type === "session.tool.called" ? "tool.execution.started" : item.type === "session.tool.success" || item.type === "session.tool.failed" ? "tool.execution.completed" : null;
+    if (progress) await appendHeartbeatRunEvent(tx as unknown as Db, { companyId: binding.companyId, agentId: binding.agentId, runId: binding.runId, eventType: progress, stream: "system", payload: { opencodeSharedV2: { sessionId: binding.providerSessionId, generation: binding.generation, epoch: binding.epoch, sourceEventId: item.id, sourceSeq: input.next, origin: "unknown" } } });
     await tx.update(agentTaskSessions).set({ sessionParamsJson: { ...params, opencodeSharedV2: { ...native, cursor: input.next } }, updatedAt: sql`clock_timestamp()` }).where(eq(agentTaskSessions.id, binding.taskSessionId));
   });
 }

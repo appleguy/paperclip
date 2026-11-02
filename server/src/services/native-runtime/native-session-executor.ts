@@ -1,4 +1,7 @@
 import { measureRunnerOperation, recordRunnerTimingReceipt } from "./runner-operation-timing.js";
+import { getOpenCodeRetainedOwnership, startOpenCodeManagedBackend } from "./opencode-managed-admission.js";
+import { startClaudeNativeSession } from "./claude-native-port.js";
+import { resolveClaudeNativeHostSettings } from "../claude-native-host-settings.js";
 import {
   assessCancelledNativeOwner, buildCancelledBridgeSettlementPlan, cancelledBridgeSettlementDigest,
   consumePreparedCancelledIntent, exactCancelledClosedActivationMatches,
@@ -140,6 +143,7 @@ import {
   opencodeRuntimeSessionDirectoryName,
   createNativeSessionBackend,
   createRunnerdCodexTransport,
+  createSharedCodexThreadConfig,
   executeNativeSession,
   applyNativeSessionGoalControl,
   inspectWarmRunTransition,
@@ -243,7 +247,11 @@ import { createNativeHarnessBackupStamp } from "./native-harness-backup-stamp.js
 import { noteNativeRunnerEvidence } from "./native-runner-evidence-signal.js";
 import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
 import { registerLiveRunnerGoalController } from "../runner-goal-control-broker.js";
-import { applyRunnerGoalPrpEvent } from "../runner-goals.js";
+import { registerCodexSharedGoalController } from "./codex-shared-goal-controller.js";
+import { claimRegisteredCodexSharedOption, type CodexSharedServerOption } from "./codex-shared-admission.js";
+import { nativeSystemInstructions, codexSemanticToolSpecs, authorizedToolSetForProvider } from "../../vendor/paperclip-runner/index.js";
+import { applyRunnerGoalPrpEvent, runnerGoalService } from "../runner-goals.js";
+import { createCodexSharedOverrunPause } from "./codex-shared-overrun-pause.js";
 import { readProcessStartedAt } from "../hot-restart.js";
 import {
   NativeRunnerOwnershipUnverifiedError,
@@ -265,11 +273,22 @@ type ActiveNativeSession = {
   restartDetach?: Promise<void>;
 };
 
-class NativeResultPendingFinalizationError extends Error {
+export class NativeResultPendingFinalizationError extends Error {
   constructor() {
     super("native_result_pending_finalization");
     this.name = "NativeResultPendingFinalizationError";
   }
+}
+
+/**
+ * A returned result does not prove a Claude tool effect stopped. A refused close is turned into a failure so the
+ * executor's failure boundary (which holds run/task/lease ownership) records it instead of the outer finally swallowing it.
+ */
+export async function assertClaudeEffectsSettledAfterResult(port: { close(): Promise<void> } | undefined): Promise<void> {
+  if (!port) return;
+  await port.close().catch(() => {
+    throw new Error("claude_native_effects_unsettled: a tool effect is still in flight after the session returned");
+  });
 }
 
 export class NativeCancellationPendingRecoveryError extends Error {
@@ -1873,6 +1892,8 @@ function nativeProviderSessionScope(execution: NativeExecutionInput) {
       };
     case "codex":
     case "opencode":
+    case "opencode_shared_v2":
+    case "claude_interactive":
     case "antigravity_headless":
       // These local providers have no separate persisted profile id. Company,
       // agent, and workspace bind their credential/session context; mutable
@@ -6057,6 +6078,8 @@ function canonicalJson(value: unknown): string {
 
 function runnerProviderStateFilename(execution: NativeExecutionInput): string {
   switch (execution.provider.kind) {
+    case "opencode_shared_v2": return "opencode-shared-provider-state.json";
+    case "claude_interactive": return "claude-interactive-provider-state.json";
     case "antigravity_headless": return "antigravity-provider-state.json";
     case "muse": return "muse-provider-state.json";
     case "grok_bot":
@@ -6094,6 +6117,8 @@ export function providerSessionIdentityFromDurableProviderState(input: {
     providerSessionIdentity: null,
   });
   switch (input.execution.provider.kind) {
+    case "opencode_shared_v2":
+    case "claude_interactive":
     case "antigravity_headless":
     case "muse":
     case "grok_bot":
@@ -7923,6 +7948,12 @@ export function resolveNativeCancellationStatus(input: {
 }
 
 export async function executePaperclipNativeSession(input: {
+  /** Internal server-issued capability; never constructed from agent inputs. */
+  codexShared?: CodexSharedServerOption;
+  /** Internal admission observer; the callback runs before the first task turn. */
+  onCodexSharedSessionReady?: () => Promise<void>;
+  /** Test/proof seam: runs with the live event consumer and before any provider turn (codex shared only). */
+  onCodexSharedEventConsumerReady?: () => Promise<void>;
   casesEnabled?: boolean;
   getFreshSessionHandoff?: () => Promise<string | null>;
   /** Retire a retained transport so recovery can replace provider tool declarations. */
@@ -7957,8 +7988,10 @@ export async function executePaperclipNativeSession(input: {
   instructionWorkingCopy?: NativeInstructionWorkingCopy;
   /** Persist task-level continuity before a durable goal can outlive this run. */
   onUsage?: (receipt: AdapterUsageCheckpoint) => Promise<void>;
-  onGoalCheckpoint?: (snapshot: PersistedNativeSession) => Promise<void>;
+  onGoalCheckpoint?: (snapshot: PersistedNativeSession, lease: { owner: string; attempt: number; runnerInstanceId: string; controller: { bootId: string; pid: number; processStartedAt: Date } }) => Promise<void>;
+  onOpenCodeFinalCheckpoint?: (session: { normalizedSessionId: string; providerSessionId: string | null; result: PrpStructuredRunResult }, lease: { owner: string; attempt: number; runnerInstanceId: string; controllerGeneration: number; controller: { bootId: string; pid: number; processStartedAt: Date } }) => Promise<string>;
   sessionGoalControl?: NativeSessionGoalControl | null;
+  applySessionGoalControl?: (control: NativeSessionGoalControl) => Promise<unknown>;
   resumeSessionGoalHeartbeat?: boolean;
   preparationSpans?: NativeRunHistoricalSpan[];
   /** Use a session-owned GitHub broker, rebound only after run ownership is acquired. */
@@ -8221,6 +8254,8 @@ async function executePaperclipNativeSessionWithinScope(
     input.execution.provider.kind !== "claude_managed" &&
     input.execution.provider.kind !== "aws_agentcore" &&
     input.execution.provider.kind !== "acpx" &&
+    input.execution.schema !== "paperclip.native-execution-input.v12" &&
+    input.execution.schema !== "paperclip.native-execution-input.v13" &&
     input.execution.schema !== "paperclip.native-execution-input.v6" &&
     input.execution.schema !== "paperclip.native-execution-input.v8"
   ) {
@@ -8639,6 +8674,7 @@ async function executePaperclipNativeSessionWithinScope(
   let sessionStartupMode: "bootstrap" | "resume" | null = null;
   let turnSubmittedAtMs: number | null = null;
   let turnStartedAtMs: number | null = null;
+  let observeCodexOverrun: ((event: { eventType: string; payload?: unknown }) => Promise<void>) | null = null;
   let firstAgentEventRecorded = false;
   let firstTokenRecorded = false;
   const observeDeliverableText = createNativeDeliverableTextObservation();
@@ -8942,6 +8978,8 @@ async function executePaperclipNativeSessionWithinScope(
             "stdout",
             `${JSON.stringify({ type: "paperclip.prp.event", event })}\n`,
           );
+        // Hard stop for a shared-Codex ACTIVE goal; detached because the pause is routed back through this same session.
+        if (observeCodexOverrun) void observeCodexOverrun(event).catch(() => undefined);
         if (
           input.onEvent &&
           [
@@ -9060,6 +9098,7 @@ async function executePaperclipNativeSessionWithinScope(
     const release: unknown = releaseGoalController;
     if (typeof release === "function") release();
     releaseGoalController = null;
+    observeCodexOverrun = null;
   };
   const lifecyclePolicy = input.execution.session?.lifecyclePolicy ?? {
     mode: "per_turn" as const,
@@ -9087,6 +9126,8 @@ async function executePaperclipNativeSessionWithinScope(
   let managedCredentialSession: NativeSession | undefined;
   let githubAccess: NativeGitHubAccess | undefined;
   let releaseGitHubRun: (() => void) | undefined;
+  // v13 Claude: launched before backend.openSession, so it must be settled here if no NativeSession ever took ownership of it.
+  let claudeAdmission: Awaited<ReturnType<typeof startClaudeNativeSession>> | undefined;
   let persistedWarmSession: PersistedNativeSession | null | undefined;
   if (warmSessionId !== null && warmConfigDigest !== null && !input.restartRecovery) {
     const entry = warmNativeSessions.get(warmSessionId);
@@ -9324,11 +9365,41 @@ async function executePaperclipNativeSessionWithinScope(
         verifiedVersion: "1.4.12", env: process.env, admit, withAdmission,
       } });
     }
+    let openCodeAdmission: Awaited<ReturnType<typeof startOpenCodeManagedBackend>> | undefined;
+    let openCodeBackend: ReturnType<typeof createNativeSessionBackend> | undefined;
+    if (input.execution.schema === "paperclip.native-execution-input.v12" && input.backend === undefined) {
+      if (!input.useRunnerd || input.runnerExecutionTarget?.kind === "remote" || input.restartRecovery || !input.execution.workspace.cwd || input.execution.runtimeContext.mcp.bindingId) throw new Error("opencode_shared_requires_fresh_local_admission");
+      const cli = process.env.PAPERCLIP_OPENCODE_V2_CLI?.trim();
+      if (!cli || !cli.startsWith("/")) throw new Error("opencode_shared_cli_not_configured");
+      const execution = input.execution, binding = execution.binding;
+      const authority = new PaperclipRunnerToolAuthority(input.db, { companyId: binding.companyId, issueId: binding.issueId, runId: binding.runId, agentId: binding.agentId, normalizedSessionId: execution.session.normalizedSessionId!, casesEnabled: input.casesEnabled === true, pinnedMcpDigest: execution.runtimeContext.mcp.digest, runtimeContext: execution.runtimeContext, workMode: execution.task.workMode, workspaceRoot: execution.workspace.cwd, executionTargetKind: "local", currentWakeComments: expectedCurrentWakeComments ?? undefined, chatAttachmentReadScope: input.chatAttachmentReadScope, stopTaskForReassignment: input.stopTaskForReassignment, syncIssueExternalObjects: input.syncIssueExternalObjects, enqueueWakeup: input.enqueueWakeup });
+      if (!input.runnerEnvironment) throw new Error("opencode_shared_provider_profile_unavailable");
+      const environment = input.runnerEnvironment;
+      // A Paperclip endpoint can route to a local engine even when it uses a
+      // non-loopback address. Until its existing host lease can be bound to
+      // this run, do not infer admission from the URL or a catalog response.
+      if (execution.provider.model.startsWith("paperclip/")) throw new Error("opencode_shared_local_model_lease_unavailable");
+      openCodeAdmission = await startOpenCodeManagedBackend(input.db, { execution, runnerInstanceId: effectiveRunnerInstanceId, leaseOwner, attempt, controller, executable: cli, dataRoot: resolve(resolvePaperclipInstanceRoot(), "runtime", "paperclip-runner", "opencode-shared"), environment, authority, completionFeedback: async result => { assertControllerActive(); return nativeCompletionFeedback(input.db, binding.runId, result); } });
+      openCodeBackend = createNativeSessionBackend(execution, { runnerInstanceId: effectiveRunnerInstanceId, opencodeSharedAuthority: { port: openCodeAdmission.admitted.port, model: execution.provider.model, effort: execution.provider.effort, version: execution.provider.cliVersion } });
+    }
+    // v13: the executor launches the ONE genuine Claude interactive session; the managed service adopts it (no second launch).
+    let claudeBackend: ReturnType<typeof createNativeSessionBackend> | undefined;
+    if (input.execution.schema === "paperclip.native-execution-input.v13" && input.backend === undefined) {
+      if (input.runnerExecutionTarget?.kind === "remote" || input.restartRecovery || !input.execution.workspace.cwd) throw new Error("claude_interactive_requires_fresh_local_admission");
+      const stateDirectory = process.env.PAPERCLIP_CLAUDE_INTERACTIVE_STATE_DIR?.trim(), hookHelperExecutable = process.env.PAPERCLIP_CLAUDE_HOOK_HELPER?.trim();
+      if (!stateDirectory || !hookHelperExecutable) throw new Error("claude_interactive_host_not_configured");
+      const execution = input.execution, binding = execution.binding;
+      claudeAdmission = await startClaudeNativeSession(input.db, { execution, runnerInstanceId: effectiveRunnerInstanceId, leaseOwner, attempt, controller, assertControllerActive,
+        completionFeedback: async result => { assertControllerActive(); return nativeCompletionFeedback(input.db, binding.runId, result); },
+        host: { ...(await resolveClaudeNativeHostSettings()), stateDirectory, hookHelperExecutable } });
+      claudeBackend = createNativeSessionBackend(execution, { runnerInstanceId: effectiveRunnerInstanceId, claudeInteractiveAuthority: { port: claudeAdmission.port, model: execution.provider.model, effort: execution.provider.effort } });
+    }
     let remoteWarmRecoveryPending = remoteWarmRecovery !== undefined;
     let runnerdBackend =
-      antigravityBackend ?? (input.useRunnerd && input.backend === undefined
+      openCodeBackend ?? claudeBackend ?? antigravityBackend ?? (input.useRunnerd && input.backend === undefined
         ? await timeController("backend_setup", () => createRunnerdBackend({
             ...input,
+            codexSharedLease: {owner:leaseOwner,attempt,controller,onAdmitted:option=>{input={...input,codexShared:option};}},
             controllerPersistence: input.runnerExecutionTarget?.kind === "remote" ? {
               bootId: controller.bootId,
               runnerArtifact: restoredController ? { version: restoredController.runnerVersion, digest: restoredController.runnerDigest } : undefined,
@@ -9394,6 +9465,7 @@ async function executePaperclipNativeSessionWithinScope(
           executeNativeSession({
             resumeInterruptedTurn: input.restartRecovery?.kind === "resume_dead_runner",
             getFreshSessionHandoff: input.getFreshSessionHandoff,
+            ...(input.codexShared && input.onCodexSharedEventConsumerReady ? { onEventConsumerReady: input.onCodexSharedEventConsumerReady } : {}),
             onSessionAdmission: async () => {
               // Invalidate prior stop evidence before a backend can spawn.
               await appendHeartbeatRunEvent(input.db, {
@@ -9407,6 +9479,8 @@ async function executePaperclipNativeSessionWithinScope(
               });
             },
             input: runnerExecution,
+            ...(openCodeAdmission ? { authorizeWorkSessionResult: openCodeAdmission.admitted.authorizeWorkSessionResult } : {}),
+            ...(claudeAdmission ? { authorizeWorkSessionResult: claudeAdmission.authorizeWorkSessionResult } : {}),
             remoteCleanupScope: remoteCleanupLease ? remoteLeaseCleanupScope(remoteCleanupLease) : undefined,
             turnTimeoutMs: input.turnTimeoutMs,
             backend:
@@ -9476,6 +9550,7 @@ async function executePaperclipNativeSessionWithinScope(
             persistedSession: persistedWarmSession,
             keepSessionOpen: warmSessionId !== null,
             sessionGoalControl: input.sessionGoalControl,
+            applySessionGoalControl: input.applySessionGoalControl,
             resumeSessionGoalHeartbeat: input.resumeSessionGoalHeartbeat,
             requireSessionCloseBeforeReturn: runnerdBackend !== null || input.instructionWorkingCopy !== undefined,
             onSessionClosed: input.instructionWorkingCopy?.collectStopped,
@@ -9498,7 +9573,7 @@ async function executePaperclipNativeSessionWithinScope(
                 input.sessionGoalControl ||
                 input.resumeSessionGoalHeartbeat
               ) {
-                await input.onGoalCheckpoint?.(snapshot);
+                await input.onGoalCheckpoint?.(snapshot, { owner: leaseOwner, attempt, runnerInstanceId: effectiveRunnerInstanceId, controller });
               }
             },
             onPostCompletionEnrichmentFailure: async ({ stage, error }) => {
@@ -9552,7 +9627,21 @@ async function executePaperclipNativeSessionWithinScope(
               releaseRegisteredGoalController();
               liveQuestions.close();
               if (session?.goal) {
-                releaseGoalController = registerLiveRunnerGoalController(
+                const sharedBinding=input.codexShared?.admission.binding();
+                if (input.codexShared) {
+                  if (!sharedBinding) throw new Error("codex_shared_bootstrap_binding_missing");
+                  releaseGoalController=registerCodexSharedGoalController({
+                    db:input.db,binding:sharedBinding,
+                    session:{goal:async request=>session.goal!(request)},
+                    dispatch:async control=>applyNativeSessionGoalControl(session,control),
+                    createPaused:async control=>session.goal!({action:"set",objective:control.objective,status:"paused",requestId:control.requestId,...(control.tokenBudget!==undefined ? {tokenBudget:control.tokenBudget} : {})}),
+                    activate:async control=>session.goal!({action:"set",objective:control.objective,status:"active",tokenBudget:control.tokenBudget,requestId:control.requestId}),
+                    pause:async control=>session.goal!({action:"set",objective:control.objective,status:"paused",...(control.tokenBudget!==null ? {tokenBudget:control.tokenBudget} : {}),requestId:control.requestId}),
+                    attestDaemon:input.codexShared.attestDaemon,
+                  });
+                  observeCodexOverrun=createCodexSharedOverrunPause({threadId:sharedBinding.threadId,companyId:sharedBinding.companyId,issueId:sharedBinding.issueId,agentId:sharedBinding.agentId,goals:runnerGoalService(input.db)});
+                  await input.onCodexSharedSessionReady?.();
+                } else releaseGoalController = registerLiveRunnerGoalController(
                   {
                     companyId: input.execution.binding.companyId,
                     issueId: input.execution.binding.issueId,
@@ -9754,6 +9843,7 @@ async function executePaperclipNativeSessionWithinScope(
     activeNativeSessions.delete(input.execution.binding.runId);
     clearSteeringDeliveries(input.execution.binding.runId);
     clearNativeRuntimeRequestResolutions(input.execution.binding.runId);
+    await assertClaudeEffectsSettledAfterResult(claudeAdmission?.port);
   } catch (error) {
     // Preserve typed failure semantics while removing credentials before any
     // persistence, reporting, logging, or rethrow at this boundary.
@@ -9776,7 +9866,28 @@ async function executePaperclipNativeSessionWithinScope(
     }
     const protocolIntegrityFailure =
       error instanceof NativeSessionProtocolIntegrityError ? error : null;
+    // v13 Claude: a launched session whose tool effects cannot be settled is still running native work. Check this
+    // BEFORE any irreversible failure disposition; a refused close holds the run/task/resource ownership (same
+    // held-ownership semantics as an unauthenticated adopted runner) and the original failure stays as evidence.
+    const claudeEffectsRetained = claudeAdmission
+      ? await claudeAdmission.port.close().then(() => false, () => true)
+      : false;
+    // OpenCode (Terra's guard): a host this controller still owns holds ownership from host creation, including a
+    // failure before any admission was returned. A guard throw (owner mismatch) is also a hold, never a release.
+    let openCodeRetained: { durable: boolean; cause: string | null; providerSessionId: string | null; taskSessionId: string | null } | null = null;
+    {
+      const generation = await input.db.select({ generation: nativeRunFinalizations.controllerGeneration }).from(nativeRunFinalizations)
+        .where(eq(nativeRunFinalizations.runId, input.execution.binding.runId)).then(rows => rows[0]?.generation ?? -1, () => -1);
+      try {
+        const held = getOpenCodeRetainedOwnership({ runId: input.execution.binding.runId, leaseOwner, attempt, controllerGeneration: generation });
+        if (held) openCodeRetained = { durable: held.durable, cause: held.cause === undefined ? null : redactIdentityText(held.cause instanceof Error ? held.cause.message : String(held.cause)).slice(0, 500), providerSessionId: (held.binding as { providerSessionId?: string }).providerSessionId ?? null, taskSessionId: (held.binding as { taskSessionId?: string }).taskSessionId ?? null };
+      } catch (guardError) {
+        openCodeRetained = { durable: false, cause: redactIdentityText(guardError instanceof Error ? guardError.message : String(guardError)).slice(0, 500), providerSessionId: null, taskSessionId: null };
+      }
+    }
+    const nativeEffectsRetained = claudeEffectsRetained || openCodeRetained !== null;
     const ownershipUnverified =
+      nativeEffectsRetained ||
       nativeSessionFailureSourceCode(error) ===
       NATIVE_ADOPTED_RUNNER_AUTHENTICATION_TIMEOUT;
     const attemptFailureStep = async (operation: () => unknown) => {
@@ -9821,7 +9932,7 @@ async function executePaperclipNativeSessionWithinScope(
       // finished; a missing result must not overwrite cancellation or trigger
       // another turn to perform completion bookkeeping.
       const stoppedBeforeFirstTurn = error instanceof Error && error.message === "native_session_cancelled";
-      if (protocolIntegrityFailure === null && error instanceof Error &&
+      if (protocolIntegrityFailure === null && !nativeEffectsRetained && error instanceof Error &&
           (stoppedBeforeFirstTurn || error instanceof NativePermissionDeclinedError || error.message === "native_finalization_missing: session returned no semantic result")) {
         const [stoppedRun] = await input.db.select().from(heartbeatRuns).where(and(
           eq(heartbeatRuns.id, input.execution.binding.runId),
@@ -9863,8 +9974,9 @@ async function executePaperclipNativeSessionWithinScope(
         }
       }
       if (
-        error instanceof NativeResultPendingFinalizationError ||
-        error instanceof NativeCancellationPendingRecoveryError
+        !nativeEffectsRetained &&
+        (error instanceof NativeResultPendingFinalizationError ||
+        error instanceof NativeCancellationPendingRecoveryError)
       ) {
         // This is not a provider failure and must not overwrite the durable
         // result/coordinator state. The heartbeat boundary will either hand an
@@ -9895,15 +10007,15 @@ async function executePaperclipNativeSessionWithinScope(
         sourceFailureCode,
       );
       const phase =
-        recoveryEvidence.recoveryMode === "ambiguous_state"
+        recoveryEvidence.recoveryMode === "ambiguous_state" || nativeEffectsRetained
           ? ("terminal_failure" as const)
           : disposition.phase;
       const failureCode =
-        recoveryEvidence.recoveryMode === "ambiguous_state"
+        recoveryEvidence.recoveryMode === "ambiguous_state" || nativeEffectsRetained
           ? sourceFailureCode
           : disposition.failureCode;
       const nextAttemptAt =
-        recoveryEvidence.recoveryMode === "ambiguous_state"
+        recoveryEvidence.recoveryMode === "ambiguous_state" || nativeEffectsRetained
           ? null
           : disposition.nextAttemptAt;
       const recoveryProjection = nativeSessionRecoveryProjection({
@@ -9985,6 +10097,10 @@ async function executePaperclipNativeSessionWithinScope(
                         ? "Inspect the persisted runner events and checkpoint for a source-sequence integrity conflict; automatic recovery is stopped."
                         : sourceFailureCode === "native_provider_usage_limit"
                           ? "Restore model provider usage capacity, then explicitly retry the task. Automatic retries cannot resolve an exhausted provider allowance."
+                          : openCodeRetained
+                            ? "An OpenCode host owned by this controller is retained and its effects are not proven settled. Inspect the retained host; do not relaunch, re-prompt or replace the session until settlement is confirmed."
+                          : claudeEffectsRetained
+                            ? "A Claude tool effect is not settled and the live native session still owns this run. Inspect or interrupt the session; do not relaunch, re-prompt or replace it until its effects are confirmed settled."
                           : ownershipUnverified
                             ? "Inspect the retained runner's executable and authenticated connection. Do not replace its provider until ownership is safely resolved."
                             : exhausted
@@ -10084,7 +10200,11 @@ async function executePaperclipNativeSessionWithinScope(
             nativePhase: phase,
             nativePhaseUpdatedAt: now,
             error: message,
-            resultJson: sql`(coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) - 'remoteRunnerRecovery') || ${JSON.stringify(remoteRunnerRecovery ? { remoteRunnerRecovery } : {})}::jsonb`,
+            resultJson: sql`(coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) - 'remoteRunnerRecovery') || ${JSON.stringify({
+              ...(remoteRunnerRecovery ? { remoteRunnerRecovery } : {}),
+              ...(openCodeRetained ? { openCodeRetainedOwnership: { ...openCodeRetained, originalFailureCode: sourceFailureCode, originalError: message.slice(0, 500) } } : {}),
+              ...(claudeEffectsRetained ? { claudeRetainedOwnership: { nativeSessionId: input.execution.session.normalizedSessionId, originalFailureCode: sourceFailureCode, originalError: message.slice(0, 500) } } : {}),
+            })}::jsonb`,
             errorCode: ownershipUnverified
               ? NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE
               : sourceFailureCode,
@@ -10110,7 +10230,7 @@ async function executePaperclipNativeSessionWithinScope(
           (!failureTask.checkoutRunId ||
             failureTask.checkoutRunId === input.execution.binding.runId);
         let failureBlockStatusVersion: number | undefined;
-        if (stillOwnsTask && recoveryProjection.issueStatus) {
+        if (stillOwnsTask && recoveryProjection.issueStatus && !ownershipUnverified) {
           const projected = await issueService(tx as unknown as Db).update(
             input.execution.binding.issueId,
             { status: recoveryProjection.issueStatus },
@@ -10244,6 +10364,8 @@ async function executePaperclipNativeSessionWithinScope(
       if (protocolIntegrityFailure !== null) throw protocolIntegrityFailure;
     }
   } finally {
+    // Idempotent. Refuses (and keeps session, authority and registry) while a tool effect is unsettled; never kills native work.
+    await claudeAdmission?.port.close().catch(() => undefined);
     releaseGitHubRun?.();
     // A startup failure or onSession(null) must not leak a transport. A warm
     // owner retains only the inactive broker until its normal retirement.
@@ -10276,6 +10398,10 @@ async function executePaperclipNativeSessionWithinScope(
       });
     }
   }
+  const [openCodeLease] = input.execution.schema === "paperclip.native-execution-input.v12" ? await input.db.select({ generation: nativeRunFinalizations.controllerGeneration }).from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.runId, input.execution.binding.runId), eq(nativeRunFinalizations.leaseOwner, leaseOwner), eq(nativeRunFinalizations.attempt, attempt), eq(nativeRunFinalizations.controllerBootId, controller.bootId), eq(nativeRunFinalizations.controllerPid, controller.pid), eq(nativeRunFinalizations.controllerProcessStartedAt, controller.processStartedAt), gt(nativeRunFinalizations.leaseExpiresAt, sql`clock_timestamp()`))).limit(1) : [];
+  const openCodeFinalCheckpointRevision = openCodeLease
+    ? await input.onOpenCodeFinalCheckpoint?.({ normalizedSessionId: native.normalizedSessionId, providerSessionId: native.providerSessionId ?? null, result: native.result }, { owner: leaseOwner, attempt, runnerInstanceId: effectiveRunnerInstanceId, controllerGeneration: openCodeLease.generation, controller }) : undefined;
+  if (input.execution.schema === "paperclip.native-execution-input.v12" && !openCodeFinalCheckpointRevision) throw new Error("opencode_final_checkpoint_unavailable");
   const releaseNow = new Date();
   const released = await timeController("coordinator_release", () => input.db.transaction(async tx => {
     await notifyNativeFinalizationWork(tx, input.execution.binding);
@@ -10379,6 +10505,7 @@ async function executePaperclipNativeSessionWithinScope(
     resultJson: {
       nativeResult: native.result as unknown as Record<string, unknown>,
       nativeTerminal: native.terminal as unknown as Record<string, unknown>,
+      ...(openCodeFinalCheckpointRevision ? { openCodeFinalCheckpointRevision } : {}),
       ...((input.execution.schema === "paperclip.native-execution-input.v6" || input.execution.schema === "paperclip.native-execution-input.v8") ? { providerAccounting: { usage: null, cost: null, externallyBilled: true }, externalStopConfirmed: false } : {}),
       ...(providerFailure ? { nativeProviderFailure: providerFailure.diagnostic } : {}),
       ...(unclassifiedTurnFailure ? { nativeTurnFailure: unclassifiedTurnFailure } : {}),
@@ -11999,6 +12126,9 @@ export function remoteCheckpointIncompleteFailure(
 
 /** Production runnerd backend seam, exported so provider wiring can be regression tested. */
 export async function createRunnerdBackend(input: {
+  codexShared?: CodexSharedServerOption;
+  codexSharedLease?: {owner:string;attempt:number;controller:{bootId:string;pid:number;processStartedAt:Date};onAdmitted:(option:CodexSharedServerOption)=>void};
+  conversationMode?: boolean;
   casesEnabled?: boolean;
   db: Db;
   controllerPersistence?: { bootId: string; runnerArtifact?: { version: string; digest: string } };
@@ -12212,6 +12342,7 @@ async function createRunnerdBackendWithinSessionClaim(
   const target = input.runnerExecutionTarget ?? { kind: "local" as const };
   const remoteTarget = target.kind === "remote" ? target : null;
   const pluginTask = remoteTarget?.transport === "sandbox" ? remoteTarget.runnerTask : undefined;
+  if (input.codexShared && (input.execution.provider.kind!=="codex" || remoteTarget || retainedTransition || input.codexShared.daemon.writer.runId!==input.execution.binding.runId || input.codexShared.daemon.writer.runnerInstanceId!==input.runnerInstanceId || input.codexShared.daemon.writer.normalizedSessionId!==nativeSessionKey(input.execution))) throw new Error("codex_shared_admission_identity_mismatch");
   let runnerControlPlane: DurablePrpControlPlane | undefined;
   if (pluginTask && input.runnerIngressAuthorized !== true) throw new Error("runner_ingress_unavailable");
   if (pluginTask && (input.execution.schema === "paperclip.native-execution-input.v6" || input.execution.schema === "paperclip.native-execution-input.v8")) {
@@ -12331,6 +12462,27 @@ async function createRunnerdBackendWithinSessionClaim(
     authorityEpoch.revoke();
     throw error;
   }
+  // Opt in one explicitly registered agent through server-owned host settings.
+  // Neither the agent's input nor a provider-supplied thread can select this.
+  const sharedAgent=process.env.PAPERCLIP_CODEX_SHARED_AGENT_ID?.trim();
+  if (sharedAgent && sharedAgent===input.execution.binding.agentId) {
+    const provider=input.execution.provider, lease=input.codexSharedLease;
+    const grant=process.env.PAPERCLIP_CODEX_SHARED_GRANT_ID?.trim(), hostId=process.env.PAPERCLIP_CODEX_SHARED_HOST_ID?.trim();
+    const codexExecutable=process.env.PAPERCLIP_CODEX_SHARED_EXECUTABLE?.trim(), codexHome=process.env.PAPERCLIP_CODEX_SHARED_CODEX_HOME?.trim(), home=process.env.PAPERCLIP_CODEX_SHARED_HOME?.trim();
+    if (input.codexShared || !lease || input.conversationMode || remoteTarget || retainedTransition || input.restartRecovery || provider.kind!=="codex" || !provider.model || !("reasoningEffort" in provider) || !provider.reasoningEffort || !input.execution.workspace.cwd || !grant || !hostId || !codexExecutable || !codexHome || !home) throw new Error("codex_shared_registration_unavailable");
+    const binding=input.execution.binding;
+    // The server alone generates the managed thread's permission profile, shell environment and web-search policy; the runner
+    // must echo it unchanged (exact digest-bound match), so no host environment can widen it.
+    const sharedReadOnly="executionMode" in input.execution && input.execution.executionMode==="plan";
+    const sharedRuntimeContext="runtimeContext" in input.execution ? input.execution.runtimeContext : null;
+    const sharedPath=input.runnerEnvironment?.PATH ?? process.env.PATH;
+    if (!sharedPath) throw new Error("codex_shared_registration_unavailable");
+    const sharedWebSearchDisabled="webSearch" in provider && provider.webSearch==="disabled";
+    const sharedThreadConfig=createSharedCodexThreadConfig({cwd:input.execution.workspace.cwd,readOnly:sharedReadOnly,webSearchDisabled:sharedWebSearchDisabled,networkAccess:input.runnerEnvironment?.PAPERCLIP_RUNNER_NETWORK_ACCESS==="enabled",codexHome,codexExecutable,path:sharedPath,instructionWorkingCopyRoot:sharedRuntimeContext?.instructions.workingCopy?.rootPath,runtimeReadRoots:sharedRuntimeContext?[resolve(codexHome,"skills"),sharedRuntimeContext.instructions.bundle.rootPath,...sharedRuntimeContext.skills.map(skill=>skill.bundle.rootPath)]:[]});
+    const option=await claimRegisteredCodexSharedOption({db:input.db,companyId:binding.companyId,agentId:binding.agentId,issueId:binding.issueId,runId:binding.runId,normalizedSessionId:nativeSessionKey(input.execution),runnerInstanceId:input.runnerInstanceId,executionWorkspaceId:binding.executionWorkspaceId,model:provider.model,effort:provider.reasoningEffort,leaseOwner:lease.owner,leaseAttempt:lease.attempt,controller:lease.controller,delegationGrantId:grant,hostId,codexExecutable,codexHome,home,runnerExecutable:resolvePaperclipRunnerBinary(),launch:{cwd:input.execution.workspace.cwd,instructions:nativeSystemInstructions(input.execution),approvalPolicy:"never",readOnly:sharedReadOnly,webSearchDisabled:sharedWebSearchDisabled,threadConfig:sharedThreadConfig,authorizedTools:authorizedToolSetForProvider("codex",[...dynamicTools,...codexSemanticToolSpecs()])}});
+    input={...input,codexShared:option};
+    lease.onAdmitted(option);
+  }
   const root = runnerdStateRoot(input.execution);
   const durableIdentity = readRunnerdDurableIdentity(root);
   const durableBinding = retainedTransition
@@ -12341,7 +12493,7 @@ async function createRunnerdBackendWithinSessionClaim(
   const effectiveRunnerInstanceId =
     durableBinding?.runnerInstanceId ?? input.runnerInstanceId;
   const effectiveEnvironmentLeaseId =
-    (pluginTask ? remoteTarget?.leaseId : undefined) ?? durableBinding?.environmentLeaseId ??
+    input.codexShared?.environmentLeaseId ?? (pluginTask ? remoteTarget?.leaseId : undefined) ?? durableBinding?.environmentLeaseId ??
     input.durableEnvironmentLeaseId ??
     input.execution.binding.executionWorkspaceId;
   mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -13926,6 +14078,7 @@ async function createRunnerdBackendWithinSessionClaim(
     ),
     codexTransportFactory: (recoveryContext) => {
       const bundle = createRunnerdCodexTransport({
+        ...(input.codexShared ? {sharedCodexDaemon:input.codexShared.daemon,sharedCodexBootstrapAuthority:input.codexShared.admission.bootstrapAuthority,authorizeSharedCodexGoalWrite:input.codexShared.admission.authorizeGoalWrite} : {}),
         measureOperation: process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim() ? measureRunnerOperation : undefined,
         recordTimingReceipt: process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim() ? recordRunnerTimingReceipt : undefined,
         onSpawn: input.onSpawn,

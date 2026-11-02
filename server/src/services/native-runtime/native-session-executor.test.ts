@@ -92,7 +92,7 @@ import { nativeToolContractFingerprintForTarget } from "./native-session-resume.
 import * as nativeSessionResume from "./native-session-resume.js";
 import * as nativeLeaseRenewal from "./native-execution-lease.js";
 import { buildNativeHeartbeatPreparationSpans, createNativeRunTrace } from "./native-run-trace.js";
-import { NativeRunnerOwnershipUnverifiedError } from "./native-runner-ownership.js";
+import { isNativeRunnerOwnershipHeld, NativeRunnerOwnershipUnverifiedError } from "./native-runner-ownership.js";
 import type { AdapterRuntimeEvent } from "../../adapters/index.js";
 import type { AdapterUsageCheckpoint } from "@paperclipai/adapter-utils";
 
@@ -255,6 +255,13 @@ vi.mock("./paperclip-control-plane-port.js", async importOriginal => {
   } };
 });
 
+// Terra's OpenCode retention guard: the real function unless a test arms a hold.
+const openCodeHold = vi.hoisted(() => ({ guard: undefined as undefined | (() => unknown) }));
+vi.mock("./opencode-managed-admission.js", async importOriginal => {
+  const original = await importOriginal<typeof import("./opencode-managed-admission.js")>();
+  return { ...original, getOpenCodeRetainedOwnership: (...args: Parameters<typeof original.getOpenCodeRetainedOwnership>) => openCodeHold.guard ? openCodeHold.guard() : original.getOpenCodeRetainedOwnership(...args) };
+});
+
 const grokCopyBack = vi.hoisted(() => vi.fn(async (_input: { readSandboxAuth: () => Promise<Buffer>; hostHomeDir: string }) => undefined));
 vi.mock("@paperclipai/adapter-grok-local/server", async importOriginal => ({
   ...await importOriginal<typeof import("@paperclipai/adapter-grok-local/server")>(),
@@ -359,6 +366,8 @@ import {
   detachNativeSessionsForRestart,
   NativeControllerDetachedForRestartError,
   NativeCancellationPendingRecoveryError,
+  NativeResultPendingFinalizationError,
+  assertClaudeEffectsSettledAfterResult,
   getNativeSessionSteeringState,
   NativeSessionSteeringError,
   assertRemoteRunnerBuildMetadata,
@@ -10516,6 +10525,60 @@ describe("native session bounded recovery", () => {
     })).rejects.toThrow("native_cancellation_pending_recovery");
     expect(updates.some(update => update.table === heartbeatRuns && update.values.status === "failed")).toBe(false);
     expect(state.upsertRecoveryAction).not.toHaveBeenCalled();
+  });
+
+  describe("retained native effects hold ownership ahead of the cancellation and result-pending paths", () => {
+    const arm = () => { openCodeHold.guard = () => ({ binding: { providerSessionId: "ses_held", taskSessionId: "task-held" }, durable: true }); };
+    afterEach(() => { openCodeHold.guard = undefined; });
+    // Heartbeat teardown consults the persisted run, so assert the marker it will read rather than the thrown error alone.
+    const heartbeatSeesHold = (updates: Array<{ table: unknown; values: Record<string, unknown> }>) => {
+      const run = updates.filter(update => update.table === heartbeatRuns && update.values.errorCode).at(-1)?.values;
+      expect(run).toBeDefined();
+      expect(isNativeRunnerOwnershipHeld({ runtimeMode: "native", status: "running", errorCode: run!.errorCode, nativePhase: run!.nativePhase } as never)).toBe(true);
+    };
+    const expectHeld = (updates: Array<{ table: unknown; values: Record<string, unknown> }>, original: string) => {
+      expect(updates.some(update => update.table === heartbeatRuns && update.values.status === "failed")).toBe(false);
+      expect(updates.some(update => update.table === nativeRunFinalizations && update.values.failureCode === "native_retry_cancelled")).toBe(false);
+      // The coordinator lease is released by the one persisted hold write (as for every held run); the run stays running with the marker.
+      expect(updates.filter(update => update.table === nativeRunFinalizations && update.values.phase === "terminal_failure")).toHaveLength(1);
+      heartbeatSeesHold(updates);
+      expect(updates.find(update => update.table === heartbeatRuns && update.values.error)?.values.error).toContain(original); // original cause preserved
+    };
+    it.each(["native_session_cancelled", "native_finalization_missing: session returned no semantic result"])("an acknowledged Stop (%s) with a retained host holds instead of releasing the lease", async (cause) => {
+      const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+      const stop: Record<string, unknown> = {};
+      state.execute.mockReset().mockImplementationOnce(async () => {
+        Object.assign(stop, { cancelledByActorType: "user", cancelledByUserId: "board", nativeCancellation: {
+          schema: "paperclip.native-cancellation.v1", ...execution.binding, scope: "run", reasonCode: "cancellation_run_only",
+          dispatched: true, dispatchState: "acknowledged", intentAuditId: "intent", acknowledgementAuditId: "ack",
+        } });
+        throw new Error(cause);
+      });
+      state.upsertRecoveryAction.mockClear();
+      arm();
+      await expect(executePaperclipNativeSession({ db: leaseDb(execution, {}, stop, updates), execution, runnerInstanceId: "held-stop" })).rejects.toBeInstanceOf(NativeRunnerOwnershipUnverifiedError);
+      expectHeld(updates, cause);
+    });
+    it.each([["result pending finalization", () => new NativeResultPendingFinalizationError()], ["cancellation pending recovery", () => new NativeCancellationPendingRecoveryError()]])("%s with a retained host holds instead of escaping before the persisted hold", async (_name, make) => {
+      const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+      const failure = make();
+      state.execute.mockReset().mockRejectedValueOnce(failure);
+      state.upsertRecoveryAction.mockClear();
+      arm();
+      await expect(executePaperclipNativeSession({ db: leaseDb(execution, {}, {}, updates), execution, runnerInstanceId: "held-pending" })).rejects.toBeInstanceOf(NativeRunnerOwnershipUnverifiedError);
+      expectHeld(updates, failure.message);
+    });
+    it("without a retained host the same errors still escape unchanged (no regression)", async () => {
+      const updates: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+      state.execute.mockReset().mockRejectedValueOnce(new NativeResultPendingFinalizationError());
+      await expect(executePaperclipNativeSession({ db: leaseDb(execution, {}, {}, updates), execution, runnerInstanceId: "unheld-pending" })).rejects.toBeInstanceOf(NativeResultPendingFinalizationError);
+      expect(updates.some(update => update.table === heartbeatRuns && update.values.errorCode)).toBe(false);
+    });
+    it("a refused Claude close after a returned result is surfaced as a failure, a settled close is silent", async () => {
+      await expect(assertClaudeEffectsSettledAfterResult(undefined)).resolves.toBeUndefined();
+      await expect(assertClaudeEffectsSettledAfterResult({ close: async () => undefined })).resolves.toBeUndefined();
+      await expect(assertClaudeEffectsSettledAfterResult({ close: async () => { throw new Error("claude_native_effects_unsettled"); } })).rejects.toThrow("claude_native_effects_unsettled");
+    });
   });
 
   it("keeps typed integrity failure permanent even if a wrapper changes its message", () => {

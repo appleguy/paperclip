@@ -307,6 +307,14 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(f.deps.upsertTaskSession).not.toHaveBeenCalled();
   });
 
+  it("carries the native final-checkpoint revision to session recognition", async () => {
+    const f = await fixture();
+    const revision = randomUUID();
+    f.input.adapterResult.resultJson = { openCodeFinalCheckpointRevision: revision };
+    await f.completion.completeRun(f.input);
+    expect(f.deps.upsertTaskSession).toHaveBeenCalledWith(expect.objectContaining({ openCodeFinalCheckpointRevision: revision, lastRunId: f.run.id }));
+  });
+
   it("redacts execution failures, retains restore evidence and resumes the latest checkpoint", async () => {
     const f = await fixture();
     const failure = f.failure(new Error("private-identity-material crashed"));

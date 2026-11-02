@@ -1,4 +1,7 @@
 import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
+import { saveOpenCodeGoalCheckpoint } from "./opencode-shared-checkpoint.js";
+import { randomUUID } from "node:crypto";
+import { nativeSha256 } from "../native-runtime/canonical.js";
 import { writeExecutionControl } from "../execution-control-notifications.js";
 import { inspectPluginWorkspaceForFinalization } from "../native-runtime/native-plugin-workspace-finalization.js";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -602,7 +605,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               resumeSessionGoalHeartbeat:
                 context.resumeSessionGoalHeartbeat === true ||
                 completedGoalControl,
-              onGoalCheckpoint: async (snapshot) => {
+              onGoalCheckpoint: async (snapshot, lease) => {
                 if (!taskKey) return;
                 const params =
                   attachPaperclipSessionMetadataToSessionParams(
@@ -616,7 +619,9 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
                   )!;
                 const displayId =
                   snapshot.providerSessionId ?? snapshot.sessionId;
-                await upsertTaskSession({
+                if ((nativeExecution.provider.kind === "opencode" || nativeExecution.provider.kind === "opencode_shared_v2") && agent.adapterType === "paperclip_runner") {
+                  await saveOpenCodeGoalCheckpoint(db, { companyId: agent.companyId, agentId: agent.id, adapterType: agent.adapterType, taskKey, runId: run.id, params, displayId, providerSessionId: snapshot.providerSessionId ?? null, normalizedSessionId: snapshot.identity.sessionId, runnerInstanceId: lease.runnerInstanceId, lease });
+                } else await upsertTaskSession({
                   companyId: agent.companyId,
                   agentId: agent.id,
                   adapterType: agent.adapterType,
@@ -628,6 +633,13 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
                 });
                 goalCheckpointSession.current = { params, displayId };
               },
+              onOpenCodeFinalCheckpoint: nativeExecution.schema === "paperclip.native-execution-input.v12" ? async (session, lease) => {
+                if (!taskKey || !session.providerSessionId) throw new Error("opencode_final_checkpoint_unavailable");
+                const params = attachPaperclipSessionMetadataToSessionParams({ ...runtimeSessionParamsForAdapter, sessionId: session.normalizedSessionId, cwd: executionWorkspace.cwd }, configuredModel, sessionConfigMetadata)!;
+                const revision = randomUUID();
+                await saveOpenCodeGoalCheckpoint(db, { companyId: agent.companyId, agentId: agent.id, adapterType: agent.adapterType, taskKey, runId: run.id, params, displayId: session.providerSessionId, providerSessionId: session.providerSessionId, normalizedSessionId: session.normalizedSessionId, runnerInstanceId: lease.runnerInstanceId, lease, finalRevision: revision, terminalDigest: nativeSha256(session.result) });
+                return revision;
+              } : undefined,
               onLog,
               onEvent: onAdapterEvent,
               instructionWorkingCopy: nativeInstructionWorkingCopy(),

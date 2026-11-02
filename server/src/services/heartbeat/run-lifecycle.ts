@@ -358,8 +358,21 @@ export function decorateHeartbeatRunRuntimeStatus<
         })
       : null;
 
+  // Liveness classification describes a *finished attempt*. A queued or
+  // running attempt may have been adopted/retried with the same run row;
+  // its historical "Run ended with scheduled_retry" verdict is not the
+  // health of the current process. Keep persistent evidence untouched, but
+  // never present a terminal verdict for a nonterminal run.
+  const terminalAssessment = !isHeartbeatRunTerminalStatus(run.status)
+    ? {
+        ...("livenessState" in run ? { livenessState: null } : {}),
+        ...("livenessReason" in run ? { livenessReason: null } : {}),
+      }
+    : {};
+
   return {
     ...run,
+    ...terminalAssessment,
     currentStatusMessage: currentStatus?.message ?? null,
     currentStatusUpdatedAt: currentStatus?.updatedAt ?? null,
     currentToolName: currentStatus?.currentToolName ?? null,

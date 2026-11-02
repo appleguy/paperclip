@@ -34,6 +34,7 @@ import { isNewTerminalRunFailure, reportRunFailure } from "../run-failure-report
 import { isNativeRunnerOwnershipHeld } from "./native-runner-ownership.js";
 import { nativeRestartInterruptedTurnId, type PersistedNativeSession } from "../../vendor/paperclip-runner/index.js";
 import { retireSupersededNativeRetry } from "./native-superseded-retry.js";
+import { inspectOpenCodeRestartClaim } from "./opencode-restart-claim.js";
 
 export type NativeControllerIdentity = {
   bootId: string;
@@ -44,6 +45,17 @@ export type NativeControllerIdentity = {
 export type NativeRestartKind = "hot" | "hard" | "graceful";
 
 export type NativeRestartRecoveryClaim =
+  | {
+      kind: "observe_saved_opencode_host";
+      runId: string;
+      leaseOwner: string;
+      controllerGeneration: number;
+      providerAttempt: number;
+      restartKind: NativeRestartKind;
+      recoveryRequestId: string | null;
+      reason: "opencode_saved_host_observation_only";
+      savedHost: { taskSessionId: string; generation: string; epoch: string };
+    }
   | {
       kind: "reattach_existing_runner";
       runId: string;
@@ -100,7 +112,7 @@ export function nextNativeProviderAttempt(
   currentAttempt: number,
   recoveryKind?: NativeRestartRecoveryClaim["kind"],
 ): number {
-  return recoveryKind === "reattach_existing_runner" ||
+  return recoveryKind === "observe_saved_opencode_host" || recoveryKind === "reattach_existing_runner" ||
     recoveryKind === "reattach_remote_runner"
     ? currentAttempt
     : currentAttempt + 1;
@@ -558,6 +570,7 @@ export async function claimNativeRestartRecoveries(input: {
           issueExecutionRunId: issues.executionRunId,
           issueAssigneeAgentId: issues.assigneeAgentId,
           issueStatus: issues.status,
+          issueProjectId: issues.projectId,
         })
         .from(heartbeatRuns)
         .innerJoin(
@@ -596,7 +609,8 @@ export async function claimNativeRestartRecoveries(input: {
           reason: "result_already_persisted",
         } as const;
       }
-      if (!input.liveRunExecutions?.has(row.run.id) && await retireSupersededNativeRetry(tx as unknown as Db, {
+      const savedOpenCode = await inspectOpenCodeRestartClaim(tx as unknown as Db, row.run, row.coordinator.issueId, row.issueProjectId);
+      if (savedOpenCode.kind === "other" && !input.liveRunExecutions?.has(row.run.id) && await retireSupersededNativeRetry(tx as unknown as Db, {
         run: row.run, coordinator: row.coordinator, issueExecutionRunId: row.issueExecutionRunId, now,
       })) return { kind: "blocked", runId: row.run.id, reason: "native_retry_superseded" } as const;
       if (row.issueExecutionRunId !== row.run.id) {
@@ -626,10 +640,17 @@ export async function claimNativeRestartRecoveries(input: {
       const durableAuthority = (remoteWorkspace || pluginTask) && await hasNativeRunnerCheckpoint(tx, {
         companyId: row.run.companyId, issueId: row.coordinator.issueId, runId: row.run.id,
       });
+      if (savedOpenCode.kind !== "other") {
+        const actual = await currentNativeControllerIdentity();
+        if (actual.pid !== controller.pid || actual.bootId !== controller.bootId || actual.processStartedAt.getTime() !== controller.processStartedAt.getTime()) return { kind: "awaiting_evidence", runId: row.run.id, reason: "opencode_foreign_successor_controller" } as const;
+        if (savedOpenCode.kind === "hold") return { kind: "awaiting_evidence", runId: row.run.id, reason: savedOpenCode.reason } as const;
+        if (remoteProcess) return { kind: "awaiting_evidence", runId: row.run.id, reason: "opencode_remote_recovery_unsupported" } as const;
+      }
       const takeover = await evaluateNativeControllerTakeover({
         owner: row.coordinator,
         now,
         remoteLeaseFenced: Boolean(durableAuthority),
+        requireStoppedController: savedOpenCode.kind !== "other",
         coordinatedPreviousController:
           input.coordinatedPreviousController ?? null,
       });
@@ -872,10 +893,11 @@ export async function claimNativeRestartRecoveries(input: {
       const ownershipChanged =
         row.issueAssigneeAgentId !== row.run.agentId ||
         ["done", "cancelled"].includes(row.issueStatus);
-      const claimKind = ownershipChanged ? null : classification.claimKind;
+      if (savedOpenCode.kind === "saved" && ownershipChanged) return { kind: "awaiting_evidence", runId: row.run.id, reason: "task_ownership_or_status_changed" } as const;
+      const claimKind = ownershipChanged ? null : savedOpenCode.kind === "saved" ? "observe_saved_opencode_host" as const : classification.claimKind;
       const reason = ownershipChanged
         ? "task_ownership_or_status_changed"
-        : classification.reason;
+        : savedOpenCode.kind === "saved" ? "opencode_saved_host_observation_only" : classification.reason;
 
       if (!claimKind) {
         const generation = row.coordinator.controllerGeneration;
@@ -1033,7 +1055,7 @@ export async function claimNativeRestartRecoveries(input: {
           controllerProcessStartedAt: controller.processStartedAt,
           controllerGeneration: generation,
           recoveryState:
-            claimKind === "reattach_existing_runner" ||
+            claimKind === "observe_saved_opencode_host" || claimKind === "reattach_existing_runner" ||
             claimKind === "reattach_remote_runner"
               ? "awaiting_runner_reattach"
               : claimKind === "resume_dead_runner"
@@ -1069,7 +1091,7 @@ export async function claimNativeRestartRecoveries(input: {
       }
 
       if (
-        claimKind !== "reattach_existing_runner" &&
+        claimKind !== "observe_saved_opencode_host" && claimKind !== "reattach_existing_runner" &&
         claimKind !== "reattach_remote_runner"
       ) {
         await recordNativeLocalProcessStop(tx as unknown as Db, row.run);
@@ -1084,7 +1106,7 @@ export async function claimNativeRestartRecoveries(input: {
           errorCode: null,
           nativePhase: "observed",
           nativePhaseUpdatedAt: now,
-          ...(claimKind === "reattach_existing_runner" ||
+          ...(claimKind === "observe_saved_opencode_host" || claimKind === "reattach_existing_runner" ||
           claimKind === "reattach_remote_runner"
             ? {}
             : {
@@ -1105,6 +1127,10 @@ export async function claimNativeRestartRecoveries(input: {
         restartKind: input.restartKind,
         recoveryRequestId: input.recoveryRequestId ?? null,
       };
+      if (claimKind === "observe_saved_opencode_host") {
+        if (savedOpenCode.kind !== "saved") throw new Error("opencode_restart_claim_inconsistent");
+        return { kind: claimKind, ...common, reason: "opencode_saved_host_observation_only", savedHost: { taskSessionId: savedOpenCode.taskSessionId, generation: savedOpenCode.generation, epoch: savedOpenCode.epoch } } satisfies NativeRestartRecoveryClaim;
+      }
       if (claimKind === "reattach_remote_runner") {
         return {
           kind: claimKind,
@@ -1126,10 +1152,8 @@ export async function claimNativeRestartRecoveries(input: {
           },
         } satisfies NativeRestartRecoveryClaim;
       }
-      return {
-        kind: claimKind,
-        ...common,
-      } satisfies NativeRestartRecoveryClaim;
+      if (claimKind === "resume_dead_runner") return { kind: "resume_dead_runner", ...common } satisfies NativeRestartRecoveryClaim;
+      return { kind: "bootstrap_incomplete", ...common } satisfies NativeRestartRecoveryClaim;
     });
     if (terminalRunToReport)
       void reportRunFailure(input.db, terminalRunToReport);

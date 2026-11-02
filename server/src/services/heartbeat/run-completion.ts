@@ -511,6 +511,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           sessionDisplayId: nextSessionState.displayId,
           lastRunId: finalizedRun.id,
           lastError: runErrorMessage,
+          ...(typeof adapterResult.resultJson?.openCodeFinalCheckpointRevision === "string" ? { openCodeFinalCheckpointRevision: adapterResult.resultJson.openCodeFinalCheckpointRevision } : {}),
         });
       }
     }
