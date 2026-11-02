@@ -199,6 +199,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const beforeId = await currentConversationId(cwd);
     // One TUI process, one /r/ URL, isolated conversations via /new.
     await send(socket, session, "/new", stateDir);
+    // The TUI can still show its old idle prompt before slash-command dispatch.
+    // Require the workspace-scoped conversation ID to rotate, not just an idle repaint.
+    let newConversationId: string | null = null;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      newConversationId = await currentConversationId(cwd);
+      if (newConversationId && newConversationId !== beforeId) break;
+      await sleep(250);
+    }
+    if (!newConversationId || newConversationId === beforeId)
+      throw new Error("agy /new did not create a fresh task conversation; refusing to merge task histories");
     if (!(await waitIdle(socket, session, Date.now() + 12_000)))
       throw new Error("agy /new did not settle to an idle prompt");
     const receiptPath = path.join(stateDir, `receipt-${ctx.runId}.json`);
