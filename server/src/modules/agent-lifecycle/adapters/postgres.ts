@@ -58,7 +58,7 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
   let next = command === "reconcile"
     ? blockingHolds.length && !["pausing", "paused"].includes(agent.lifecycleState) ? "pausing" as const
       : !holds.length && agent.lifecycleState === "paused" ? "resuming" as const : agent.lifecycleState
-    : command === "resume" && (holds.length || agent.lifecycleState === "pausing") ? agent.lifecycleState
+    : command === "resume" && holds.length ? agent.lifecycleState
     : transition(agent.lifecycleState, command, agent.lifecycleOperation?.resumeState);
   if (restartPause && next === "paused") next = "pausing";
   if (command === "complete" && next === "ready" && holds.length) next = "pausing";
@@ -66,8 +66,18 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
   if (["complete", "reconcile"].includes(command) && next === "paused" && holds.length === 1 && holds[0] === "setup"
     && await effects.setupRequiresPreparation(tx, agent.companyId, agent.defaultEnvironmentId)) next = "preparing";
   if (next === agent.lifecycleState) {
-    if (JSON.stringify(holds) !== JSON.stringify(agent.lifecycleHolds) || agent.pauseReason !== (holds[0] ?? null)) {
-      const [updated] = await tx.update(agents).set({ lifecycleHolds: holds, pauseReason: holds[0] ?? null }).where(eq(agents.id, agent.id)).returning();
+    // Older pause paths could leave status=paused while lifecycleState=ready.
+    // A successful resume must restore the dispatchable compatibility status,
+    // not merely clear the hold and return HTTP 200 with a paused agent.
+    const status = command === "resume" && !holds.length && next === "ready"
+      ? compatibilityStatus(next, agent.status) : agent.status;
+    if (JSON.stringify(holds) !== JSON.stringify(agent.lifecycleHolds) ||
+      agent.pauseReason !== (holds[0] ?? null) || status !== agent.status) {
+      if (status !== agent.status) await effects.beforeStatusChange(tx, agent.companyId, agent.id, agent.status, status);
+      const [updated] = await tx.update(agents).set({ lifecycleHolds: holds, pauseReason: holds[0] ?? null,
+        status, ...(status !== agent.status ? { pausedAt: null } : {}), updatedAt: new Date() })
+        .where(eq(agents.id, agent.id)).returning();
+      if (status !== agent.status) await effects.recordStatus(tx, agent.companyId, agent.id, agent.status, status);
       return updated;
     }
     return agent;

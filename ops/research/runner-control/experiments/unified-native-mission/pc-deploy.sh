@@ -19,18 +19,8 @@ if [ "${PC_DEPLOY_IN_LOCK:-}" != 1 ]; then
     /usr/bin/env PC_DEPLOY_IN_LOCK=1 /bin/sh "$0" "$@"
 fi
 
-health() { curl -fsS --connect-timeout 2 --max-time 5 http://127.0.0.1:3100/api/health | grep -q '"status":"ok"'; }
 current() { readlink "$repo/cli/current" | sed 's#.*/##'; }
 cli() { node "$repo/cli/current/node_modules/paperclipai/dist/index.js" "$@"; }
-poll_health() {
-  i=0
-  while [ "$i" -lt 40 ]; do
-    sleep 6
-    if health; then return 0; fi
-    i=$((i + 1))
-  done
-  return 1
-}
 held=0
 restarted=0
 installed=0
@@ -51,10 +41,10 @@ rollback_restart() {
   echo 'pc-deploy: restoring previous build and checking restart health' >&2
   restore_old_payload || return 1
   launchctl kickstart -k "gui/$(id -u)/ing.paperclip.paperclipai.main" || return 1
-  poll_health || { echo 'pc-deploy: rollback health FAILED' >&2; return 1; }
-  if [ -n "$original_sha" ]; then
-    node "$helper" finish "$manifest" "$original_sha" || return 1
-  fi
+  [ -n "$original_sha" ] || { echo 'pc-deploy: original exact SHA unavailable for rollback verification' >&2; return 1; }
+  node "$helper" finish "$manifest" "$original_sha" || {
+    echo 'pc-deploy: rollback health/process identity FAILED' >&2; return 1;
+  }
   echo "pc-deploy: rollback healthy, restored $original" >&2
   return 0
 }
@@ -162,8 +152,10 @@ if ! launchctl kickstart -k "gui/$(id -u)/ing.paperclip.paperclipai.main"; then
   exit 1
 fi
 restarted=1
-if ! poll_health || ! node "$helper" finish "$manifest" "$sha"; then
-  echo 'pc-deploy: new payload not verified, initiating rollback' >&2
+# The helper polls health *and* new process identity for up to four minutes.
+# A transient status=starting directly after kickstart is expected.
+if ! node "$helper" finish "$manifest" "$sha"; then
+  echo 'pc-deploy: new payload not verified after readiness window, initiating rollback' >&2
   rollback_restart || echo 'pc-deploy: rollback FAILED, operator investigation required' >&2
   exit 1
 fi

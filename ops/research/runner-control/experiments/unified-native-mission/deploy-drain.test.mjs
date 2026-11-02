@@ -1,7 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
-import { verifyOwned, jsonRequest, pauseOwned } from "./deploy-drain.mjs";
+import { verifyOwned, jsonRequest, pauseOwned, selectStaleUnowned,
+  interruptStaleUnowned, waitForRestartReady } from "./deploy-drain.mjs";
 
 const id = "11111111-1111-4111-8111-111111111111";
 const issue = "22222222-2222-4222-8222-222222222222";
@@ -55,6 +56,78 @@ describe("deploy drain exact ownership and fail-closed rules", () => {
   it("fails closed for malformed provider inventory", () => {
     assert.throws(() => verifyOwned([run], new Map([[agentId, agent]]), [binding], new Map([[url, null]])),
       /unverifiable provider/);
+  });
+});
+
+describe("pre-L2 stale orphan reconciliation", () => {
+  const orphan = "ses_orphan_pre_l2_45678";
+  const at = 1_800_000;
+  const active = new Map([[url, { [orphan]: { type: "busy" } }]]);
+  const details = new Map([[url + "/" + orphan, { time: { updated: at - 180_001 } }]]);
+  const candidate = (runs = [], agents = new Map(), bindings = [], journals = new Set(), data = details) =>
+    selectStaleUnowned(active, data, runs, agents, bindings, journals, at);
+
+  it("selects only a running unowned and unjournaled session older than 3 minutes", () => {
+    assert.deepEqual(candidate(), [{ url, sessionId: orphan, updatedAt: at - 180_001, state: "planned" }]);
+    assert.equal(candidate([], new Map(), [], new Set([url + "/" + orphan])).length, 0);
+    assert.equal(candidate([run], new Map([[agentId, agent]]), []).length, 0);
+    assert.equal(candidate([run], new Map([[agentId, agent]]), [binding]).length, 1);
+    assert.equal(candidate([], new Map(), [], new Set(), new Map([
+      [url + "/" + orphan, { time: { updated: at - 179_999 } }],
+    ])).length, 0);
+    assert.equal(candidate([], new Map(), [], new Set(), new Map([
+      [url + "/" + orphan, { time: { updated: "stale" } }],
+    ])).length, 0);
+  });
+  it("rejects malformed active status and does not treat retry as interruptible", () => {
+    assert.throws(() => selectStaleUnowned(new Map([[url, null]]), details, [], new Map(), [], new Set(), at),
+      /unverifiable/);
+    assert.equal(selectStaleUnowned(new Map([[url, { [orphan]: { type: "retry" } }]]),
+      details, [], new Map(), [], new Set(), at).length, 0);
+  });
+  it("persists intent before exact interrupt, acknowledges and observes idle", async () => {
+    const items = candidate();
+    const steps = [];
+    const p = new Map([[url, { request: async (method, uri) => {
+      steps.push(method + " " + uri);
+      return method === "POST" ? { interrupted: true } : {};
+    } }]]);
+    await interruptStaleUnowned(items, p, async item => {
+      steps.push("persist:" + item.state);
+    }, async item => {
+      assert.equal(item.sessionId, orphan); steps.push("revalidated");
+    });
+    assert.deepEqual(steps, [
+      "revalidated", "persist:planned", "POST /session/" + orphan + "/interrupt",
+      "persist:interrupt-acknowledged", "GET /session/active", "persist:interrupted-and-idle",
+    ]);
+  });
+});
+
+describe("kickstart startup readiness race", () => {
+  const sha = "a".repeat(40);
+  const healthy = { health: { status: "ok", commit: sha },
+    state: { serverPid: 300, draining: false }, payload: sha.slice(0, 12) };
+  it("polls starting health and old PID, requiring two stable new-PID observations", async () => {
+    let tick = 0, calls = 0;
+    const ready = await waitForRestartReady(async () => {
+      calls++;
+      if (calls <= 2) return { ...healthy, health: { status: "starting" } };
+      if (calls === 3) return { ...healthy, state: { serverPid: 200, draining: false } };
+      return healthy;
+    }, { previousPid: 200, sha, timeoutMs: 240_000 },
+    { now: () => tick, sleep: async ms => { tick += ms; } });
+    assert.equal(ready.state.serverPid, 300);
+    assert.ok(calls >= 6);
+    assert.ok(tick >= 20_000);
+  });
+  it("fails after the bound if the PID stays old or the installed SHA is wrong", async () => {
+    let tick = 0;
+    await assert.rejects(waitForRestartReady(async () =>
+      ({ ...healthy, payload: "b".repeat(12) }),
+    { previousPid: 200, sha, timeoutMs: 12_000 },
+    { now: () => tick, sleep: async ms => { tick += ms; } }), /within 240 seconds/);
+    assert.equal(tick, 12_000);
   });
 });
 
@@ -132,7 +205,8 @@ describe("installed deploy shell contract", () => {
     assert.match(source, /node "\$helper" release "\$manifest"/);
     assert.match(source, /if \[ "\$rc" -eq 10 \]|\[ "\$rc" -eq 10 \]/);
     assert.match(source, /flock -x|-x -w 2700/);
-    assert.match(source, /--connect-timeout 2 --max-time 5/);
+    assert.doesNotMatch(source, /poll_health|curl -fsS/);
+    assert.match(source, /helper" finish "\$manifest" "\$sha"/);
     assert.match(source, /install --ref "\$sha"/);
     assert.match(source, /source_branch=fix\/git-installer-bundled-workspaces-20261030/);
     assert.match(source, /rollback_restart/);

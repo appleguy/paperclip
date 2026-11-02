@@ -97,6 +97,36 @@ async function liveServer(client) {
 async function currentPayload() {
   return path.basename(await fs.readlink("/Volumes/NVM/Paperclip/cli/current"));
 }
+
+/** A kickstart can serve HTTP 200 with status=starting before identity and
+ * readiness converge. Require a new PID, exact payload and two stable healthy
+ * observations 8 seconds apart; retry transient transport/starting responses. */
+export async function waitForRestartReady(probe, { previousPid, sha, timeoutMs = 240_000 },
+  controls = { now: Date.now, sleep }) {
+  ensure(Number.isInteger(previousPid) && previousPid > 1 && /^[0-9a-f]{40}$/.test(sha),
+    "restart identity inputs are invalid");
+  const end = controls.now() + timeoutMs;
+  let stablePid = null;
+  let stableSince = 0;
+  while (true) {
+    try {
+      const { health, state, payload } = await probe();
+      const healthy = health?.status === "ok" && Number.isInteger(state?.serverPid) &&
+        state.serverPid > 1 && state.serverPid !== previousPid && state.draining === false &&
+        payload === sha.slice(0, 12) && (typeof health.commit !== "string" || health.commit === sha);
+      if (healthy) {
+        if (stablePid === state.serverPid && controls.now() - stableSince >= 8_000) {
+          return { health, state };
+        }
+        if (stablePid !== state.serverPid) { stablePid = state.serverPid; stableSince = controls.now(); }
+      } else { stablePid = null; }
+    } catch { stablePid = null; }
+    const remaining = end - controls.now();
+    if (remaining <= 0) break;
+    await controls.sleep(Math.min(4_000, remaining));
+  }
+  throw new Error("Paperclip restart did not reach stable health and verified new process identity within 240 seconds");
+}
 async function isVerified(client, sha) {
   ensure(/^[0-9a-f]{40}$/.test(sha), "expected exact commit SHA");
   const { health, state } = await liveServer(client);
@@ -179,11 +209,73 @@ async function provider(config) {
   };
 }
 
-async function snapshot(client) {
+/** Only busy/running, >=3-minute-stale, journal-free sessions with no
+ * unpaired Paperclip run on that provider are eligible for orphan cleanup. */
+export function selectStaleUnowned(active, details, runs, agents, bindings, journals, at = Date.now()) {
+  const candidates = [];
+  for (const [url, states] of active) {
+    ensure(object(states), "unverifiable provider active sessions");
+    const unpairedRun = runs.some(run => agents.get(run.agentId)?.url === url &&
+      !bindings.some(b => b.agentId === run.agentId && b.runId === run.id));
+    for (const [sessionId, status] of Object.entries(states)) {
+      if (status?.type === "idle") continue;
+      ensure(SESSION.test(sessionId), "invalid active OpenCode session identity");
+      if (!["busy", "running"].includes(status?.type) || unpairedRun ||
+        journals.has(url + "/" + sessionId) ||
+        bindings.some(b => b.url === url && b.sessionId === sessionId)) continue;
+      const updated = details.get(url + "/" + sessionId)?.time?.updated;
+      if (!Number.isSafeInteger(updated) || updated <= 0 || updated > at ||
+        at - updated < 180_000) continue;
+      candidates.push({ url, sessionId, updatedAt: updated, state: "planned" });
+    }
+  }
+  ensure(candidates.length <= 100, "too many unowned sessions to verify safely");
+  return candidates;
+}
+
+export async function interruptStaleUnowned(candidates, providers, persist = async () => {},
+  revalidate = async () => {}) {
+  for (const item of candidates) {
+    const provider = providers.get(item.url);
+    ensure(provider && typeof provider.request === "function", "missing exact orphan provider");
+    await revalidate(item);
+    await persist(item); // 0600 durable intent *before* the destructive POST
+    const reply = await provider.request("POST", "/session/" + item.sessionId + "/interrupt", {});
+    ensure(reply?.interrupted === true, "OpenCode did not acknowledge stale-session interrupt");
+    item.state = "interrupt-acknowledged"; await persist(item);
+    let idle = false;
+    for (let n = 0; n < 8; n++) {
+      const states = await provider.request("GET", "/session/active");
+      idle = object(states) && (!Object.hasOwn(states, item.sessionId) ||
+        states[item.sessionId]?.type === "idle");
+      if (idle) break;
+      await sleep(200 * (n + 1));
+    }
+    ensure(idle, "stale OpenCode session remained active after interrupt");
+    item.state = "interrupted-and-idle"; await persist(item);
+  }
+}
+
+async function snapshot(client, record = null) {
   const runs = await listRunning(client);
   const agents = new Map();
   const bindings = [];
+  const journals = new Set();
+  const journalDirs = new Set();
   const providers = new Map();
+  async function scanJournal(cfgPath, url) {
+    const dir = path.join(path.dirname(cfgPath), "paperclip-opencode-session-recovery");
+    if (journalDirs.has(dir)) return;
+    journalDirs.add(dir);
+    const filenames = await fs.readdir(dir).catch(e => e.code === "ENOENT" ? [] : Promise.reject(e));
+    for (const filename of filenames) {
+      if (!/^[a-zA-Z0-9_-]{1,130}\.json$/.test(filename)) continue;
+      const row = await readJson(path.join(dir, filename));
+      if (SESSION.test(row?.sessionId)) journals.add(url + "/" + row.sessionId);
+      if (row?.version === 1 && UUID.test(row.agentId) && UUID.test(row.runId) &&
+        UUID.test(row.taskId) && SESSION.test(row.sessionId)) bindings.push(row);
+    }
+  }
   for (const run of runs) {
     if (agents.has(run.agentId)) continue;
     const agent = await client.api("GET", "/api/agents/" + run.agentId);
@@ -200,14 +292,7 @@ async function snapshot(client) {
     } else {
       providers.set(p.url, { ...p, credentialPath: cfg.passwordFile });
     }
-    const dir = path.join(path.dirname(cfgPath), "paperclip-opencode-session-recovery");
-    const filenames = await fs.readdir(dir).catch(e => e.code === "ENOENT" ? [] : Promise.reject(e));
-    for (const filename of filenames) {
-      if (!/^[a-zA-Z0-9_-]{1,130}\.json$/.test(filename)) continue;
-      const row = await readJson(path.join(dir, filename));
-      if (row?.version === 1 && row.agentId === run.agentId && UUID.test(row.runId) &&
-        UUID.test(row.taskId) && SESSION.test(row.sessionId)) bindings.push(row);
-    }
+    await scanJournal(cfgPath, p.url);
   }
   // Provider servers remain relevant even when no live run maps to them:
   // an orphan known only to the server cannot be silently abandoned.
@@ -217,9 +302,14 @@ async function snapshot(client) {
   ];
   for (const filename of configs) {
     const cfg = await readJson(filename).catch(e => e.code === "ENOENT" ? null : Promise.reject(e));
-    if (!cfg || providers.has(cfg.url)) continue;
-    const p = await provider(cfg);
-    providers.set(p.url, { ...p, credentialPath: cfg.passwordFile });
+    if (!cfg) continue;
+    if (providers.has(cfg.url)) {
+      ensure(providers.get(cfg.url).credentialPath === cfg.passwordFile, "conflicting server credentials");
+    } else {
+      const p = await provider(cfg);
+      providers.set(p.url, { ...p, credentialPath: cfg.passwordFile });
+    }
+    await scanJournal(filename, cfg.url);
   }
   const active = new Map();
   for (const [url, p] of providers) {
@@ -231,6 +321,57 @@ async function snapshot(client) {
       const owned = runs.some(run => agents.get(run.agentId)?.url === url);
       if (owned || !(error instanceof Error) || !error.message.includes("transport unavailable")) throw error;
       active.set(url, {});
+    }
+  }
+  if (record) {
+    const details = new Map();
+    for (const [url, states] of active) {
+      ensure(object(states), "unverifiable provider active sessions");
+      for (const [sid, state] of Object.entries(states)) {
+        if (!["busy", "running"].includes(state?.type) || journals.has(url + "/" + sid) ||
+          bindings.some(b => b.url === url && b.sessionId === sid)) continue;
+        ensure(SESSION.test(sid), "invalid OpenCode session identity");
+        details.set(url + "/" + sid, await providers.get(url).request("GET", "/session/" + sid));
+      }
+    }
+    const candidates = selectStaleUnowned(active, details, runs, agents, bindings, journals);
+    if (candidates.length) {
+      ensure(typeof record.manifestFile === "string", "stale-session recovery requires a durable manifest");
+      record.orphans ??= [];
+      const persist = async item => {
+        if (!record.orphans.some(o => o.url === item.url && o.sessionId === item.sessionId)) {
+          record.orphans.push(item);
+        }
+        await writePrivate(record.manifestFile, record);
+      };
+      const initialRunIds = runs.map(run => run.id).sort().join(",");
+      await interruptStaleUnowned(candidates, providers, persist, async item => {
+        const p = providers.get(item.url);
+        // Recheck activity, age, current Paperclip runs and all journal files
+        // just before each exact-session POST. New work or a new journal wins.
+        const [states, detail, latestRuns] = await Promise.all([
+          p.request("GET", "/session/active"),
+          p.request("GET", "/session/" + item.sessionId),
+          listRunning(client),
+        ]);
+        ensure(["busy", "running"].includes(states?.[item.sessionId]?.type) &&
+          detail?.time?.updated === item.updatedAt && Date.now() - item.updatedAt >= 180_000,
+          "orphan activity changed during safety recheck");
+        ensure(latestRuns.map(run => run.id).sort().join(",") === initialRunIds,
+          "Paperclip run set changed during orphan safety recheck");
+        for (const dir of journalDirs) {
+          const files = await fs.readdir(dir).catch(e => e.code === "ENOENT" ? [] : Promise.reject(e));
+          for (const filename of files) {
+            if (!/^[a-zA-Z0-9_-]{1,130}\.json$/.test(filename)) continue;
+            const row = await readJson(path.join(dir, filename));
+            ensure(row?.sessionId !== item.sessionId, "new journal ownership appeared for orphan session");
+          }
+        }
+      });
+      for (const url of new Set(candidates.map(item => item.url))) {
+        active.set(url, await providers.get(url).request("GET", "/session/active"));
+      }
+      console.log("deploy-drain: interrupted " + candidates.length + " stale unowned OpenCode session(s)");
     }
   }
   return { planned: verifyOwned(runs, agents, bindings, active), providers };
@@ -296,7 +437,7 @@ async function main() {
     const started = await client.api("POST", "/api/instance/task-drain", { ttlMs: 1_200_000 });
     ensure(typeof started?.startedAt === "string", "task drain did not acknowledge start");
     const record = { schema: 1, startedAt: started.startedAt, serverPid: before.serverPid,
-      phase: "draining", runs: [], createdAt: now(), evidence: [] };
+      manifestFile: file, phase: "draining", runs: [], orphans: [], createdAt: now(), evidence: [] };
     try {
       await writePrivate(file, record);
       await held(client, record);
@@ -325,18 +466,14 @@ async function main() {
   }
   if (action === "finish") {
     ensure(typeof extra === "string" && /^[0-9a-f]{40}$/.test(extra), "exact installed SHA required");
-    const { health, state } = await liveServer(client);
-    ensure(!state.draining, "post-restart admission unexpectedly held");
-    ensure(Number.isInteger(record.serverPid) && state.serverPid !== record.serverPid,
-      "Paperclip server process did not restart");
-    ensure(await currentPayload() === extra.slice(0, 12), "restarted payload symlink does not match SHA");
-    ensure(typeof health.commit !== "string" || health.commit === extra,
-      "restarted Paperclip reports the wrong build");
-    // A second health read catches fast crashes after an initial HTTP success.
-    await sleep(8_000);
-    const recheck = await liveServer(client);
-    ensure(recheck.state.serverPid === state.serverPid && !recheck.state.draining,
-      "Paperclip process changed or admission remained held after health stabilization");
+    const { state } = await waitForRestartReady(async () => {
+      const [health, current, payload] = await Promise.all([
+        client.api("GET", "/api/health"),
+        client.api("GET", "/api/instance/task-drain?upgradeReadiness=1"),
+        currentPayload(),
+      ]);
+      return { health, state: current, payload };
+    }, { previousPid: record.serverPid, sha: extra });
     record.phase = "restarted-healthy"; record.finishedAt = now();
     record.evidence.push("new Paperclip PID, matching installed SHA, stable health; admission restored");
     await writePrivate(VERIFIED, { schema: 1, sha: extra, serverPid: state.serverPid,
@@ -374,11 +511,18 @@ async function main() {
         // The database can be empty while an abandoned OpenCode server turn
         // is still generating. Never call this quiescent until every known
         // provider reports no unowned activity.
-        const proof = await snapshot(client);
-        ensure(proof.planned.length === 0, "running rows appeared during drain");
-        record.phase = "quiescent"; await writePrivate(file, record);
-        console.log("deploy-drain: quiescent (all recorded runs and provider sessions settled)");
-        return;
+        try {
+          const proof = await snapshot(client, record);
+          ensure(proof.planned.length === 0, "running rows appeared during drain");
+          record.phase = "quiescent"; await writePrivate(file, record);
+          console.log("deploy-drain: quiescent (all recorded runs and provider sessions settled)");
+          return;
+        } catch (error) {
+          // Fresh unowned sessions are not yet old enough to interrupt; keep
+          // draining so they can become eligible without manual intervention.
+          if (!(error instanceof Error) ||
+            !error.message.includes("unowned or pre-journal OpenCode session")) throw error;
+        }
       }
       if (Date.now() >= end) break;
       await sleep(Math.min(5_000, Math.max(0, end - Date.now())));
@@ -388,7 +532,7 @@ async function main() {
     return;
   }
   if (action === "pause") {
-    const { planned, providers } = await snapshot(client);
+    const { planned, providers } = await snapshot(client, record);
     record.runs = planned;
     record.phase = "pausing";
     await writePrivate(file, record); // durable intent precedes any POST
