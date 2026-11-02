@@ -147,6 +147,7 @@ interface IssueRecoveryResolveOptions extends BaseClientOptions {
   outcome: string;
   sourceIssueStatus: string;
   resolutionNote?: string;
+  executionReconciliationFile?: string;
 }
 
 interface InteractionAcceptOptions extends BaseClientOptions {
@@ -534,14 +535,25 @@ export function registerIssueCommands(program: Command): void {
       .requiredOption("--source-issue-status <status>", "todo, done, or in_review for restored outcomes; blocked is only valid for blocked outcomes")
       .option("--action-id <id>", "Specific recovery action ID")
       .option("--resolution-note <text>", "Resolution note")
+      .option("--execution-reconciliation-file <path>", "JSON file containing the observed execution reconciliation")
       .action(async (issueId: string, opts: IssueRecoveryResolveOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
+          let executionReconciliation: unknown;
+          if (opts.executionReconciliationFile !== undefined) {
+            const contents = await readFile(opts.executionReconciliationFile, "utf8");
+            try {
+              executionReconciliation = JSON.parse(contents);
+            } catch {
+              throw new Error("Execution reconciliation file must contain valid JSON.");
+            }
+          }
           const payload = resolveIssueRecoveryActionSchema.parse({
             actionId: opts.actionId,
             outcome: opts.outcome,
             sourceIssueStatus: opts.sourceIssueStatus,
             resolutionNote: opts.resolutionNote,
+            ...(opts.executionReconciliationFile !== undefined ? { executionReconciliation } : {}),
           });
           const result = await ctx.api.post(apiPath`/api/issues/${issueId}/recovery-actions/resolve`, payload);
           printOutput(result, { json: ctx.json });

@@ -35,11 +35,13 @@ import { Identity } from "../components/Identity";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { PageTabBar } from "../components/PageTabBar";
 import { ProviderQuotaCard } from "../components/ProviderQuotaCard";
+import { AntigravityQuotaCard } from "../components/AntigravityQuotaCard";
 import { StatusBadge } from "../components/StatusBadge";
 import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useCompany } from "../context/CompanyContext";
 import { useDateRange, PRESET_KEYS, PRESET_LABELS } from "../hooks/useDateRange";
 import { retainQuotaWindows } from "../lib/quota-refresh";
+import { quotaPaceLabel } from "@/lib/quota-pace-labels";
 import { queryKeys } from "../lib/queryKeys";
 import { billingTypeDisplayName, cn, formatCents, formatTokens, providerDisplayName } from "../lib/utils";
 import { Button } from "@/components/ui/button";
@@ -57,6 +59,14 @@ export interface CostsProps {
   lockTab?: boolean;
   /** Budgets is a peer Audit section, so omit it from the Costs sub-navigation. */
   hideBudgetsTab?: boolean;
+}
+
+function quotaPct(value: number): string {
+  return value > 0 && value < 0.1 ? value.toFixed(3) : value.toFixed(1);
+}
+function remainingQuotaPct(used: number): string {
+  const remaining = Math.max(0, 100 - used);
+  return used > 0 && used < 0.1 ? remaining.toFixed(3) : remaining.toFixed(1);
 }
 
 function currentWeekRange(): { from: string; to: string } {
@@ -403,6 +413,14 @@ export function Costs({
     staleTime: 10_000,
   });
 
+  const { data: sentinelData, isLoading: sentinelLoading, isError: sentinelError } = useQuery({
+    queryKey: ["quota-sentinel", companyId],
+    queryFn: () => costsApi.quotaSentinel(companyId),
+    enabled: !!selectedCompanyId && mainTab === "providers",
+    refetchInterval: 60_000,
+    staleTime: 30_000,
+  });
+
   const { data: quotaData, isLoading: quotaLoading, error: quotaFetchError } = useQuery({
     queryKey: queryKeys.usageQuotaWindows(companyId),
     queryFn: () => costsApi.quotaWindows(companyId),
@@ -410,10 +428,53 @@ export function Costs({
       previous as ProviderQuotaResult[] | undefined,
       incoming as ProviderQuotaResult[],
     ),
-    enabled: !!selectedCompanyId && mainTab === "providers",
+    enabled: !!selectedCompanyId && mainTab === "providers" && !(Array.isArray(sentinelData?.pools) && sentinelData.pools.length > 0),
     refetchInterval: 300_000,
     staleTime: 60_000,
   });
+
+  const quotaDeadlineEvents = useMemo(() => {
+    const items: Array<{ at: number; displayAt?: number; label: string; stake: string; source: string }> = [];
+    const now = Date.now();
+    const observed = Date.parse(sentinelData?.observedAt ?? "");
+    for (const pool of sentinelData?.pools ?? []) {
+      if (pool.pool === "session" || pool.pool.endsWith(":5h")) continue;
+      const at = Date.parse(pool.resetsAt ?? "");
+      if (!Number.isFinite(at) || at <= now) continue;
+      if (pool.provider === "antigravity" && pool.pool === "gemini:weekly"
+          && pool.usedPercent === 0 && Number.isFinite(observed)
+          && Math.abs(at - observed - 7 * 86_400_000) < 300_000) continue;
+      const name = pool.provider === "antigravity" ? "Antigravity" : pool.provider === "codex" ? "Codex" : "Claude";
+      items.push({ at, label: name + " · " + pool.pool,
+        stake: pool.usedPercent == null ? "Allowance unknown" : remainingQuotaPct(pool.usedPercent) + "% remaining",
+        source: "subscription allowance" });
+    }
+    for (const offer of sentinelData?.creditOffers ?? []) {
+      const at = Date.parse(offer.expiresAt ?? "");
+      if (!Number.isFinite(at) || at <= now) continue;
+      const amount = offer.balanceLastReportedUsd == null ? "Balance unknown"
+        : "Up to $" + offer.balanceLastReportedUsd.toFixed(2) + " last reported";
+      items.push({ at, displayAt: at - 1000, label: offer.label,
+        stake: amount + " · " + offer.source + "; not live verified",
+        source: "promotional credit" });
+    }
+    if (sentinelData?.bankedReset?.expiresAt) {
+      const at = Date.parse(sentinelData.bankedReset.expiresAt);
+      if (Number.isFinite(at) && at > now) {
+        const count = sentinelData.bankedReset.available;
+        const expected = sentinelData.bankedResetDispute?.ownerExpected;
+        items.push({ at, label: "Codex · banked resets",
+          stake: expected != null && expected !== count ? "Disputed: reader " + count + ", owner expects " + expected
+            : count == null ? "Count unknown" : count + " reset(s) reported",
+          source: "manual redemption" });
+      }
+    }
+    return items.sort((a,b) => a.at-b.at).slice(0,12);
+  }, [sentinelData]);
+
+  // Quota Sentinel is the primary subscription allowance display.
+  // Avoid competing native quota labels and permissions errors when it has data.
+  const preferSentinelQuota = Array.isArray(sentinelData?.pools) && sentinelData.pools.length > 0;
 
   const byProvider = useMemo(() => {
     const map = new Map<string, CostByProviderModel[]>();
@@ -509,7 +570,11 @@ export function Costs({
     return map;
   }, [preset, spendData, byProvider]);
 
-  const providers = useMemo(() => Array.from(byProvider.keys()), [byProvider]);
+  // A provider may have subscription quota even with zero Paperclip cost events.
+  // Antigravity is a subscription source, not a cost-ledger provider.
+  const providers = useMemo(() => {
+    return ["antigravity", ...Array.from(byProvider.keys()).filter(key => key !== "antigravity")];
+  }, [byProvider]);
   const billers = useMemo(() => Array.from(byBiller.keys()), [byBiller]);
 
   const effectiveProvider =
@@ -525,7 +590,7 @@ export function Costs({
   }, [effectiveBiller, activeBiller]);
 
   const providerTabItems = useMemo(() => {
-    const providerKeys = Array.from(byProvider.keys());
+    const providerKeys = providers;
     const allTokens = providerKeys.reduce(
       (sum, provider) => sum + (byProvider.get(provider)?.reduce((acc, row) => acc + row.inputTokens + row.cachedInputTokens + row.outputTokens, 0) ?? 0),
       0,
@@ -551,10 +616,12 @@ export function Costs({
       },
       ...providerKeys.map((provider) => ({
         value: provider,
-        label: <ProviderTabLabel provider={provider} rows={byProvider.get(provider) ?? []} />,
+        label: provider === "antigravity"
+          ? <span>Antigravity <span className="text-xs text-muted-foreground">Quota</span></span>
+          : <ProviderTabLabel provider={provider} rows={byProvider.get(provider) ?? []} />,
       })),
     ];
-  }, [byProvider]);
+  }, [byProvider, providers]);
 
   const billerTabItems = useMemo(() => {
     const billerKeys = Array.from(byBiller.keys());
@@ -1036,6 +1103,80 @@ export function Costs({
         </TabsContent>
 
         <TabsContent value="providers" className="mt-4 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
+            <span className="text-muted-foreground">Quota allowances are separate from Paperclip inference costs.</span>
+            <a className="underline underline-offset-4" href="/subscription-quotas.html">
+              Open live subscription-only dashboard
+            </a>
+          </div>
+          <Card data-testid="quota-sentinel-panel">
+            <CardHeader>
+              <CardTitle>Subscription quota across providers</CardTitle>
+              <CardDescription>
+                Quota Sentinel · polled every 30 minutes · allowance, not API spend · pace is recent consumption speed
+                {sentinelData?.observedAt ? ` · observed ${new Date(sentinelData.observedAt).toLocaleString("en-US", { timeZone: "America/Los_Angeles", year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" })}` : ""}
+                {sentinelData?.stale ? " · STALE snapshot" : ""}
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              {sentinelLoading ? <p className="text-sm text-muted-foreground">Loading quota snapshot…</p>
+                : sentinelError || !Array.isArray(sentinelData?.pools) ? <p role="status" className="text-sm text-muted-foreground">Quota Sentinel data unavailable. Provider usage is not assumed to be zero.</p>
+                : <div className="grid gap-4 md:grid-cols-3">
+                    {(["antigravity", "codex", "claude"] as const).map(provider => (
+                      <div key={provider} className="space-y-3">
+                        <h3 className="font-semibold">{provider === "codex" ? "ChatGPT / Codex" : provider === "claude" ? "Claude" : "Antigravity"}</h3>
+                        {sentinelData.pools.filter(p => p.provider === provider && p.pool !== "session" && !p.pool.endsWith(":5h")).map(p => (
+                          <div key={p.pool} className="space-y-1 text-sm">
+                            <div className="flex justify-between gap-3">
+                              <span>{p.pool}</span>
+                              <span className="tabular-nums">{p.usedPercent == null ? "Unknown" : `${quotaPct(p.usedPercent)}% used`}</span>
+                            </div>
+                            <div className="h-2 rounded bg-muted overflow-hidden">
+                              {p.usedPercent != null && <div className="h-full bg-primary" style={{ width: `${p.usedPercent}%` }} />}
+                            </div>
+                            <p className="text-xs text-muted-foreground">
+                              {p.resetsAt ? `Resets ${new Date(p.resetsAt).toLocaleString("en-US", { timeZone: "America/Los_Angeles", year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" })}` : "Reset unknown"}
+                              {" · "}{quotaPaceLabel(p.state)}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    ))}
+                  </div>}
+              {sentinelData?.bankedReset && (
+                <div data-testid="quota-banked-resets" className="mt-4 border-t pt-4 text-sm">
+                  <div className="font-semibold">Codex banked resets: {sentinelData.bankedReset.available ?? "Unknown"}</div>
+                  <div className="text-xs text-muted-foreground">
+                    {sentinelData.bankedReset.expiresAt
+                      ? `Expires ${new Date(sentinelData.bankedReset.expiresAt).toLocaleString("en-US", { timeZone: "America/Los_Angeles", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" })}`
+                      : "Expiry unknown"}
+                    {" · Manual redemption only; Paperclip never redeems automatically"}
+                  </div>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+          <Card data-testid="quota-deadline-timeline">
+            <CardHeader>
+              <CardTitle>Upcoming quota deadlines</CardTitle>
+              <CardDescription>Chronological allowance and credit expirations. Rare five-hour limits are grouped at the bottom of the standalone dashboard.</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <ol className="ml-2 space-y-4 border-l-2 border-border pl-5">
+                {quotaDeadlineEvents.length ? quotaDeadlineEvents.map(event => (
+                  <li key={event.label + event.at} className="relative">
+                    <span aria-hidden="true" className="absolute -left-7 top-1.5 h-3 w-3 rounded-full bg-primary ring-2 ring-background" />
+                    <div className="text-xs text-muted-foreground">
+                      {new Date(event.displayAt ?? event.at).toLocaleString("en-US", { timeZone: "America/Los_Angeles", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" })}
+                    </div>
+                    <div className="font-medium">{event.label}</div>
+                    <div className="text-sm text-muted-foreground">{event.stake}</div>
+                  </li>
+                )) : <li className="text-sm text-muted-foreground">No known upcoming deadlines. Missing values are not zero.</li>}
+              </ol>
+              <p className="mt-4 text-xs text-muted-foreground">Promotional Cloud Session Credit balances are separate from Claude subscription quota and reflect the last available report, not necessarily the live account balance.</p>
+            </CardContent>
+          </Card>
           {showCustomPrompt ? (
             <p className="text-sm text-muted-foreground">Select a start and end date to load data.</p>
           ) : (
@@ -1048,7 +1189,16 @@ export function Costs({
                     <p className="text-sm text-muted-foreground">No cost events in this period.</p>
                   ) : (
                     <div className="grid gap-4 md:grid-cols-2">
-                      {providers.map((provider) => (
+                      {providers.map((provider) => provider === "antigravity" ? (
+                        <AntigravityQuotaCard
+                          key="antigravity"
+                          pools={sentinelData?.pools?.filter(p => p.provider === "antigravity") ?? []}
+                          observedAt={sentinelData?.observedAt}
+                          stale={sentinelData?.stale}
+                          loading={sentinelLoading}
+                          error={sentinelError}
+                        />
+                      ) : (
                         <ProviderQuotaCard
                           key={provider}
                           provider={provider}
@@ -1059,12 +1209,12 @@ export function Costs({
                           weekSpendCents={weekSpendByProvider.get(provider) ?? 0}
                           windowRows={windowSpendByProvider.get(provider) ?? []}
                           showDeficitNotch={deficitNotchByProvider.get(provider) ?? false}
-                          quotaAccounts={quotaData?.filter(account => account.provider === provider)}
-                      quotaRequestFailed={Boolean(quotaFetchError)}
-                      quotaWindows={quotaWindowsByProvider.get(provider) ?? []}
-                          quotaError={quotaErrorsByProvider.get(provider) ?? null}
-                          quotaSource={quotaSourcesByProvider.get(provider) ?? null}
-                          quotaLoading={quotaLoading}
+                          quotaAccounts={preferSentinelQuota ? [] : quotaData?.filter(account => account.provider === provider)}
+                      quotaRequestFailed={!preferSentinelQuota && Boolean(quotaFetchError)}
+                      quotaWindows={preferSentinelQuota ? [] : quotaWindowsByProvider.get(provider) ?? []}
+                          quotaError={preferSentinelQuota ? null : quotaErrorsByProvider.get(provider) ?? null}
+                          quotaSource={preferSentinelQuota ? null : quotaSourcesByProvider.get(provider) ?? null}
+                          quotaLoading={!preferSentinelQuota && quotaLoading}
                         />
                       ))}
                     </div>
@@ -1073,6 +1223,15 @@ export function Costs({
 
                 {providers.map((provider) => (
                   <TabsContent key={provider} value={provider} className="mt-4">
+                    {provider === "antigravity" ? (
+                      <AntigravityQuotaCard
+                        pools={sentinelData?.pools?.filter(p => p.provider === "antigravity") ?? []}
+                        observedAt={sentinelData?.observedAt}
+                        stale={sentinelData?.stale}
+                        loading={sentinelLoading}
+                        error={sentinelError}
+                      />
+                    ) : (
                     <ProviderQuotaCard
                       provider={provider}
                       rows={byProvider.get(provider) ?? []}
@@ -1082,13 +1241,14 @@ export function Costs({
                       weekSpendCents={weekSpendByProvider.get(provider) ?? 0}
                       windowRows={windowSpendByProvider.get(provider) ?? []}
                       showDeficitNotch={deficitNotchByProvider.get(provider) ?? false}
-                      quotaAccounts={quotaData?.filter(account => account.provider === provider)}
-                      quotaRequestFailed={Boolean(quotaFetchError)}
-                      quotaWindows={quotaWindowsByProvider.get(provider) ?? []}
-                      quotaError={quotaErrorsByProvider.get(provider) ?? null}
-                      quotaSource={quotaSourcesByProvider.get(provider) ?? null}
-                      quotaLoading={quotaLoading}
+                      quotaAccounts={preferSentinelQuota ? [] : quotaData?.filter(account => account.provider === provider)}
+                      quotaRequestFailed={!preferSentinelQuota && Boolean(quotaFetchError)}
+                      quotaWindows={preferSentinelQuota ? [] : quotaWindowsByProvider.get(provider) ?? []}
+                      quotaError={preferSentinelQuota ? null : quotaErrorsByProvider.get(provider) ?? null}
+                      quotaSource={preferSentinelQuota ? null : quotaSourcesByProvider.get(provider) ?? null}
+                      quotaLoading={!preferSentinelQuota && quotaLoading}
                     />
+                    )}
                   </TabsContent>
                 ))}
               </Tabs>

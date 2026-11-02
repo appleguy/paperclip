@@ -19,6 +19,9 @@ import type {
   NativeExecutionInputV8,
   NativeExecutionInputV9,
   NativeExecutionInputV10,
+  NativeExecutionInputV11,
+  NativeExecutionInputV12,
+  NativeExecutionInputV13,
   MuseBindingSnapshot,
   DotBindingSnapshot,
   NativeExecutionInputV7,
@@ -96,7 +99,9 @@ export interface BuildNativeExecutionInput {
     branchName: string | null;
   };
   normalizedSessionId: string | null;
-  provider?: "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx" | "openai_dot" | "grok_bot" | "muse";
+  provider?: "codex" | "opencode" | "opencode_shared_v2" | "claude_interactive" | "claude_managed" | "aws_agentcore" | "acpx" | "openai_dot" | "grok_bot" | "muse" | "antigravity_headless";
+  opencodeEffort?: string;
+  claudeAutoCompactTokens?: number;
   museBinding?: MuseBindingSnapshot;
   dotBinding?: DotBindingSnapshot;
   acpxAgent?: NativeAcpxAgent;
@@ -140,15 +145,18 @@ export interface BuildNativeExecutionInput {
   runtimeContext: NativeRuntimeContextSnapshot;
 }
 export function buildNativeExecutionInput(input: BuildNativeExecutionInput & { provider: "muse"; museBinding: MuseBindingSnapshot }): NativeExecutionInputV8;
+export function buildNativeExecutionInput(input: BuildNativeExecutionInput & { provider: "antigravity_headless" }): NativeExecutionInputV11;
+export function buildNativeExecutionInput(input: BuildNativeExecutionInput & { provider: "opencode_shared_v2" }): NativeExecutionInputV12;
+export function buildNativeExecutionInput(input: BuildNativeExecutionInput & { provider: "claude_interactive" }): NativeExecutionInputV13;
 export function buildNativeExecutionInput(input: BuildNativeExecutionInput & { provider: "openai_dot" | "grok_bot"; dotBinding: DotBindingSnapshot }): NativeExecutionInputV6;
-export function buildNativeExecutionInput(input: BuildNativeExecutionInput & { provider?: Exclude<BuildNativeExecutionInput["provider"], "openai_dot" | "grok_bot" | "muse"> }): NativeExecutionInputV5 | NativeExecutionInputV7 | NativeExecutionInputV9 | NativeExecutionInputV10;
-export function buildNativeExecutionInput(input: BuildNativeExecutionInput): NativeExecutionInputV5 | NativeExecutionInputV6 | NativeExecutionInputV7 | NativeExecutionInputV8 | NativeExecutionInputV9 | NativeExecutionInputV10;
-export function buildNativeExecutionInput(input: BuildNativeExecutionInput): NativeExecutionInputV5 | NativeExecutionInputV6 | NativeExecutionInputV7 | NativeExecutionInputV8 | NativeExecutionInputV9 | NativeExecutionInputV10 {
-  if (input.issue.workMode !== "standard" && input.issue.workMode !== "planning" && input.issue.workMode !== "ask") {
-    throw new Error("native_execution_input_invalid: issue work mode must be standard, planning, or ask");
+export function buildNativeExecutionInput(input: BuildNativeExecutionInput & { provider?: Exclude<BuildNativeExecutionInput["provider"], "openai_dot" | "grok_bot" | "muse" | "antigravity_headless" | "opencode_shared_v2" | "claude_interactive"> }): NativeExecutionInputV5 | NativeExecutionInputV7 | NativeExecutionInputV9 | NativeExecutionInputV10;
+export function buildNativeExecutionInput(input: BuildNativeExecutionInput): NativeExecutionInputV5 | NativeExecutionInputV6 | NativeExecutionInputV7 | NativeExecutionInputV8 | NativeExecutionInputV9 | NativeExecutionInputV10 | NativeExecutionInputV11 | NativeExecutionInputV12 | NativeExecutionInputV13;
+export function buildNativeExecutionInput(input: BuildNativeExecutionInput): NativeExecutionInputV5 | NativeExecutionInputV6 | NativeExecutionInputV7 | NativeExecutionInputV8 | NativeExecutionInputV9 | NativeExecutionInputV10 | NativeExecutionInputV11 | NativeExecutionInputV12 | NativeExecutionInputV13 {
+  if (input.issue.workMode !== "standard" && input.issue.workMode !== "planning" && input.issue.workMode !== "ask" && input.issue.workMode !== "skill_test") {
+    throw new Error("native_execution_input_invalid: issue work mode must be standard, planning, ask, or skill_test");
   }
-  const mode = resolvePaperclipRunnerCursorMode(input.provider, input.acpxAgent, input.acpxSessionMode);
-  const piThinkingLevel = resolvePaperclipRunnerPiThinkingLevel(input.provider, input.acpxAgent, input.piThinkingLevel);
+  const mode = resolvePaperclipRunnerCursorMode(input.provider === "antigravity_headless" || input.provider === "opencode_shared_v2" || input.provider === "claude_interactive" ? undefined : input.provider, input.acpxAgent, input.acpxSessionMode);
+  const piThinkingLevel = resolvePaperclipRunnerPiThinkingLevel(input.provider === "antigravity_headless" || input.provider === "opencode_shared_v2" || input.provider === "claude_interactive" ? undefined : input.provider, input.acpxAgent, input.piThinkingLevel);
   const executionMode = input.executionMode
     ?? (input.issue.workMode === "planning" ? "plan" : "default");
   const acpxProfile = input.provider === "acpx"
@@ -388,7 +396,19 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
     credentialBindings: [],
     runtimeContext: input.runtimeContext,
   };
-  return parseNativeExecutionInput(input.provider === "muse" ? { ...prepared,
+  return parseNativeExecutionInput(input.provider === "claude_interactive" ? { ...prepared,
+    schema: "paperclip.native-execution-input.v13", homeMode: "preconfigured",
+    provider: { kind: "claude_interactive", model: input.model, effort: input.claudeEffort, autoCompactTokens: input.claudeAutoCompactTokens },
+    session: { ...prepared.session, normalizedSessionId: input.normalizedSessionId, driverKind: "claude_interactive_v1" },
+  } : input.provider === "opencode_shared_v2" ? { ...prepared,
+    schema: "paperclip.native-execution-input.v12", homeMode: "preconfigured",
+    provider: { kind: "opencode_shared_v2", model: input.model, effort: input.opencodeEffort, cliVersion: "2.2.5" },
+    session: { ...prepared.session, normalizedSessionId: input.normalizedSessionId, driverKind: "opencode_shared_v2" },
+  } : input.provider === "antigravity_headless" ? { ...prepared,
+    schema: "paperclip.native-execution-input.v11", homeMode: "preconfigured",
+    provider: { kind: "antigravity_headless", model: null, cliVersion: "1.4.12" },
+    session: { ...prepared.session, normalizedSessionId: input.normalizedSessionId ?? `session-${input.runId}`, driverKind: "antigravity_headless", lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } }
+  } : input.provider === "muse" ? { ...prepared,
     schema: "paperclip.native-execution-input.v8", provider: { kind: "muse", model: null, binding: input.museBinding, bridgeRevision: "muse-v1" },
     workspace: { access: "none", cwd: null, repoUrl: null, repoRef: null, branchName: null },
     session: { ...prepared.session, driverKind: "muse_external", lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } }
@@ -396,7 +416,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
     schema: "paperclip.native-execution-input.v6", provider: { kind: input.provider, model: null, binding: input.dotBinding },
     workspace: { access: "none", cwd: null, repoUrl: null, repoRef: null, branchName: null },
     session: { ...prepared.session, driverKind: input.provider === "grok_bot" ? "grok_bot_mcp" : "openai_dot_mcp", lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } }
-  } : prepared) as NativeExecutionInputV5 | NativeExecutionInputV6 | NativeExecutionInputV7 | NativeExecutionInputV8 | NativeExecutionInputV9 | NativeExecutionInputV10;
+  } : prepared) as NativeExecutionInputV5 | NativeExecutionInputV6 | NativeExecutionInputV7 | NativeExecutionInputV8 | NativeExecutionInputV9 | NativeExecutionInputV10 | NativeExecutionInputV11 | NativeExecutionInputV12 | NativeExecutionInputV13;
 }
 
 

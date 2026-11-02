@@ -1,3 +1,9 @@
+import { createServer } from "node:http";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { DurablePrpControlPlane, spawnRunner } from "../../../packages/paperclip-runner/src/control-plane/durable-prp-control-plane.js";
+import { readRunnerdArtifactBinding } from "../../../packages/paperclip-runner/src/live/runnerd-codex-transport.js";
+import { registerRunnerPrpAuthority, runnerPrpWebSocketInternals, setupRunnerPrpWebSocketServer } from "../realtime/runner-prp-ws.js";
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -221,7 +227,7 @@ describeEmbeddedPostgres("runner goal service", () => {
       },
     });
     expect(updated).toMatchObject({
-      goal: { status: "active", workingNow: true },
+      goal: { status: "active", workingNow: false },
       pendingAction: null,
     });
     expect(await isRunnerGoalActionCompleted(db, binding, requestId)).toBe(true);
@@ -517,7 +523,7 @@ describeEmbeddedPostgres("runner goal service", () => {
       goal: {
         objective: "Project the durable provider goal",
         status: "active",
-        workingNow: true,
+        workingNow: false,
       },
       revision: 2,
     });
@@ -623,4 +629,29 @@ describeEmbeddedPostgres("runner goal service", () => {
         .from(agentSessionGoalActions),
     ).resolves.toEqual([{ status: "pending" }]);
   });
+  it("shows work only for the exact authenticated live run and observation epoch", async () => {
+    const b=await seed(),runId=randomUUID(),runnerInstanceId=randomUUID();
+    await db.insert(heartbeatRuns).values({id:runId,companyId:b.companyId,agentId:b.agentId,nativeIssueId:b.issueId,status:"running",invocationSource:"on_demand",runnerInstanceId});
+    await db.insert(agentTaskSessions).values({companyId:b.companyId,agentId:b.agentId,adapterType:"paperclip_runner",taskKey:b.issueId,goalJson:{objective:"Persist",status:"active",workingNow:true},goalSourceId:`${runnerInstanceId}:${runId}`,goalObservedAt:new Date()});
+    const service=runnerGoalService(db), current=()=>service.projection(b.companyId,b.issueId);
+    expect(await current()).toMatchObject({workingNow:false,goal:{status:"active",workingNow:false}});
+    const root=await mkdtemp("/Volumes/NVM/AI_Agent_Runtime/tmp/goal-live-"),binary=process.env.AGY_TEST_RUNNER_BINARY ?? "/Volumes/NVM/AI_Agent_Runtime/tmp/sco337-agy-tool-target/debug/paperclip-runnerd";
+    const artifact=readRunnerdArtifactBinding(binary),identity={runnerInstanceId,environmentLeaseId:"lease",runId,normalizedSessionId:"session",turnId:"turn",itemId:"item"};
+    const core=new DurablePrpControlPlane({stateDirectory:join(root,"core"),identity,expectedRunnerVersion:artifact.version,expectedRunnerDigest:artifact.digest});
+    const server=createServer();await new Promise<void>(r=>server.listen(0,"127.0.0.1",r));const address=server.address();if(!address||typeof address==="string")throw Error("listener");setupRunnerPrpWebSocketServer(server,{apiUrl:`http://127.0.0.1:${address.port}`});
+    let child:ReturnType<typeof spawnRunner>|undefined;let registration:Awaited<ReturnType<typeof registerRunnerPrpAuthority>>|undefined;
+    try {
+      await core.start();registration=await registerRunnerPrpAuthority({...b,runId,authority:core});const ticket=core.issueBootstrapTicket(60000);await core.flushCheckpoint();
+      expect(await current()).toMatchObject({workingNow:false});
+      child=spawnRunner({connectUrl:registration.connectUrl,stateDirectory:join(root,"runner"),identity,ticket,runnerBinaryPath:binary,runnerVersion:artifact.version,runnerDigest:artifact.digest,maxOutboxBytes:1024*1024,p0ReserveBytes:64*1024,maxRuntimeMs:0,environment:{PATH:process.env.PATH}});
+      await vi.waitFor(()=>expect(core.activeRunnerConnectionCount()).toBe(1),{timeout:10000,interval:25});
+      expect(await current()).toMatchObject({workingNow:true,goal:{status:"active",workingNow:true},activeRunId:runId});
+      await db.update(agentTaskSessions).set({goalSourceId:`${runnerInstanceId}:foreign`}).where(eq(agentTaskSessions.taskKey,b.issueId));expect(await current()).toMatchObject({workingNow:false,goal:{status:"active",workingNow:false}});
+      await db.update(agentTaskSessions).set({goalSourceId:`${runnerInstanceId}:${runId}`,goalObservedAt:null}).where(eq(agentTaskSessions.taskKey,b.issueId));expect(await current()).toMatchObject({workingNow:false});
+      await db.update(agentTaskSessions).set({goalObservedAt:new Date()}).where(eq(agentTaskSessions.taskKey,b.issueId));await db.update(heartbeatRuns).set({status:"queued"}).where(eq(heartbeatRuns.id,runId));expect(await current()).toMatchObject({workingNow:false});
+      await db.update(heartbeatRuns).set({status:"succeeded"}).where(eq(heartbeatRuns.id,runId));expect(await current()).toMatchObject({activeRunId:null,workingNow:false,goal:{status:"active",workingNow:false}});
+      await db.update(heartbeatRuns).set({status:"running"}).where(eq(heartbeatRuns.id,runId));await registration.release();registration=undefined;expect(await current()).toMatchObject({workingNow:false});
+    } finally {await registration?.release();if(child){child.child.kill("SIGTERM");await child.completion.catch(()=>{});}await core.stop();await new Promise<void>(r=>server.close(()=>r()));runnerPrpWebSocketInternals.resetForTests();await rm(root,{recursive:true,force:true});}
+  },30000);
+
 });

@@ -1,0 +1,14 @@
+import { describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
+import { parseNativeExecutionInput } from "../../contracts/native-execution.js";
+import { canonicalNativeRuntimeContextDigest, NATIVE_RUNTIME_ASSET_SCHEMA } from "../../contracts/runtime-context.js";
+import { createNativeSessionBackend } from "../../backends/native-backend-factory.js";
+import { describeRunnerdNativeSessionBackend } from "../../backends/codex-native-backend.js";
+const digest="0".repeat(64), text="instructions";
+const context={prompt:{revision:"r",text,digest:createHash("sha256").update(text).digest("hex")},instructions:{entryPath:"AGENTS.md",bundle:{schema:NATIVE_RUNTIME_ASSET_SCHEMA,digest,manifestDigest:digest,rootPath:"/runtime/instructions",fileCount:1,totalBytes:1}},skills:[],mcp:{assignmentSetId:"none",digest,bindingId:null}};
+const input={schema:"paperclip.native-execution-input.v11",binding:{companyId:"c",runId:"r",issueId:"i",agentId:"a",executionWorkspaceId:"w"},task:{identifier:"I",title:"Task",description:null,prompt:"task",workMode:"standard"},workspace:{cwd:"/workspace",repoUrl:null,repoRef:null,branchName:null},session:{normalizedSessionId:"session",driverKind:"antigravity_headless",protocolVersion:1,lifecyclePolicy:{mode:"per_turn",idleTimeoutMs:null}},provider:{kind:"antigravity_headless",model:null,cliVersion:"1.4.12"},completionContract:{id:"c",sha256:"abc",schemaVersion:"v1",contract:{revision:"1",objective:"task",criteria:[{id:"c",requirement:"done"}]}},interactionResponses:[],credentialBindings:[],executionMode:"default",planningContext:null,runtimeContext:{...context,aggregateDigest:canonicalNativeRuntimeContextDigest(context)},homeMode:"preconfigured"};
+describe("Antigravity v11 admission",()=>{
+  it("accepts the closed native provider schema but requires server authority",()=>{const parsed=parseNativeExecutionInput(input);expect(parsed.schema).toBe(input.schema);expect(()=>createNativeSessionBackend(parsed)).toThrow(/authority/);});
+  it("describes native headless limits without a Codex fallback",async()=>{const descriptor=await describeRunnerdNativeSessionBackend(parseNativeExecutionInput(input));expect(descriptor.name).toBe("antigravity_headless");expect(descriptor.capabilities).toMatchObject({structuredResult:false,steering:false,dynamicTools:false,usage:false});expect(descriptor.capabilities.unsupported).toEqual(expect.arrayContaining(["managed tool accounting","native tool ingress fencing","shared interactive remote control"]));});
+  it("rejects caller supplied authority and mismatched provider settings",()=>{expect(()=>parseNativeExecutionInput({...input,provider:{...input.provider,leaseId:"forged"}})).toThrow();expect(()=>parseNativeExecutionInput({...input,provider:{...input.provider,cliVersion:"other"}})).toThrow();});
+});

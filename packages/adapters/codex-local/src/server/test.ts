@@ -11,6 +11,7 @@ import {
 import {
   ensureAdapterExecutionTargetCommandResolvable,
   ensureAdapterExecutionTargetDirectory,
+  isAdapterExecutionTargetUnavailableError,
   maybeRunSandboxInstallCommand,
   runAdapterExecutionTargetProcess,
   describeAdapterExecutionTarget,
@@ -60,7 +61,10 @@ function firstNonEmptyLine(text: string): string {
 
 function commandLooksLike(command: string, expected: string): boolean {
   const base = path.basename(command).toLowerCase();
-  return base === expected || base === `${expected}.cmd` || base === `${expected}.exe`;
+  // The official @openai/codex npm package exposes bin/codex.js as an executable.
+  // Treat it as Codex too, so custom absolute-path installs receive the same
+  // version and authenticated hello checks as the bare `codex` command.
+  return base === expected || base === `${expected}.cmd` || base === `${expected}.exe` || base === `${expected}.js`;
 }
 
 function summarizeProbeDetail(stdout: string, stderr: string, parsedError: string | null): string | null {
@@ -308,6 +312,7 @@ export async function testEnvironment(
   } catch (err) {
     checks.push({
       code: "codex_cwd_invalid",
+      ...(isAdapterExecutionTargetUnavailableError(err) ? { retryable: true } : {}),
       level: "error",
       message: err instanceof Error ? err.message : "Invalid working directory",
       detail: cwd,
@@ -339,6 +344,7 @@ export async function testEnvironment(
   } catch (err) {
     checks.push({
       code: "codex_command_unresolvable",
+      ...(isAdapterExecutionTargetUnavailableError(err) ? { retryable: true } : {}),
       level: "error",
       message: err instanceof Error ? err.message : "Command is not executable",
       detail: command,

@@ -177,6 +177,12 @@ pub(crate) enum ProviderStartupObservation {
         process_id: u32,
         process_group_id: u32,
     },
+    Attached {
+        socket_path: PathBuf,
+        daemon_generation: String,
+        thread_id: String,
+        codex_home: PathBuf,
+    },
     Failed {
         stage: ProviderStartupStage,
         child_exit: Option<ProcessExitFact>,
@@ -403,6 +409,165 @@ fn default_approval_policy() -> String {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SharedDaemonConfig {
+    pub socket_path: PathBuf,
+    pub daemon_generation: String,
+    pub thread_id: String,
+    pub codex_home: PathBuf,
+    #[serde(default)]
+    pub peer: Option<ExpectedPeer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer: Option<SharedDaemonWriter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_id: Option<String>,
+    /// Display name only: sent best-effort after thread creation, never part of thread identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_name: Option<String>,
+}
+
+/// A server-issued grant bound to the existing durable PRP run, not a Codex credential.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SharedDaemonWriter {
+    pub run_id: String,
+    pub normalized_session_id: String,
+    pub runner_instance_id: String,
+    pub grant_id: String,
+    pub epoch: u64,
+    pub observation_epoch_id: String,
+    /// Only a server-verified managed-thread bootstrap may enable tool calls.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub managed_tools: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_bootstrap_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Thread-local configuration, independently bound by the server to the admitted launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_config: Option<serde_json::Map<String, Value>>,
+}
+
+/// Shell commands inherit nothing from the shared daemon's environment: only the listed names and the explicit set values.
+fn shared_shell_environment_policy_valid(policy: &Value) -> bool {
+    let Some(policy) = policy.as_object() else { return false };
+    policy.get("inherit") == Some(&json!("none"))
+        && policy.keys().all(|k| matches!(k.as_str(), "inherit" | "ignore_default_excludes" | "include_only" | "set"))
+        && policy.get("ignore_default_excludes").is_none_or(Value::is_boolean)
+        && policy.get("include_only").is_none_or(|v| v.as_array().is_some_and(|names| names.len() <= 64 && names.iter().all(Value::is_string)))
+        && policy.get("set").is_none_or(|v| v.as_object().is_some_and(|set| set.len() <= 64 && set.values().all(Value::is_string)))
+}
+
+pub const SHARED_WRITABLE_PROFILE: &str = "paperclip-runner-workspace-only";
+pub const SHARED_READ_ONLY_PROFILE: &str = "paperclip-runner-workspace-read-only";
+
+impl SharedDaemonWriter {
+    fn thread_config_valid(&self, cwd: &str, read_only: bool) -> bool {
+        let cwd_path = std::path::Path::new(cwd);
+        if !cwd_path.is_absolute()
+            || cwd_path == std::path::Path::new("/")
+            || cwd_path.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+        {
+            return false;
+        }
+        let Some(config) = self.thread_config.as_ref() else {
+            return false;
+        };
+        if config
+            .keys()
+            .any(|k| k != "permissions" && k != "web_search" && k != "shell_environment_policy" && k != "mcp_servers")
+            || config.get("mcp_servers").is_some_and(|v| !v.as_object().is_some_and(|servers| servers.len() <= 256 && servers.iter().all(|(name, entry)| {
+                !name.is_empty() && name.len() <= 128 && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+                    && entry.as_object().is_some_and(|entry| entry.get("enabled") == Some(&json!(false)) && (entry.len() == 1 || entry.len() == 2 && entry.get("command") == Some(&json!("/usr/bin/false"))))
+            })))
+            || config.get("web_search").is_some_and(|v| v != "disabled")
+            || !config
+                .get("shell_environment_policy")
+                .is_some_and(shared_shell_environment_policy_valid)
+        {
+            return false;
+        }
+        let Some(profiles) = config.get("permissions").and_then(Value::as_object) else {
+            return false;
+        };
+        if profiles.len() != 2 {
+            return false;
+        }
+        for (name, mode) in [
+            (SHARED_WRITABLE_PROFILE, "write"),
+            (SHARED_READ_ONLY_PROFILE, "read"),
+        ] {
+            let Some(profile) = profiles.get(name).and_then(Value::as_object) else {
+                return false;
+            };
+            if profile.keys().any(|k| k != "filesystem" && k != "network") {
+                return false;
+            }
+            let Some(fs) = profile.get("filesystem").and_then(Value::as_object) else {
+                return false;
+            };
+            if fs.len() > 256
+                || fs.get(":root") != Some(&json!("none"))
+                || fs.get(":minimal") != Some(&json!("read"))
+                || fs.get(":tmpdir") != Some(&json!("none"))
+                || fs.get(":workspace_roots") != Some(&json!({".": mode}))
+            {
+                return false;
+            }
+            for (path, value) in fs {
+                if path.starts_with(':') {
+                    if !matches!(
+                        path.as_str(),
+                        ":root" | ":minimal" | ":tmpdir" | ":workspace_roots"
+                    ) {
+                        return false;
+                    }
+                } else {
+                    let p = std::path::Path::new(path);
+                    if !p.is_absolute()
+                        || (p == std::path::Path::new("/") && value != "none")
+                        || path.len() > 4096
+                        || path.chars().any(char::is_control)
+                        || p.components().any(|c| {
+                            matches!(
+                                c,
+                                std::path::Component::ParentDir | std::path::Component::CurDir
+                            )
+                        })
+                        || !matches!(value.as_str(), Some("none" | "read" | "write"))
+                        || (value == "write"
+                            && (read_only || mode == "read" || !p.starts_with(cwd)))
+                    {
+                        return false;
+                    }
+                }
+            }
+            let Some(network) = profile.get("network").and_then(Value::as_object) else {
+                return false;
+            };
+            if network.len() != 1 || !network.get("enabled").is_some_and(Value::is_boolean) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExpectedPeer {
+    pub pid: u32,
+    pub start_seconds: u64,
+    pub start_microseconds: u64,
+    pub executable: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexProviderConfig {
     pub provider: String,
@@ -430,6 +595,8 @@ pub struct CodexProviderConfig {
     // Older sessions retain their standalone task envelope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_daemon: Option<SharedDaemonConfig>,
 }
 
 /// Explicit per-turn skill selection. The controller resolves assigned skill
@@ -480,6 +647,66 @@ impl CodexProviderConfig {
     }
 
     pub fn validate(&self) -> Result<(), LocalRunnerError> {
+        if let Some(shared) = &self.shared_daemon {
+            let bootstrap = shared.bootstrap_id.as_deref();
+            if self.provider != "codex"
+                || (!self.read_only && bootstrap.is_none())
+                || !shared.socket_path.is_absolute()
+                || !shared.codex_home.is_absolute()
+                || shared.daemon_generation.is_empty()
+                || shared.daemon_generation.len() > 240
+                || (shared.thread_id.is_empty() && bootstrap.is_none())
+                || shared.thread_id.len() > 240
+                || (bootstrap.is_none()
+                    && self.provider_session_id.as_deref() != Some(shared.thread_id.as_str()))
+                || (bootstrap.is_some()
+                    && (!shared.thread_id.is_empty()
+                        || self.provider_session_id.is_some()
+                        || self.model.is_none()
+                        || self.instructions.is_empty()
+                        || shared.writer.as_ref().is_none_or(|w| {
+                            !w.managed_tools
+                                || w.managed_bootstrap_id.as_deref() != bootstrap
+                                || !matches!(
+                                    w.reasoning_effort.as_deref(),
+                                    Some("minimal" | "low" | "medium" | "high" | "xhigh" | "ultra")
+                                )
+                                || !w.thread_config_valid(&self.cwd, self.read_only)
+                        })))
+                || !self.args.is_empty()
+                || (bootstrap.is_none() && (!self.instructions.is_empty() || self.model.is_some()))
+                || shared.writer.as_ref().is_some_and(|writer| {
+                    (writer.managed_tools
+                        && writer.managed_bootstrap_id.as_ref().is_none_or(|id| {
+                            id.is_empty() || id.len() > 128 || id.chars().any(char::is_control)
+                        }))
+                        || writer.epoch == 0
+                        || [
+                            &writer.run_id,
+                            &writer.normalized_session_id,
+                            &writer.runner_instance_id,
+                            &writer.grant_id,
+                            &writer.observation_epoch_id,
+                        ]
+                        .iter()
+                        .any(|value| {
+                            value.is_empty()
+                                || value.len() > 240
+                                || value.chars().any(char::is_control)
+                        })
+                })
+                || shared.peer.as_ref().is_none_or(|peer| {
+                    peer.pid == 0
+                        || peer.executable.as_os_str().is_empty()
+                        || !peer.executable.is_absolute()
+                        || peer.start_microseconds >= 1_000_000
+                })
+            {
+                return Err(LocalRunnerError::invalid(
+                    "invalid read-only shared daemon configuration",
+                ));
+            }
+        }
         if !matches!(
             self.conversation_mode.as_deref(),
             None | Some("task" | "prepared")
@@ -566,6 +793,36 @@ impl CodexProviderConfig {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod shared_mode_guard_tests {
+    use super::*;
+    #[test]
+    fn shared_attachment_never_uses_owned_process_startup() {
+        let config: CodexProviderConfig = serde_json::from_value(json!({
+            "provider": "codex", "driver": "codex_app_server", "providerVersion": "test",
+            "command": "/not/executed", "cwd": "/", "readOnly": true, "providerSessionId": "t", "sharedDaemon": {
+                "socketPath": "/not/connected", "daemonGeneration": "g", "threadId": "t", "codexHome": "/", "peer":{"pid":1,"startSeconds":1,"startMicroseconds":0,"executable":"/bin/example"}
+            }
+        })).unwrap();
+        assert!(CodexProvider::start_with_tools_observed(
+            &config,
+            [],
+            Some("t"),
+            1,
+            None,
+            None,
+            &mut |_| Ok(())
+        )
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("read-only executor path"));
+        let mut metadata_only = config.clone();
+        metadata_only.shared_daemon.as_mut().unwrap().peer = None;
+        assert!(metadata_only.validate().is_err());
     }
 }
 
@@ -965,6 +1222,11 @@ impl CodexProvider {
         observe: &mut dyn FnMut(ProviderStartupObservation) -> Result<(), LocalRunnerError>,
     ) -> Result<Self, LocalRunnerError> {
         config.validate()?;
+        if config.shared_daemon.is_some() {
+            return Err(LocalRunnerError::invalid(
+                "shared daemon requires the read-only executor path",
+            ));
+        }
         if config.provider == "codex"
             && std::env::var("PAPERCLIP_RUNNER_HOME_MODE").as_deref() != Ok("preconfigured")
         {
@@ -1342,6 +1604,7 @@ impl CodexProvider {
         &mut self,
         authorized_tools: impl IntoIterator<Item = AuthorizedTool>,
         completion_contract: Option<(&str, &[String])>,
+        accounting: &mut Vec<(String, Value)>,
     ) -> Result<bool, LocalRunnerError> {
         let authorized_tools = authorized_tools.into_iter().collect::<Vec<_>>();
         let completion_contract =
@@ -1354,7 +1617,15 @@ impl CodexProvider {
         {
             return Ok(false);
         }
-        let blockers = self.warm_run_attachment_blockers(true)?;
+        let (tail, result) = self.drain_completed_turn_tail_for_warm_attachment();
+        accounting.extend(tail);
+        result?;
+        if !accounting.is_empty() {
+            return Err(LocalRunnerError::invalid(
+                "Codex warm run attachment requires pending accounting reconciliation",
+            ));
+        }
+        let blockers = self.warm_run_attachment_blockers()?;
         if !blockers.is_empty() {
             return Err(LocalRunnerError::invalid(
                 format!(
@@ -1375,49 +1646,53 @@ impl CodexProvider {
         Ok(true)
     }
 
-    fn drain_completed_turn_tail_for_warm_attachment(&mut self) -> Result<(), LocalRunnerError> {
-        let Some(completed_turn_id) = self
-            .completed_turn_authority
-            .as_ref()
-            .map(|authority| authority.provider_turn_id.clone())
-        else {
-            return Ok(());
-        };
-        if self.active_provider_turn_id.is_some() {
-            return Ok(());
-        }
-
-        // Readiness probes run over the PRP command channel while provider
-        // stdout is drained by runnerd's adjacent control-loop iteration. A
-        // final usage/warning/item frame can therefore land after the last
-        // successful probe but before run.attach executes. Close that race in
-        // the same critical section as authority rotation. Only bounded tail
-        // notifications for the already-settled turn may be discarded: a new
-        // turn, provider request, process exit, or mismatched turn remains a
-        // fail-closed attachment error.
-        let deadline = std::time::Instant::now() + WARM_ATTACHMENT_DRAIN_DEADLINE;
-        let mut quiet_since: Option<std::time::Instant> = None;
-        let mut drained = 0usize;
-        loop {
-            if std::time::Instant::now() >= deadline {
-                return Err(LocalRunnerError::invalid(
-                    "Codex warm run attachment tail did not become quiescent",
-                ));
+    pub(crate) fn drain_completed_turn_tail_for_warm_attachment(
+        &mut self,
+    ) -> (Vec<(String, Value)>, Result<(), LocalRunnerError>) {
+        let mut accounting = Vec::new();
+        let result = (|| {
+            let Some(completed_turn_id) = self
+                .completed_turn_authority
+                .as_ref()
+                .map(|authority| authority.provider_turn_id.clone())
+            else {
+                return Ok(());
+            };
+            if self.active_provider_turn_id.is_some() {
+                return Ok(());
             }
-            match self.poll()? {
-                Some(CodexProviderEvent::Notification { method, params }) => {
-                    quiet_since = None;
-                    drained = drained.saturating_add(1);
-                    if drained > WARM_ATTACHMENT_TAIL_DRAIN_LIMIT {
-                        return Err(LocalRunnerError::invalid(
-                            "Codex warm run attachment tail exceeded its bounded frame limit",
-                        ));
-                    }
-                    let names_other_turn = notification_turn_id(&params)
-                        .is_some_and(|turn_id| turn_id != completed_turn_id);
-                    let safe_tail_method = matches!(
-                        method.as_str(),
-                        "warning"
+
+            // Readiness probes run over the PRP command channel while provider
+            // stdout is drained by runnerd's adjacent control-loop iteration. A
+            // final usage/warning/item frame can therefore land after the last
+            // successful probe but before run.attach executes. Close that race in
+            // the same critical section as authority rotation. Only bounded tail
+            // notifications for the already-settled turn may be discarded: a new
+            // turn, provider request, process exit, or mismatched turn remains a
+            // fail-closed attachment error.
+            let deadline = std::time::Instant::now() + WARM_ATTACHMENT_DRAIN_DEADLINE;
+            let mut quiet_since: Option<std::time::Instant> = None;
+            let mut drained = 0usize;
+            loop {
+                if std::time::Instant::now() >= deadline {
+                    return Err(LocalRunnerError::invalid(
+                        "Codex warm run attachment tail did not become quiescent",
+                    ));
+                }
+                match self.poll()? {
+                    Some(CodexProviderEvent::Notification { method, params }) => {
+                        quiet_since = None;
+                        drained = drained.saturating_add(1);
+                        if drained > WARM_ATTACHMENT_TAIL_DRAIN_LIMIT {
+                            return Err(LocalRunnerError::invalid(
+                                "Codex warm run attachment tail exceeded its bounded frame limit",
+                            ));
+                        }
+                        let names_other_turn = notification_turn_id(&params)
+                            .is_some_and(|turn_id| turn_id != completed_turn_id);
+                        let safe_tail_method = matches!(
+                            method.as_str(),
+                            "warning"
                             | "configWarning"
                             | "remoteControl/status/changed"
                             | "mcpServer/startupStatus/updated"
@@ -1436,73 +1711,82 @@ impl CodexProvider {
                             | "thread/status/changed"
                             | "turn/diff/updated"
                             | "turn/plan/updated"
-                    );
-                    if names_other_turn || !safe_tail_method {
-                        return Err(LocalRunnerError::invalid(format!(
+                        );
+                        if names_other_turn || !safe_tail_method {
+                            return Err(LocalRunnerError::invalid(format!(
                             "Codex warm run attachment observed unsafe post-terminal provider method {}",
                             bounded_method(&method)
                         )));
-                    }
-                    if let Some(frame_id) = self.take_provider_trace_frame_id() {
-                        self.record_provider_trace_interpretation(
+                        }
+                        if matches!(
+                            method.as_str(),
+                            "thread/tokenUsage/updated" | "paperclip/resumeUsageSnapshot"
+                        ) {
+                            accounting.push((method, params));
+                            continue;
+                        }
+                        if let Some(frame_id) = self.take_provider_trace_frame_id() {
+                            self.record_provider_trace_interpretation(
                             frame_id,
                             "codex.warm_attachment.completed_turn_tail",
                             "ignored",
                             Vec::new(),
                             "Provider emitted a bounded tail notification after the prior turn terminal and before run attachment",
                         );
+                        }
                     }
-                }
-                Some(CodexProviderEvent::ResourceLimit { .. }) => {
-                    return Err(LocalRunnerError::invalid("Codex descendant capacity requires reconciliation before fresh-session continuation"));
-                }
-                Some(CodexProviderEvent::ProtocolFailure { .. }) => {
-                    return Err(LocalRunnerError::invalid(
-                        "Codex protocol integrity failed during warm attachment",
-                    ));
-                }
-                Some(CodexProviderEvent::DescendantNotification { .. }) => {
-                    // Child output cannot certify a quiescent root attachment.
-                    return Err(LocalRunnerError::invalid(
-                        "Codex descendant remains active during warm run attachment",
-                    ));
-                }
-                Some(CodexProviderEvent::ToolCall { .. })
-                | Some(CodexProviderEvent::RuntimeRequest { .. })
-                | Some(CodexProviderEvent::McpPermissionRequest { .. }) => {
-                    return Err(LocalRunnerError::invalid(
-                        "Codex warm run attachment observed a post-terminal provider request",
-                    ));
-                }
-                Some(CodexProviderEvent::Exited { .. }) => {
-                    return Err(LocalRunnerError::invalid(
-                        "Codex exited while quiescing for warm run attachment",
-                    ));
-                }
-                None => {
-                    let now = std::time::Instant::now();
-                    let quiet_start = quiet_since.get_or_insert(now);
-                    if now.duration_since(*quiet_start) >= WARM_ATTACHMENT_QUIET_WINDOW {
-                        return Ok(());
+                    Some(CodexProviderEvent::ResourceLimit { .. }) => {
+                        return Err(LocalRunnerError::invalid("Codex descendant capacity requires reconciliation before fresh-session continuation"));
                     }
-                    std::thread::sleep(Duration::from_millis(1));
+                    Some(CodexProviderEvent::ProtocolFailure { .. }) => {
+                        return Err(LocalRunnerError::invalid(
+                            "Codex protocol integrity failed during warm attachment",
+                        ));
+                    }
+                    Some(CodexProviderEvent::DescendantNotification { .. }) => {
+                        // Child output cannot certify a quiescent root attachment.
+                        return Err(LocalRunnerError::invalid(
+                            "Codex descendant remains active during warm run attachment",
+                        ));
+                    }
+                    Some(CodexProviderEvent::ToolCall { .. })
+                    | Some(CodexProviderEvent::RuntimeRequest { .. })
+                    | Some(CodexProviderEvent::McpPermissionRequest { .. }) => {
+                        return Err(LocalRunnerError::invalid(
+                            "Codex warm run attachment observed a post-terminal provider request",
+                        ));
+                    }
+                    Some(CodexProviderEvent::Exited {
+                        completed_turn_authoritative,
+                        completion_reconciles_exit,
+                        ..
+                    }) if completion_reconciles_exit
+                        || (completed_turn_authoritative && self.process.stdout_drained()) =>
+                    {
+                        return Ok(())
+                    }
+                    Some(CodexProviderEvent::Exited { .. }) => {
+                        return Err(LocalRunnerError::invalid(
+                            "Codex exited while quiescing for warm run attachment",
+                        ));
+                    }
+                    None => {
+                        let now = std::time::Instant::now();
+                        let quiet_start = quiet_since.get_or_insert(now);
+                        if now.duration_since(*quiet_start) >= WARM_ATTACHMENT_QUIET_WINDOW {
+                            return Ok(());
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
                 }
             }
-        }
+        })();
+        (accounting, result)
     }
 
     pub(crate) fn warm_run_attachment_blockers(
         &mut self,
-        quiesce_completed_tail: bool,
     ) -> Result<Vec<&'static str>, LocalRunnerError> {
-        // Only an explicit attachment-readiness probe may consume the bounded,
-        // already-settled provider suffix. Ordinary checkpoint snapshots run
-        // immediately after a terminal frame while the provider can still be
-        // unwinding; turning those observations into quiescence barriers can
-        // quarantine an otherwise reusable runner before its next turn.
-        if quiesce_completed_tail {
-            self.drain_completed_turn_tail_for_warm_attachment()?;
-        }
         let mut blockers = Vec::new();
         if self.process.try_wait()?.is_some() {
             blockers.push("process_exited");
@@ -1517,7 +1801,18 @@ impl CodexProvider {
             blockers.push("ambiguous_turn_start");
         }
         if !self.pending_messages.is_empty() {
-            blockers.push("pending_messages");
+            blockers.push(
+                if self.pending_messages.iter().any(|message| {
+                    matches!(
+                        message.value.get("method").and_then(Value::as_str),
+                        Some("paperclip/resumeUsageSnapshot" | "thread/tokenUsage/updated")
+                    )
+                }) {
+                    "pending_accounting_reconciliation"
+                } else {
+                    "pending_messages"
+                },
+            );
         }
         if !self.deferred_ambiguous_messages.is_empty() {
             blockers.push("deferred_messages");
@@ -2919,13 +3214,11 @@ impl CodexProvider {
                 .and_then(Value::as_str);
             if notification_turn_id.is_some()
                 && notification_turn_id != self.active_provider_turn_id.as_deref()
-                && notification_turn_id
+                && (notification_turn_id
                     .is_some_and(|turn_id| self.settled_provider_turn_ids.contains(turn_id))
+                    || (self.active_provider_turn_id.is_none()
+                        && method == "thread/tokenUsage/updated"))
             {
-                self.notification_identity_diagnostics += 1;
-                if self.notification_identity_diagnostics > 32 {
-                    return Ok(None);
-                }
                 // Resume replays the cumulative usage of the last settled turn.
                 // Keep its identity and baseline, but never bill its `last`
                 // measurement to the newly attached run.
@@ -2940,6 +3233,10 @@ impl CodexProvider {
                             "total": params.pointer("/tokenUsage/total"),
                         }),
                     }));
+                }
+                self.notification_identity_diagnostics += 1;
+                if self.notification_identity_diagnostics > 32 {
+                    return Ok(None);
                 }
                 return Ok(Some(CodexProviderEvent::Notification {
                     method: "warning".to_owned(),
@@ -3409,7 +3706,7 @@ fn retain_pending_runtime_request_bytes(current: usize, incoming: usize) -> Opti
         .filter(|total| *total <= MAX_PENDING_RUNTIME_REQUEST_BYTES)
 }
 
-fn codex_dynamic_tools(
+pub(crate) fn codex_dynamic_tools(
     authorized_tools: impl IntoIterator<Item = AuthorizedTool>,
 ) -> Result<(Vec<Value>, BTreeSet<String>), LocalRunnerError> {
     let mut dynamic_tools = Vec::new();
@@ -4235,6 +4532,73 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shared_thread_config_rejects_widening_and_general_configuration() {
+        let make = |config: Value| {
+            serde_json::from_value::<SharedDaemonWriter>(json!({
+                "runId":"r", "normalizedSessionId":"s", "runnerInstanceId":"i", "grantId":"g",
+                "epoch":1, "observationEpochId":"o", "threadConfig":config
+            }))
+            .unwrap()
+        };
+        let mut config = json!({"permissions": {
+            SHARED_WRITABLE_PROFILE: {"filesystem":{":root":"none",":minimal":"read",":tmpdir":"none",":workspace_roots":{".":"write"}},"network":{"enabled":false}},
+            SHARED_READ_ONLY_PROFILE: {"filesystem":{":root":"none",":minimal":"read",":tmpdir":"none",":workspace_roots":{".":"read"}},"network":{"enabled":false}}
+        }, "web_search":"disabled", "shell_environment_policy": {"inherit":"none","ignore_default_excludes":false,"include_only":["PATH"],"set":{"PATH":"/usr/bin:/bin"}}});
+        assert!(make(config.clone()).thread_config_valid("/workspace", false));
+        let mut with_mcp = config.clone();
+        with_mcp["mcp_servers"] = json!({"fixture-server": {"enabled": false}});
+        assert!(make(with_mcp.clone()).thread_config_valid("/workspace", false));
+        with_mcp["mcp_servers"] = json!({"fixture-server": {"enabled": false}, "stubbed": {"enabled": false, "command": "/usr/bin/false"}});
+        assert!(make(with_mcp.clone()).thread_config_valid("/workspace", false));
+        with_mcp["mcp_servers"] = json!({"fixture-server": {"enabled": false}});
+        for invalid in [json!({"fixture": {"enabled": true}}), json!({"fixture": {"enabled": false, "command": "x"}}), json!({"fixture": {"enabled": false, "command": "/usr/bin/false", "args": []}}), json!({"bad.name": {"enabled": false}})] {
+            with_mcp["mcp_servers"] = invalid;
+            assert!(!make(with_mcp.clone()).thread_config_valid("/workspace", false));
+        }
+        for env in [json!({"inherit":"all"}), json!({"inherit":"none","include_only":[1]}), json!({"inherit":"none","unknown":true})] {
+            let mut widened = config.clone();
+            widened["shell_environment_policy"] = env;
+            assert!(!make(widened).thread_config_valid("/workspace", false));
+        }
+        let mut no_env = config.clone();
+        no_env.as_object_mut().unwrap().remove("shell_environment_policy");
+        assert!(!make(no_env).thread_config_valid("/workspace", false));
+        for (pointer, value) in [
+            (
+                "/permissions/paperclip-runner-workspace-only/filesystem/:root",
+                json!("write"),
+            ),
+            (
+                "/permissions/paperclip-runner-workspace-only/filesystem/:workspace_roots",
+                json!({"/":"write"}),
+            ),
+            (
+                "/permissions/paperclip-runner-workspace-only/network/enabled",
+                json!("yes"),
+            ),
+            ("/web_search", json!("live")),
+        ] {
+            let mut changed = config.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            assert!(!make(changed).thread_config_valid("/workspace", false));
+        }
+        let mut foreign = config.clone();
+        foreign["permissions"][SHARED_WRITABLE_PROFILE]["filesystem"]["/outside"] = json!("write");
+        assert!(!make(foreign).thread_config_valid("/workspace", false));
+        let mut root = config.clone();
+        root["permissions"][SHARED_WRITABLE_PROFILE]["filesystem"]["/"] = json!("read");
+        assert!(!make(root).thread_config_valid("/workspace", false));
+        let mut unknown = config.clone();
+        unknown["permissions"][SHARED_WRITABLE_PROFILE]["extra"] = json!(true);
+        assert!(!make(unknown).thread_config_valid("/workspace", false));
+        let mut model = config.clone();
+        model["model"] = json!("other");
+        assert!(!make(model).thread_config_valid("/workspace", false));
+        config["model_reasoning_effort"] = json!("high");
+        assert!(!make(config).thread_config_valid("/workspace", false));
+    }
+
+    #[test]
     #[cfg(unix)]
     fn runtime_notification_policy_grants_only_discovery_files_and_ipc() {
         let mut args = vec![
@@ -4358,6 +4722,7 @@ done
             read_only: false,
             include_skill_instructions: None,
             conversation_mode: None,
+            shared_daemon: None,
         };
         let mut provider = CodexProvider::start(&config, None).unwrap();
         provider.start_turn("First turn", &config.cwd).unwrap();
@@ -4392,9 +4757,58 @@ done
             });
         // poll() normalizes settled-turn usage to paperclip/resumeUsageSnapshot.
         // That accounting fact is not new work and must not force replacement.
-        let result = provider.drain_completed_turn_tail_for_warm_attachment();
+        let (accounting, result) = provider.drain_completed_turn_tail_for_warm_attachment();
         provider.shutdown().unwrap();
-        result.expect("historical usage must not break provider continuity");
+        result.expect("historical usage must remain available to its owner");
+        assert_eq!(accounting.len(), 1);
+        assert_eq!(accounting[0].1["total"]["inputTokens"], 120);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_warm_drain_retains_consumed_usage_before_unsafe_tail() {
+        for attach in [false, true] {
+            let mut provider = completion_tail_provider();
+            provider
+                .restore_completed_turn_authority(true, Some(1), Some("reader-tail-1"))
+                .unwrap();
+            provider.active_provider_turn_id = None;
+            for value in [
+                json!({"method":"thread/tokenUsage/updated","params":{"threadId":"reader-tail-thread","turnId":"reader-tail-1","tokenUsage":{"total":{"inputTokens":120,"outputTokens":12}}}}),
+                json!({"method":"turn/started","params":{"threadId":"reader-tail-thread","turn":{"id":"unsafe-next-turn"}}}),
+            ] {
+                provider
+                    .pending_messages
+                    .push_back(BufferedProviderMessage {
+                        value,
+                        trace_frame_id: None,
+                    });
+            }
+            let (accounting, result) = if attach {
+                let mut accounting = Vec::new();
+                let tools = provider.authorized_tools.clone();
+                let contract = provider.completion_contract.clone();
+                let result = provider
+                    .attach_run_in_place(
+                        tools,
+                        contract.as_ref().map(|contract| {
+                            (
+                                contract.revision.as_str(),
+                                contract.criterion_ids.as_slice(),
+                            )
+                        }),
+                        &mut accounting,
+                    )
+                    .map(|_| ());
+                (accounting, result)
+            } else {
+                provider.drain_completed_turn_tail_for_warm_attachment()
+            };
+            provider.shutdown().unwrap();
+            assert!(result.is_err());
+            assert_eq!(accounting.len(), 1);
+            assert_eq!(accounting[0].1["total"]["inputTokens"], 120);
+        }
     }
 
     #[cfg(unix)]
@@ -4746,6 +5160,7 @@ done
             read_only: false,
             include_skill_instructions: None,
             conversation_mode: None,
+            shared_daemon: None,
         };
         let mut spawned = None;
         let mut failure = None;
@@ -4771,6 +5186,9 @@ done
                     failure = Some((stage, child_exit));
                     Ok(())
                 }
+                ProviderStartupObservation::Attached { .. } => {
+                    panic!("owned startup cannot attach a shared daemon")
+                }
             },
         )
         .err()
@@ -4790,6 +5208,7 @@ done
     }
 
     #[test]
+    #[cfg_attr(windows, ignore = "verified launch is not supported on Windows yet")]
     fn verified_opencode_proxy_executes_the_descriptor_safe_commonjs_bundle() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -4867,6 +5286,7 @@ done
             read_only: false,
             include_skill_instructions: None,
             conversation_mode: None,
+            shared_daemon: None,
         };
         config.include_skill_instructions = Some(true);
         assert_eq!(

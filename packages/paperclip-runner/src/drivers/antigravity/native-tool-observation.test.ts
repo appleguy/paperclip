@@ -1,0 +1,8 @@
+import { describe, expect, it } from "vitest";
+import { normalizeAntigravityToolObservation } from "./native-tool-observation.js";
+const binding={runId:"r",environmentLeaseId:"l",normalizedSessionId:"s",turnId:"t",bindingId:"b",bindingGeneration:1,conversationId:"native",processGeneration:"p"};
+const step={kind:"step" as const,conversationId:"native",index:3,state:"running",stepType:"tool",toolName:"read",textDelta:"private input"};
+describe("Antigravity tool observations",()=>{
+ it("binds and deduplicates stream evidence without copying content or claiming tool authority",()=>{const value=normalizeAntigravityToolObservation(binding,step)!;expect(value).toMatchObject({authority:"provider_observation_only",conversationId:"native",stepIndex:3});expect(JSON.stringify(value)).not.toContain("private input");expect(JSON.stringify(value)).not.toContain("read");expect(normalizeAntigravityToolObservation(binding,step)).toEqual(value);expect(normalizeAntigravityToolObservation({...binding,processGeneration:"other"},step)?.observationId).not.toBe(value.observationId);});
+ it("rejects foreign and malformed inputs and does not infer unnamed tools or results",()=>{expect(()=>normalizeAntigravityToolObservation(binding,{...step,conversationId:"foreign"})).toThrow(/conversation/);expect(()=>normalizeAntigravityToolObservation(binding,{...step,toolName:"x".repeat(257)})).toThrow(/Invalid/);expect(normalizeAntigravityToolObservation(binding,{...step,toolName:undefined})).toBeNull();expect(normalizeAntigravityToolObservation(binding,{kind:"result",conversationId:"native",status:"SUCCESS"})).toBeNull();});
+});

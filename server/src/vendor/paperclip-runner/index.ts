@@ -10,6 +10,12 @@
 type RunnerModule = typeof import("@paperclipai/paperclip-runner");
 
 export type {
+  AntigravityMcpScope,
+  RunnerToolCall,
+  V2Authority,
+  V2Binding,
+  V2Cursor,
+  V2Event,
   AcpxCandidateAdmission,
   DotHarnessDriver,
   DotAssignment,
@@ -40,6 +46,10 @@ export type {
   NativeExecutionInputV8,
   NativeExecutionInputV9,
   NativeExecutionInputV10,
+  NativeExecutionInputV11,
+  NativeExecutionInputV12,
+  NativeExecutionInputV13,
+  ClaudeInteractiveNativePort,
   MuseBindingSnapshot,
   DotBindingSnapshot,
   ExternalProviderPort,
@@ -56,6 +66,7 @@ export type {
   NativeRuntimeContextSnapshot,
   NativeSession,
   NativeSessionBackend,
+  OpenCodeSharedNativePort,
   NativeSessionGoalControl,
   OpenControlPlaneRunInput,
   PersistedNativeSession,
@@ -70,6 +81,7 @@ export type {
   RunnerExecutionDriver,
   RunnerLaunchPreparer,
   DurableRecoveryIdentity,
+  RetainedRunnerdCleanupProof,
   DurablePrpCheckpoint,
   RunnerProcessHandle,
   RunnerProcessLaunchSpec,
@@ -87,15 +99,25 @@ const sourceUrl = new URL(
 );
 const runner = (await import(sourceUrl.href)) as RunnerModule;
 
+export const OpenCodeV2Shared = runner.OpenCodeV2Shared;
 export const DurablePrpControlPlane = runner.DurablePrpControlPlane;
 export const decodeDurablePrpCheckpoint = runner.decodeDurablePrpCheckpoint;
 export const inspectDurablePrpCheckpointHeader = runner.inspectDurablePrpCheckpointHeader;
 export const RUNNER_PRP_PROTOCOL_MIN = runner.RUNNER_PRP_PROTOCOL_MIN;
 export const RUNNER_PRP_PROTOCOL_MAX = runner.RUNNER_PRP_PROTOCOL_MAX;
 export const runnerCodexDynamicToolsFit = runner.runnerCodexDynamicToolsFit;
+export const nativeSystemInstructions = runner.nativeSystemInstructions;
+export const codexSemanticToolSpecs = runner.codexSemanticToolSpecs;
+export const authorizedToolSetForProvider = runner.authorizedToolSetForProvider;
 export const inspectWarmRunTransition = runner.inspectWarmRunTransition;
+export const inspectStagedRunAttachment = runner.inspectStagedRunAttachment;
+export const inspectRetainedRunInstructions = runner.inspectRetainedRunInstructions;
+export const inspectStagedRunAttachmentHeader = runner.inspectStagedRunAttachmentHeader;
+export type StagedRunAttachment = import("@paperclipai/paperclip-runner").StagedRunAttachment;
 export const readRunnerdArtifactBinding = runner.readRunnerdArtifactBinding;
 export const readLinuxProcessStartedAt = runner.readLinuxProcessStartedAt;
+export const NativeSessionCloseUnrecoverableError =
+  runner.NativeSessionCloseUnrecoverableError;
 export const NativeSessionCleanupQuarantinedError =
   runner.NativeSessionCleanupQuarantinedError;
 export const NativeSessionProtocolIntegrityError =
@@ -122,9 +144,15 @@ export const opencodeRuntimeSessionDirectoryName =
 export const canonicalNativeRuntimeContextDigest =
   runner.canonicalNativeRuntimeContextDigest;
 export const createNativeSessionBackend = runner.createNativeSessionBackend;
+export const OpenCodeSharedNativeBackend = runner.OpenCodeSharedNativeBackend;
+export const PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA = runner.PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA;
+export const PRP_COMPLETION_TOOL_DESCRIPTION = runner.PRP_COMPLETION_TOOL_DESCRIPTION;
+export const startOpenCodeProviderProxy = runner.startOpenCodeProviderProxy;
 export const describeRunnerdNativeSessionBackend = runner.describeRunnerdNativeSessionBackend;
 export const createPaperclipRunnerAuthorizedToolSet =
   runner.createPaperclipRunnerAuthorizedToolSet;
+export const createSharedCodexThreadConfig = runner.createSharedCodexThreadConfig;
+export const sharedThreadConfigViolation = runner.sharedThreadConfigViolation;
 export const createRunnerdCodexTransport: (
   options?: import("@paperclipai/paperclip-runner").RunnerdCodexTransportOptions,
 ) => import("@paperclipai/paperclip-runner").RunnerdCodexTransport =
@@ -137,6 +165,7 @@ export const applyNativeSessionGoalControl =
   runner.applyNativeSessionGoalControl;
 export const completeRetainedNativeSessionCleanup = runner.completeRetainedNativeSessionCleanup;
 export const settleRetainedRunnerdSession = runner.settleRetainedRunnerdSession;
+export const retainedRunnerdCleanupProofIsCurrent = runner.retainedRunnerdCleanupProofIsCurrent;
 export const retainedRunnerdMaintenanceIsIdle =
   runner.retainedRunnerdMaintenanceIsIdle;
 export const drainRetainedRunnerdMaintenanceOperations =
@@ -160,6 +189,7 @@ export const resolveGrokEffort = runner.resolveGrokEffort;
 export const QUALIFIED_ACPX_PROFILES = runner.QUALIFIED_ACPX_PROFILES;
 export const QUALIFIED_ACPX_VERSION = runner.QUALIFIED_ACPX_VERSION;
 export const CURSOR_DISTRIBUTION_PINS = runner.CURSOR_DISTRIBUTION_PINS;
+export const KIMI_DISTRIBUTION_CLOSURE_SHA256 = runner.KIMI_DISTRIBUTION_CLOSURE_SHA256;
 export const resolveSourceCodexHome = runner.resolveSourceCodexHome;
 export const resolveCodexCommand = runner.resolveCodexCommand;
 export const resolvePinnedCodexCommand = runner.resolvePinnedCodexCommand;
@@ -188,6 +218,7 @@ export const bundledRemoteRunnerBinary = runner.bundledRemoteRunnerBinary;
 
 export const externalOperationDigest = runner.externalOperationDigest;
 export const digestPaperclipSemanticContent = runner.digestPaperclipSemanticContent;
+export const startOpenCodeMcpBridge = runner.startOpenCodeMcpBridge;
 export const CONFIGURED_ENVIRONMENT_KEYS = runner.CONFIGURED_ENVIRONMENT_KEYS;
 export const GENERATED_RUNTIME_ENVIRONMENT_KEYS = runner.GENERATED_RUNTIME_ENVIRONMENT_KEYS;
 export const configuredEnvironmentProjection = runner.configuredEnvironmentProjection;

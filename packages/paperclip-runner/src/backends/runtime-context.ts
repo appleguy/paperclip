@@ -39,7 +39,7 @@ export function nativeSystemInstructions(input: NativeExecutionInput): string {
       "When you receive a Paperclip assignment or message, use your own available tools, apps, plugins, skills, and capabilities to complete the requested work, then return the result to Paperclip. For example, use your existing Slack connection when the task calls for Slack. Paperclip's app catalog describes what this connection exposes; it is not a list of everything you can use in your own runtime. A missing Paperclip app connection does not make your own connection unavailable. Respect each tool's existing permissions, approvals, and the user's current instructions. Keep Paperclip data and actions within this connection's authorized company, agent, and task. Never use another Paperclip connection or identity to bypass a denial. Setup or test restrictions apply only to their stated scope; do not carry them into later requests unless the user explicitly says they continue.\n\nUse the assignment catalog through paperclip_dot_tool for Paperclip operations. Use your native tools directly for the rest of the work; they do not need to appear in that catalog. Record useful results and deliverables on the task and follow the Paperclip completion instructions.".replaceAll("paperclip_dot_", grok ? "paperclip_grok_" : "paperclip_dot_"),
       `Assigned Paperclip skills: ${input.runtimeContext.skills.map(skill => skill.runtimeName).join(", ") || "none"}.`].join("\n\n");
   }
-  return composeNativeSystemInstructions(input.runtimeContext, entry);
+  return composeNativeSystemInstructions(input.runtimeContext, entry, input.provider.kind === "codex" && input.provider.sharedDaemon === true);
 }
 
 export function nativeTaskConstraints(input: NativeExecutionInput): string[] {
@@ -124,7 +124,9 @@ export function nativeTaskConstraints(input: NativeExecutionInput): string[] {
   return [
     "Use only the assigned skills and provider-native tools.",
     ...(input.runtimeContext.instructions.workingCopy ? [
-      input.runtimeContext.instructions.workingCopy.kind === "agent_files"
+      input.provider.kind === "codex" && input.provider.sharedDaemon === true
+        ? `For this turn, AGENT_HOME is ${input.runtimeContext.instructions.workingCopy.rootPath}. It and its instruction file are read-only. Put persistent changes in the workspace or issue documents.`
+        : input.runtimeContext.instructions.workingCopy.kind === "agent_files"
         ? `For this turn, AGENT_HOME is ${input.runtimeContext.instructions.workingCopy.rootPath}. This replaces any prior turn's agent directory path. It contains your instructions and persistent personal files, separate from the task working directory. Changes save after the provider stops; check the save receipt.`
         : `For this turn, the editable agent instruction file is ${input.runtimeContext.instructions.workingCopy.rootPath}/${input.runtimeContext.instructions.workingCopy.entryPath}. This replaces any private working-copy path from a previous turn. Ordinary edits save after the provider stops and only with a durable revision receipt. Use the agent instruction tools for immediate saves. Shared instruction assets and repository instructions are not collected.`,
     ] : []),

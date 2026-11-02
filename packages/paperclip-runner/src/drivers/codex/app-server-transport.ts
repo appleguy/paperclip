@@ -43,6 +43,8 @@ export interface CodexAppServerTransport {
     method: string,
     params: Record<string, unknown>,
   ): Promise<Record<string, unknown>>;
+  /** Runner control metadata stays on PRP and is never sent as a Codex RPC field. */
+  requestGoal?(method:string, params:Record<string,unknown>, metadata:{requestId?:string}):Promise<Record<string,unknown>>;
   notify(method: string, params?: Record<string, unknown>): void;
   notifications(): AsyncIterable<CodexRpcNotification>;
   setServerRequestHandler(handler: CodexServerRequestHandler): void;

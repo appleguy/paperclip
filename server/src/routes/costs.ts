@@ -9,6 +9,7 @@ import { accountingIntegrityService } from "../services/accounting-integrity.js"
 import { costDataQualityReport } from "../services/cost-data-quality.js";
 import { billingReconciliationService } from "../services/billing-reconciliation.js";
 import { adjustCostSchema, importBillingInvoiceSchema, repairAccountingSchema, retryAccountingSchema } from "@paperclipai/shared";
+import { readFile } from "node:fs/promises";
 import { Router } from "express";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
@@ -326,6 +327,88 @@ export function costRoutes(
     if (!(await assertCompanyCostReadAllowed(req, res, companyId))) return;
     const rows = await costs.windowSpend(companyId);
     res.json(rows);
+  });
+
+  // Local process-only Quota Sentinel snapshot. No provider calls or credentials.
+  router.get("/companies/:companyId/costs/quota-sentinel", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    assertBoard(req);
+    const company = await companies.getById(companyId);
+    if (!company) {
+      res.status(404).json({ error: "Company not found" });
+      return;
+    }
+    // The single-company local installation supplies this file; never disclose raw provider data.
+    const snapshotPath = process.env.PAPERCLIP_QUOTA_SENTINEL_STATUS_PATH
+      ?? "/Volumes/NVM/Paperclip/knowledge/raw/model-routing/quota_pacing_status.json";
+    try {
+      const raw = JSON.parse(await readFile(snapshotPath, "utf8")) as Record<string, any>;
+      const observedAt = typeof raw.observed_at === "string" ? raw.observed_at : null;
+      const ageMs = observedAt ? Date.now() - Date.parse(observedAt) : NaN;
+      const pools: Array<{ provider: string; pool: string; usedPercent: number | null; resetsAt: string | null; state: string; requiredPtsPerHour: number | null; requiredPtsPerDay: number | null }> = [];
+      for (const provider of ["antigravity", "codex", "claude"]) {
+        const forecasts = raw.providers?.[provider]?.forecasts;
+        if (!forecasts || typeof forecasts !== "object") continue;
+        for (const [pool, value] of Object.entries(forecasts)) {
+          if (!value || typeof value !== "object") continue;
+          const item = value as Record<string, unknown>;
+          pools.push({
+            provider,
+            pool,
+            usedPercent: typeof item.used_pct === "number" && Number.isFinite(item.used_pct)
+              ? Math.max(0, Math.min(100, item.used_pct)) : null,
+            resetsAt: typeof item.reset_at === "string" ? item.reset_at : null,
+            state: typeof item.state === "string" ? item.state : "unknown",
+            requiredPtsPerHour: typeof item.required_pts_per_hour === "number" && Number.isFinite(item.required_pts_per_hour) ? item.required_pts_per_hour : null,
+            requiredPtsPerDay: typeof item.required_pts_per_day === "number" && Number.isFinite(item.required_pts_per_day) ? item.required_pts_per_day : null,
+          });
+        }
+      }
+      const credit = raw.codex_banked_reset && typeof raw.codex_banked_reset === "object" ? raw.codex_banked_reset : {};
+      const bankedReset = {
+        available: Number.isSafeInteger(credit.available) && credit.available >= 0 ? credit.available as number : null,
+        expiresAt: typeof credit.expires_at === "string" ? credit.expires_at : null,
+        ordinaryResetAt: typeof credit.ordinary_reset_at === "string" ? credit.ordinary_reset_at : null,
+        redeemNoLaterThan: typeof credit.redeem_no_later_than === "string" ? credit.redeem_no_later_than : null,
+        automaticRedemption: false,
+      };
+      // Credit offers are independently sourced and *not* regular plan usage.
+      // Keep only allowlisted metadata, never account identifiers or credentials.
+      let creditOffers: Array<{ id: string; label: string; balanceLastReportedUsd: number | null;
+        observedAt: string | null; expiresAt: string | null; source: string; status: string }> = [];
+      let bankedResetDispute: { ownerExpected: number; source: string } | null = null;
+      try {
+        const local = JSON.parse(await readFile(
+          "/Volumes/NVM/Paperclip/knowledge/raw/model-routing/credit_offers.json", "utf8"
+        )) as Record<string, any>;
+        if (local.schema === 1 && Array.isArray(local.offers)) {
+          creditOffers = local.offers.filter((offer: unknown) => offer && typeof offer === "object")
+            .slice(0, 12).map((value: Record<string, unknown>) => ({
+              id: typeof value.id === "string" ? value.id.slice(0, 90) : "unknown",
+              label: typeof value.label === "string" ? value.label.slice(0, 120) : "Promotional credit",
+              balanceLastReportedUsd: typeof value.last_reported_remaining_usd === "number"
+                && Number.isFinite(value.last_reported_remaining_usd)
+                && value.last_reported_remaining_usd >= 0 ? value.last_reported_remaining_usd : null,
+              observedAt: typeof value.observed_at === "string" ? value.observed_at : null,
+              expiresAt: typeof value.expires_at === "string" ? value.expires_at : null,
+              source: typeof value.source === "string" ? value.source : "unknown",
+              status: typeof value.status === "string" ? value.status : "unverified",
+            }));
+        }
+        const dispute = local.disputes?.codex_banked_reset;
+        if (dispute && Number.isSafeInteger(dispute.owner_expected) && dispute.owner_expected >= 0) {
+          bankedResetDispute = { ownerExpected: dispute.owner_expected, source: "owner_reported" };
+        }
+      } catch {
+        // The credit source may not be configured. Do not invent balances.
+      }
+      res.setHeader("Cache-Control", "private, no-store");
+      res.json({ source: "quota-sentinel", observedAt, stale: !Number.isFinite(ageMs) || ageMs < 0 || ageMs > 3_900_000,
+        pools, bankedReset, bankedResetDispute, creditOffers });
+    } catch {
+      res.status(503).json({ error: "Quota Sentinel snapshot unavailable" });
+    }
   });
 
   router.get("/companies/:companyId/costs/quota-windows", async (req, res) => {

@@ -97,6 +97,7 @@ export function codexLocalReasoningEffortsForModel(
   switch (normalizedModel) {
     case "gpt-6-astra":
     case "gpt-6.1-sol":
+    case "gpt-6.1-terra":
     case "gpt-6-sol":
     case "gpt-5.6-sol":
     case "gpt-5.6-terra":
@@ -120,6 +121,9 @@ const CODEX_LOCAL_MODEL_MINIMUM_CLI_VERSIONS: Readonly<Record<string, string>> =
   // 0.156.1 and older are rejected (openai/codex#49396); 0.159.0 and 0.159.2 are accepted
   // (openai/codex#49464). No stable release between those was verified either way.
   "gpt-6.1-sol": "0.159.0",
+  // The owner-verified ChatGPT subscription probe completed on 0.166.0;
+  // older versions have not been qualified for Terra in this environment.
+  "gpt-6.1-terra": "0.166.0",
   // Codex 0.157.0 release notes: "Add GPT-6 Sol and Luna to the model catalog".
   "gpt-6-sol": "0.157.0",
   "gpt-6-luna": "0.157.0",
@@ -216,6 +220,7 @@ export function isCodexLocalFastModeSupported(model: string | null | undefined):
 // returns this list as written and the model dropdown keeps its order.
 export const models = [
   { id: "gpt-6.1-sol", label: "gpt-6.1-sol" },
+  { id: "gpt-6.1-terra", label: "gpt-6.1-terra" },
   { id: "gpt-6-astra", label: "gpt-6-astra" },
   { id: "gpt-6-sol", label: "gpt-6-sol" },
   { id: "gpt-6-luna", label: "gpt-6-luna" },

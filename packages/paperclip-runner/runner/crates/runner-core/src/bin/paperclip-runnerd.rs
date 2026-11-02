@@ -505,6 +505,24 @@ fn run(args: &[String]) -> Result<(), LocalRunnerError> {
 }
 
 fn run_main(args: Vec<String>) -> ExitCode {
+    #[cfg(target_os = "macos")]
+    if args.len() == 2 && args[0] == "--inspect-codex-peer" {
+        return match paperclip_runner_core::codex_shared_socket::inspect_peer(std::path::Path::new(
+            &args[1],
+        )) {
+            Ok((peer, generation)) => {
+                println!(
+                    "{}",
+                    serde_json::json!({"peer": peer, "daemonGeneration": generation})
+                );
+                ExitCode::SUCCESS
+            }
+            Err(_) => {
+                eprintln!("paperclip-runnerd: shared peer inspection failed");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let diagnostics_directory = diagnostic_directory(&args);
     install_diagnostic_panic_hook(diagnostics_directory.clone());
     install_crypto_provider();
@@ -671,10 +689,15 @@ mod tests {
             args.extend(options.into_iter().map(str::to_owned));
             assert!(metadata_with_provider_packs(&args).is_err());
         }
+        let missing_root = if cfg!(windows) {
+            r"C:\missing-provider-pack"
+        } else {
+            "/missing-provider-pack"
+        };
         let metadata = metadata_with_provider_packs(&[
             "--build-metadata".to_owned(),
             "--provider-pack-root".to_owned(),
-            "/missing-provider-pack".to_owned(),
+            missing_root.to_owned(),
         ])
         .unwrap();
         assert_eq!(metadata["binaryContractVersion"], 2);

@@ -94,6 +94,9 @@ export const PAPERCLIP_PUBLIC_SCHEMA_IDS = new Set([
   "paperclip.native-execution-input.v8",
   "paperclip.native-execution-input.v9",
   "paperclip.native-execution-input.v10",
+  "paperclip.native-execution-input.v11",
+  "paperclip.native-execution-input.v12",
+  "paperclip.native-execution-input.v13",
   "paperclip.native-finalization.v1",
   "paperclip.native-finalization.v2",
   "paperclip.native-harness-backup-stamp.v1",
@@ -310,7 +313,7 @@ export const PRP_V1_EVENT_TYPES = new Set([
   "issue.status.decision.superseded",
   "run.terminal",
 ]);
-// PRP v2 currently adds the session capability/goal notifications below. Keep
+// PRP v2 adds session capability/goal and admitted-dispatch notifications. Keep
 // this set separate so the v1 parity test remains meaningful; common v1 event
 // types are accepted for v2 envelopes as well. Unknown dotted values still go
 // through the normal secret redaction path.
@@ -319,6 +322,7 @@ export const PRP_V2_EVENT_TYPES = new Set([
   "session.goal.snapshot",
   "session.goal.updated",
   "session.goal.cleared",
+  "native_controller.dispatch_requested",
 ]);
 const NATIVE_RUN_SPAN_SCHEMA = "paperclip.run-performance-span.v1";
 const NATIVE_RUN_SPAN_FIELDS = ["span", "parentSpan"] as const;

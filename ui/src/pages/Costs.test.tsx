@@ -30,6 +30,7 @@ const costsApiMocks = vi.hoisted(() => ({
   byBiller: vi.fn(),
   windowSpend: vi.fn(),
   quotaWindows: vi.fn(),
+  quotaSentinel: vi.fn(),
   dataQuality: vi.fn(),
   retryAccounting: vi.fn(),
 }));
@@ -370,6 +371,80 @@ describe("Shared Costs surfaces", () => {
     expect(container.textContent).not.toContain("1200%");
     expect(container.textContent).not.toContain("of monthly budget consumed");
     expect(costsApiMocks.summary).toHaveBeenLastCalledWith("company-1", undefined, undefined);
+    queryClient.clear();
+  });
+
+  it("shows Antigravity quota even when no provider cost events exist", async () => {
+    for (const mock of Object.values(costsApiMocks)) mock.mockResolvedValue([]);
+    costsApiMocks.summary.mockResolvedValue({ spendCents: 0, budgetCents: 0, pricingComplete: true });
+    costsApiMocks.quotaSentinel.mockResolvedValue({
+      source: "quota-sentinel",
+      observedAt: "2026-10-31T03:39:37Z",
+      stale: false,
+      pools: [
+        { provider: "antigravity", pool: "3p:weekly", usedPercent: 76.85, resetsAt: "2026-11-04T04:14:42Z", state: "behind_pace" },
+        { provider: "antigravity", pool: "gemini:weekly", usedPercent: 0, resetsAt: "2026-11-06T23:04:15Z", state: "need_trend" },
+      ],
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    root = createRoot(container);
+    await act(async () => root.render(<MemoryRouter initialEntries={["/?tab=providers"]}><QueryClientProvider client={queryClient}><Costs /></QueryClientProvider></MemoryRouter>));
+    await act(async () => vi.waitFor(() => expect(container.querySelector('[data-testid="antigravity-quota-card"]')?.textContent).toContain("76.8% used")));
+    expect(container.querySelector('a[href="/subscription-quotas.html"]')).not.toBeNull();
+    expect(container.textContent).toContain("Third-party · weekly");
+    expect(container.textContent).toContain("Gemini · weekly");
+    expect(container.querySelector('[data-testid="antigravity-quota-card"]')?.textContent).not.toContain("$0.00");
+    const antigravityTab = [...container.querySelectorAll('[role="tab"]')].find(tab => tab.textContent?.includes("Antigravity"));
+    expect(antigravityTab).toBeDefined();
+    await act(async () => antigravityTab!.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, button: 0 })));
+    await act(async () => vi.waitFor(() => expect(antigravityTab?.getAttribute("data-state")).toBe("active")));
+    expect(container.querySelectorAll('[data-testid="antigravity-quota-card"]')).toHaveLength(1);
+    expect(container.textContent).toContain("Resets Nov 3, 8:14 PM PST");
+    expect(container.textContent).toContain("recent rate below goal");
+    queryClient.clear();
+  });
+
+  it("uses three-provider Sentinel readings rather than conflicting native account quota errors", async () => {
+    for (const mock of Object.values(costsApiMocks)) mock.mockResolvedValue([]);
+    costsApiMocks.summary.mockResolvedValue({ spendCents: 0, budgetCents: 0, pricingComplete: true });
+    costsApiMocks.quotaSentinel.mockResolvedValue({
+      source: "quota-sentinel",
+      observedAt: "2026-10-30T22:30:00Z",
+      stale: false,
+      bankedReset: { available: 2, expiresAt: "2026-11-06T23:04:58Z", ordinaryResetAt: "2026-11-05T10:04:17Z", redeemNoLaterThan: "2026-11-06T21:04:58Z", automaticRedemption: false },
+      bankedResetDispute: { ownerExpected: 1, source: "owner_reported" },
+      creditOffers: [{ id: "cloud", label: "Claude Cloud Session Credits", balanceLastReportedUsd: 92, observedAt: "2026-10-31T19:36:00Z", expiresAt: "2026-11-05T08:00:00Z", source: "owner_reported", status: "reported_unverified" }],
+      pools: [
+        { provider: "antigravity", pool: "3p:weekly", usedPercent: 76.8, resetsAt: "2026-11-04T04:14:42Z", state: "behind_pace" },
+        { provider: "codex", pool: "weekly", usedPercent: 18, resetsAt: "2026-11-05T10:04:17Z", state: "behind_pace" },
+        { provider: "claude", pool: "weekly", usedPercent: 0, resetsAt: "2026-11-06T11:00:00Z", state: "need_trend" },
+        { provider: "claude", pool: "session", usedPercent: null, resetsAt: null, state: "unknown" },
+      ],
+    });
+    costsApiMocks.quotaWindows.mockResolvedValue([
+      { provider: "anthropic", ok: false, windows: [], source: "managed-connection", error: "Subscription quota is currently unavailable" },
+      { provider: "openai", ok: true, windows: [{ label: "5h limit", usedPercent: 18, resetsAt: "2026-11-05T10:04:17Z" }], source: "managed-connection" },
+    ]);
+    const row = { model: "claude-sonnet-5-5", provider: "anthropic", biller: "anthropic", billingType: "subscription_included", costCents: 0, inputTokens: 20, cachedInputTokens: 0, outputTokens: 10, eventCount: 1, apiRunCount: 0, subscriptionRunCount: 1, subscriptionInputTokens: 20, subscriptionCachedInputTokens: 0, subscriptionOutputTokens: 10 };
+    costsApiMocks.byProvider.mockResolvedValue([row, { ...row, provider: "openai", biller: "openai" }]);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    root = createRoot(container);
+    await act(async () => root.render(<MemoryRouter initialEntries={["/?tab=providers"]}><QueryClientProvider client={queryClient}><Costs /></QueryClientProvider></MemoryRouter>));
+    await act(async () => vi.waitFor(() => expect(container.querySelector('[data-testid="quota-sentinel-panel"]')?.textContent).toContain("76.8% used")));
+    const panel = container.querySelector('[data-testid="quota-sentinel-panel"]')!;
+    expect(panel.textContent).toContain("ChatGPT / Codex");
+    expect(panel.textContent).toContain("Claude");
+    expect(panel.querySelector('[data-testid="quota-banked-resets"]')?.textContent).toContain("Codex banked resets: 2");
+    expect(panel.textContent).toContain("Manual redemption only");
+    expect(container.querySelector('[data-testid="quota-deadline-timeline"]')?.textContent).toContain("Claude Cloud Session Credits");
+    expect(container.querySelector('[data-testid="quota-deadline-timeline"]')?.textContent).toContain("Up to $92.00");
+    expect(container.querySelector('[data-testid="quota-deadline-timeline"]')?.textContent).toContain("Disputed");
+    expect(panel.textContent).not.toContain("Session · 5h");
+    expect(panel.textContent).toContain("Nov 6, 2026");
+    expect(panel.textContent).toContain("3:00 AM PST");
+    expect(panel.textContent).not.toContain("Unknown"); // Short session window is intentionally separated.
+    expect(container.textContent).not.toContain("Subscription quota is currently unavailable");
+    expect(container.textContent).not.toContain("5h limit");
     queryClient.clear();
   });
 

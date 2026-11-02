@@ -779,6 +779,16 @@ describe("Codex app-server Codex driver", () => {
     await session.close({ reason: "fixture complete" });
   });
 
+  it("passes goal request identity only through Runner metadata", async () => {
+    const transport = new FakeCodexTransport();
+    const requestGoal = vi.fn((method:string,params:Record<string,unknown>,_metadata:{requestId?:string})=>transport.request(method,params));
+    const session = await makeDriver([Object.assign(transport,{requestGoal})]).openSession({runId:"run-goal-metadata",normalizedSessionId:"session-goal-metadata",workingDirectory:WORKSPACE});
+    await session.goal?.({action:"set",objective:"Paused",status:"paused",requestId:"request-identity"});
+    expect(requestGoal).toHaveBeenCalledWith("thread/goal/set",expect.not.objectContaining({requestId:expect.anything()}),{requestId:"request-identity"});
+    expect(transport.calls.find(call=>call.method==="thread/goal/set")?.params).not.toHaveProperty("requestId");
+    await session.close({reason:"fixture complete"});
+  });
+
   it("rolls back only a definitely rejected idle goal autostart", async () => {
     const definiteTransport = new FakeCodexTransport();
     const definiteSession = await makeDriver([definiteTransport]).openSession({

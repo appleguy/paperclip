@@ -29,6 +29,9 @@ export interface OpenCodeMcpBridgeOptions {
   /** Runner-owned operations callable only by a trusted harness extension and never advertised to the model. */
   privateTools?: readonly Readonly<Record<string, unknown>>[];
   handler: (call: OpenCodeMcpCall) => Promise<unknown>;
+  /** Opt-in shared-daemon boundary. Must authenticate this exact socket peer
+   * and the live session/run lease; sessionID itself is only correlation. */
+  admitSharedCall?: (input: { sessionId: string; remoteAddress: string; remotePort: number; localAddress: string; localPort: number }) => Promise<void>;
   timeoutMs?: number;
   /** Human-gated private operations may remain pending much longer than model tool calls. */
   privateToolTimeoutMs?: number;
@@ -76,6 +79,7 @@ export async function startOpenCodeMcpBridge(
       calls,
       controllers,
       handler: options.handler,
+      admitSharedCall: options.admitSharedCall,
       timeoutMs: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       privateToolTimeoutMs: options.privateToolTimeoutMs ?? options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       privateToolNames: new Set(privateTools.map((tool) => tool.name)),
@@ -146,6 +150,7 @@ async function handleRequest(
     calls: Map<string, { fingerprint: string; promise: Promise<unknown> }>;
     controllers: Map<string, AbortController>;
     handler: OpenCodeMcpBridgeOptions["handler"];
+    admitSharedCall?: OpenCodeMcpBridgeOptions["admitSharedCall"];
     timeoutMs: number;
     privateToolTimeoutMs: number;
     privateToolNames: ReadonlySet<string>;
@@ -184,6 +189,8 @@ async function handleRequest(
   const id = message.id ?? null;
   const method = typeof message.method === "string" ? message.method : "";
   if (method === "notifications/cancelled") {
+    // A context-free cancellation cannot identify a shared native session.
+    if (context.admitSharedCall) { response.statusCode = 202; response.end(); return; }
     const params = isRecord(message.params) ? message.params : {};
     const requestId = params.requestId;
     if (typeof requestId === "string" || typeof requestId === "number") {
@@ -220,6 +227,26 @@ async function handleRequest(
     return;
   }
   const params = isRecord(message.params) ? message.params : {};
+  let sharedSessionId: string | undefined;
+  if (context.admitSharedCall) {
+    const meta = isRecord(params._meta) ? params._meta : {};
+    const sessionId = meta["ai.opencode/sessionID"];
+    const socket = request.socket;
+    if (typeof sessionId !== "string" || !/^ses_[A-Za-z0-9_-]{1,200}$/.test(sessionId) ||
+        !socket.remoteAddress || !socket.remotePort || !socket.localAddress || !socket.localPort ||
+        (typeof id !== "string" && typeof id !== "number")) {
+      writeRpc(response, id, { isError: true, content: [{ type: "text", text: "Shared session admission failed." }] });
+      return;
+    }
+    try {
+      await context.admitSharedCall({ sessionId, remoteAddress: socket.remoteAddress, remotePort: socket.remotePort, localAddress: socket.localAddress, localPort: socket.localPort });
+      if (socket.destroyed) throw new Error("peer disconnected");
+      sharedSessionId = sessionId;
+    } catch {
+      writeRpc(response, id, { isError: true, content: [{ type: "text", text: "Shared session admission failed." }] });
+      return;
+    }
+  }
   const rawName = typeof params.name === "string" ? params.name : "";
   // A declared operation may itself start with paperclip_. Preserve that
   // authority identity before accepting an OpenCode transport prefix alias.
@@ -242,10 +269,15 @@ async function handleRequest(
     });
     return;
   }
-  const fingerprint = canonicalJson({ tool, args });
+  const fingerprint = canonicalJson({ tool, args, ...(sharedSessionId ? { sessionId: sharedSessionId } : {}) });
   const existing = context.calls.get(callId);
   if (existing && existing.fingerprint !== fingerprint) {
     writeRpc(response, id, { isError: true, content: [{ type: "text", text: "Duplicate call identity conflict." }] });
+    return;
+  }
+  if (!existing && context.admitSharedCall && context.calls.size >= 2_048) {
+    // Eviction could re-execute a mutating call when a client retries it.
+    writeRpc(response, id, { isError: true, content: [{ type: "text", text: "Shared call capacity exhausted." }] });
     return;
   }
   const controller = existing === undefined ? new AbortController() : undefined;

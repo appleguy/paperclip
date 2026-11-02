@@ -622,7 +622,9 @@ export class CodexHarnessSession
       }
     }
     try {
-      const response = await this.transport.request(method, params);
+      const response = this.transport.requestGoal
+        ? await this.transport.requestGoal(method, params, { requestId: input.requestId })
+        : await this.transport.request(method, params);
       this.assertProtocolIntegrity();
       const goal =
         input.action === "clear" ? null : parseThreadGoal(response.goal);

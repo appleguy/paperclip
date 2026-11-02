@@ -46,8 +46,10 @@ export type NativeRuntimeResolution =
       profile: {
         mode: "native";
         backend:
+          | "claude_interactive"
           | "codex_app_server"
           | "opencode_server"
+          | "antigravity_headless"
           | "claude_managed_agents_api"
           | "aws_agentcore_harness_api"
           | "acpx_runtime"
@@ -156,11 +158,11 @@ export function resolveNativeRuntimeMode(input: {
       "Paperclip Runner requires an active agent.",
     );
   }
-  const allowedWorkModes = ["standard", "planning", "ask"];
+  const allowedWorkModes = ["standard", "planning", "ask", "skill_test"];
   if (!input.issue || !allowedWorkModes.includes(input.issue.workMode)) {
     throw ineligible(
       "paperclip_runner_issue_ineligible",
-      "Paperclip Runner requires a standard, planning, or ask task.",
+      "Paperclip Runner requires a standard, planning, ask, or skill test task.",
     );
   }
   const rollout = resolveNativeMigrationStatus({
@@ -259,7 +261,7 @@ export function resolveHeartbeatRuntimeMode(input: {
     kind: "native",
     resolverVersion: NATIVE_RUNTIME_RESOLVER_VERSION,
     reason: "explicit_paperclip_runner",
-    provider: resolution.profile.backend === "opencode_server"
+    provider: resolution.profile.backend === "claude_interactive" ? "claude_interactive" : resolution.profile.backend === "antigravity_headless" ? "antigravity_headless" : resolution.profile.backend === "opencode_server"
       ? "opencode"
       : resolution.profile.backend === "claude_managed_agents_api"
         ? "claude_managed"
@@ -315,7 +317,7 @@ export function resolveHeartbeatNativeRuntimeMode(input: {
         );
       }
       const driverKind = input.persisted.driverKind;
-      const backend = driverKind === "opencode_server"
+      const backend = driverKind === "claude_interactive_v1" ? "claude_interactive" : driverKind === "antigravity_headless" ? "antigravity_headless" : driverKind === "opencode_server"
         ? "opencode_server"
         : driverKind === "claude_managed_agents_api"
           ? "claude_managed_agents_api"

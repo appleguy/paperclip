@@ -1,3 +1,6 @@
+import { notifyStrandedAgentStatus } from "../live-run-recovery-notifications.js";
+import { notifyRunDispatch } from "../run-dispatch-notifications.js";
+import { preserveAcceptedRunUsageProjectionSql } from "../usage-receipts.js";
 import { notifyNativeEnvironmentSettlement } from "../native-environment-settlement-notifications.js";
 import { notifyExternalAgentSettlement } from "../../modules/external-agents/index.js";
 import { notifyExternalConversationSettlement } from "../external-conversation-settlement-notifications.js";
@@ -358,8 +361,21 @@ export function decorateHeartbeatRunRuntimeStatus<
         })
       : null;
 
+  // Liveness classification describes a *finished attempt*. A queued or
+  // running attempt may have been adopted/retried with the same run row;
+  // its historical "Run ended with scheduled_retry" verdict is not the
+  // health of the current process. Keep persistent evidence untouched, but
+  // never present a terminal verdict for a nonterminal run.
+  const terminalAssessment = !isHeartbeatRunTerminalStatus(run.status)
+    ? {
+        ...("livenessState" in run ? { livenessState: null } : {}),
+        ...("livenessReason" in run ? { livenessReason: null } : {}),
+      }
+    : {};
+
   return {
     ...run,
+    ...terminalAssessment,
     currentStatusMessage: currentStatus?.message ?? null,
     currentStatusUpdatedAt: currentStatus?.updatedAt ?? null,
     currentToolName: currentStatus?.currentToolName ?? null,
@@ -1043,7 +1059,8 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       if (previous && isHeartbeatRunTerminalStatus(status))
         await notifyRetainedNativeSessionCleanup(tx, { companyId: previous.companyId, runId: previous.id });
       if (isHeartbeatRunTerminalStatus(status)) await notifyDeliveryWork(tx, DELIVERY_QUEUES.accounting, companyId);
-      await notifyExecutionRunWork(tx);
+      await notifyExecutionRunWork(tx, previous ? { companyId: previous.companyId, runId: previous.id,
+        issueId: previous.nativeIssueId ?? previous.issueId ?? readNonEmptyString(parseObject(previous.contextSnapshot).issueId) ?? undefined } : undefined);
       if (previous) await notifyChatRunMilestones(tx, { companyId: previous.companyId, runId: previous.id,
         issueId: previous.nativeIssueId ?? previous.issueId ?? readNonEmptyString(parseObject(previous.contextSnapshot).issueId) ?? undefined });
       return write(tx);
@@ -1202,6 +1219,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
             .set({
               status,
               ...patch,
+              ...(patch?.usageJson ? { usageJson: preserveAcceptedRunUsageProjectionSql(patch.usageJson) } : {}),
               executionStatusDeliveryId: randomUUID(),
               updatedAt: new Date(),
             })
@@ -1415,12 +1433,13 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
   ) {
     if (!wakeupRequestId) return;
     await db.transaction(async tx => {
-      const [current] = await tx.select({ companyId: agentWakeupRequests.companyId, status: agentWakeupRequests.status })
+      const [current] = await tx.select({ companyId: agentWakeupRequests.companyId, agentId: agentWakeupRequests.agentId, status: agentWakeupRequests.status })
         .from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeupRequestId)).for("update");
       if (!current || current.status === "cancelled") return;
       if (current.status !== (patch?.status ?? status) || patch?.payload !== undefined || patch?.runId !== undefined) {
         await notifyExternalConversationSettlement(tx, { companyId: current.companyId });
       }
+      await notifyStrandedAgentStatus(tx, { companyId: current.companyId, agentId: current.agentId });
       await tx.update(agentWakeupRequests)
         .set({ status, ...patch, updatedAt: new Date() })
 
@@ -2445,6 +2464,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
         .returning()
         .then((rows) => rows[0]);
 
+      await notifyRunDispatch(tx, { companyId: run.companyId });
       const queuedRun = await tx
         .insert(heartbeatRuns)
         .values({

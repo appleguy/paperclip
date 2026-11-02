@@ -8,6 +8,7 @@ import { DurablePrpControlPlane } from "@paperclipai/paperclip-runner";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  hasConnectedRunnerPrpAuthority,
   queueLiveRunnerPrpCommand,
   queueRunnerPrpRuntimeRequestResolution,
   registerRunnerPrpAuthority,
@@ -18,6 +19,18 @@ import {
 
 describe("runner PRP websocket route", () => {
   afterEach(() => runnerPrpWebSocketInternals.resetForTests());
+
+  it("requires exact current run, writer identity and authenticated connection", async () => {
+    const server=createServer();setupRunnerPrpWebSocketServer(server,{apiUrl:"http://127.0.0.1:3213"});
+    const binding={companyId:"company",issueId:"issue",agentId:"agent",runId:"00000000-0000-4000-8000-000000000771",runnerInstanceId:"writer"};
+    let connected=0;const authority={store:{state:{identity:{runId:binding.runId,runnerInstanceId:binding.runnerInstanceId}}},activeRunnerConnectionCount:()=>connected} as unknown as DurablePrpControlPlane;
+    const first=await registerRunnerPrpAuthority({...binding,authority});
+    try{expect(hasConnectedRunnerPrpAuthority(binding)).toBe(false);connected=1;expect(hasConnectedRunnerPrpAuthority(binding)).toBe(true);
+      expect(hasConnectedRunnerPrpAuthority({...binding,companyId:"foreign"})).toBe(false);expect(hasConnectedRunnerPrpAuthority({...binding,issueId:"foreign"})).toBe(false);expect(hasConnectedRunnerPrpAuthority({...binding,agentId:"foreign"})).toBe(false);expect(hasConnectedRunnerPrpAuthority({...binding,runnerInstanceId:"foreign"})).toBe(false);
+      const secondId="00000000-0000-4000-8000-000000000772";const second=await registerRunnerPrpAuthority({...binding,runId:secondId,authority:{...authority,store:{state:{identity:{runId:secondId,runnerInstanceId:"next"}}}} as unknown as DurablePrpControlPlane});
+      try{expect(hasConnectedRunnerPrpAuthority(binding)).toBe(false);await first.release();expect(hasConnectedRunnerPrpAuthority({...binding,runId:secondId,runnerInstanceId:"next"})).toBe(true);}finally{await second.release();}
+    }finally{await first.release();server.close();}
+  });
 
   it("routes only the registered run and releases it by generation", async () => {
     const server = createServer();

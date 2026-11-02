@@ -7,6 +7,22 @@ import { validatePrpEvent, type PrpEvent } from "./replay-contract.js";
 const validate = new Ajv2020({ allErrors: true, strict: false }).compile(providerDescriptorSchema);
 
 describe("provider runtime descriptor", () => {
+  it("distinguishes shared native daemon attachments from owned children", () => {
+    const processOwnership = { kind: "shared_daemon", socketPath: "/native/control.sock", daemonGeneration: "device:inode:birth", threadId: "thread-1", codexHome: "/native/home" };
+    const descriptor = { provider: "codex", driver: "codex_app_server", model: "explicit-model", executionKind: "local_process", providerVersion: "0.166.0", processOwnership };
+    expect(validate(descriptor), JSON.stringify(validate.errors)).toBe(true);
+    for (const extra of [{ processId: 42 }, { processId: null }, { agentProcessId: 42 }, { agentProcessId: null },
+      { provider: "opencode", driver: "opencode_server" }, { executionKind: "remote_service" }]) {
+      expect(validate({ ...descriptor, ...extra }), JSON.stringify(extra)).toBe(false);
+    }
+    for (const change of [{ socketPath: "relative.sock" }, { codexHome: "relative" }, { daemonGeneration: "" }, { threadId: "" },
+      { socketPath: "/control\n.sock" }, { codexHome: "/native\u0000/home" }, { daemonGeneration: "  " }, { threadId: "x\u007f" },
+      { kind: "shared_daemon", extra: "unnegotiated" }]) expect(validate({ ...descriptor, processOwnership: { ...processOwnership, ...change } })).toBe(false);
+    expect(validate({ ...descriptor, processOwnership: { kind: "owned_child" }, processId: 42 })).toBe(true);
+    expect(validate({ ...descriptor, processOwnership: { kind: "owned_child" } })).toBe(false);
+    expect(validate({ ...descriptor, processOwnership: { kind: "owned_child" }, processId: null })).toBe(false);
+  });
+
   it("validates negotiated turn controls in descriptors and capability events", () => {
     const descriptor = { provider: "acpx", driver: "acpx_runtime", agent: "pi", model: "explicit-model",
       requestedModel: "explicit-model", executionKind: "local_process", providerVersion: "0.13.1",

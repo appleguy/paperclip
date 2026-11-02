@@ -1,0 +1,32 @@
+import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
+import { afterAll, beforeAll, expect, it } from "vitest";
+import { agents, companies, companyMemberships, createDb, heartbeatRuns, issues, projectAccessMembers, projects, startEmbeddedPostgresTestDatabase } from "@paperclipai/db";
+import { errorHandler } from "../middleware/error-handler.js";
+import { nativeSessionCatalogRoutes } from "./native-session-catalog.js";
+
+let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>, db: ReturnType<typeof createDb>;
+beforeAll(async()=>{database=await startEmbeddedPostgresTestDatabase("catalog-privacy-");db=createDb(database.connectionString);},60000);
+afterAll(async()=>{await db?.$client.end();await database?.cleanup();});
+it("enforces actual private-project and company permissions for persisted sessions",async()=>{
+  const company=randomUUID(), foreign=randomUUID(), user=`catalog-${randomUUID()}`;
+  const publicAgent=randomUUID(), foreignAgent=randomUUID(), privateProject=randomUUID(), publicIssue=randomUUID(), privateIssue=randomUUID(), foreignIssue=randomUUID();
+  const publicRun=randomUUID(), privateRun=randomUUID(), foreignRun=randomUUID();
+  await db.insert(companies).values([{id:company,name:"Catalog",issuePrefix:`C${company.slice(0,7)}`},{id:foreign,name:"Foreign",issuePrefix:`F${foreign.slice(0,7)}`}]);
+  await db.insert(companyMemberships).values({companyId:company,principalType:"user",principalId:user,status:"active",membershipRole:"member"});
+  await db.insert(agents).values([{id:publicAgent,companyId:company,name:"Agent",role:"engineer"},{id:foreignAgent,companyId:foreign,name:"Foreign agent",role:"engineer"}]);
+  await db.insert(projects).values({id:privateProject,companyId:company,name:"Private",visibility:"private"});
+  await db.insert(issues).values([{id:publicIssue,companyId:company,title:"Public",visibility:"open"},{id:privateIssue,companyId:company,projectId:privateProject,title:"Private project task",visibility:"open"},{id:foreignIssue,companyId:foreign,title:"Foreign",visibility:"open"}]);
+  await db.insert(heartbeatRuns).values([{id:publicRun,companyId:company,agentId:publicAgent,issueId:publicIssue,scopeKind:"issue",status:"failed",sessionIdAfter:"public-native"},{id:privateRun,companyId:company,agentId:publicAgent,issueId:privateIssue,scopeKind:"issue",status:"running",sessionIdAfter:"private-native"},{id:foreignRun,companyId:foreign,agentId:foreignAgent,issueId:foreignIssue,scopeKind:"issue",status:"running",sessionIdAfter:"foreign-native"}]);
+  const app=express();app.use((req,_res,next)=>{req.actor={type:"board",source:"board_key",userId:user,authorizingUserId:user,isInstanceAdmin:false,companyIds:[company]};next()});app.use("/api",nativeSessionCatalogRoutes(db));app.use(errorHandler);
+  const path=`/api/companies/${company}/native-sessions`;
+  const initial=await request(app).get(path).expect(200);
+  expect(initial.body.sessions.map((r:any)=>r.runId)).toEqual([publicRun]);
+  expect(initial.body.sessions[0]).toMatchObject({state:"run-terminal",runStatus:"failed",stateEvidence:"persisted_terminal_run"});
+  expect(JSON.stringify(initial.body)).not.toContain("private-native");expect(JSON.stringify(initial.body)).not.toContain("foreign-native");
+  await request(app).get(`/api/companies/${foreign}/native-sessions`).expect(403);
+  await db.insert(projectAccessMembers).values({companyId:company,projectId:privateProject,subjectType:"user",subjectId:user});
+  const admitted=await request(app).get(path).expect(200);
+  expect(admitted.body.sessions.map((r:any)=>r.runId).sort()).toEqual([publicRun,privateRun].sort());
+},60000);

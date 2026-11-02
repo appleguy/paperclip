@@ -1,3 +1,5 @@
+import { createSharedCodexThreadConfig } from "./shared-codex-thread-config-builder.js";
+import { sharedThreadConfigViolation } from "./shared-codex-thread-config.js";
 import { describe, expect, it } from "vitest";
 import { createRunnerProviderLaunch, preparedRunnerLaunchWorkingDirectory, runnerLaunchRequirementsDigest, validatePreparedRunnerLaunch,
   runnerProviderLaunchRequirements, type RunnerProviderLaunchEnvironment, type RunnerProviderLaunchRequirements } from "./runner-provider-launch.js";
@@ -19,6 +21,142 @@ const environment: RunnerProviderLaunchEnvironment = {
 };
 
 describe("built-in provider launch preparation", () => {
+  it("carries a shared thread display name without including it in launch identity", () => {
+    const shared={socketPath:"/private/socket",daemonGeneration:"generation",threadId:"thread",codexHome:"/private/home",threadName:"Old name",peer:{pid:12,startSeconds:1,startMicroseconds:2,executable:"/private/codex"}};
+    const selected=runnerProviderLaunchRequirements({provider:"codex",sharedCodexDaemon:shared},requirements.identity,{permissions:"paperclip-runner-workspace-read-only"},null,"");
+    const renamed={...selected,sharedCodexDaemon:{...shared,threadName:"New name"}};
+    expect(runnerLaunchRequirementsDigest(selected)).toBe(runnerLaunchRequirementsDigest(renamed));
+    const launch=createRunnerProviderLaunch(renamed,environment);
+    expect(launch.sharedDaemon).toMatchObject({threadName:"New name"});
+    expect(()=>validatePreparedRunnerLaunch(selected,{configurationId:"test",requirementsDigest:runnerLaunchRequirementsDigest(selected),provider:launch})).not.toThrow();
+    expect(runnerLaunchRequirementsDigest({...renamed,sharedCodexDaemon:{...shared,threadId:"other"}})).not.toBe(runnerLaunchRequirementsDigest(selected));
+  });
+  it("exposes only the registered agent home alongside PATH", () => {
+    const base = { cwd: environment.cwd, readOnly: false, webSearchDisabled: true, networkAccess: false,
+      codexHome: "/private/home", codexExecutable: "/bin/sh", path: "/usr/bin:/bin" };
+    const absent = createSharedCodexThreadConfig(base) as any;
+    expect(absent.shell_environment_policy).toMatchObject({ inherit: "none", set: { PATH: base.path } });
+    expect(absent.shell_environment_policy.set).toEqual({ PATH: base.path });
+    const config = createSharedCodexThreadConfig({ ...base, agentHome: "/private/agent", runtimeReadRoots: ["/private/agent"] }) as any;
+    expect(config.shell_environment_policy.set).toEqual({ PATH: base.path, AGENT_HOME: "/private/agent" });
+    for (const profile of Object.values(config.permissions) as any[]) expect(profile.filesystem["/private/agent"]).toBe("read");
+    const policy = { cwd: base.cwd, readOnly: false, disableWebSearch: true };
+    expect(sharedThreadConfigViolation(config, policy)).toBeNull();
+    config.shell_environment_policy.set.SECRET = "value";
+    expect(sharedThreadConfigViolation(config, policy)).toBe("shell_environment_invalid");
+  });
+  it("builds only explicitly disabled MCP entries and rejects malformed names or overrides", () => {
+    const base = { cwd: environment.cwd, readOnly: false, webSearchDisabled: true, networkAccess: false,
+      codexHome: "/private/home", codexExecutable: "/bin/sh", path: "/usr/bin:/bin" };
+    const policy = { cwd: base.cwd, readOnly: false, disableWebSearch: true };
+    const config = createSharedCodexThreadConfig({ ...base, disabledMcp: "z-server, alpha_1,z-server" }) as any;
+    expect(config.mcp_servers).toEqual({ alpha_1: { enabled: false }, "z-server": { enabled: false } });
+    const stubbed = createSharedCodexThreadConfig({ ...base, disabledMcp: "plain,stubbed!" }) as any;
+    expect(stubbed.mcp_servers).toEqual({ plain: { enabled: false }, stubbed: { enabled: false, command: "/usr/bin/false" } });
+    expect(sharedThreadConfigViolation(stubbed, policy)).toBeNull();
+    expect(sharedThreadConfigViolation(config, policy)).toBeNull();
+    for (const invalid of ["foo,,bar", "foo.bar", "../foo", "foo bar", "__proto__."]) {
+      expect(() => createSharedCodexThreadConfig({ ...base, disabledMcp: invalid })).toThrow("shared_codex_disable_mcp_invalid");
+    }
+    for (const invalid of [{ alpha: { enabled: true } }, { alpha: { enabled: false, command: "x" } }, { "bad.name": { enabled: false } }]) {
+      expect(sharedThreadConfigViolation({ ...config, mcp_servers: invalid }, policy)).toBe("mcp_servers_invalid");
+    }
+    expect(createSharedCodexThreadConfig(base)).not.toHaveProperty("mcp_servers");
+  });
+  it("pins the explicitly attested shared daemon into readonly launch requirements",()=>{
+    const shared={socketPath:"/private/socket",daemonGeneration:"generation",threadId:"thread",codexHome:"/private/home",peer:{pid:12,startSeconds:1,startMicroseconds:2,executable:"/private/codex"},writer:{runId:"run",normalizedSessionId:"session",runnerInstanceId:"runner",grantId:"grant",epoch:1,observationEpochId:"observation"}};
+    const selected=runnerProviderLaunchRequirements({provider:"codex",sharedCodexDaemon:shared},requirements.identity,{permissions:"paperclip-runner-workspace-read-only"},null,"");
+    const launch=createRunnerProviderLaunch(selected,environment);
+    expect(launch).toMatchObject({args:[],model:null,readOnly:true,instructions:"",providerSessionId:"thread",sharedDaemon:shared});
+    validatePreparedRunnerLaunch(selected,{configurationId:"test",requirementsDigest:runnerLaunchRequirementsDigest(selected),provider:launch});
+    shared.threadId="changed";
+    expect(selected.sharedCodexDaemon?.threadId).toBe("thread");
+    expect(()=>createRunnerProviderLaunch({...selected,instructions:"do work"},environment)).toThrow("requirements_invalid");
+    expect(()=>validatePreparedRunnerLaunch(selected,{configurationId:"test",requirementsDigest:runnerLaunchRequirementsDigest(selected),provider:{...launch,sharedDaemon:{...selected.sharedCodexDaemon,threadId:"foreign"}}})).toThrow("requirements_mismatch");
+  });
+  it.each([false, true])("binds Core's web-search policy and a narrow permission profile into the shared bootstrap thread config (readOnly=%s)", readOnly => {
+    const serverConfig=(networkAccess=false)=>createSharedCodexThreadConfig({cwd:environment.cwd,readOnly,webSearchDisabled:true,networkAccess,codexHome:"/private/home",codexExecutable:"/bin/sh",path:"/usr/bin:/bin",disabledMcp:"fixture"});
+    const bootstrapWith=(threadConfig:Record<string,unknown>)=>({socketPath:"/private/socket",daemonGeneration:"generation",threadId:"",codexHome:"/private/home",bootstrapId:"boot",peer:{pid:12,startSeconds:1,startMicroseconds:2,executable:"/bin/sh"},writer:{runId:"run",normalizedSessionId:"session",runnerInstanceId:"runner",grantId:"grant",epoch:1,observationEpochId:"observation",managedTools:true,managedBootstrapId:"boot",reasoningEffort:"high",threadConfig}});
+    const bootstrap=bootstrapWith(serverConfig());
+    const selected=runnerProviderLaunchRequirements({provider:"codex",disableCodexWebSearch:true,sharedCodexDaemon:bootstrap},requirements.identity,{model:"selected-model",permissions:readOnly?"paperclip-runner-workspace-read-only":"paperclip-runner-workspace-only"},null,"Follow the assigned instructions.");
+    const env={...environment,options:{codexArgs:[],environment:{PATH:"/usr/bin:/bin"}}};
+    const launch=createRunnerProviderLaunch(selected,env) as {args:unknown[];sharedDaemon:{writer:{threadConfig:Record<string,unknown>}}};
+    expect(launch.args).toEqual([]);
+    expect(launch.sharedDaemon.writer.threadConfig.web_search).toBe("disabled");
+    const prepared={configurationId:"boot",requirementsDigest:runnerLaunchRequirementsDigest(selected),provider:launch as unknown as Record<string,unknown>};
+    expect(()=>validatePreparedRunnerLaunch(selected,prepared)).not.toThrow();
+    const mutate=(change:(config:Record<string,any>)=>void)=>{ const copy=structuredClone(launch); change(copy.sharedDaemon.writer.threadConfig); return {...prepared,provider:copy as unknown as Record<string,unknown>}; };
+    const profile=readOnly?"paperclip-runner-workspace-read-only":"paperclip-runner-workspace-only";
+    for (const change of [
+      (config:Record<string,any>)=>{ delete config.mcp_servers.fixture; },
+      // Mutations that stay inside the shape validator's vocabulary but differ from the server-generated policy.
+      (config:Record<string,any>)=>{ config.permissions[profile].network.enabled=true; },
+      (config:Record<string,any>)=>{ config.permissions[profile].filesystem["/Users/attacker/.ssh"]="read"; },
+      (config:Record<string,any>)=>{ config.shell_environment_policy.set.PATH="/tmp/attacker/bin:/usr/bin"; },
+      (config:Record<string,any>)=>{ config.shell_environment_policy.include_only=["PATH","SECRET_TOKEN"]; },
+      (config:Record<string,any>)=>{ config.shell_environment_policy.set.SECRET_TOKEN="x"; },
+      (config:Record<string,any>)=>{ config.permissions[profile].filesystem[":minimal"]="read"; config.permissions[profile].filesystem["/private/home"]="read"; },
+      (config:Record<string,any>)=>{ delete config.web_search; },
+      (config:Record<string,any>)=>{ config.web_search="live"; },
+      (config:Record<string,any>)=>{ config.model="other"; },
+      (config:Record<string,any>)=>{ config.permissions["paperclip-runner-workspace-only"].filesystem[":root"]="write"; },
+      (config:Record<string,any>)=>{ config.permissions["paperclip-runner-workspace-only"].filesystem["/outside"]="write"; },
+      (config:Record<string,any>)=>{ config.permissions["paperclip-runner-workspace-read-only"].filesystem[":workspace_roots"]={".":"write"}; },
+      (config:Record<string,any>)=>{ config.permissions["paperclip-runner-workspace-only"].network.enabled="yes"; },
+      (config:Record<string,any>)=>{ config.shell_environment_policy.inherit="all"; },
+      (config:Record<string,any>)=>{ delete config.shell_environment_policy; },
+    ]) expect(()=>validatePreparedRunnerLaunch(selected,mutate(change))).toThrow("requirements_mismatch");
+    expect(()=>validatePreparedRunnerLaunch(selected,{...prepared,provider:{...launch,args:["-c",'web_search="disabled"']} as unknown as Record<string,unknown>})).toThrow("requirements_mismatch");
+    // Networking the server admitted is carried, not banned: the same exact binding accepts it and then rejects its removal.
+    const networked=runnerProviderLaunchRequirements({provider:"codex",disableCodexWebSearch:true,sharedCodexDaemon:bootstrapWith(serverConfig(true))},requirements.identity,{model:"selected-model",permissions:readOnly?"paperclip-runner-workspace-read-only":"paperclip-runner-workspace-only"},null,"Follow the assigned instructions.");
+    const networkedLaunch=createRunnerProviderLaunch(networked,env);
+    const networkedPrepared={configurationId:"boot",requirementsDigest:runnerLaunchRequirementsDigest(networked),provider:networkedLaunch as unknown as Record<string,unknown>};
+    expect(()=>validatePreparedRunnerLaunch(networked,networkedPrepared)).not.toThrow();
+    const downgraded=structuredClone(networkedLaunch) as unknown as {sharedDaemon:{writer:{threadConfig:Record<string,any>}}};
+    downgraded.sharedDaemon.writer.threadConfig.permissions[profile].network.enabled=false;
+    expect(()=>validatePreparedRunnerLaunch(networked,{...networkedPrepared,provider:downgraded as unknown as Record<string,unknown>})).toThrow("requirements_mismatch");
+    // A descriptor built for another requirement digest cannot carry a different policy.
+    expect(()=>validatePreparedRunnerLaunch(selected,{...networkedPrepared,provider:networkedLaunch as unknown as Record<string,unknown>})).toThrow("requirements_mismatch");
+    // The host cannot generate a policy of its own: a bootstrap without the server's config is refused at creation.
+    const missing=structuredClone(bootstrap) as Record<string,any>; delete missing.writer.threadConfig;
+    expect(()=>createRunnerProviderLaunch(runnerProviderLaunchRequirements({provider:"codex",disableCodexWebSearch:true,sharedCodexDaemon:missing as typeof bootstrap},requirements.identity,{model:"selected-model",permissions:readOnly?"paperclip-runner-workspace-read-only":"paperclip-runner-workspace-only"},null,"Follow the assigned instructions."),env)).toThrow("runner_shared_codex_launch_requirements_invalid");
+  });
+
+  it("preserves probe project-instruction suppression through a prepared launch", () => {
+    const selected = runnerProviderLaunchRequirements({ provider: "codex", disableCodexProjectInstructions: true,
+      disableCodexWebSearch: true }, requirements.identity,
+      { model: requirements.model, permissions: "paperclip-runner-workspace-read-only" }, null, "");
+    expect(selected.settings).toHaveProperty("disableCodexProjectInstructions", true);
+    const ordinary = runnerProviderLaunchRequirements({ provider: "codex", disableCodexWebSearch: true },
+      requirements.identity, { model: requirements.model, permissions: "paperclip-runner-workspace-read-only" }, null, "");
+    expect(runnerLaunchRequirementsDigest(selected)).not.toBe(runnerLaunchRequirementsDigest(ordinary));
+    const launch = createRunnerProviderLaunch(selected, { ...environment,
+      options: { codexArgs: ["-c", "project_doc_max_bytes=8192", "app-server"], disableCodexProjectInstructions: false } });
+    expect(launch.args).toEqual(["-c", "project_doc_max_bytes=8192", "-c", "project_doc_max_bytes=0",
+      "-c", 'web_search="disabled"', "app-server"]);
+    const prepared = { configurationId: "probe-policy", requirementsDigest: runnerLaunchRequirementsDigest(selected), provider: launch };
+    expect(() => validatePreparedRunnerLaunch(selected, prepared)).not.toThrow();
+    expect(() => validatePreparedRunnerLaunch(selected, { ...prepared,
+      provider: { ...launch, args: ["-c", 'web_search="disabled"', "app-server"] } }))
+      .toThrow("runner_prepared_launch_requirements_mismatch");
+  });
+
+  it.each([undefined, false])("keeps ordinary project instructions when suppression is %s", disableCodexProjectInstructions => {
+    const selected = runnerProviderLaunchRequirements({ provider: "codex", disableCodexProjectInstructions },
+      requirements.identity, { model: requirements.model }, null, "");
+    expect(selected.settings).not.toHaveProperty("disableCodexProjectInstructions");
+    expect(createRunnerProviderLaunch(selected, environment).args).toEqual(["app-server"]);
+  });
+
+  it("can suppress project instructions without disabling hosted search", () => {
+    const selected = runnerProviderLaunchRequirements({ provider: "codex", disableCodexProjectInstructions: true },
+      requirements.identity, { model: requirements.model }, null, "");
+    const provider = createRunnerProviderLaunch(selected, environment);
+    expect(provider.args).toEqual(["-c", "project_doc_max_bytes=0", "app-server"]);
+    expect(() => validatePreparedRunnerLaunch(selected, { configurationId: "probe", provider,
+      requirementsDigest: runnerLaunchRequirementsDigest(selected) })).not.toThrow();
+  });
+
   it.each([true, false])("binds Grok search policy %s into the prepared descriptor", disabled => {
     const selected = runnerProviderLaunchRequirements({ provider: "acpx", acpxAgent: "grok", grokDisableWebSearch: disabled },
       requirements.identity, { model: "grok-4.7" }, null, "");

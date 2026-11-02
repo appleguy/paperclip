@@ -72,6 +72,24 @@ afterEach(async () => {
   container.remove();
 });
 
+describe("working indicator", () => {
+  it("requires the server working projection, run and observation rather than the stored goal flag", async () => {
+    const stale = { ...projection, goal: { ...projection.goal!, workingNow: true }, workingNow: false };
+    const show = async (objective: string, update: Partial<RunnerGoalProjection>) => {
+      await act(async () => { client.setQueryData(queryKeys.issues.runnerGoal("issue-goal", "agent-goal"), { ...stale, ...update, goal: { ...stale.goal, objective } }); });
+      await vi.waitFor(() => expect(container.textContent).toContain(objective));
+    };
+    await show("Persisted goal only", {});
+    expect(container.textContent).not.toContain("Working now");
+    await show("Missing run", { workingNow: true });
+    expect(container.textContent).not.toContain("Working now");
+    await show("Missing observation", { workingNow: true, activeRunId: "run", observedAt: null });
+    expect(container.textContent).not.toContain("Working now");
+    await show("Live authority", { workingNow: true, activeRunId: "run" });
+    expect(container.textContent).toContain("Working now");
+  });
+});
+
 describe("session goal dialogs", () => {
   it("hides the widget after an expanded goal is cleared", async () => {
     await click("Focus goal");

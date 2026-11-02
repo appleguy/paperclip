@@ -14,4 +14,6 @@ export const PAPERCLIP_AGENT_DIRECTORY_PROMPT = "Your persistent agent directory
 
 export const PAPERCLIP_EDITABLE_INSTRUCTIONS_PROMPT = "Your editable agent instruction file is {rootPath}/{entryPath}. Edit this registered private copy normally. After this run stops, Paperclip saves changed content as a persistent revision if your responsible user still has permission and the baseline has not changed. Check the run's instruction-save receipt before claiming persistence. Conflicts are preserved for explicit resolution. Repository instruction files, skills, and this run's loaded prompt are separate and are not collected.";
 
+export const PAPERCLIP_READ_ONLY_AGENT_DIRECTORY_PROMPT = "Your agent directory is {rootPath}; its instruction entry is {entryPath}. This directory and its instruction file are read-only on this route. Use the current $AGENT_HOME in shell commands when available. Put persistent changes in the workspace or issue documents.";
+
 export const PAPERCLIP_INSTRUCTION_SIBLING_ROOT_PROMPT = "Read-only instruction sibling root: ";

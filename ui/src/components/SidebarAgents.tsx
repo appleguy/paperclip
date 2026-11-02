@@ -48,6 +48,7 @@ import {
 import { BudgetSidebarMarker } from "./BudgetSidebarMarker";
 import { SidebarNavItem } from "./SidebarNavItem";
 import { SidebarSection, type SidebarSectionRadioChoice } from "./SidebarSection";
+import { ExternalActivitySection } from "./ExternalActivitySection";
 import { StarToggle } from "./StarToggle";
 import { Button } from "@/components/ui/button";
 import {
@@ -636,6 +637,7 @@ export function SidebarAgents({ streamlined = false }: { streamlined?: boolean }
   );
 
   return (
+    <>
     <SidebarSection
       label="Agents"
       collapsible={{ open, onOpenChange: setOpen }}
@@ -688,5 +690,7 @@ export function SidebarAgents({ streamlined = false }: { streamlined?: boolean }
         );
       })()}
     </SidebarSection>
+    <ExternalActivitySection companyId={selectedCompanyId ?? null} />
+    </>
   );
 }

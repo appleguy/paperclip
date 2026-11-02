@@ -17,6 +17,7 @@ use crate::codex_provider::{
     ProviderStartupObservation, ProviderStartupStage, RejectedAcceptedTurn,
     MAX_SETTLED_PROVIDER_TURN_IDS,
 };
+use crate::codex_usage::CodexRunUsage;
 use crate::durable::{
     create_private_temporary_file, current_unix_ms, open_private_regular_file, sanitize_value,
     validate_semantic_tool_input, verify_private_directory, Command, CommandExecution,
@@ -37,6 +38,9 @@ use crate::stable_identity::{is_stable_id, DURABLE_STABLE_ID_CHARS, SHORT_STABLE
 const PROVIDER_STATE_SCHEMA: &str = "paperclip.runner.codex-provider-state.v1";
 pub const CODEX_PROVIDER_STATE_FILE: &str = "codex-provider-state.json";
 const MAX_PROVIDER_STATE_BYTES: u64 = 16 * 1024 * 1024;
+/// Hard cap on the token budget of a Paperclip-activated shared goal (canary scale).
+const SHARED_ACTIVE_GOAL_TOKEN_BUDGET_CAP: u64 = 20_000;
+
 const MAX_EVENTS_PER_POLL: usize = 128;
 // One accepted semantic call can produce an input and a result event. Normal
 // traffic cannot consume the additional capacity required to diagnose a
@@ -95,6 +99,13 @@ struct ProviderEventIdentity {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CodexAccountingOrigin {
+    identity: ProviderEventIdentity,
+    provider_turn_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProviderStartupCommand {
     command_id: String,
     controller_seq: u64,
@@ -114,7 +125,17 @@ enum ProviderStartupTrigger {
 enum ProviderStartupPhase {
     Intent,
     Spawned,
+    Attached,
     InitializationFailed,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SharedStartupIdentity {
+    socket_path: std::path::PathBuf,
+    daemon_generation: String,
+    thread_id: String,
+    codex_home: std::path::PathBuf,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -130,6 +151,8 @@ struct ProviderStartupAttempt {
     configuration_fingerprint: String,
     requested_thread_id: Option<String>,
     authenticated_thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shared_attachment: Option<SharedStartupIdentity>,
     process_id: Option<u32>,
     process_group_id: Option<u32>,
     failed_stage: Option<ProviderStartupStage>,
@@ -179,11 +202,48 @@ impl ProviderStartupAttempt {
             no_exit
         };
         let phase_valid = match self.phase {
-            ProviderStartupPhase::Intent => no_process && no_exit && self.failed_stage.is_none(),
-            ProviderStartupPhase::Spawned => has_process && no_exit && self.failed_stage.is_none(),
+            ProviderStartupPhase::Intent => {
+                no_process
+                    && no_exit
+                    && self.failed_stage.is_none()
+                    && self.shared_attachment.is_none()
+            }
+            ProviderStartupPhase::Spawned => {
+                has_process
+                    && no_exit
+                    && self.failed_stage.is_none()
+                    && self.shared_attachment.is_none()
+            }
+            ProviderStartupPhase::Attached => {
+                no_process
+                    && no_exit
+                    && self.failed_stage.is_none()
+                    && self.shared_attachment.as_ref().is_some_and(|identity| {
+                        identity.socket_path.is_absolute()
+                            && identity.codex_home.is_absolute()
+                            && identifier(&identity.daemon_generation, 240)
+                            && identifier(&identity.thread_id, 240)
+                            && self.requested_thread_id.as_deref()
+                                == Some(identity.thread_id.as_str())
+                    })
+            }
             ProviderStartupPhase::InitializationFailed => match self.failed_stage {
-                Some(ProviderStartupStage::Spawn) => no_process && no_exit,
-                Some(_) => has_process && exit_valid,
+                Some(ProviderStartupStage::Spawn) => {
+                    no_process && no_exit && self.shared_attachment.is_none()
+                }
+                Some(_) => {
+                    (has_process && exit_valid && self.shared_attachment.is_none())
+                        || (no_process
+                            && no_exit
+                            && self.shared_attachment.as_ref().is_some_and(|identity| {
+                                identity.socket_path.is_absolute()
+                                    && identity.codex_home.is_absolute()
+                                    && identifier(&identity.daemon_generation, 240)
+                                    && identifier(&identity.thread_id, 240)
+                                    && self.requested_thread_id.as_deref()
+                                        == Some(identity.thread_id.as_str())
+                            }))
+                }
                 None => false,
             },
         };
@@ -608,6 +668,105 @@ fn normalize_provider_notification(
     method: &str,
     params: &Value,
 ) -> Result<Vec<NormalizedProviderEvent>, DurableRunnerError> {
+    if state.config.provider == "codex"
+        && ["thread/tokenUsage/updated", "paperclip/resumeUsageSnapshot"].contains(&method)
+    {
+        let historical = method == "paperclip/resumeUsageSnapshot";
+        let total = if historical {
+            params.get("total")
+        } else {
+            params.pointer("/tokenUsage/total")
+        }
+        .unwrap_or(&Value::Null);
+        let increases_known_usage = state
+            .codex_usage
+            .as_ref()
+            .is_some_and(|usage| usage.increases_known_usage(total));
+        let received_turn = params.get("turnId").and_then(Value::as_str);
+        let increases_prior_baseline = state.previous_accounting_origin.is_some()
+            && received_turn != state.completed_provider_turn_id.as_deref()
+            && state
+                .codex_usage
+                .as_ref()
+                .is_some_and(|usage| usage.increases_run_baseline(total));
+        if historical
+            && (increases_known_usage || increases_prior_baseline)
+            && params.get("turnId").and_then(Value::as_str)
+                != state.active_provider_turn_id.as_deref()
+        {
+            state.lifecycle = "reconciliation_required".to_owned();
+            let owns_completed_turn = state.active_provider_turn_id.is_none()
+                && state
+                    .completed_provider_turn_id
+                    .as_deref()
+                    .is_some_and(|id| params.get("turnId").and_then(Value::as_str) == Some(id));
+            if !owns_completed_turn {
+                if state.active_provider_turn_id.is_some() {
+                    state.settle_active_provider_turn_identity()?;
+                }
+                state.active_provider_turn_id = None;
+                let mut invalidation = normalize_codex_notification("thread/tokenUsage/updated", &json!({
+                    "threadId":params.get("threadId"), "model":state.config.model, "tokenUsage":{"total":total}
+                })).remove(0);
+                invalidation.payload["runDeltaBasis"] = json!("run");
+                invalidation.payload["reconciliation"] = json!({"reason":"accounting_reconciliation_required",
+                    "receivedTurnId":params.get("turnId"),"cumulative":invalidation.payload["cumulative"],
+                    "priorOrigin":state.previous_accounting_origin.as_ref().filter(|origin| received_turn == Some(origin.provider_turn_id.as_str())).map(|origin| &origin.identity)});
+                return Ok(vec![
+                    NormalizedProviderEvent {
+                        event_type: "harness.diagnostic".to_owned(),
+                        priority: EventPriority::P0,
+                        payload: json!({"code":"codex_usage_accounting_integrity", "classification":"accounting_reconciliation_required",
+                        "receivedTurnId":params.get("turnId"),"cumulative":total,"priorOrigin":state.previous_accounting_origin.as_ref().filter(|origin| params.get("turnId").and_then(Value::as_str) == Some(origin.provider_turn_id.as_str())).map(|origin| &origin.identity),
+                        "message":"Late provider usage cannot be attributed to the attached run; explicit reconciliation is required"}),
+                    },
+                    invalidation,
+                    NormalizedProviderEvent {
+                        event_type: "turn.failed".to_owned(),
+                        priority: EventPriority::P0,
+                        payload: json!({"provider":"codex","status":"failed","code":"codex_usage_accounting_integrity","recoverable":false,
+                        "message":"Late provider usage requires explicit accounting reconciliation"}),
+                    },
+                    NormalizedProviderEvent {
+                        event_type: "run.terminal".to_owned(),
+                        priority: EventPriority::P0,
+                        payload: json!({"schema":"paperclip.prp.terminal.v1","provider":"codex","turnTerminalState":"failed","runTerminalState":"failed","reportedWorkDisposition":"needs_review"}),
+                    },
+                ]);
+            }
+        }
+        let had_baseline = state
+            .codex_usage
+            .as_ref()
+            .is_some_and(CodexRunUsage::has_baseline);
+        let (delta, complete) = state
+            .codex_usage
+            .get_or_insert_with(|| CodexRunUsage::new(true))
+            .observe(total, historical);
+        let mut normalized_params = params.clone();
+        let emit_usage = !historical || (had_baseline && increases_known_usage);
+        if historical && emit_usage {
+            normalized_params = json!({"threadId": params.get("threadId"), "turnId": params.get("turnId"),
+                "tokenUsage":{"total":total,"last":delta}});
+        } else if !historical {
+            normalized_params["tokenUsage"]["last"] = delta;
+        }
+        let mut events = normalize_codex_notification(
+            if emit_usage {
+                "thread/tokenUsage/updated"
+            } else {
+                method
+            },
+            &normalized_params,
+        );
+        for event in &mut events {
+            if event.event_type == "usage.reported" {
+                event.payload["runDeltaAvailable"] = json!(complete);
+                event.payload["runDeltaBasis"] = json!("run");
+            }
+        }
+        return Ok(events);
+    }
     if method != "paperclip/runResult" {
         return Ok(normalize_codex_notification(method, params)
             .into_iter()
@@ -640,28 +799,46 @@ fn normalize_provider_notification(
     }
 }
 
+fn terminal_completion_rejected(state: &CodexProviderState) -> bool {
+    state.active_terminal_tool_rejected && state.active_provider_result_fingerprint.is_none()
+}
+
+fn goal_continues_after_turn(state: &CodexProviderState, goal_active: bool) -> bool {
+    goal_active && !terminal_completion_rejected(state)
+}
+
 fn terminal_events(
     state: &CodexProviderState,
     event_type: &str,
     goal_status: Option<&str>,
 ) -> Vec<NormalizedProviderEvent> {
-    let rejected_completion =
-        state.active_terminal_tool_rejected && state.active_provider_result_fingerprint.is_none();
-    if goal_status == Some("active") && !rejected_completion {
+    let rejected_completion = terminal_completion_rejected(state);
+    if goal_continues_after_turn(state, goal_status == Some("active")) {
         return Vec::new();
     }
     let Some(contract) = state.completion_contract.as_ref() else {
         return Vec::new();
     };
-    if rejected_completion {
+    let empty_opencode_completion = state.config.provider == "opencode"
+        && event_type == "turn.completed"
+        && state.active_provider_result_fingerprint.is_none()
+        && state
+            .last_agent_message
+            .as_deref()
+            .is_none_or(|text| text.trim().is_empty());
+    if rejected_completion || empty_opencode_completion {
         return vec![
             NormalizedProviderEvent {
                 event_type: "session.failed".to_owned(),
                 priority: EventPriority::P0,
                 payload: json!({
                     "provider": state.config.provider,
-                    "code": "semantic_completion_rejected",
-                    "message": "The turn ended without correcting its rejected completion report.",
+                    "code": if rejected_completion { "semantic_completion_rejected" } else { "opencode_empty_response" },
+                    "message": if rejected_completion {
+                        "The turn ended without correcting its rejected completion report."
+                    } else {
+                        "OpenCode ended without a final answer or an accepted completion report."
+                    },
                     "recoverable": false,
                 }),
             },
@@ -1007,6 +1184,10 @@ struct CodexProviderState {
     #[serde(default)]
     opencode_launch_profile_digest: Option<String>,
     #[serde(default)]
+    codex_usage: Option<CodexRunUsage>,
+    #[serde(default)]
+    previous_accounting_origin: Option<CodexAccountingOrigin>,
+    #[serde(default)]
     completion_contract: Option<CompletionContractBinding>,
     #[serde(default)]
     tool_bridge: ProviderToolBridge,
@@ -1018,6 +1199,14 @@ struct CodexProviderState {
     active_provider_turn_id: Option<String>,
     #[serde(default)]
     ambiguous_turn_start_pending: bool,
+    // Upstream has no notification replay cursor. Retain the epoch before
+    // attaching so a later process cannot silently bridge an observation gap.
+    #[serde(default)]
+    shared_observation_epoch: Option<String>,
+    #[serde(default)]
+    shared_goal_intent: Option<Value>,
+    #[serde(default)]
+    shared_bootstrap: Option<Value>,
     #[serde(default)]
     completed_turn_authoritative: bool,
     #[serde(default)]
@@ -1107,17 +1296,24 @@ impl CodexProviderState {
         tool_bridge: ProviderToolBridge,
     ) -> Self {
         let thread_id = config.provider_session_id.clone();
+        let codex_usage =
+            (config.provider == "codex").then(|| CodexRunUsage::new(thread_id.is_some()));
         Self {
             schema: PROVIDER_STATE_SCHEMA.to_owned(),
             lifecycle: "prepared".to_owned(),
             config,
             opencode_launch_profile_digest: None,
+            codex_usage,
+            previous_accounting_origin: None,
             completion_contract,
             tool_bridge,
             thread_id,
             provider_session_id: None,
             active_provider_turn_id: None,
             ambiguous_turn_start_pending: false,
+            shared_observation_epoch: None,
+            shared_goal_intent: None,
+            shared_bootstrap: None,
             completed_turn_authoritative: false,
             provider_process_generation: 0,
             startup_attempt: None,
@@ -1154,6 +1350,13 @@ impl CodexProviderState {
         self.tool_bridge.validate_recovered().map_err(|error| {
             DurableRunnerError::invalid(format!("Codex semantic tool state is invalid: {error}"))
         })?;
+        if self
+            .codex_usage
+            .as_ref()
+            .is_some_and(|usage| !usage.is_valid())
+        {
+            return Err(DurableRunnerError::invalid("invalid Codex usage baseline"));
+        }
         let mut pending_event_ids = HashSet::new();
         if self.descendant_thread_ids.len() > crate::codex_provider::MAX_DESCENDANT_THREAD_IDS
             || self
@@ -1561,6 +1764,8 @@ pub struct CodexCommandExecutor {
     state_dir: PathBuf,
     state: Option<CodexProviderState>,
     provider: Option<CodexProvider>,
+    #[cfg(unix)]
+    shared_socket: Option<crate::codex_shared_socket::SharedSocket>,
     event_identity: Option<ProviderEventIdentity>,
     restore_checked: bool,
     restore_error: Option<DurableRunnerError>,
@@ -1575,6 +1780,8 @@ impl CodexCommandExecutor {
             state_dir: state_dir.into(),
             state: None,
             provider: None,
+            #[cfg(unix)]
+            shared_socket: None,
             event_identity: None,
             restore_checked: false,
             restore_error: None,
@@ -1689,6 +1896,7 @@ impl CodexCommandExecutor {
             configuration_fingerprint: format!("sha256:{:x}", Sha256::digest(configuration)),
             requested_thread_id: state.thread_id.clone(),
             authenticated_thread_id: None,
+            shared_attachment: None,
             process_id: None,
             process_group_id: None,
             failed_stage: None,
@@ -1717,6 +1925,20 @@ impl CodexCommandExecutor {
                 attempt.phase = ProviderStartupPhase::Spawned;
                 attempt.process_id = Some(process_id);
                 attempt.process_group_id = Some(process_group_id);
+            }
+            ProviderStartupObservation::Attached {
+                socket_path,
+                daemon_generation,
+                thread_id,
+                codex_home,
+            } => {
+                attempt.phase = ProviderStartupPhase::Attached;
+                attempt.shared_attachment = Some(SharedStartupIdentity {
+                    socket_path,
+                    daemon_generation,
+                    thread_id,
+                    codex_home,
+                });
             }
             ProviderStartupObservation::Failed { stage, child_exit } => {
                 attempt.phase = ProviderStartupPhase::InitializationFailed;
@@ -1864,6 +2086,9 @@ impl CodexCommandExecutor {
         let Some(state) = self.state.clone() else {
             return Ok(());
         };
+        if state.config.shared_daemon.is_some() {
+            return Ok(());
+        }
         if self.provider.is_some()
             || !matches!(
                 state.lifecycle.as_str(),
@@ -2310,6 +2535,23 @@ impl CodexCommandExecutor {
         config
             .validate()
             .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        if let Some(writer) = config
+            .shared_daemon
+            .as_ref()
+            .and_then(|shared| shared.writer.as_ref())
+        {
+            let identity = self.event_identity.as_ref().ok_or_else(|| {
+                DurableRunnerError::invalid("shared daemon writer requires durable PRP identity")
+            })?;
+            if writer.run_id != identity.run_id
+                || writer.normalized_session_id != identity.normalized_session_id
+                || writer.runner_instance_id != identity.runner_instance_id
+            {
+                return Err(DurableRunnerError::invalid(
+                    "shared daemon writer identity mismatch",
+                ));
+            }
+        }
         let provider_name = config.provider.clone();
         let driver = config.driver.clone();
         let opencode_launch_profile_digest = self.bind_opencode_launch_profile(&config)?;
@@ -2358,11 +2600,187 @@ impl CodexCommandExecutor {
             self.state = Some(state);
             self.save_state()?;
         }
+        #[cfg(unix)]
+        if self
+            .state
+            .as_ref()
+            .and_then(|s| s.config.shared_daemon.as_ref())
+            .and_then(|s| s.bootstrap_id.as_ref())
+            .is_some()
+        {
+            let thread = self.bootstrap_shared_thread()?;
+            return Ok(CommandExecution::result(
+                json!({"status":"prepared","provider":provider_name,"driver":driver,"providerSessionId":thread}),
+            ));
+        }
         Ok(CommandExecution::result(json!({
             "status": "prepared",
             "provider": provider_name,
             "driver": driver,
         })))
+    }
+
+    #[cfg(unix)]
+    fn bootstrap_shared_thread(&mut self) -> Result<String, DurableRunnerError> {
+        use std::os::unix::fs::MetadataExt;
+        let state = self
+            .state
+            .clone()
+            .ok_or_else(|| DurableRunnerError::invalid("shared bootstrap state missing"))?;
+        if let Some(bootstrap) = state.shared_bootstrap.as_ref() {
+            if self.shared_socket.is_none() {
+                return Err(DurableRunnerError::invalid(
+                    "shared bootstrap observation requires reconciliation",
+                ));
+            }
+            return if bootstrap.get("state").and_then(Value::as_str) == Some("created") {
+                bootstrap
+                    .get("threadId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| DurableRunnerError::invalid("shared bootstrap receipt invalid"))
+            } else {
+                Err(DurableRunnerError::invalid(
+                    "shared bootstrap outcome unknown",
+                ))
+            };
+        }
+        let shared =
+            state.config.shared_daemon.as_ref().ok_or_else(|| {
+                DurableRunnerError::invalid("shared bootstrap configuration missing")
+            })?;
+        let bootstrap_id = shared
+            .bootstrap_id
+            .as_deref()
+            .ok_or_else(|| DurableRunnerError::invalid("shared bootstrap identity missing"))?;
+        let metadata = std::fs::symlink_metadata(&shared.socket_path)
+            .map_err(|_| DurableRunnerError::invalid("shared bootstrap socket unavailable"))?;
+        let generation = format!(
+            "{}:{}:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.ctime(),
+            metadata.ctime_nsec()
+        );
+        let home = std::fs::symlink_metadata(&shared.codex_home)
+            .map_err(|_| DurableRunnerError::invalid("shared bootstrap home unavailable"))?;
+        use std::os::unix::fs::FileTypeExt;
+        let uid = rustix::process::geteuid().as_raw();
+        if !metadata.file_type().is_socket()
+            || metadata.uid() != uid
+            || metadata.mode() & 0o022 != 0
+            || !home.is_dir()
+            || home.uid() != uid
+            || home.mode() & 0o022 != 0
+            || generation != shared.daemon_generation
+        {
+            return Err(DurableRunnerError::invalid(
+                "shared bootstrap daemon identity mismatch",
+            ));
+        }
+        let (tools, _) = crate::codex_provider::codex_dynamic_tools(
+            state.tool_bridge.authorized_tools().cloned(),
+        )
+        .map_err(|error| DurableRunnerError::invalid(error.to_string()))?;
+        self.state.as_mut().expect("shared state").shared_bootstrap =
+            Some(json!({"state":"starting","bootstrapId":bootstrap_id}));
+        self.save_state()?;
+        let peer = shared
+            .peer
+            .clone()
+            .ok_or_else(|| DurableRunnerError::invalid("shared bootstrap peer missing"))?;
+        let mut socket =
+            crate::codex_shared_socket::SharedSocket::connect_bootstrap_authenticated_with_tools(
+                &shared.socket_path,
+                std::time::Duration::from_secs(15),
+                peer,
+            )
+            .map_err(|_| DurableRunnerError::invalid("shared bootstrap connection failed"))?;
+        let init=socket.request("initialize",json!({"clientInfo":{"name":"paperclip-runnerd","version":"1"},"capabilities":{"experimentalApi":true}})).map_err(|_|DurableRunnerError::invalid("shared bootstrap initialization unknown"))?;
+        if init.get("error").is_some() {
+            return Err(DurableRunnerError::invalid(
+                "shared bootstrap initialization rejected",
+            ));
+        }
+        socket
+            .initialized()
+            .map_err(|_| DurableRunnerError::invalid("shared bootstrap initialization unknown"))?;
+        let effort = shared
+            .writer
+            .as_ref()
+            .and_then(|w| w.reasoning_effort.as_deref())
+            .ok_or_else(|| DurableRunnerError::invalid("shared bootstrap effort missing"))?;
+        let mut thread_config = shared
+            .writer
+            .as_ref()
+            .and_then(|w| w.thread_config.clone())
+            .ok_or_else(|| DurableRunnerError::invalid("shared bootstrap configuration missing"))?;
+        thread_config.insert("model_reasoning_effort".into(), json!(effort));
+        let profile = if state.config.read_only {
+            crate::codex_provider::SHARED_READ_ONLY_PROFILE
+        } else {
+            crate::codex_provider::SHARED_WRITABLE_PROFILE
+        };
+        let params = json!({"cwd":state.config.cwd,"model":state.config.model,"developerInstructions":state.config.instructions,"approvalPolicy":state.config.approval_policy,"dynamicTools":tools,"permissions":profile,"config":thread_config});
+        let result = socket
+            .request("thread/start", params)
+            .map_err(|_| DurableRunnerError::invalid("shared bootstrap create outcome unknown"))?;
+        if result.get("error").is_some() {
+            return Err(DurableRunnerError::invalid(
+                "shared bootstrap create outcome unknown",
+            ));
+        }
+        let thread = result
+            .pointer("/result/thread/id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && id.len() <= 240 && !id.chars().any(char::is_control))
+            .ok_or_else(|| DurableRunnerError::invalid("shared bootstrap thread identity invalid"))?
+            .to_owned();
+        if result
+            .pointer("/result/cwd")
+            .or_else(|| result.pointer("/result/thread/cwd"))
+            .and_then(Value::as_str)
+            != Some(state.config.cwd.as_str())
+            || result.pointer("/result/model").and_then(Value::as_str)
+                != state.config.model.as_deref()
+            || result
+                .pointer("/result/reasoningEffort")
+                .and_then(Value::as_str)
+                != Some(effort)
+            || socket.verify_peer().is_err()
+        {
+            return Err(DurableRunnerError::invalid(
+                "shared bootstrap identity changed",
+            ));
+        }
+        let current = std::fs::symlink_metadata(&shared.socket_path)
+            .map_err(|_| DurableRunnerError::invalid("shared bootstrap socket changed"))?;
+        if format!(
+            "{}:{}:{}:{}",
+            current.dev(),
+            current.ino(),
+            current.ctime(),
+            current.ctime_nsec()
+        ) != generation
+        {
+            return Err(DurableRunnerError::invalid(
+                "shared bootstrap socket changed",
+            ));
+        }
+        if let Some(name) = shared.thread_name.as_deref().map(str::trim).filter(|n| !n.is_empty() && n.chars().count() <= 200 && !n.chars().any(char::is_control)) {
+            // Cosmetic and best-effort: a rejected rename must never fail the run.
+            let _ = socket.request("thread/name/set", json!({"threadId":thread,"name":name}));
+        }
+        socket
+            .bind_bootstrap_thread(&thread)
+            .map_err(|_| DurableRunnerError::invalid("shared bootstrap thread binding failed"))?;
+        let next = self.state.as_mut().expect("shared state");
+        next.thread_id = Some(thread.clone());
+        next.shared_bootstrap =
+            Some(json!({"state":"created","bootstrapId":bootstrap_id,"threadId":thread}));
+        self.save_state()?;
+        self.shared_socket = Some(socket);
+        Ok(thread)
     }
 
     fn ensure_provider(&mut self) -> Result<&mut CodexProvider, DurableRunnerError> {
@@ -2501,7 +2919,43 @@ impl CodexCommandExecutor {
         stable
     }
 
+    fn persist_completed_accounting_tail(
+        &mut self,
+        tail: Vec<(String, Value)>,
+        failed: bool,
+    ) -> Result<(), DurableRunnerError> {
+        if !tail.is_empty() || failed {
+            let state = self.state.as_mut().ok_or_else(|| {
+                DurableRunnerError::invalid("Codex provider has not been prepared")
+            })?;
+            for (method, params) in tail {
+                let events = normalize_provider_notification(state, &method, &params)?;
+                state.extend_events(events)?;
+            }
+            if failed {
+                state.lifecycle = "reconciliation_required".to_owned();
+            }
+            self.save_state()?;
+        }
+        Ok(())
+    }
+
+    fn retain_completed_accounting_tail(&mut self) -> Result<(), DurableRunnerError> {
+        let (tail, result) = self
+            .provider
+            .as_mut()
+            .map(CodexProvider::drain_completed_turn_tail_for_warm_attachment)
+            .unwrap_or_else(|| (Vec::new(), Ok(())));
+        self.persist_completed_accounting_tail(tail, result.is_err())?;
+        result.map_err(|error| {
+            DurableRunnerError::invalid(format!(
+                "failed to retain completed Codex accounting: {error}"
+            ))
+        })
+    }
+
     fn attach_run(&mut self, payload: &Value) -> Result<(), DurableRunnerError> {
+        self.retain_completed_accounting_tail()?;
         let mut next_state = self
             .state
             .clone()
@@ -2600,6 +3054,17 @@ impl CodexCommandExecutor {
                     "run.attach tool contract could not be rebound: {error}"
                 ))
             })?;
+        if let Some(usage) = next_state.codex_usage.as_mut() {
+            usage.begin_run();
+        }
+        next_state.previous_accounting_origin = self
+            .event_identity
+            .clone()
+            .zip(next_state.completed_provider_turn_id.clone())
+            .map(|(identity, provider_turn_id)| CodexAccountingOrigin {
+                identity,
+                provider_turn_id,
+            });
         next_state.completion_contract = completion_contract;
         next_state.completed_turn_authoritative = false;
         next_state.completed_turn_process_generation = None;
@@ -2613,10 +3078,12 @@ impl CodexCommandExecutor {
         next_state.active_provider_result_disposition = None;
         next_state.active_terminal_tool_rejected = false;
         next_state.last_agent_message = None;
-        let retained_provider = if let Some(provider) = self.provider.as_mut() {
-            !runtime_launch_changed
-                && !upgraded_skill_config
-                && provider
+        let mut attachment_accounting = Vec::new();
+        let retention = if let Some(provider) = self.provider.as_mut() {
+            if runtime_launch_changed || upgraded_skill_config {
+                Ok(false)
+            } else {
+                provider
                     .attach_run_in_place(
                         next_state.tool_bridge.authorized_tools().cloned(),
                         next_state.completion_contract.as_ref().map(|contract| {
@@ -2625,12 +3092,14 @@ impl CodexCommandExecutor {
                                 contract.criterion_ids.as_slice(),
                             )
                         }),
+                        &mut attachment_accounting,
                     )
                     .map_err(|error| {
                         DurableRunnerError::invalid(format!(
                             "failed to retain Codex for warm run attachment: {error}"
                         ))
-                    })?
+                    })
+            }
         } else if next_state.lifecycle == "prepared"
             && next_state.provider_process_generation > 0
             && next_state.pending_events.iter().all(is_startup_audit_event)
@@ -2640,11 +3109,16 @@ impl CodexCommandExecutor {
             // validated run-scoped settings here; open_session then restores
             // that same thread under the new authority. Never restart during
             // drain/suspend or require the stopped process to still exist.
-            false
+            Ok(false)
         } else {
             return Err(DurableRunnerError::invalid(
                 "run.attach requires the restored Codex provider process",
             ));
+        };
+        self.persist_completed_accounting_tail(attachment_accounting, retention.is_err())?;
+        let retained_provider = match retention {
+            Ok(retained) => retained,
+            Err(error) => return Err(error),
         };
         if !retained_provider {
             if let Some(provider) = self.provider.as_mut() {
@@ -2672,7 +3146,211 @@ impl CodexCommandExecutor {
         Ok(())
     }
 
+    #[cfg(unix)]
+    fn open_shared_session(&mut self) -> Result<CommandExecution, DurableRunnerError> {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        if self.shared_socket.is_some()
+            && !self
+                .state
+                .as_ref()
+                .and_then(|s| s.config.shared_daemon.as_ref())
+                .is_some_and(|s| s.bootstrap_id.is_some())
+        {
+            return Err(DurableRunnerError::invalid(
+                "shared daemon is already attached",
+            ));
+        }
+        let state = self
+            .state
+            .clone()
+            .ok_or_else(|| DurableRunnerError::invalid("Codex provider is not prepared"))?;
+        let mut shared =
+            state.config.shared_daemon.clone().ok_or_else(|| {
+                DurableRunnerError::invalid("shared daemon configuration missing")
+            })?;
+        if let Some(bootstrap_id) = shared.bootstrap_id.as_ref() {
+            let bootstrap = state
+                .shared_bootstrap
+                .as_ref()
+                .ok_or_else(|| DurableRunnerError::invalid("shared bootstrap receipt missing"))?;
+            if bootstrap.get("state").and_then(Value::as_str) != Some("created")
+                || bootstrap.get("bootstrapId").and_then(Value::as_str)
+                    != Some(bootstrap_id.as_str())
+            {
+                return Err(DurableRunnerError::invalid(
+                    "shared bootstrap receipt invalid",
+                ));
+            }
+            shared.thread_id = bootstrap
+                .get("threadId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| DurableRunnerError::invalid("shared bootstrap thread missing"))?
+                .to_owned();
+        }
+        if matches!(
+            state.lifecycle.as_str(),
+            "closed" | "reconciliation_required"
+        ) || state.thread_id.as_deref() != Some(shared.thread_id.as_str())
+        {
+            return Err(DurableRunnerError::invalid(
+                "shared daemon thread binding mismatch",
+            ));
+        }
+        if let Some(writer) = shared.writer.as_ref() {
+            if state.shared_observation_epoch.is_some() {
+                return Err(DurableRunnerError::invalid(
+                    "shared daemon observation requires reconciliation",
+                ));
+            }
+            self.state
+                .as_mut()
+                .expect("prepared state")
+                .shared_observation_epoch = Some(writer.observation_epoch_id.clone());
+            // This precedes every network operation: crash/failed attach is an
+            // unknown interval, never permission to reattach and write.
+            self.save_state()?;
+        }
+        let inspect = || -> Result<String, DurableRunnerError> {
+            let socket = std::fs::symlink_metadata(&shared.socket_path)
+                .map_err(|_| DurableRunnerError::invalid("shared daemon socket unavailable"))?;
+            let home = std::fs::symlink_metadata(&shared.codex_home)
+                .map_err(|_| DurableRunnerError::invalid("shared daemon home unavailable"))?;
+            let uid = rustix::process::geteuid().as_raw();
+            if !socket.file_type().is_socket()
+                || !home.is_dir()
+                || socket.uid() != uid
+                || home.uid() != uid
+                || socket.mode() & 0o022 != 0
+                || home.mode() & 0o022 != 0
+            {
+                return Err(DurableRunnerError::invalid(
+                    "shared daemon socket or home ownership invalid",
+                ));
+            }
+            Ok(format!(
+                "{}:{}:{}:{}",
+                socket.dev(),
+                socket.ino(),
+                socket.ctime(),
+                socket.ctime_nsec()
+            ))
+        };
+        let observed = inspect()?;
+        if observed != shared.daemon_generation {
+            return Err(DurableRunnerError::invalid(
+                "shared daemon socket generation mismatch",
+            ));
+        }
+        let peer = shared
+            .peer
+            .clone()
+            .ok_or_else(|| DurableRunnerError::invalid("shared daemon peer identity missing"))?;
+        let bootstrap = shared.bootstrap_id.is_some();
+        let mut socket = if bootstrap {
+            Ok(self.shared_socket.take().ok_or_else(|| {
+                DurableRunnerError::invalid("shared bootstrap observation requires reconciliation")
+            })?)
+        } else if shared
+            .writer
+            .as_ref()
+            .is_some_and(|writer| writer.managed_tools)
+        {
+            crate::codex_shared_socket::SharedSocket::connect_authenticated_with_tools(
+                &shared.socket_path,
+                std::time::Duration::from_secs(15),
+                shared.thread_id.clone(),
+                peer,
+            )
+        } else {
+            crate::codex_shared_socket::SharedSocket::connect_authenticated(
+                &shared.socket_path,
+                std::time::Duration::from_secs(15),
+                shared.thread_id.clone(),
+                peer,
+            )
+        }
+        .map_err(|_| DurableRunnerError::invalid("shared daemon connection failed"))?;
+        if !bootstrap {
+            let initialized = socket.request("initialize", json!({"clientInfo":{"name":"paperclip-runnerd","title":"Paperclip Runner","version":"1"},"capabilities":{"experimentalApi":true,"requestAttestation":false}})).map_err(|_| DurableRunnerError::invalid("shared daemon initialization outcome unknown"))?;
+            if initialized.get("error").is_some() {
+                return Err(DurableRunnerError::invalid(
+                    "shared daemon initialization rejected",
+                ));
+            }
+            socket.initialized().map_err(|_| {
+                DurableRunnerError::invalid("shared daemon initialization outcome unknown")
+            })?;
+        }
+        let snapshot = socket
+            .request(
+                "thread/read",
+                json!({"threadId":shared.thread_id,"includeTurns":false}),
+            )
+            .map_err(|_| DurableRunnerError::invalid("shared daemon thread read failed"))?;
+        if snapshot
+            .pointer("/result/thread/id")
+            .and_then(Value::as_str)
+            != Some(shared.thread_id.as_str())
+            || snapshot
+                .pointer("/result/thread/cwd")
+                .and_then(Value::as_str)
+                != Some(state.config.cwd.as_str())
+            || inspect()? != observed
+            || socket.verify_peer().is_err()
+        {
+            return Err(DurableRunnerError::invalid(
+                "shared daemon identity or workspace mismatch",
+            ));
+        }
+        if bootstrap
+            && socket
+                .receive_notification(std::time::Duration::ZERO)
+                .map_err(|_| DurableRunnerError::invalid("shared bootstrap observation lost"))?
+                .is_some()
+        {
+            let state = self.state.as_mut().expect("prepared state");
+            state.lifecycle = "reconciliation_required".to_owned();
+            state.push_event(NormalizedProviderEvent{event_type:"harness.diagnostic".to_owned(),priority:EventPriority::P1,payload:json!({"code":"shared_native_intervention","origin":"unknown","phase":"bootstrap"})})?;
+            self.save_state()?;
+            return Err(DurableRunnerError::invalid(
+                "shared bootstrap observation requires reconciliation",
+            ));
+        }
+        let generation = state
+            .provider_process_generation
+            .checked_add(1)
+            .ok_or_else(|| DurableRunnerError::invalid("startup generation exhausted"))?;
+        self.begin_startup(ProviderStartupTrigger::Ensure, generation)?;
+        self.observe_startup(ProviderStartupObservation::Attached {
+            socket_path: shared.socket_path.clone(),
+            daemon_generation: observed.clone(),
+            thread_id: shared.thread_id.clone(),
+            codex_home: shared.codex_home.clone(),
+        })?;
+        self.state.as_mut().expect("prepared state").lifecycle = "session_open".to_owned();
+        self.commit_startup_admission()?;
+        self.shared_socket = Some(socket);
+        let ownership = json!({"kind":"shared_daemon","socketPath":shared.socket_path,"daemonGeneration":observed,"threadId":shared.thread_id,"codexHome":shared.codex_home});
+        Ok(CommandExecution {
+            result: json!({"status":"resumed","provider":"codex","providerSessionId":shared.thread_id}),
+            events: vec![(
+                "session.resumed".to_owned(),
+                EventPriority::P0,
+                json!({"provider":"codex","providerSessionId":shared.thread_id,"providerDescriptor":{"provider":"codex","driver":state.config.driver,"model":null,"executionKind":"local_process","providerVersion":state.config.provider_version,"processOwnership":ownership}}),
+            )],
+        })
+    }
+
     fn open_session(&mut self) -> Result<CommandExecution, DurableRunnerError> {
+        #[cfg(unix)]
+        if self
+            .state
+            .as_ref()
+            .is_some_and(|state| state.config.shared_daemon.is_some())
+        {
+            return self.open_shared_session();
+        }
         self.restore_provider_if_needed()?;
         if self
             .state
@@ -3001,6 +3679,21 @@ impl CodexCommandExecutor {
             Some(_) => return Err(DurableRunnerError::invalid("invalid turn.reasoningMode")),
         };
         self.restore_provider_if_needed()?;
+        if let Some(writer) = self
+            .state
+            .as_ref()
+            .and_then(|state| state.config.shared_daemon.as_ref())
+            .and_then(|shared| shared.writer.as_ref())
+            .filter(|writer| writer.managed_tools)
+        {
+            let expected = writer
+                .reasoning_effort
+                .as_deref()
+                .ok_or_else(|| DurableRunnerError::invalid("shared turn effort missing"))?;
+            if payload.get("effort").and_then(Value::as_str) != Some(expected) {
+                return Err(DurableRunnerError::invalid("shared turn effort mismatch"));
+            }
+        }
         if reasoning_mode.is_some()
             && self
                 .state
@@ -3076,6 +3769,21 @@ impl CodexCommandExecutor {
                 .is_some_and(|state| state.config.provider != "codex")
         {
             return Err(DurableRunnerError::invalid("explicit skills require Codex"));
+        }
+        #[cfg(unix)]
+        if self
+            .state
+            .as_ref()
+            .and_then(|state| state.config.shared_daemon.as_ref())
+            .and_then(|shared| shared.writer.as_ref())
+            .is_some_and(|writer| writer.managed_tools)
+        {
+            if !skills.is_empty() {
+                return Err(DurableRunnerError::invalid(
+                    "shared turn does not accept explicit skills",
+                ));
+            }
+            return self.start_shared_turn(text, &cwd, payload.get("effort"));
         }
         self.ensure_provider()?;
         {
@@ -3194,6 +3902,191 @@ impl CodexCommandExecutor {
         })
     }
 
+    /// Plain turn on the owner's shared daemon. The intent is durable before the
+    /// write, and an unknown outcome stays ambiguous: it is never retried.
+    #[cfg(unix)]
+    fn start_shared_turn(
+        &mut self,
+        text: &str,
+        cwd: &str,
+        effort: Option<&Value>,
+    ) -> Result<CommandExecution, DurableRunnerError> {
+        if text.is_empty() || text.len() > 1024 * 1024 {
+            return Err(DurableRunnerError::invalid(
+                "shared turn text is empty or exceeds the 1 MiB limit",
+            ));
+        }
+        let state = self
+            .state
+            .as_ref()
+            .ok_or_else(|| DurableRunnerError::invalid("Codex provider is not prepared"))?;
+        if state.lifecycle != "session_open" {
+            return Err(DurableRunnerError::invalid(
+                "shared turn requires an open, unheld session",
+            ));
+        }
+        if state
+            .goal
+            .as_ref()
+            .is_some_and(|goal| goal.status != "paused")
+        {
+            return Err(DurableRunnerError::invalid(
+                "shared plain turn requires a paused or absent goal",
+            ));
+        }
+        let thread_id = state
+            .thread_id
+            .clone()
+            .ok_or_else(|| DurableRunnerError::invalid("shared thread unavailable"))?;
+        let socket = self
+            .shared_socket
+            .as_mut()
+            .ok_or_else(|| DurableRunnerError::invalid("shared daemon is not attached"))?;
+        socket
+            .verify_peer()
+            .map_err(|_| DurableRunnerError::invalid("shared daemon peer changed"))?;
+        if socket
+            .receive_notification(std::time::Duration::ZERO)
+            .map_err(|_| DurableRunnerError::invalid("shared observation lost"))?
+            .is_some()
+        {
+            // Any turn Paperclip did not start belongs to the owner.
+            self.state.as_mut().expect("shared state").lifecycle =
+                "reconciliation_required".to_owned();
+            self.save_state()?;
+            return Err(DurableRunnerError::invalid(
+                "shared observation changed before turn start",
+            ));
+        }
+        self.state
+            .as_mut()
+            .expect("shared state")
+            .tool_bridge
+            .prepare_turn()
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!(
+                    "Codex semantic tool receipts could not prepare the next turn: {error}"
+                ))
+            })?;
+        self.state
+            .as_mut()
+            .expect("shared state")
+            .ambiguous_turn_start_pending = true;
+        self.save_state()?;
+        let mut params = json!({
+            "threadId": thread_id,
+            "cwd": cwd,
+            "input": [{"type": "text", "text": text, "text_elements": []}],
+        });
+        if let Some(effort) = effort.filter(|value| !value.is_null()) {
+            params["effort"] = effort.clone();
+        }
+        let socket = self.shared_socket.as_mut().expect("shared socket");
+        let response = socket
+            .request("turn/start", params)
+            .map_err(|_| DurableRunnerError::invalid("shared turn start outcome unknown"))?;
+        if response.get("error").is_some() {
+            // A definite rejection proves no work began.
+            self.state
+                .as_mut()
+                .expect("shared state")
+                .ambiguous_turn_start_pending = false;
+            self.save_state()?;
+            return Err(DurableRunnerError::invalid("shared turn start rejected"));
+        }
+        let provider_turn_id = response
+            .pointer("/result/turn/id")
+            .or_else(|| response.pointer("/result/turnId"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && id.len() <= 240 && !id.chars().any(char::is_control))
+            .ok_or_else(|| {
+                DurableRunnerError::invalid("shared turn start omitted a usable turn identity")
+            })?
+            .to_owned();
+        let state = self.state.as_mut().expect("shared state");
+        state.active_provider_turn_id = Some(provider_turn_id.clone());
+        state.ambiguous_turn_start_pending = false;
+        state.completed_turn_authoritative = false;
+        state.completed_turn_process_generation = None;
+        state.completed_provider_turn_id = None;
+        state.active_provider_result_fingerprint = None;
+        state.active_provider_result_disposition = None;
+        state.active_terminal_tool_rejected = false;
+        state.last_agent_message = None;
+        state.lifecycle = "turn_active".to_owned();
+        let provider_label = state.config.provider.clone();
+        self.save_state()?;
+        Ok(CommandExecution {
+            result: json!({"status": "accepted", "providerTurnId": provider_turn_id}),
+            events: vec![(
+                "turn.accepted".to_owned(),
+                EventPriority::P0,
+                json!({"provider": provider_label, "providerSessionId": thread_id, "providerTurnId": provider_turn_id}),
+            )],
+        })
+    }
+
+    /// Settles a notification that belongs to the turn Paperclip started.
+    #[cfg(unix)]
+    fn settle_shared_turn_notification(
+        &mut self,
+        method: &str,
+        params: &Value,
+    ) -> Result<(), DurableRunnerError> {
+        let terminal_event_type = normalized_codex_terminal_event_type(method, params);
+        let identity = self.event_identity.clone();
+        let state = self
+            .state
+            .as_mut()
+            .ok_or_else(|| DurableRunnerError::invalid("Codex provider is not prepared"))?;
+        if method == "item/completed" {
+            let item = params.get("item").unwrap_or(params);
+            if item.get("type").and_then(Value::as_str) == Some("agentMessage") {
+                state.last_agent_message = item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .map(|text| text.chars().take(1_000_000).collect());
+            }
+        }
+        let normalized = normalize_provider_notification(state, method, params)?;
+        if let Some(event_type) = terminal_event_type {
+            state.settle_active_provider_turn_identity()?;
+            let settled = state
+                .tool_bridge
+                .settle_turn("provider_turn_terminated")
+                .map_err(|error| {
+                    DurableRunnerError::invalid(format!(
+                        "failed to settle semantic tools at turn termination: {error}"
+                    ))
+                })?;
+            let mut events = Vec::new();
+            if !settled.is_empty() {
+                let identity = identity.as_ref().ok_or_else(|| {
+                    DurableRunnerError::invalid(
+                        "Codex semantic tool events require the durable runner identity",
+                    )
+                })?;
+                for result in settled {
+                    state.push_terminal_event(semantic_result_event(identity, &result))?;
+                }
+            }
+            state.active_provider_turn_id = None;
+            state.completed_turn_authoritative = false;
+            state.completed_turn_process_generation = None;
+            state.completed_provider_turn_id = None;
+            state.ambiguous_turn_start_pending = false;
+            state.lifecycle = "session_open".to_owned();
+            let goal_status = state.goal.as_ref().map(|goal| goal.status.as_str());
+            let outcome = terminal_events(state, event_type, goal_status);
+            events.extend(normalized);
+            state.extend_terminal_events(with_terminal_outcome(events, outcome))?;
+        } else {
+            state.extend_events(normalized)?;
+        }
+        self.save_state()
+    }
+
     fn interrupt_turn(&mut self, reason: &str) -> Result<CommandExecution, DurableRunnerError> {
         self.restore_provider_if_needed()?;
         let provider_turn_id = self
@@ -3231,6 +4124,30 @@ impl CodexCommandExecutor {
         // Record cause and pending identities before touching the provider.
         self.persist_state(&next_state)?;
         self.state = Some(next_state);
+        #[cfg(unix)]
+        if let (Some(socket), Some(turn_id)) =
+            (self.shared_socket.as_mut(), provider_turn_id.as_deref())
+        {
+            let thread_id = self
+                .state
+                .as_ref()
+                .and_then(|state| state.thread_id.clone())
+                .ok_or_else(|| DurableRunnerError::invalid("shared thread unavailable"))?;
+            let response = socket
+                .request(
+                    "turn/interrupt",
+                    json!({"threadId": thread_id, "turnId": turn_id}),
+                )
+                .map_err(|_| DurableRunnerError::invalid("shared turn interrupt outcome unknown"))?;
+            if response.get("error").is_some() {
+                return Err(DurableRunnerError::invalid("shared turn interrupt rejected"));
+            }
+            return Ok(CommandExecution::result(json!({
+                "status": "interrupt_requested",
+                "reason": reason,
+                "providerTurnId": provider_turn_id,
+            })));
+        }
         self.ensure_provider()?.interrupt_turn().map_err(|error| {
             DurableRunnerError::invalid(format!("Codex turn interrupt failed: {error}"))
         })?;
@@ -3246,6 +4163,17 @@ impl CodexCommandExecutor {
         reason: &str,
     ) -> Result<CommandExecution, DurableRunnerError> {
         self.restore_provider_if_needed()?;
+        // A shared daemon turn belongs to the daemon, not an owned process: stopping it
+        // is a cooperative interrupt, settled only when its terminal frame is polled.
+        if self
+            .state
+            .as_ref()
+            .and_then(|state| state.config.shared_daemon.as_ref())
+            .and_then(|shared| shared.writer.as_ref())
+            .is_some_and(|writer| writer.managed_tools)
+        {
+            return self.interrupt_turn(reason);
+        }
         let state = self.state.as_ref();
         // An unprepared or permanently closed executor cannot become a
         // successor checkpoint merely because the controller asks it to stop.
@@ -3386,6 +4314,365 @@ impl CodexCommandExecutor {
                 payload,
             )],
         })
+    }
+
+    #[cfg(unix)]
+    fn set_shared_paused_goal(
+        &mut self,
+        payload: &Value,
+    ) -> Result<CommandExecution, DurableRunnerError> {
+        let activate = payload.get("status").and_then(Value::as_str) == Some("active");
+        self.set_shared_goal(payload, activate)
+    }
+
+    /// Activation is only ever a resume of an existing paused goal with a bounded budget.
+    fn set_shared_goal(
+        &mut self,
+        payload: &Value,
+        activate: bool,
+    ) -> Result<CommandExecution, DurableRunnerError> {
+        let target_status = if activate { "active" } else { "paused" };
+        let state = self
+            .state
+            .as_ref()
+            .ok_or_else(|| DurableRunnerError::invalid("shared state missing"))?;
+        let shared = state
+            .config
+            .shared_daemon
+            .as_ref()
+            .ok_or_else(|| DurableRunnerError::invalid("shared daemon missing"))?;
+        let writer = shared
+            .writer
+            .as_ref()
+            .ok_or_else(|| DurableRunnerError::invalid("shared writer not admitted"))?;
+        if state.lifecycle != "session_open"
+            || state.shared_goal_intent.is_some()
+            || state.shared_observation_epoch.as_deref()
+                != Some(writer.observation_epoch_id.as_str())
+        {
+            return Err(DurableRunnerError::invalid(
+                "shared observation requires reconciliation",
+            ));
+        }
+        let supplied = payload
+            .get("writer")
+            .ok_or_else(|| DurableRunnerError::invalid("shared writer grant missing"))?;
+        if supplied.get("grantId").and_then(Value::as_str) != Some(writer.grant_id.as_str())
+            || supplied.get("epoch").and_then(Value::as_u64) != Some(writer.epoch)
+            || supplied.get("observationEpochId").and_then(Value::as_str)
+                != Some(writer.observation_epoch_id.as_str())
+        {
+            return Err(DurableRunnerError::invalid("shared writer grant mismatch"));
+        }
+        let request_id = payload
+            .get("requestId")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty() && s.len() <= 128)
+            .ok_or_else(|| DurableRunnerError::invalid("shared goal request identity missing"))?;
+        let objective = payload
+            .get("objective")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && s.chars().count() <= 4000)
+            .ok_or_else(|| DurableRunnerError::invalid("shared paused goal objective invalid"))?;
+        if payload.get("status").and_then(Value::as_str) != Some(target_status) {
+            return Err(DurableRunnerError::invalid(
+                "shared writer admits paused goals only",
+            ));
+        }
+        if activate
+            && !payload
+                .get("tokenBudget")
+                .and_then(Value::as_u64)
+                .is_some_and(|n| (1..=SHARED_ACTIVE_GOAL_TOKEN_BUDGET_CAP).contains(&n))
+        {
+            return Err(DurableRunnerError::invalid(
+                "shared active goal requires a bounded token budget",
+            ));
+        }
+        if payload
+            .get("tokenBudget")
+            .is_some_and(|v| !v.is_null() && v.as_u64().is_none_or(|n| n == 0))
+        {
+            return Err(DurableRunnerError::invalid(
+                "shared goal token budget invalid",
+            ));
+        }
+        let expected = payload
+            .get("expectedGoal")
+            .ok_or_else(|| DurableRunnerError::invalid("shared goal source pin missing"))?
+            .clone();
+        let thread_id = state
+            .thread_id
+            .clone()
+            .ok_or_else(|| DurableRunnerError::invalid("shared thread unavailable"))?;
+        let socket = self
+            .shared_socket
+            .as_mut()
+            .ok_or_else(|| DurableRunnerError::invalid("shared daemon is not attached"))?;
+        socket
+            .verify_peer()
+            .map_err(|_| DurableRunnerError::invalid("shared daemon peer changed"))?;
+        if socket
+            .receive_notification(std::time::Duration::ZERO)
+            .map_err(|_| DurableRunnerError::invalid("shared observation lost"))?
+            .is_some()
+        {
+            self.state.as_mut().expect("shared state").lifecycle =
+                "reconciliation_required".to_owned();
+            self.save_state()?;
+            return Err(DurableRunnerError::invalid(
+                "shared observation changed before goal write",
+            ));
+        }
+        let source = socket
+            .request("thread/goal/get", json!({"threadId":thread_id}))
+            .map_err(|_| DurableRunnerError::invalid("shared goal read outcome unknown"))?;
+        if source.get("error").is_some() {
+            return Err(DurableRunnerError::invalid("shared goal read rejected"));
+        }
+        let goal = source.pointer("/result/goal").unwrap_or(&Value::Null);
+        let projected = if goal.is_null() {
+            Value::Null
+        } else {
+            json!({"objective":goal.get("objective"),"status":goal.get("status"),"tokenBudget":goal.get("tokenBudget").unwrap_or(&Value::Null)})
+        };
+        // Pause is the only write that may start from an active goal; every other write starts from the paused goal.
+        let pausing =
+            !activate && expected.get("status").and_then(Value::as_str) == Some("active");
+        let source_status = if pausing { "active" } else { "paused" };
+        if projected != expected
+            || (!goal.is_null()
+                && goal.get("status").and_then(Value::as_str) != Some(source_status))
+        {
+            return Err(DurableRunnerError::invalid("shared goal source changed"));
+        }
+        if activate
+            && (goal.is_null()
+                || goal.get("objective").and_then(Value::as_str).map(str::trim) != Some(objective))
+        {
+            return Err(DurableRunnerError::invalid(
+                "shared active goal requires the paused goal with the same objective",
+            ));
+        }
+        if socket
+            .receive_notification(std::time::Duration::ZERO)
+            .map_err(|_| DurableRunnerError::invalid("shared observation lost before goal write"))?
+            .is_some()
+        {
+            self.state.as_mut().expect("shared state").lifecycle =
+                "reconciliation_required".to_owned();
+            self.save_state()?;
+            return Err(DurableRunnerError::invalid(
+                "shared observation changed before goal write",
+            ));
+        }
+        let mut params = json!({"threadId":thread_id,"objective":objective,"status":target_status});
+        if let Some(budget) = payload.get("tokenBudget") {
+            params["tokenBudget"] = budget.clone();
+        }
+        self.state
+            .as_mut()
+            .expect("shared state")
+            .shared_goal_intent =
+            Some(json!({"requestId":request_id,"writer":supplied,"expectedGoal":expected}));
+        self.save_state()?;
+        let socket = self.shared_socket.as_mut().expect("shared socket");
+        let response = socket
+            .request("thread/goal/set", params)
+            .map_err(|_| DurableRunnerError::invalid("shared goal write outcome unknown"))?;
+        if response.get("error").is_some() {
+            return Err(DurableRunnerError::invalid(
+                "shared goal write outcome requires reconciliation",
+            ));
+        }
+        socket
+            .verify_peer()
+            .map_err(|_| DurableRunnerError::invalid("shared daemon peer changed after write"))?;
+        let after_set_event = socket
+            .receive_notification(std::time::Duration::ZERO)
+            .map_err(|_| DurableRunnerError::invalid("shared observation lost after write"))?;
+        let result = response.get("result").cloned().unwrap_or(Value::Null);
+        let goal = normalize_codex_goal(&result, false)
+            .filter(|g| g.status == target_status)
+            .ok_or_else(|| DurableRunnerError::invalid("shared paused goal receipt invalid"))?;
+        if goal.objective != objective {
+            return Err(DurableRunnerError::invalid("shared goal receipt changed"));
+        }
+        if let Some(budget) = payload.get("tokenBudget") {
+            if budget.as_u64() != goal.token_budget {
+                return Err(DurableRunnerError::invalid(
+                    "shared goal receipt budget changed",
+                ));
+            }
+        }
+        let readback = socket
+            .request("thread/goal/get", json!({"threadId":thread_id}))
+            .map_err(|_| DurableRunnerError::invalid("shared goal readback outcome unknown"))?;
+        let readback_goal =
+            normalize_codex_goal(readback.get("result").unwrap_or(&Value::Null), false);
+        let readback_event = socket
+            .receive_notification(std::time::Duration::ZERO)
+            .map_err(|_| DurableRunnerError::invalid("shared observation lost during readback"))?;
+        let same_goal = |candidate: &SessionGoalSnapshot| {
+            if activate || pausing {
+                // An active goal accrues usage immediately; identity is objective, status and budget.
+                candidate.objective == goal.objective
+                    && candidate.status == goal.status
+                    && candidate.token_budget == goal.token_budget
+            } else {
+                *candidate == goal
+            }
+        };
+        let matching_goal_event = |event: &Value| {
+            event.get("method").and_then(Value::as_str) == Some("thread/goal/updated")
+                && event.pointer("/params/threadId").and_then(Value::as_str)
+                    == Some(thread_id.as_str())
+                && event.pointer("/params/turnId").is_none_or(Value::is_null)
+                && normalize_codex_goal(
+                    event.pointer("/params/goal").unwrap_or(&Value::Null),
+                    false,
+                )
+                .as_ref()
+                .is_some_and(|candidate| same_goal(candidate))
+        };
+        let mut strays: Vec<Value> = Vec::new();
+        let (mut after_set_event, mut readback_event) = (after_set_event, readback_event);
+        if activate || pausing {
+            for slot in [&mut after_set_event, &mut readback_event] {
+                if slot.as_ref().is_some_and(|v| !matching_goal_event(v)) {
+                    strays.extend(slot.take());
+                }
+            }
+        }
+        if readback.get("error").is_some()
+            || readback_goal.as_ref().is_none_or(|candidate| !same_goal(candidate))
+            || after_set_event
+                .as_ref()
+                .is_some_and(|v| !matching_goal_event(v))
+            || readback_event
+                .as_ref()
+                .is_some_and(|v| !matching_goal_event(v))
+        {
+            return Err(DurableRunnerError::invalid("shared goal readback changed"));
+        }
+        for index in 0..MAX_EVENTS_PER_POLL {
+            match socket
+                .receive_notification(std::time::Duration::ZERO)
+                .map_err(|_| {
+                    DurableRunnerError::invalid("shared observation lost during readback")
+                })? {
+                None => break,
+                Some(value) if matching_goal_event(&value) && index + 1 < MAX_EVENTS_PER_POLL => {}
+                Some(value) if activate || pausing => strays.push(value),
+                Some(_) => return Err(DurableRunnerError::invalid("shared goal readback changed")),
+            }
+        }
+        let state = self.state.as_mut().expect("shared state");
+        state.goal = Some(goal.clone());
+        state.goal_revision = state.goal_revision.saturating_add(1);
+        state.shared_goal_intent = None;
+        let event = goal_control_event_payload(
+            Some(&goal),
+            state.goal_capability.as_ref(),
+            state.goal_revision,
+            Some(request_id),
+        );
+        self.save_state()?;
+        // Notifications that raced the activation (the goal runtime may start a turn at once)
+        // are applied through the same adoption path as polled ones; anything else is held.
+        for stray in strays {
+            let method = stray.get("method").and_then(Value::as_str).unwrap_or("").to_owned();
+            let params = stray.get("params").cloned().unwrap_or(Value::Null);
+            if !(stray.get("id").is_none() && self.adopt_active_goal_notification(&method, &params)?) {
+                self.state.as_mut().expect("shared state").lifecycle = "reconciliation_required".to_owned();
+                self.save_state()?;
+            }
+        }
+        Ok(CommandExecution {
+            result: json!({"status":"accepted","snapshot":event}),
+            events: vec![("session.goal.updated".to_owned(), EventPriority::P0, event)],
+        })
+    }
+
+    /// While Paperclip's own ACTIVE goal is running, the daemon's goal runtime starts turns
+    /// and updates the goal without a Paperclip command. Those are Paperclip-caused: adopt the
+    /// turn identity and the goal snapshot. Returns false when the notification is not ours.
+    #[cfg(unix)]
+    fn adopt_active_goal_notification(
+        &mut self,
+        method: &str,
+        params: &Value,
+    ) -> Result<bool, DurableRunnerError> {
+        let Some(state) = self.state.as_ref() else {
+            return Ok(false);
+        };
+        if state.goal.as_ref().is_none_or(|goal| goal.status != "active")
+            || !matches!(state.lifecycle.as_str(), "session_open" | "turn_active")
+            || params
+                .get("threadId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| Some(id) != state.thread_id.as_deref())
+        {
+            return Ok(false);
+        }
+        match method {
+            "thread/goal/updated" => {
+                let Some(goal) = normalize_codex_goal(params.get("goal").unwrap_or(&Value::Null), false)
+                else {
+                    return Ok(false);
+                };
+                let state = self.state.as_mut().expect("shared state");
+                state.goal = Some(goal.clone());
+                state.goal_revision = state.goal_revision.saturating_add(1);
+                let event = goal_control_event_payload(
+                    Some(&goal),
+                    state.goal_capability.as_ref(),
+                    state.goal_revision,
+                    None,
+                );
+                state.push_event(NormalizedProviderEvent {
+                    event_type: "session.goal.updated".to_owned(),
+                    priority: EventPriority::P0,
+                    payload: event,
+                })?;
+                self.save_state()?;
+                Ok(true)
+            }
+            "turn/started" if state.active_provider_turn_id.is_none() => {
+                let Some(turn_id) = params
+                    .pointer("/turn/id")
+                    .or_else(|| params.get("turnId"))
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty() && id.len() <= 240 && !id.chars().any(char::is_control))
+                    .map(str::to_owned)
+                else {
+                    return Ok(false);
+                };
+                let state = self.state.as_mut().expect("shared state");
+                state.tool_bridge.prepare_turn().map_err(|error| {
+                    DurableRunnerError::invalid(format!(
+                        "Codex semantic tool receipts could not prepare the goal turn: {error}"
+                    ))
+                })?;
+                state.active_provider_turn_id = Some(turn_id);
+                state.ambiguous_turn_start_pending = false;
+                state.completed_turn_authoritative = false;
+                state.completed_turn_process_generation = None;
+                state.completed_provider_turn_id = None;
+                state.active_provider_result_fingerprint = None;
+                state.active_provider_result_disposition = None;
+                state.active_terminal_tool_rejected = false;
+                state.last_agent_message = None;
+                state.lifecycle = "turn_active".to_owned();
+                self.save_state()?;
+                self.settle_shared_turn_notification(method, params)?;
+                Ok(true)
+            }
+            // The goal runtime reports idle->active before it starts a turn; that status flip is not an intervention.
+            "thread/status/changed" | "thread/readState/changed" if state.active_provider_turn_id.is_none() => Ok(true),
+            _ => Ok(false),
+        }
     }
 
     fn set_goal(&mut self, payload: &Value) -> Result<CommandExecution, DurableRunnerError> {
@@ -3621,15 +4908,7 @@ impl CodexCommandExecutor {
         }
         self.save_state()?;
         let rejection = invalid_tool_call_result(call_id, operation_id, &error);
-        self.provider
-            .as_mut()
-            .expect("provider remains present while rejecting its tool call")
-            .deliver_tool_result(&rejection)
-            .map_err(|delivery_error| {
-                DurableRunnerError::invalid(format!(
-                    "failed to return the semantic tool rejection: {delivery_error}"
-                ))
-            })
+        self.deliver_tool_to_provider(&rejection)
     }
 
     fn stop_turn_at_tool_receipt_limit(
@@ -3887,20 +5166,16 @@ impl CodexCommandExecutor {
             .admit_tool_call(&call_id, &operation_id, &input);
         match admission {
             Ok(ToolCallAdmission::CompletedReplay(result)) => {
-                self.provider
-                    .as_mut()
-                    .expect("provider remains present while handling its tool call")
-                    .deliver_tool_result(&result)
-                    .map_err(|error| {
-                        DurableRunnerError::invalid(format!(
-                            "failed to replay a durable semantic tool result: {error}"
-                        ))
-                    })?;
+                self.deliver_tool_to_provider(&result)?;
                 return Ok(());
             }
             Ok(ToolCallAdmission::PendingReplay) => return Ok(()),
             Err(error) => {
                 if error.is_active_turn_receipt_limit() {
+                    #[cfg(unix)]
+                    if self.shared_socket.is_some() {
+                        return self.reject_tool_call(call_id, operation_id, error);
+                    }
                     return self.stop_turn_at_tool_receipt_limit(call_id, operation_id);
                 }
                 return self.reject_tool_call(call_id, operation_id, error);
@@ -3913,6 +5188,27 @@ impl CodexCommandExecutor {
                 self.save_state()
             }
         }
+    }
+
+    fn deliver_tool_to_provider(&mut self, result: &ToolResult) -> Result<(), DurableRunnerError> {
+        #[cfg(unix)]
+        if let Some(socket) = self.shared_socket.as_mut() {
+            let encoded = serde_json::to_string(&result.result)
+                .map_err(|_| DurableRunnerError::invalid("shared tool receipt invalid"))?;
+            if encoded.len() > 1024 * 1024 {
+                return Err(DurableRunnerError::invalid("shared tool receipt oversized"));
+            }
+            return socket.respond_tool(&result.call_id,json!({"success":!result.is_error,"contentItems":[{"type":"inputText","text":encoded}]})).map_err(|_|DurableRunnerError::invalid("shared tool receipt delivery unknown"));
+        }
+        self.provider
+            .as_mut()
+            .ok_or_else(|| DurableRunnerError::invalid("provider unavailable for tool receipt"))?
+            .deliver_tool_result(result)
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!(
+                    "failed to deliver semantic tool result: {error}"
+                ))
+            })
     }
 
     fn deliver_semantic_result(
@@ -3982,6 +5278,13 @@ impl CodexCommandExecutor {
                 "callId": result.call_id,
             })));
         }
+        #[cfg(unix)]
+        if self.shared_socket.is_some() {
+            self.deliver_tool_to_provider(&result)?;
+            return Ok(CommandExecution::result(
+                json!({"status":"delivered","callId":result.call_id}),
+            ));
+        }
         let provider = self.ensure_provider()?;
         if terminal_tool_authoritative {
             provider
@@ -4004,16 +5307,43 @@ impl CodexCommandExecutor {
     }
 
     fn close_session(&mut self) -> Result<CommandExecution, DurableRunnerError> {
-        if let Some(provider) = self.provider.as_mut() {
+        if self.provider.is_some()
+            && self
+                .state
+                .as_ref()
+                .is_some_and(|state| state.config.shared_daemon.is_some())
+        {
+            return Err(DurableRunnerError::invalid(
+                "shared session cannot own a provider process",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            self.shared_socket.take();
+        }
+        let provider_exit_confirmed = if let Some(provider) = self.provider.as_mut() {
             provider.shutdown().map_err(|error| {
                 DurableRunnerError::invalid(format!("failed to stop Codex provider: {error}"))
             })?;
-        }
+            true
+        } else {
+            false
+        };
         self.provider = None;
         let state = self
             .state
             .as_mut()
             .ok_or_else(|| DurableRunnerError::invalid("Codex provider is not prepared"))?;
+        // Closing admission preserves pending calls for exact receipt settlement,
+        // without allowing a maintenance restart to admit fresh tool effects.
+        state
+            .tool_bridge
+            .settle_turn("provider_session_closed")
+            .map_err(|error| {
+                DurableRunnerError::invalid(format!(
+                    "failed to close semantic tool admission with Codex session: {error}"
+                ))
+            })?;
         state.active_provider_turn_id = None;
         state.ambiguous_turn_start_pending = false;
         state.receipt_limit_diagnostic_emitted = false;
@@ -4028,8 +5358,12 @@ impl CodexCommandExecutor {
         let thread_id = state.thread_id.clone();
         let provider_name = state.config.provider.clone();
         self.save_state()?;
+        let mut result = json!({"status": "closed", "providerSessionId": thread_id});
+        if provider_exit_confirmed {
+            result["providerExitConfirmed"] = json!(true);
+        }
         Ok(CommandExecution {
-            result: json!({"status": "closed", "providerSessionId": thread_id}),
+            result,
             events: vec![(
                 "session.closed".to_owned(),
                 EventPriority::P0,
@@ -4044,10 +5378,13 @@ impl CodexCommandExecutor {
             .get("quiesceForWarmAttach")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        if quiesce_for_warm_attach {
+            self.retain_completed_accounting_tail()?;
+        }
         let mut warm_attach_blockers = self
             .provider
             .as_mut()
-            .map(|provider| provider.warm_run_attachment_blockers(quiesce_for_warm_attach))
+            .map(|provider| provider.warm_run_attachment_blockers())
             .transpose()
             .map_err(|error| {
                 DurableRunnerError::invalid(format!(
@@ -4071,6 +5408,9 @@ impl CodexCommandExecutor {
         if !state.queued_events.is_empty() {
             warm_attach_blockers.push("durable_queued_events");
         }
+        if state.lifecycle == "reconciliation_required" {
+            warm_attach_blockers.push("reconciliation_required");
+        }
         let warm_attach_ready = warm_attach_blockers.is_empty();
         Ok(CommandExecution::result(json!({
             "status": state.lifecycle,
@@ -4092,6 +5432,118 @@ impl CodexCommandExecutor {
 
     fn poll_provider(&mut self) -> Result<(), DurableRunnerError> {
         self.restore()?;
+        #[cfg(unix)]
+        if let Some(socket) = self.shared_socket.as_ref() {
+            // Backpressure: never drain the socket while earlier events of our own turn await acknowledgement.
+            if self.state.as_ref().is_some_and(|state| {
+                state.active_provider_turn_id.is_some() && !state.pending_events.is_empty()
+            }) {
+                return Ok(());
+            }
+            let observed = socket.receive_notification(std::time::Duration::ZERO);
+            let managed = self
+                .state
+                .as_ref()
+                .and_then(|state| state.config.shared_daemon.as_ref())
+                .and_then(|shared| shared.writer.as_ref())
+                .is_some();
+            if managed {
+                if let Ok(Some(value)) = &observed {
+                    if let (None, Some(method), Some(params)) = (
+                        value.get("id"),
+                        value.get("method").and_then(Value::as_str),
+                        value.get("params"),
+                    ) {
+                        let (method, params) = (method.to_owned(), params.clone());
+                        if self.adopt_active_goal_notification(&method, &params)? {
+                            return Ok(());
+                        }
+                    }
+                    let active = self
+                        .state
+                        .as_ref()
+                        .and_then(|state| state.active_provider_turn_id.as_deref());
+                    if let (None, Some(method), Some(params), Some(active)) = (
+                        value.get("id"),
+                        value.get("method").and_then(Value::as_str),
+                        value.get("params"),
+                        active,
+                    ) {
+                        let turn = params
+                            .get("turnId")
+                            .or_else(|| params.pointer("/turn/id"))
+                            .and_then(Value::as_str);
+                        if turn == Some(active)
+                            || (turn.is_none() && matches!(method, "thread/status/changed" | "thread/readState/changed"))
+                        {
+                            let (method, params) = (method.to_owned(), params.clone());
+                            return self.settle_shared_turn_notification(&method, &params);
+                        }
+                    }
+                    if value.get("method").and_then(Value::as_str) == Some("item/tool/call") {
+                        let params = &value["params"];
+                        let active = self
+                            .state
+                            .as_ref()
+                            .and_then(|state| state.active_provider_turn_id.as_deref());
+                        let turn = params.get("turnId").and_then(Value::as_str);
+                        let call = params
+                            .get("callId")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty() && id.len() <= 240);
+                        let operation = params
+                            .get("tool")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty() && id.len() <= 240);
+                        if active.is_some() && active == turn {
+                            if let (Some(call), Some(operation)) = (call, operation) {
+                                self.handle_tool_call(
+                                    call.to_owned(),
+                                    operation.to_owned(),
+                                    params.get("arguments").cloned().unwrap_or(Value::Null),
+                                )?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+            if managed && !matches!(&observed, Ok(None)) {
+                let (method, turn) = match &observed {
+                    Ok(Some(value)) => (
+                        value
+                            .get("method")
+                            .and_then(Value::as_str)
+                            .map(|s| s.chars().take(128).collect::<String>()),
+                        value
+                            .pointer("/params/turn/id")
+                            .or_else(|| value.pointer("/params/turnId"))
+                            .and_then(Value::as_str)
+                            .map(|s| s.chars().take(240).collect::<String>()),
+                    ),
+                    _ => (None, None),
+                };
+                if observed.is_err() {
+                    self.shared_socket.take();
+                }
+                let state = self.state.as_mut().expect("shared state");
+                state.lifecycle = "reconciliation_required".to_owned();
+                state.push_event(NormalizedProviderEvent{event_type:"harness.diagnostic".to_owned(),priority:EventPriority::P1,payload:json!({"code":"shared_native_intervention","origin":"unknown","method":method,"providerTurnId":turn})})?;
+                self.save_state()?;
+                return Ok(());
+            }
+            match observed {
+                Ok(None) => {}
+                Ok(Some(_)) | Err(_) => {
+                    self.shared_socket.take();
+                    if let Some(state) = self.state.as_mut() {
+                        state.lifecycle = "reconciliation_required".to_owned();
+                    }
+                    self.save_state()?;
+                    return Err(DurableRunnerError::invalid("shared daemon observation is not supported; connection detached and reconciliation required"));
+                }
+            }
+        }
         // `restore_checked` records that the durable file was loaded even when
         // provider recovery failed. Retry the provider reconciliation here so
         // an ambiguous-start failure cannot degrade into an empty successful
@@ -4281,6 +5733,22 @@ impl CodexCommandExecutor {
                     } else {
                         None
                     };
+                    let goal_remains_active = match &goal_reconciliation {
+                        Some(Ok(snapshot)) => normalize_codex_goal(snapshot, false)
+                            .is_some_and(|goal| goal.status == "active"),
+                        _ => self
+                            .state
+                            .as_ref()
+                            .and_then(|state| state.goal.as_ref())
+                            .is_some_and(|goal| goal.status == "active"),
+                    };
+                    let run_continues = self
+                        .state
+                        .as_ref()
+                        .is_some_and(|state| goal_continues_after_turn(state, goal_remains_active));
+                    if terminal_event_type.as_deref() == Some("turn.completed") && !run_continues {
+                        self.retain_completed_accounting_tail()?;
+                    }
                     let working_now = self
                         .provider
                         .as_ref()
@@ -4370,7 +5838,9 @@ impl CodexCommandExecutor {
                         state.receipt_limit_interrupt_attempts = 0;
                         state.receipt_limit_interrupt_deadline_unix_ms = None;
                         state.ambiguous_turn_start_pending = false;
-                        state.lifecycle = "session_open".to_owned();
+                        if state.lifecycle != "reconciliation_required" {
+                            state.lifecycle = "session_open".to_owned();
+                        }
                         if let Some(goal) = state.goal.as_mut() {
                             goal.working_now = false;
                             state.goal_revision = state.goal_revision.saturating_add(1);
@@ -4473,6 +5943,13 @@ impl CodexCommandExecutor {
                         })
                         .unwrap_or_default();
                     self.save_state()?;
+                    if self
+                        .state
+                        .as_ref()
+                        .is_some_and(|state| state.lifecycle == "reconciliation_required")
+                    {
+                        break;
+                    }
                     if let (Some(frame_id), Some(provider)) =
                         (trace_frame_id, self.provider.as_mut())
                     {
@@ -4624,6 +6101,45 @@ impl CommandExecutor for CodexCommandExecutor {
             if self
                 .state
                 .as_ref()
+                .is_some_and(|state| state.config.shared_daemon.is_some())
+                && !matches!(
+                    command.command_type.as_str(),
+                    "run.prepare"
+                        | "session.open"
+                        | "session.snapshot"
+                        | "session.goal.get"
+                        | "session.close"
+                        | "session.destroy"
+                        | "runner.drain"
+                        | "runner.suspend"
+                        | "runner.shutdown"
+                )
+                && !(matches!(
+                    command.command_type.as_str(),
+                    "session.goal.set" | "semantic_tool.result"
+                ) && self
+                    .state
+                    .as_ref()
+                    .and_then(|state| state.config.shared_daemon.as_ref())
+                    .and_then(|shared| shared.writer.as_ref())
+                    .is_some())
+                && !(matches!(
+                    command.command_type.as_str(),
+                    "turn.start" | "turn.interrupt" | "turn.stop"
+                ) && self
+                    .state
+                    .as_ref()
+                    .and_then(|state| state.config.shared_daemon.as_ref())
+                    .and_then(|shared| shared.writer.as_ref())
+                    .is_some_and(|writer| writer.managed_tools))
+            {
+                return Err(DurableRunnerError::invalid(
+                    "shared daemon managed mutation is not admitted",
+                ));
+            }
+            if self
+                .state
+                .as_ref()
                 .is_some_and(|state| state.lifecycle == "reconciliation_required")
                 && !matches!(
                     command.command_type.as_str(),
@@ -4636,7 +6152,13 @@ impl CommandExecutor for CodexCommandExecutor {
                         | "turn.interrupt"
                         | "run.cancel"
                         | "turn.stop"
+                        | "semantic_tool.result"
                 )
+                && !(command.command_type == "session.goal.get"
+                    && self
+                        .state
+                        .as_ref()
+                        .is_some_and(|state| state.config.shared_daemon.is_some()))
             {
                 return Err(DurableRunnerError::invalid(
                     "Codex provider session requires explicit reconciliation and a fresh session",
@@ -4649,6 +6171,15 @@ impl CommandExecutor for CodexCommandExecutor {
                         self.prepare(&command.payload)?;
                     } else {
                         self.attach_run(&command.payload)?;
+                    }
+                    if self
+                        .state
+                        .as_ref()
+                        .is_some_and(|state| state.config.shared_daemon.is_some())
+                    {
+                        return Err(DurableRunnerError::invalid(
+                            "shared daemon managed run attachment is not admitted",
+                        ));
                     }
                     let mut execution = self.open_session()?;
                     let provider = self
@@ -4666,8 +6197,46 @@ impl CommandExecutor for CodexCommandExecutor {
                 "session.open" => self.open_session(),
                 "turn.start" => self.start_turn(&command.payload),
                 "turn.steer" => self.steer_turn(&command.payload),
-                "session.goal.get" => self.get_goal(),
-                "session.goal.set" => self.set_goal(&command.payload),
+                "session.goal.get" => {
+                    #[cfg(unix)]
+                    if let Some(socket) = self.shared_socket.as_mut() {
+                        let thread_id = self
+                            .state
+                            .as_ref()
+                            .and_then(|s| s.thread_id.clone())
+                            .ok_or_else(|| {
+                                DurableRunnerError::invalid("shared thread unavailable")
+                            })?;
+                        let response = socket
+                            .request("thread/goal/get", json!({"threadId": thread_id}))
+                            .map_err(|_| DurableRunnerError::invalid("shared goal read failed"))?;
+                        if response.get("error").is_some() {
+                            return Err(DurableRunnerError::invalid("shared goal read rejected"));
+                        }
+                        return Ok(CommandExecution::result(
+                            response.get("result").cloned().unwrap_or(Value::Null),
+                        ));
+                    }
+                    if self
+                        .state
+                        .as_ref()
+                        .is_some_and(|state| state.config.shared_daemon.is_some())
+                    {
+                        return Err(DurableRunnerError::invalid("shared daemon is not attached"));
+                    }
+                    self.get_goal()
+                }
+                "session.goal.set" => {
+                    #[cfg(unix)]
+                    if self
+                        .state
+                        .as_ref()
+                        .is_some_and(|state| state.config.shared_daemon.is_some())
+                    {
+                        return self.set_shared_paused_goal(&command.payload);
+                    }
+                    self.set_goal(&command.payload)
+                }
                 "session.goal.clear" => self.clear_goal(&command.payload),
                 "turn.interrupt" | "run.cancel" => self.interrupt_turn(
                     command
@@ -4682,6 +6251,10 @@ impl CommandExecutor for CodexCommandExecutor {
                 "session.snapshot" => self.snapshot(&command.payload),
                 "session.close" | "session.destroy" => self.close_session(),
                 "runner.drain" | "runner.suspend" | "runner.shutdown" => {
+                    #[cfg(unix)]
+                    {
+                        self.shared_socket.take();
+                    }
                     Ok(CommandExecution::result(json!({"status": "completed"})))
                 }
                 _ => Ok(CommandExecution::result(json!({
@@ -4755,6 +6328,10 @@ impl CommandExecutor for CodexCommandExecutor {
         // attempted against the persisted session instead of reporting a
         // successful no-op from an empty in-memory provider slot.
         self.restore()?;
+        #[cfg(unix)]
+        {
+            self.shared_socket.take();
+        }
         if let Some(provider) = self.provider.as_mut() {
             provider.shutdown().map_err(|error| {
                 DurableRunnerError::invalid(format!("failed to stop Codex provider: {error}"))
@@ -4767,6 +6344,10 @@ impl CommandExecutor for CodexCommandExecutor {
     fn reconcile_terminal_delivery(
         &mut self,
     ) -> Result<TerminalDeliveryReconciliation, DurableRunnerError> {
+        #[cfg(unix)]
+        {
+            self.shared_socket.take();
+        }
         // A fresh terminal-delivery process has no provider handle. Validate
         // its retained state without starting a provider merely to stop it.
         // If this process already owns a handle, stop only that exact handle.
@@ -4798,6 +6379,750 @@ impl CommandExecutor for CodexCommandExecutor {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    mod shared_thread_name_tests {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/shared_thread_name_tests.rs"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_writer_real_isolated_paused_goal() {
+        if std::env::var_os("PAPERCLIP_CODEX_REAL_ISOLATED").is_none() {
+            return;
+        }
+        use libproc::libproc::{
+            bsd_info::BSDInfo,
+            proc_pid::{pidinfo, pidpath},
+        };
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        struct OwnChild(std::process::Child);
+        impl Drop for OwnChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let root = PathBuf::from(format!(
+            "/Volumes/NVM/AI_Agent_Runtime/tmp/p-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = root.join("socket");
+        let child = std::process::Command::new("/opt/homebrew/bin/codex")
+            .args([
+                "app-server",
+                "--listen",
+                &format!("unix://{}", socket.display()),
+            ])
+            .current_dir(&root)
+            .env_clear()
+            .env("PATH", "/opt/homebrew/bin:/usr/bin:/bin")
+            .env("HOME", &root)
+            .env("CODEX_HOME", &root)
+            .env("LANG", "C")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut child = OwnChild(child);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while !socket.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "isolated daemon socket unavailable"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let socket = fs::canonicalize(&socket).unwrap();
+        let pid = child.0.id();
+        let info = pidinfo::<BSDInfo>(pid as i32, 0).unwrap();
+        let peer = crate::codex_provider::ExpectedPeer {
+            pid,
+            start_seconds: info.pbi_start_tvsec,
+            start_microseconds: info.pbi_start_tvusec,
+            executable: pidpath(pid as i32).unwrap().into(),
+        };
+        let meta = fs::symlink_metadata(&socket).unwrap();
+        let generation = format!(
+            "{}:{}:{}:{}",
+            meta.dev(),
+            meta.ino(),
+            meta.ctime(),
+            meta.ctime_nsec()
+        );
+        let cmd = |kind: &str, payload: Value, seq: u64| Command {
+            schema: "paperclip.prp.command.v2".into(),
+            command_id: format!("cmd-{seq}"),
+            controller_seq: seq,
+            command_type: kind.into(),
+            issued_at: "test".into(),
+            deadline_at: None,
+            precondition: None,
+            payload,
+        };
+        let mut provider = json!({"provider":"codex","driver":"codex_app_server","providerVersion":"test","command":"/opt/homebrew/bin/codex","cwd":root,"model":"gpt-5.1-codex","instructions":"Isolated no-inference qualification.","readOnly":true,"sharedDaemon":{"socketPath":socket,"daemonGeneration":generation,"threadId":"","codexHome":root,"peer":peer,"bootstrapId":"bootstrap","writer":{"runId":"run","normalizedSessionId":"session","runnerInstanceId":"runner","grantId":"grant","epoch":1,"observationEpochId":"observation","managedTools":true,"managedBootstrapId":"bootstrap","reasoningEffort":"high"}}});
+        provider["sharedDaemon"]["writer"]["threadConfig"] = json!({"permissions": {
+            "paperclip-runner-workspace-only": {"filesystem":{":root":"none",":minimal":"read",":tmpdir":"none",":workspace_roots":{".":"write"}},"network":{"enabled":false}},
+            "paperclip-runner-workspace-read-only": {"filesystem":{":root":"none",":minimal":"read",":tmpdir":"none",":workspace_roots":{".":"read"}},"network":{"enabled":false}}
+        }, "web_search":"disabled"});
+        for profile in [
+            "paperclip-runner-workspace-only",
+            "paperclip-runner-workspace-read-only",
+        ] {
+            provider["sharedDaemon"]["writer"]["threadConfig"]["permissions"][profile]
+                ["filesystem"]["/opt/homebrew"] = json!("read");
+        }
+        let mut executor = CodexCommandExecutor::new(root.join("state"));
+        executor.event_identity = Some(ProviderEventIdentity {
+            runner_instance_id: "runner".into(),
+            run_id: "run".into(),
+            normalized_session_id: "session".into(),
+            turn_id: "turn".into(),
+            item_id: "item".into(),
+        });
+        let tool = crate::provider_bridge::AuthorizedTool {
+            operation_id: "paperclip_test".into(),
+            version: 1,
+            description: "Isolated qualification only".into(),
+            input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
+            response_schema: json!({"type":"object"}),
+        };
+        let tools = AuthorizedToolSet {
+            schema: TOOL_SET_SCHEMA.to_owned(),
+            schema_version: 1,
+            catalog_digest: authorized_tool_catalog_digest(std::slice::from_ref(&tool)).unwrap(),
+            operations: vec![tool],
+        };
+        let prepared = executor
+            .execute(&cmd(
+                "run.prepare",
+                json!({"provider":provider,"authorizedTools":tools}),
+                1,
+            ))
+            .unwrap();
+        assert!(!prepared.result["providerSessionId"]
+            .as_str()
+            .unwrap()
+            .is_empty());
+        executor
+            .execute(&cmd("session.open", json!({}), 2))
+            .unwrap();
+        let result=executor.execute(&cmd("session.goal.set",json!({"requestId":"request","objective":"isolated no inference proof","status":"paused","tokenBudget":16,"expectedGoal":null,"writer":{"grantId":"grant","epoch":1,"observationEpochId":"observation"}}),3)).unwrap();
+        assert_eq!(result.result["status"], "accepted");
+        for payload in [
+            json!({"text":"must not dispatch"}),
+            json!({"text":"must not dispatch","effort":"low"}),
+        ] {
+            assert!(executor
+                .start_turn(&payload)
+                .unwrap_err()
+                .to_string()
+                .contains("shared turn effort mismatch"));
+            assert!(
+                !executor
+                    .state
+                    .as_ref()
+                    .unwrap()
+                    .ambiguous_turn_start_pending
+            );
+        }
+        drop(executor);
+        let _ = child.0.kill();
+        let _ = child.0.wait();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn shared_writer_paused_goal_fake_socket_fixture(lost_ack: bool, owner_event: bool) {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::net::UnixListener;
+        let root = PathBuf::from(format!(
+            "/Volumes/NVM/AI_Agent_Runtime/tmp/p-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("s");
+        let listener = UnixListener::bind(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let meta = fs::symlink_metadata(&path).unwrap();
+        let generation = format!(
+            "{}:{}:{}:{}",
+            meta.dev(),
+            meta.ino(),
+            meta.ctime(),
+            meta.ctime_nsec()
+        );
+        let cwd = root.to_string_lossy().to_string();
+        let server_cwd = cwd.clone();
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<()>();
+        let (sent_tx, sent_rx) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut ws = tungstenite::accept(stream).unwrap();
+            for method in [
+                "initialize",
+                "initialized",
+                "thread/read",
+                "thread/goal/get",
+                "thread/goal/set",
+                "thread/goal/get",
+            ] {
+                let request: Value =
+                    serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(request["method"], method);
+                if method == "initialized" {
+                    continue;
+                }
+                if lost_ack && method == "thread/goal/set" {
+                    return;
+                }
+                let result = match method {
+                    "thread/read" => json!({"thread":{"id":"thread","cwd":server_cwd}}),
+                    "thread/goal/get" if request["id"] == 3 => json!({"goal":null}),
+                    "thread/goal/set" | "thread/goal/get" => {
+                        json!({"goal":{"objective":"goal","status":"paused","tokenBudget":null}})
+                    }
+                    _ => json!({}),
+                };
+                ws.send(tungstenite::Message::Text(
+                    json!({"id":request["id"],"result":result})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            }
+            if owner_event {
+                event_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                ws.send(tungstenite::Message::Text(json!({"method":"turn/started","params":{"threadId":"thread","turn":{"id":"owner-turn"}}}).to_string().into())).unwrap();
+                sent_tx.send(()).unwrap();
+            }
+            assert!(ws.read().is_err());
+        });
+        let cmd = |kind: &str, payload: Value, seq: u64| Command {
+            schema: "paperclip.prp.command.v2".into(),
+            command_id: format!("cmd-{seq}"),
+            controller_seq: seq,
+            command_type: kind.into(),
+            issued_at: "test".into(),
+            deadline_at: None,
+            precondition: None,
+            payload,
+        };
+        let provider = json!({"provider":"codex","driver":"codex_app_server","providerVersion":"test","command":"/not/executed","cwd":cwd,"readOnly":true,"providerSessionId":"thread","sharedDaemon":{"socketPath":path,"daemonGeneration":generation,"threadId":"thread","codexHome":root,"peer":current_test_peer(),"writer":{"runId":"run","normalizedSessionId":"session","runnerInstanceId":"runner","grantId":"grant","epoch":1,"observationEpochId":"observation"}}});
+        let mut executor = CodexCommandExecutor::new(root.join("state"));
+        executor.event_identity = Some(ProviderEventIdentity {
+            runner_instance_id: "runner".into(),
+            run_id: "run".into(),
+            normalized_session_id: "session".into(),
+            turn_id: "turn".into(),
+            item_id: "item".into(),
+        });
+        executor
+            .execute(&cmd("run.prepare", json!({"provider":provider}), 1))
+            .unwrap();
+        executor
+            .execute(&cmd("session.open", json!({}), 2))
+            .unwrap();
+        let payload = json!({"requestId":"request","objective":"goal","status":"paused","expectedGoal":null,"writer":{"grantId":"grant","epoch":1,"observationEpochId":"observation"}});
+        let mut bad = payload.clone();
+        bad["writer"]["epoch"] = json!(2);
+        assert!(executor.execute(&cmd("session.goal.set", bad, 3)).is_err());
+        for (field, value) in [("grantId", "foreign"), ("observationEpochId", "foreign")] {
+            let mut bad = payload.clone();
+            bad["writer"][field] = json!(value);
+            assert!(executor.execute(&cmd("session.goal.set", bad, 3)).is_err());
+        }
+        let mut active = payload.clone();
+        active["status"] = json!("active");
+        assert!(executor
+            .execute(&cmd("session.goal.set", active, 3))
+            .is_err());
+        // Activation is a bounded resume only: no budget, a zero budget and an over-cap budget are all refused.
+        for budget in [json!(null), json!(0), json!(SHARED_ACTIVE_GOAL_TOKEN_BUDGET_CAP + 1)] {
+            let mut active = payload.clone();
+            active["status"] = json!("active");
+            active["tokenBudget"] = budget;
+            assert!(executor.execute(&cmd("session.goal.set", active, 3)).is_err());
+        }
+        assert!(executor
+            .state
+            .as_ref()
+            .unwrap()
+            .shared_goal_intent
+            .is_none());
+        let result = executor.execute(&cmd("session.goal.set", payload.clone(), 4));
+        if lost_ack {
+            assert!(result.is_err());
+            assert!(executor
+                .state
+                .as_ref()
+                .unwrap()
+                .shared_goal_intent
+                .is_some());
+            assert!(executor
+                .execute(&cmd("session.goal.set", payload, 5))
+                .is_err());
+        } else {
+            let result = result.unwrap();
+            assert_eq!(result.result["status"], "accepted");
+            assert_eq!(result.events[0].0, "session.goal.updated");
+            if owner_event {
+                event_tx.send(()).unwrap();
+                sent_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let events = executor.poll_events().unwrap();
+                assert!(events
+                    .iter()
+                    .any(|event| event.event_type == "harness.diagnostic"
+                        && event.payload["code"] == "shared_native_intervention"
+                        && event.payload["origin"] == "unknown"
+                        && event.payload["providerTurnId"] == "owner-turn"));
+                assert_eq!(
+                    executor.state.as_ref().unwrap().lifecycle,
+                    "reconciliation_required"
+                );
+                assert!(executor
+                    .execute(&cmd("session.goal.set", payload, 5))
+                    .is_err());
+            }
+        }
+        drop(executor);
+        server.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_writer_paused_goal_fake_socket() {
+        shared_writer_paused_goal_fake_socket_fixture(false, false);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_writer_lost_ack_is_not_redispatched() {
+        shared_writer_paused_goal_fake_socket_fixture(true, false);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_writer_observes_owner_turn_and_holds_automation() {
+        shared_writer_paused_goal_fake_socket_fixture(false, true);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_writer_epoch_survives_failed_attach_and_rejects_reconnect() {
+        let root = PathBuf::from(format!(
+            "/Volumes/NVM/AI_Agent_Runtime/tmp/p-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir(&root).unwrap();
+        let identity = ProviderEventIdentity {
+            runner_instance_id: "runner".into(),
+            run_id: "run".into(),
+            normalized_session_id: "session".into(),
+            turn_id: "turn".into(),
+            item_id: "item".into(),
+        };
+        let cmd = |kind: &str, payload: Value, seq: u64| Command {
+            schema: "paperclip.prp.command.v1".into(),
+            command_id: format!("cmd-{seq}"),
+            controller_seq: seq,
+            command_type: kind.into(),
+            issued_at: "test".into(),
+            deadline_at: None,
+            precondition: None,
+            payload,
+        };
+        let provider = json!({"provider":"codex","driver":"codex_app_server","providerVersion":"test","command":"/not/executed","cwd":root,"readOnly":true,"providerSessionId":"thread","sharedDaemon":{"socketPath":root.join("missing"),"daemonGeneration":"generation","threadId":"thread","codexHome":root,"peer":current_test_peer(),"writer":{"runId":"run","normalizedSessionId":"session","runnerInstanceId":"runner","grantId":"grant","epoch":1,"observationEpochId":"observation"}}});
+        let mut wrong = CodexCommandExecutor::new(root.join("wrong"));
+        wrong.event_identity = Some(ProviderEventIdentity {
+            run_id: "other".into(),
+            ..identity.clone()
+        });
+        assert!(wrong
+            .execute(&cmd("run.prepare", json!({"provider":provider}), 1))
+            .is_err());
+        let mut executor = CodexCommandExecutor::new(root.join("state"));
+        executor.event_identity = Some(identity.clone());
+        executor
+            .execute(&cmd("run.prepare", json!({"provider":provider}), 1))
+            .unwrap();
+        assert!(executor
+            .execute(&cmd("session.open", json!({}), 2))
+            .is_err());
+        drop(executor);
+        let mut restarted = CodexCommandExecutor::new(root.join("state"));
+        restarted.event_identity = Some(identity);
+        let error = restarted
+            .execute(&cmd("session.open", json!({}), 3))
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("observation requires reconciliation"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn current_test_peer() -> crate::codex_provider::ExpectedPeer {
+        use libproc::libproc::{
+            bsd_info::BSDInfo,
+            proc_pid::{pidinfo, pidpath},
+        };
+        let pid = std::process::id();
+        let info = pidinfo::<BSDInfo>(pid as i32, 0).unwrap();
+        crate::codex_provider::ExpectedPeer {
+            pid,
+            start_seconds: info.pbi_start_tvsec,
+            start_microseconds: info.pbi_start_tvusec,
+            executable: pidpath(pid as i32).unwrap().into(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn shared_prp_fixture(mismatch: u8) {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::net::UnixListener;
+        let root = PathBuf::from(format!(
+            "/Volumes/NVM/AI_Agent_Runtime/tmp/p-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let socket_path = root.join("s");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).unwrap();
+        if mismatch == 6 {
+            fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o666)).unwrap();
+        }
+        if mismatch == 7 {
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        let metadata = fs::symlink_metadata(&socket_path).unwrap();
+        let generation = format!(
+            "{}:{}:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.ctime(),
+            metadata.ctime_nsec()
+        );
+        let cwd = root.to_string_lossy().to_string();
+        let server_cwd = cwd.clone();
+        let server_socket_path = socket_path.clone();
+        let mut peer = current_test_peer();
+        if mismatch == 8 {
+            peer.pid = peer.pid.saturating_add(1);
+        }
+        if mismatch == 9 {
+            peer.start_seconds = peer.start_seconds.saturating_add(1);
+        }
+        if mismatch == 10 {
+            peer.executable = "/not/the/executable".into();
+        }
+        let (detached_tx, detached_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            if matches!(mismatch, 3 | 6 | 7) {
+                listener.set_nonblocking(true).unwrap();
+                assert!(listener.accept().is_err());
+                return;
+            }
+            let (stream, _) = listener.accept().unwrap();
+            if matches!(mismatch, 8..=10) {
+                use std::io::Read;
+                let mut stream = stream;
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut byte = [0u8; 1];
+                match stream.read(&mut byte) {
+                    Ok(0) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionAborted
+                                | std::io::ErrorKind::BrokenPipe
+                        ) => {}
+                    other => panic!("peer mismatch unexpectedly sent or retained data: {other:?}"),
+                }
+                return;
+            }
+            let mut ws = tungstenite::accept(stream).unwrap();
+            let init: Value = serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+            ws.send(tungstenite::Message::Text(
+                json!({"id":init["id"],"result":{}}).to_string().into(),
+            ))
+            .unwrap();
+            let initialized: Value =
+                serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(initialized["method"], "initialized");
+            let read: Value = serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(read["method"], "thread/read");
+            let _replacement = if mismatch == 5 {
+                fs::rename(
+                    &server_socket_path,
+                    server_socket_path.with_extension("old"),
+                )
+                .unwrap();
+                let replacement = UnixListener::bind(&server_socket_path).unwrap();
+                fs::set_permissions(&server_socket_path, fs::Permissions::from_mode(0o600))
+                    .unwrap();
+                Some(replacement)
+            } else {
+                None
+            };
+            ws.send(tungstenite::Message::Text(json!({"id":read["id"],"result":{"thread":{"id":if mismatch == 1 {"foreign"} else {"thread-a"},"cwd":if mismatch == 2 {"/foreign"} else {&server_cwd}}}}).to_string().into())).unwrap();
+            if mismatch == 4 {
+                ws.send(tungstenite::Message::Text(
+                    json!({"method":"turn/started","params":{"threadId":"thread-a"}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            }
+            if mismatch == 0 {
+                let goal: Value =
+                    serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(goal["method"], "thread/goal/get");
+                ws.send(tungstenite::Message::Text(
+                    json!({"id":goal["id"],"result":{"goal":null}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+            }
+            assert!(ws.read().is_err());
+            if mismatch == 5 {
+                return;
+            }
+            detached_tx.send(()).unwrap();
+            let (_second, _) = listener.accept().unwrap();
+        });
+        let mut executor = CodexCommandExecutor::new(root.join("state"));
+        let command = |kind: &str, payload: Value, seq: u64| Command {
+            schema: "paperclip.prp.command.v1".into(),
+            command_id: format!("command-{seq}"),
+            controller_seq: seq,
+            command_type: kind.into(),
+            issued_at: "test".into(),
+            deadline_at: None,
+            precondition: None,
+            payload,
+        };
+        let provider = json!({"provider":"codex","driver":"codex_app_server","providerVersion":"test","command":"/not/executed","cwd":cwd,"readOnly":true,"providerSessionId":"thread-a","sharedDaemon":{"socketPath":socket_path,"daemonGeneration":if mismatch == 3 {"stale"} else {&generation},"threadId":"thread-a","codexHome":root,"peer":peer}});
+        executor
+            .execute(&command("run.prepare", json!({"provider":provider}), 1))
+            .unwrap();
+        let opened = executor.execute(&command("session.open", json!({}), 2));
+        if (1..=3).contains(&mismatch) || (5..=10).contains(&mismatch) {
+            assert!(opened.is_err());
+        } else {
+            let opened = opened.unwrap();
+            let event = &opened.events[0].2;
+            assert_eq!(
+                event["providerDescriptor"]["processOwnership"]["kind"],
+                "shared_daemon"
+            );
+            let schema: Value = serde_json::from_str(include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../../protocol/schemas/provider-descriptor.schema.json"
+            )))
+            .unwrap();
+            let validator = jsonschema::validator_for(&schema).unwrap();
+            let descriptor = &event["providerDescriptor"];
+            assert!(
+                validator.is_valid(descriptor),
+                "invalid shared descriptor: {descriptor}"
+            );
+            assert!(event.get("processId").is_none());
+            assert!(executor
+                .execute(&command("session.open", json!({}), 3))
+                .is_err());
+            let persisted = fs::read_to_string(executor.state_path()).unwrap();
+            assert!(persisted.contains("\"phase\": \"attached\""));
+            assert!(executor
+                .execute(&command("turn.start", json!({}), 3))
+                .is_err());
+            if mismatch == 4 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                assert!(executor
+                    .poll_events()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("observation is not supported"));
+                assert_eq!(
+                    executor.state.as_ref().unwrap().lifecycle,
+                    "reconciliation_required"
+                );
+            } else {
+                executor
+                    .execute(&command("session.goal.get", json!({}), 4))
+                    .unwrap();
+            }
+            let closed = executor
+                .execute(&command("session.close", json!({}), 5))
+                .unwrap();
+            assert!(closed.result.get("providerExitConfirmed").is_none());
+        }
+        drop(executor);
+        if !matches!(mismatch, 3 | 5..=10) {
+            detached_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            let _probe = std::os::unix::net::UnixStream::connect(&socket_path).unwrap();
+        }
+        server.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_prp_readonly_attach_and_detach() {
+        shared_prp_fixture(0);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_peer_auth_works_inside_existing_tokio_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        runtime.block_on(async { shared_prp_fixture(0) });
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_prp_rejects_foreign_thread() {
+        shared_prp_fixture(1);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_prp_rejects_foreign_workspace() {
+        shared_prp_fixture(2);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_prp_rejects_stale_socket_before_connect() {
+        shared_prp_fixture(3);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_prp_rejects_socket_replacement_during_read() {
+        shared_prp_fixture(5);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_prp_rejects_writable_socket_and_home_before_connect() {
+        shared_prp_fixture(6);
+        shared_prp_fixture(7);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_prp_rejects_wrong_peer_before_websocket_handshake() {
+        shared_prp_fixture(8);
+        shared_prp_fixture(9);
+        shared_prp_fixture(10);
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_unadvertised_events_cause_visible_reconciliation() {
+        shared_prp_fixture(4);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_snapshot_suspend_and_reopen_detach_only_connections() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use std::os::unix::net::UnixListener;
+        let root = PathBuf::from(format!(
+            "/Volumes/NVM/AI_Agent_Runtime/tmp/p-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("s");
+        let listener = UnixListener::bind(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let meta = fs::symlink_metadata(&path).unwrap();
+        let generation = format!(
+            "{}:{}:{}:{}",
+            meta.dev(),
+            meta.ino(),
+            meta.ctime(),
+            meta.ctime_nsec()
+        );
+        let cwd = root.to_string_lossy().to_string();
+        let server_cwd = cwd.clone();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().unwrap();
+                let mut ws = tungstenite::accept(stream).unwrap();
+                let init: Value =
+                    serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+                ws.send(tungstenite::Message::Text(
+                    json!({"id":init["id"],"result":{}}).to_string().into(),
+                ))
+                .unwrap();
+                ws.read().unwrap();
+                let read: Value =
+                    serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+                ws.send(tungstenite::Message::Text(
+                    json!({"id":read["id"],"result":{"thread":{"id":"thread-a","cwd":server_cwd}}})
+                        .to_string()
+                        .into(),
+                ))
+                .unwrap();
+                assert!(ws.read().is_err());
+            }
+        });
+        let cmd = |kind: &str, payload: Value, seq: u64| Command {
+            schema: "paperclip.prp.command.v1".into(),
+            command_id: format!("command-{seq}"),
+            controller_seq: seq,
+            command_type: kind.into(),
+            issued_at: "test".into(),
+            deadline_at: None,
+            precondition: None,
+            payload,
+        };
+        let provider = json!({"provider":"codex","driver":"codex_app_server","providerVersion":"test","command":"/not/executed","cwd":cwd,"readOnly":true,"providerSessionId":"thread-a","sharedDaemon":{"socketPath":path,"daemonGeneration":generation,"threadId":"thread-a","codexHome":root,"peer":current_test_peer()}});
+        let mut executor = CodexCommandExecutor::new(root.join("state"));
+        executor
+            .execute(&cmd("run.prepare", json!({"provider":provider}), 1))
+            .unwrap();
+        executor
+            .execute(&cmd("session.open", json!({}), 2))
+            .unwrap();
+        let snapshot = executor
+            .execute(&cmd("session.snapshot", json!({}), 3))
+            .unwrap();
+        assert_eq!(snapshot.result["providerSessionId"], "thread-a");
+        executor
+            .execute(&cmd("runner.suspend", json!({}), 4))
+            .unwrap();
+        drop(executor);
+        let mut reopened = CodexCommandExecutor::new(root.join("state"));
+        let event = reopened
+            .execute(&cmd("session.open", json!({}), 5))
+            .unwrap();
+        assert_eq!(
+            event.events[0].2["providerDescriptor"]["processOwnership"]["kind"],
+            "shared_daemon"
+        );
+        assert!(matches!(
+            reopened.reconcile_terminal_delivery().unwrap(),
+            TerminalDeliveryReconciliation::ProviderCleanupPending
+        ));
+        reopened
+            .execute(&cmd("session.close", json!({}), 6))
+            .unwrap();
+        drop(reopened);
+        server.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn mcp_permission_requests_use_durable_turn_and_item_identity() {
@@ -4900,6 +7225,7 @@ mod tests {
             configuration_fingerprint: format!("sha256:{}", "a".repeat(64)),
             requested_thread_id: None,
             authenticated_thread_id: None,
+            shared_attachment: None,
             process_id: None,
             process_group_id: None,
             failed_stage: None,
@@ -4909,6 +7235,34 @@ mod tests {
             process_tree_retired: false,
         };
         attempt.validate().unwrap();
+        attempt.requested_thread_id = Some("thread-a".to_owned());
+        attempt.shared_attachment = Some(SharedStartupIdentity {
+            socket_path: "/tmp/daemon.sock".into(),
+            daemon_generation: "generation-a".to_owned(),
+            thread_id: "thread-a".to_owned(),
+            codex_home: "/tmp/codex".into(),
+        });
+        attempt.phase = ProviderStartupPhase::Attached;
+        attempt.validate().unwrap();
+        let restored: ProviderStartupAttempt =
+            serde_json::from_value(serde_json::to_value(&attempt).unwrap()).unwrap();
+        restored.validate().unwrap();
+        attempt.phase = ProviderStartupPhase::InitializationFailed;
+        attempt.failed_stage = Some(ProviderStartupStage::Initialize);
+        attempt.validate().unwrap();
+        attempt.direct_child_exit_observed = true;
+        assert!(attempt.validate().is_err());
+        attempt.direct_child_exit_observed = false;
+        attempt.phase = ProviderStartupPhase::Attached;
+        attempt.failed_stage = None;
+        attempt.process_id = Some(123);
+        assert!(attempt.validate().is_err());
+        attempt.process_id = None;
+        attempt.shared_attachment.as_mut().unwrap().thread_id = "foreign".to_owned();
+        assert!(attempt.validate().is_err());
+        attempt.shared_attachment = None;
+        attempt.requested_thread_id = None;
+        attempt.phase = ProviderStartupPhase::Intent;
         attempt.process_id = Some(123);
         attempt.process_group_id = Some(123);
         assert!(attempt.validate().is_err());
@@ -5189,6 +7543,7 @@ mod tests {
                 read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
+                shared_daemon: None,
             },
             Some(CompletionContractBinding {
                 revision: "revision-1".to_owned(),
@@ -5517,6 +7872,7 @@ mod tests {
     #[test]
     fn an_undeclared_finish_rejection_does_not_change_terminal_authority() {
         let mut state = opencode_result_state();
+        state.last_agent_message = Some("The requested answer is ready.".to_owned());
         state
             .admit_tool_call("undeclared-finish", "paperclip_finish", &json!({}))
             .unwrap_err();
@@ -5800,6 +8156,7 @@ mod tests {
                 read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
+                shared_daemon: None,
             },
             Some(CompletionContractBinding {
                 revision: "revision-1".to_owned(),
@@ -5807,20 +8164,32 @@ mod tests {
             }),
             ProviderToolBridge::default(),
         );
-        state.last_agent_message = None;
+        state.last_agent_message = Some("The actual final answer.".to_owned());
 
         let events = terminal_events(&state, "turn.completed", None);
 
-        assert_eq!(
-            events[0].payload["summary"],
-            "OpenCode completed the requested work."
-        );
+        assert_eq!(events[0].payload["summary"], "The actual final answer.");
         assert_eq!(
             events[0].payload["evidence"][0]["ref"],
             "provider:opencode:agent-message"
         );
         assert_eq!(events[1].payload["provider"], "opencode");
         assert!(!events[0].payload.to_string().contains("Codex"));
+    }
+
+    #[test]
+    fn opencode_empty_terminal_does_not_fabricate_a_successful_answer() {
+        for message in [None, Some(" \n".to_owned())] {
+            let mut state = opencode_result_state();
+            state.last_agent_message = message;
+            let events = terminal_events(&state, "turn.completed", None);
+            assert!(!events
+                .iter()
+                .any(|event| event.event_type == "run.result.proposed"));
+            assert_eq!(events[0].event_type, "session.failed");
+            assert_eq!(events[0].payload["code"], "opencode_empty_response");
+            assert_eq!(events[1].payload["runTerminalState"], "failed");
+        }
     }
 
     #[test]
@@ -5892,14 +8261,20 @@ mod tests {
                 read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
+                shared_daemon: None,
             },
             opencode_launch_profile_digest: None,
+            codex_usage: Some(CodexRunUsage::new(false)),
+            previous_accounting_origin: None,
             completion_contract: None,
             tool_bridge: ProviderToolBridge::default(),
             thread_id: Some("thread-1".to_owned()),
             provider_session_id: None,
             active_provider_turn_id: None,
             ambiguous_turn_start_pending: false,
+            shared_observation_epoch: None,
+            shared_goal_intent: None,
+            shared_bootstrap: None,
             completed_turn_authoritative: false,
             provider_process_generation: 0,
             completed_turn_process_generation: None,
@@ -5947,6 +8322,7 @@ mod tests {
                 read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
+                shared_daemon: None,
             },
             None,
             ProviderToolBridge::default(),
@@ -5991,6 +8367,7 @@ mod tests {
                 read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
+                shared_daemon: None,
             },
             Some(CompletionContractBinding {
                 revision: "1".to_owned(),
@@ -6084,6 +8461,7 @@ mod tests {
                 read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
+                shared_daemon: None,
             },
             None,
             ProviderToolBridge::default(),
@@ -6152,6 +8530,7 @@ mod tests {
                 read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
+                shared_daemon: None,
             },
             None,
             ProviderToolBridge::default(),
@@ -6203,6 +8582,7 @@ mod tests {
                 read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
+                shared_daemon: None,
             },
             None,
             ProviderToolBridge::default(),
@@ -6328,6 +8708,7 @@ mod tests {
                 read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
+                shared_daemon: None,
             },
             None,
             bridge,
@@ -6441,6 +8822,7 @@ mod tests {
                 read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
+                shared_daemon: None,
             },
             None,
             bridge,
@@ -6499,6 +8881,7 @@ mod tests {
                 read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
+                shared_daemon: None,
             },
             None,
             ProviderToolBridge::default(),
@@ -6642,6 +9025,7 @@ mod tests {
                 read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
+                shared_daemon: None,
             },
             None,
             bridge,
@@ -6684,6 +9068,7 @@ mod tests {
                 read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
+                shared_daemon: None,
             },
             None,
             ProviderToolBridge::default(),
@@ -6723,6 +9108,7 @@ mod tests {
                 read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
+                shared_daemon: None,
             },
             None,
             ProviderToolBridge::default(),
@@ -6801,6 +9187,7 @@ mod tests {
                 read_only: false,
                 include_skill_instructions: None,
                 conversation_mode: None,
+                shared_daemon: None,
             },
             None,
             ProviderToolBridge::default(),
@@ -6860,6 +9247,139 @@ mod tests {
         let mut restarted = CodexCommandExecutor::new(&directory);
         assert!(!restarted.poll_events().unwrap().is_empty());
         assert!(restarted.provider.is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn closing_session_seals_tool_admission_but_preserves_pending_calls() {
+        let directory = std::env::temp_dir().join(format!(
+            "paperclip-provider-session-close-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let operation = crate::provider_bridge::AuthorizedTool {
+            operation_id: "get_task_context".to_owned(),
+            version: 1,
+            description: "Read the active task context.".to_owned(),
+            input_schema: json!({"type": "object"}),
+            response_schema: json!({"type": "object"}),
+        };
+        let mut bridge = ProviderToolBridge::default();
+        bridge
+            .prepare(AuthorizedToolSet {
+                schema: TOOL_SET_SCHEMA.to_owned(),
+                schema_version: 1,
+                catalog_digest: authorized_tool_catalog_digest(std::slice::from_ref(&operation))
+                    .unwrap(),
+                operations: vec![operation],
+            })
+            .unwrap();
+        bridge
+            .begin_call(
+                "call-pending-close".to_owned(),
+                "get_task_context".to_owned(),
+                json!({}),
+            )
+            .unwrap();
+        let mut state = CodexProviderState::new(
+            CodexProviderConfig {
+                provider: "codex".to_owned(),
+                driver: "codex_app_server".to_owned(),
+                provider_version: "test".to_owned(),
+                command: PathBuf::from("codex"),
+                args: vec!["app-server".to_owned()],
+                cwd: std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                model: None,
+                provider_session_id: None,
+                instructions: String::new(),
+                approval_policy: "never".to_owned(),
+                externally_sandboxed: false,
+                read_only: false,
+                include_skill_instructions: None,
+                conversation_mode: None,
+                shared_daemon: None,
+            },
+            None,
+            bridge,
+        );
+        state.thread_id = Some("thread-close".to_owned());
+        state.lifecycle = "session_open".to_owned();
+        let mut executor = CodexCommandExecutor::new(&directory);
+        executor.state = Some(state);
+        executor.event_identity = Some(ProviderEventIdentity {
+            runner_instance_id: "runner-close".to_owned(),
+            run_id: "run-close".to_owned(),
+            normalized_session_id: "session-close".to_owned(),
+            turn_id: "turn-close".to_owned(),
+            item_id: "item-close".to_owned(),
+        });
+
+        let execution = executor.close_session().unwrap();
+
+        assert_eq!(execution.result["status"], "closed");
+        assert!(execution.result.get("providerExitConfirmed").is_none());
+        let state = executor.state.as_mut().unwrap();
+        assert_eq!(state.lifecycle, "closed");
+        assert!(state.tool_bridge.turn_closed());
+        assert_eq!(state.tool_bridge.pending_calls().count(), 1);
+        assert!(state
+            .tool_bridge
+            .begin_call(
+                "call-after-close".to_owned(),
+                "get_task_context".to_owned(),
+                json!({}),
+            )
+            .is_err());
+        let result = executor
+            .deliver_semantic_result(&json!({
+                "callId": "call-pending-close",
+                "operationId": "get_task_context",
+                "result": {"ok": false, "error": "recovery_read_cancelled"},
+                "isError": true,
+            }))
+            .unwrap();
+        assert_eq!(result.result["status"], "settled_after_turn");
+        let state = executor.state.as_ref().unwrap();
+        assert_eq!(state.tool_bridge.pending_calls().count(), 0);
+        assert!(state.tool_bridge.turn_closed());
+        assert!(executor.provider.is_none());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closing_owned_provider_confirms_only_joined_child_exit() {
+        let directory =
+            std::env::temp_dir().join(format!("paperclip-owned-close-{}", uuid::Uuid::new_v4()));
+        let mut config = opencode_result_state().config;
+        config.provider = "codex".into();
+        config.driver = "codex_app_server".into();
+        config.provider_version = "fake".into();
+        config.command = "/bin/sh".into();
+        config.args = vec!["-c".into(), r#"while IFS= read -r line; do case "$line" in *'"method":"initialize"'*) printf '%s\n' '{"id":1,"result":{}}';; *'"method":"thread/start"'*) printf '%s\n' '{"id":2,"result":{"thread":{"id":"fake-thread"}}}';; esac; done"#.into()];
+        config.cwd = std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        config.model = None;
+        config.provider_session_id = None;
+        config.instructions.clear();
+        config.read_only = true;
+        config.conversation_mode = None;
+        config.shared_daemon = None;
+        let provider = CodexProvider::start(&config, None).unwrap();
+        let mut executor = CodexCommandExecutor::new(&directory);
+        let mut state = CodexProviderState::new(config, None, ProviderToolBridge::default());
+        state.thread_id = Some("fake-thread".into());
+        state.lifecycle = "session_open".into();
+        executor.state = Some(state);
+        executor.provider = Some(provider);
+        let closed = executor.close_session().unwrap();
+        assert_eq!(closed.result["providerExitConfirmed"], true);
+        assert!(executor.provider.is_none());
         fs::remove_dir_all(directory).unwrap();
     }
 }

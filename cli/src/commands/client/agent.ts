@@ -82,6 +82,7 @@ interface AgentInstructionsFileOptions extends BaseClientOptions {
 
 interface AgentInstructionsFilePutOptions extends BaseClientOptions {
   path: string;
+  baseRevisionId?: string;
   content?: string;
   contentFile?: string;
   clearLegacyPromptTemplate?: boolean;
@@ -697,14 +698,17 @@ export function registerAgentCommands(program: Command): void {
       .requiredOption("--path <path>", "Bundle-relative file path")
       .option("--content <text>", "File content")
       .option("--content-file <path>", "Read file content from disk")
+      .option("--base-revision-id <uuid-or-null>", "Expected current entry revision ID (use null for an unversioned/new entry)")
       .option("--clear-legacy-prompt-template", "Clear legacy prompt template")
       .action(async (agentId: string, opts: AgentInstructionsFilePutOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
           const content = opts.contentFile ? await fs.readFile(opts.contentFile, "utf8") : opts.content;
+          if (opts.baseRevisionId === undefined) throw new Error("Read the current instruction entry and provide --base-revision-id UUID (or null for an unversioned entry)");
           const payload = upsertAgentInstructionsFileSchema.parse({
             path: opts.path,
             content,
+            baseRevisionId: opts.baseRevisionId === "null" ? null : opts.baseRevisionId,
             clearLegacyPromptTemplate: Boolean(opts.clearLegacyPromptTemplate),
           });
           const result = await ctx.api.put(apiPath`/api/agents/${agentId}/instructions-bundle/file`, payload);

@@ -2,7 +2,7 @@ import { resolveGrokDisableWebSearch } from "../drivers/acpx/grok-web-search.js"
 import { resolveGrokEffort } from "../drivers/acpx/grok-effort.js";
 import { resolveClaudeEffort } from "../drivers/acpx/claude-effort.js";
 import type { DotBindingSnapshot, MuseBindingSnapshot, ExternalBotProviderKind } from "./external-provider.js";
-import { QUALIFIED_ACPX_VERSION } from "../drivers/acpx/generated-profiles.js";
+import { QUALIFIED_ACPX_VERSION, QUALIFIED_ACPX_PROFILE_DATA } from "../drivers/acpx/generated-profiles.js";
 import { isSupportedAcpxProfileVersion, type AcpxProfileVersion } from "../drivers/acpx/profile-compatibility.js";
 import { isProviderMode } from "./provider-mode.js";
 import { createHash } from "node:crypto";
@@ -13,6 +13,9 @@ export const NATIVE_EXECUTION_INPUT_SCHEMA_V1 = "paperclip.native-execution-inpu
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V2 = "paperclip.native-execution-input.v2" as const;
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V3 = "paperclip.native-execution-input.v3" as const;
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V10 = "paperclip.native-execution-input.v10" as const;
+export const NATIVE_EXECUTION_INPUT_SCHEMA_V11 = "paperclip.native-execution-input.v11" as const;
+export const NATIVE_EXECUTION_INPUT_SCHEMA_V12 = "paperclip.native-execution-input.v12" as const;
+export const NATIVE_EXECUTION_INPUT_SCHEMA_V13 = "paperclip.native-execution-input.v13" as const;
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V9 = "paperclip.native-execution-input.v9" as const;
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V8 = "paperclip.native-execution-input.v8" as const;
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V6 = "paperclip.native-execution-input.v6" as const;
@@ -93,7 +96,11 @@ export interface NativeAwsAgentCoreProfileSnapshot {
   eventExpiryDays: 90;
 }
 
-export type NativeAcpxAgent = "pi" | "claude" | "codex" | "grok" | "cursor" | "copilot" | "antigravity";
+export type NativeAcpxAgent = keyof typeof QUALIFIED_ACPX_PROFILE_DATA;
+
+function isNativeAcpxAgent(value: unknown): value is NativeAcpxAgent {
+  return typeof value === "string" && Object.hasOwn(QUALIFIED_ACPX_PROFILE_DATA, value);
+}
 export type NativeCodexApprovalPolicy = "never" | "on-request" | "untrusted";
 export type NativeOpenCodePermissionMode = "allow" | "ask" | "deny";
 export type NativeAcpxPermissionMode = "approve-all" | "approve-paperclip" | "approve-reads" | "deny-all";
@@ -116,7 +123,7 @@ export interface NativeAcpxProfileSnapshot {
 }
 
 export type NativeProviderConfig =
-  | { kind: "codex"; model: string | null; approvalPolicy?: NativeCodexApprovalPolicy }
+  | { kind: "codex"; model: string | null; approvalPolicy?: NativeCodexApprovalPolicy; sharedDaemon?: true }
   | { kind: "opencode"; model: string; permissionMode?: NativeOpenCodePermissionMode }
   | {
       kind: "claude_managed";
@@ -148,7 +155,7 @@ export type NativeProviderConfig =
     };
 
 export type NativeProviderConfigV4 =
-  | { kind: "codex"; model: string | null; approvalPolicy: NativeCodexApprovalPolicy }
+  | { kind: "codex"; model: string | null; approvalPolicy: NativeCodexApprovalPolicy; sharedDaemon?: true }
   | { kind: "opencode"; model: string; permissionMode: NativeOpenCodePermissionMode }
   | Extract<NativeProviderConfig, { kind: "claude_managed" | "aws_agentcore" }>
   | {
@@ -210,7 +217,7 @@ export interface NativeExecutionInputV2 extends Omit<NativeExecutionInputV1, "sc
   schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA_V2;
   executionMode: NativeExecutionMode;
   task: Omit<NativeExecutionInputV1["task"], "workMode"> & {
-    workMode: "standard" | "planning" | "ask";
+    workMode: "standard" | "planning" | "ask" | "skill_test";
   };
   planningContext: NativePlanningContext | null;
 }
@@ -275,13 +282,34 @@ export interface NativeExecutionInputV10 extends Omit<NativeExecutionInputV9, "s
   provider: NativeProviderConfigV10;
 }
 
+/** Provider settings only; process identity and lease authority are supplied by the server. */
+export interface NativeExecutionInputV11 extends Omit<NativeExecutionInputV10, "schema" | "provider" | "session"> {
+  schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA_V11;
+  provider: { kind: "antigravity_headless"; model: null; cliVersion: "1.4.12" };
+  session: Omit<NativeExecutionInputV10["session"], "driverKind"> & { driverKind: "antigravity_headless" };
+}
+
+export interface NativeExecutionInputV12 extends Omit<NativeExecutionInputV10, "schema" | "provider" | "session"> {
+  schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA_V12;
+  provider: { kind: "opencode_shared_v2"; model: string; effort: string; cliVersion: "2.2.5" };
+  session: Omit<NativeExecutionInputV10["session"], "driverKind"> & { driverKind: "opencode_shared_v2" };
+}
+
+/** Genuine Claude interactive session: the server launches it, the owner keeps native input, and only an
+ * authenticated paperclip_finish/paperclip_block receipt completes the work session. */
+export interface NativeExecutionInputV13 extends Omit<NativeExecutionInputV10, "schema" | "provider" | "session"> {
+  schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA_V13;
+  provider: { kind: "claude_interactive"; model: string; effort: "low" | "medium" | "high" | "max"; autoCompactTokens: number };
+  session: Omit<NativeExecutionInputV10["session"], "driverKind"> & { driverKind: "claude_interactive_v1" };
+}
+
 export interface NativeExecutionInputV8 extends Omit<NativeExecutionInputV6, "schema" | "provider" | "session"> {
   schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA_V8;
   provider: { kind: "muse"; model: null; binding: MuseBindingSnapshot; bridgeRevision: "muse-v1" };
   session: Omit<NativeExecutionInputV6["session"], "driverKind"> & { driverKind: "muse_external" };
 }
 
-export type NativeExecutionInput = NativeExecutionInputV1 | NativeExecutionInputV2 | NativeExecutionInputV3 | NativeExecutionInputV4 | NativeExecutionInputV5 | NativeExecutionInputV6 | NativeExecutionInputV7 | NativeExecutionInputV8 | NativeExecutionInputV9 | NativeExecutionInputV10;
+export type NativeExecutionInput = NativeExecutionInputV1 | NativeExecutionInputV2 | NativeExecutionInputV3 | NativeExecutionInputV4 | NativeExecutionInputV5 | NativeExecutionInputV6 | NativeExecutionInputV7 | NativeExecutionInputV8 | NativeExecutionInputV9 | NativeExecutionInputV10 | NativeExecutionInputV11 | NativeExecutionInputV12 | NativeExecutionInputV13;
 
 /** The only task data that may enter provider-visible model input. */
 export interface NativeModelEnvelopeV1 {
@@ -423,6 +451,42 @@ function parseMuseNativeExecutionInput(input: Record<string, unknown>): NativeEx
 
 export function parseNativeExecutionInput(value: unknown): NativeExecutionInput {
   const input = record(value, "input");
+  if (input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V12) {
+    const provider = record(input.provider, "input.provider");
+    exactKeys(provider, ["kind", "model", "effort", "cliVersion"], "input.provider");
+    const session = record(input.session, "input.session");
+    if (provider.kind !== "opencode_shared_v2" || provider.cliVersion !== "2.2.5" || typeof provider.model !== "string" || !provider.model.trim() || typeof provider.effort !== "string" || !provider.effort.trim() || session.driverKind !== "opencode_shared_v2" || typeof session.normalizedSessionId !== "string" || !session.normalizedSessionId || !Array.isArray(input.credentialBindings) || input.credentialBindings.length !== 0) throw new NativeExecutionInputError("OpenCode shared v12 requires a pinned provider, explicit model and effort, session identity, and no credential bindings");
+    const common = parseNativeExecutionInput({ ...input, schema: NATIVE_EXECUTION_INPUT_SCHEMA_V10, provider: { kind: "codex", model: null, approvalPolicy: "never" }, session: { ...session, driverKind: "codex_app_server" } }) as NativeExecutionInputV10;
+    return { ...common, schema: NATIVE_EXECUTION_INPUT_SCHEMA_V12, provider: { kind: "opencode_shared_v2", model: provider.model, effort: provider.effort, cliVersion: "2.2.5" }, session: { ...common.session, driverKind: "opencode_shared_v2" } };
+  }
+  if (input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V13) {
+    const provider = record(input.provider, "input.provider");
+    exactKeys(provider, ["kind", "model", "effort", "autoCompactTokens"], "input.provider");
+    const session = record(input.session, "input.session");
+    if (provider.kind !== "claude_interactive" || typeof provider.model !== "string" || !/^[a-zA-Z0-9._-]{1,128}$/.test(provider.model) || !["low", "medium", "high", "max"].includes(String(provider.effort))
+      || !Number.isSafeInteger(provider.autoCompactTokens) || (provider.autoCompactTokens as number) < 1 || session.driverKind !== "claude_interactive_v1"
+      || typeof session.normalizedSessionId !== "string" || !session.normalizedSessionId || !Array.isArray(input.credentialBindings) || input.credentialBindings.length !== 0) {
+      throw new NativeExecutionInputError("Claude interactive v13 requires an explicit model, effort and auto-compact limit, the claude_interactive_v1 driver, a session identity, and no credential bindings");
+    }
+    const common = parseNativeExecutionInput({ ...input, schema: NATIVE_EXECUTION_INPUT_SCHEMA_V10, provider: { kind: "codex", model: null, approvalPolicy: "never" }, session: { ...session, driverKind: "codex_app_server" } }) as NativeExecutionInputV10;
+    return { ...common, schema: NATIVE_EXECUTION_INPUT_SCHEMA_V13,
+      provider: { kind: "claude_interactive", model: provider.model, effort: provider.effort as "low" | "medium" | "high" | "max", autoCompactTokens: provider.autoCompactTokens as number },
+      session: { ...common.session, driverKind: "claude_interactive_v1" } };
+  }
+  if (input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V11) {
+    const provider = record(input.provider, "input.provider");
+    exactKeys(provider, ["kind", "model", "cliVersion"], "input.provider");
+    const session = record(input.session, "input.session");
+    if (provider.kind !== "antigravity_headless" || provider.model !== null || provider.cliVersion !== "1.4.12" || session.driverKind !== "antigravity_headless" || typeof session.normalizedSessionId !== "string" || !session.normalizedSessionId || record(session.lifecyclePolicy, "input.session.lifecyclePolicy").mode !== "per_turn" || !Array.isArray(input.credentialBindings) || input.credentialBindings.length !== 0) {
+      throw new NativeExecutionInputError("Antigravity v11 requires the pinned headless provider, per-turn lifecycle, and no credential bindings");
+    }
+    const common = parseNativeExecutionInput({ ...input, schema: NATIVE_EXECUTION_INPUT_SCHEMA_V10,
+      provider: { kind: "codex", model: null, approvalPolicy: "never" },
+      session: { ...session, driverKind: "codex_app_server" } }) as NativeExecutionInputV10;
+    return { ...common, schema: NATIVE_EXECUTION_INPUT_SCHEMA_V11,
+      provider: { kind: "antigravity_headless", model: null, cliVersion: "1.4.12" },
+      session: { ...common.session, driverKind: "antigravity_headless" } };
+  }
   if (input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V8) return parseMuseNativeExecutionInput(input);
   if (input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V6) return parseExternalNativeExecutionInput(input);
   const isV10 = input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V10;
@@ -486,8 +550,8 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
   const contract = record(completionContract.contract, "input.completionContract.contract");
   exactKeys(contract, ["revision", "objective", "criteria"], "input.completionContract.contract");
 
-  if (task.workMode !== "standard" && (!isV2 || task.workMode !== "planning" && task.workMode !== "ask")) {
-    throw new NativeExecutionInputError("input.task.workMode must be standard, planning, or ask");
+  if (task.workMode !== "standard" && (!isV2 || task.workMode !== "planning" && task.workMode !== "ask" && task.workMode !== "skill_test")) {
+    throw new NativeExecutionInputError("input.task.workMode must be standard, planning, ask, or skill_test");
   }
   const executionMode: NativeExecutionMode = isV2 && input.executionMode === "plan" ? "plan" : "default";
   if (isV2 && input.executionMode !== "default" && input.executionMode !== "plan") {
@@ -709,8 +773,8 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
     if (providerModel === null) {
       throw new NativeExecutionInputError("input.provider.model is required for acpx");
     }
-    if (provider.agent !== "pi" && provider.agent !== "claude" && provider.agent !== "codex" && provider.agent !== "grok" && provider.agent !== "cursor" && provider.agent !== "copilot" && provider.agent !== "antigravity") {
-      throw new NativeExecutionInputError("input.provider.agent must be pi, claude, codex, grok, cursor, copilot, or antigravity");
+    if (!isNativeAcpxAgent(provider.agent)) {
+      throw new NativeExecutionInputError("input.provider.agent must name a registered ACPX profile");
     }
     if (isV4) {
       if (provider.permissionMode !== "approve-all" && provider.permissionMode !== "approve-paperclip" && provider.permissionMode !== "approve-reads" && provider.permissionMode !== "deny-all") {
@@ -871,7 +935,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
       // Recovery must retain those runs, so derive the same bounded model
       // prompt from their task fields instead of making them unrecoverable.
       prompt: text(task.prompt ?? task.description ?? task.title, "input.task.prompt"),
-      workMode: task.workMode as "standard" | "planning" | "ask",
+      workMode: task.workMode as "standard" | "planning" | "ask" | "skill_test",
     },
     workspace: {
       cwd: text(workspace.cwd, "input.workspace.cwd"),

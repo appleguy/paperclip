@@ -1,4 +1,5 @@
 import { notifyExternalConversationSettlement } from "../external-conversation-settlement-notifications.js";
+import { nativeSha256 } from "../native-runtime/canonical.js";
 import { conversationEventCondition, conversationEventColumns } from "./conversation-events.js";
 import { deriveTaskKey } from "./run-preparation.js";
 import { retryIdempotentDatabaseOperation } from "../../database-retry.js";
@@ -58,6 +59,17 @@ import { isUnsafeSessionWorkspaceCwd } from "../session-workspace-cwd.js";
 
 export const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON =
   "execution_review_participant_recovery";
+
+/** The caller holds the task-session row lock and has established settlement. */
+export async function retireSharedIdentity(tx: Parameters<Parameters<Db["transaction"]>[0]>[0], session: typeof agentTaskSessions.$inferSelect, nextRunId: string) {
+  const { codexSharedBootstrapV1: _bootstrap, codexSharedGoalV1: _observation, ...params } = session.sessionParamsJson ?? {};
+  await tx.update(agentTaskSessions).set({
+    sessionParamsJson: { ...params, __paperclipSharedRunFence: nextRunId },
+    sessionDisplayId: null,
+    lastRunId: nextRunId,
+    updatedAt: sql`clock_timestamp()`,
+  }).where(eq(agentTaskSessions.id, session.id));
+}
 
 const heartbeatRunProcessGroupIdColumn =
   heartbeatRuns.processGroupId ?? sql<number | null>`NULL`.as("processGroupId");
@@ -355,6 +367,9 @@ const heartbeatRunLogAccessColumns = {
   ...heartbeatRunReadAccessColumns,
   logStore: heartbeatRuns.logStore,
   logRef: heartbeatRuns.logRef,
+  runtimeMode: heartbeatRuns.runtimeMode,
+  status: heartbeatRuns.status,
+  logBytes: heartbeatRuns.logBytes,
 } as const;
 
 const heartbeatRunIssueControlColumns = {
@@ -1634,6 +1649,7 @@ export function createHeartbeatRunState(db: Db) {
     sessionDisplayId: string | null;
     lastRunId: string | null;
     lastError: string | null;
+    openCodeFinalCheckpointRevision?: string;
   }) {
     return db.transaction(async (tx) => {
       const [issue] = await tx.select().from(issues).where(and(sql`${issues.id}::text = ${input.taskKey}`, eq(issues.companyId, input.companyId))).for("update");
@@ -1641,12 +1657,40 @@ export function createHeartbeatRunState(db: Db) {
         const [run] = input.lastRunId ? await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.lastRunId)) : [];
         if (run?.status === "cancelled" || run?.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration) return null;
       }
-    const existing = await tx.select().from(agentTaskSessions).where(and(eq(agentTaskSessions.companyId, input.companyId), eq(agentTaskSessions.agentId, input.agentId), eq(agentTaskSessions.adapterType, input.adapterType), eq(agentTaskSessions.taskKey, input.taskKey))).then((rows) => rows[0] ?? null);
+    const existing = await tx.select().from(agentTaskSessions).where(and(eq(agentTaskSessions.companyId, input.companyId), eq(agentTaskSessions.agentId, input.agentId), eq(agentTaskSessions.adapterType, input.adapterType), eq(agentTaskSessions.taskKey, input.taskKey))).for("update").then((rows) => rows[0] ?? null);
+    if (existing?.sessionParamsJson && Object.hasOwn(existing.sessionParamsJson, "opencodeSharedV2") && input.openCodeFinalCheckpointRevision) {
+      const native = existing.sessionParamsJson.opencodeSharedV2;
+      const data = native && typeof native === "object" && !Array.isArray(native) ? native as Record<string, unknown> : null;
+      const checkpoint = data?.finalCheckpoint && typeof data.finalCheckpoint === "object" && !Array.isArray(data.finalCheckpoint) ? data.finalCheckpoint as Record<string, unknown> : null;
+      const [run] = input.lastRunId ? await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.lastRunId), eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.agentId))).for("update", { noWait: true }).limit(1) : [];
+      const { finalCheckpoint: _checkpoint, ...nativeState } = data ?? {};
+      if (!data || !checkpoint || checkpoint.revision !== input.openCodeFinalCheckpointRevision || checkpoint.runId !== input.lastRunId || checkpoint.stateDigest !== nativeSha256(nativeState) || existing.lastRunId !== input.lastRunId || data.taskSessionId !== existing.id || data.companyId !== input.companyId || data.agentId !== input.agentId || data.runId !== input.lastRunId || data.issueId !== issue?.id || data.projectId !== issue?.projectId || (issue?.executionRunId && issue.executionRunId !== input.lastRunId) || run?.nativeSessionId !== data.normalizedSessionId || run?.runnerInstanceId !== data.runnerInstanceId || run?.nativeIssueId !== issue?.id || run?.runtimeMode !== "native" || input.sessionParamsJson?.sessionId !== data.normalizedSessionId || input.sessionDisplayId !== data.providerSessionId) throw new Error("opencode_final_checkpoint_mismatch");
+      // The lease-held writer already saved this exact revision. Recognition
+      // deliberately performs no write after the lease has been released.
+      return existing;
+    }
+    // Generic completion writers do not carry the controller lease. Never let
+    // one erase or forge the v2 cursor / durable mutation ledger. The native
+    // OpenCode checkpoint path has its own lease-checked transaction.
+    if (existing?.sessionParamsJson && Object.hasOwn(existing.sessionParamsJson, "opencodeSharedV2") || input.sessionParamsJson && Object.hasOwn(input.sessionParamsJson, "opencodeSharedV2")) {
+      throw new Error("opencode_shared_session_requires_lease");
+    }
     if (existing) {
+      const sharedKeys = ["codexSharedBootstrapV1", "codexSharedGoalV1"] as const;
+      const previous = existing.sessionParamsJson ?? {};
+      if (typeof previous.__paperclipSharedRunFence === "string" && previous.__paperclipSharedRunFence !== input.lastRunId) return null;
+      const hasSharedIdentity = sharedKeys.some((key) => Object.hasOwn(previous, key));
+      // A late completion from the previous wake must not overwrite its successor.
+      if (hasSharedIdentity && existing.lastRunId !== input.lastRunId) return null;
+      const params = { ...(input.sessionParamsJson ?? {}) };
+      if (typeof previous.__paperclipSharedRunFence === "string") params.__paperclipSharedRunFence = previous.__paperclipSharedRunFence;
+      for (const key of sharedKeys) {
+        if (!Object.hasOwn(params, key) && Object.hasOwn(previous, key)) params[key] = previous[key];
+      }
       return tx
         .update(agentTaskSessions)
         .set({
-          sessionParamsJson: input.sessionParamsJson,
+          sessionParamsJson: hasSharedIdentity || typeof previous.__paperclipSharedRunFence === "string" ? params : input.sessionParamsJson,
           sessionDisplayId: input.sessionDisplayId,
           lastRunId: input.lastRunId,
           lastError: input.lastError,
@@ -1726,10 +1770,25 @@ export function createHeartbeatRunState(db: Db) {
           if (run?.status === "cancelled" || run?.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration) return 0;
         }
       }
+      // Generic clears have no native controller lease. Lock the same rows
+      // that would be deleted and refuse to erase a shared-host ledger.
+      const sessions = await tx.select({ params: agentTaskSessions.sessionParamsJson }).from(agentTaskSessions)
+        .where(and(...conditions)).for("update");
+      if (sessions.some(({ params }) => params && Object.hasOwn(params, "opencodeSharedV2"))) {
+        throw new Error("opencode_shared_session_requires_lease");
+      }
+      if (sessions.some(({ params }) => params && (Object.hasOwn(params, "codexSharedBootstrapV1") || Object.hasOwn(params, "codexSharedGoalV1") || Object.hasOwn(params, "__paperclipSharedRunFence")))) {
+        throw new Error("codex_shared_session_requires_recovery");
+      }
       const goals = await tx.select({ id: agentTaskSessions.id }).from(agentTaskSessions)
         .where(and(...conditions, sql`${agentTaskSessions.goalStatus} is not null`, sql`${agentTaskSessions.goalStatus} <> 'complete'`)).limit(1);
       if (goals.length) await notifyExternalConversationSettlement(tx, { companyId });
-      return tx.delete(agentTaskSessions).where(and(...conditions)).returning().then((rows) => rows.length);
+      // A matching session can be inserted after the SELECT under READ
+      // COMMITTED. Keep the deletion predicate independently safe as well.
+      return tx.delete(agentTaskSessions).where(and(...conditions,
+        sql`not (coalesce(${agentTaskSessions.sessionParamsJson}, '{}'::jsonb) ? 'opencodeSharedV2')`,
+        sql`not (coalesce(${agentTaskSessions.sessionParamsJson}, '{}'::jsonb) ?| array['codexSharedBootstrapV1', 'codexSharedGoalV1', '__paperclipSharedRunFence'])`,
+      )).returning().then((rows) => rows.length);
     });
   }
 

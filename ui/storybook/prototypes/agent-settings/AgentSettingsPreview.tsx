@@ -50,6 +50,7 @@ const descriptions: Record<AgentLocalDetailView, string> = {
   overview: "A snapshot of Nova’s work, capabilities, and current setup.",
   instructions: "The files that guide how your agent thinks and works.",
   skills: "Choose the skills your agent brings to each task.",
+  inspector: "Monitor live reasoning, tools, and engine activity.",
   runtime:
     "Configure the harness, model, environment, and how your agent runs.",
   secrets:
@@ -60,6 +61,10 @@ const descriptions: Record<AgentLocalDetailView, string> = {
   "api-keys": "Manage the keys this agent uses to authenticate with Paperclip.",
   revisions:
     "Review past configuration changes and restore an earlier version.",
+  activity: "Everything this agent did and everything done to it.",
+  runs: "Every execution of this agent, newest first.",
+  costs: "What this agent spent, by model.",
+  budgets: "This agent’s monthly budget and how much of it is used.",
 };
 type Feedback = Parameters<
   NonNullable<ComponentProps<typeof AgentConfigForm>["onTestFeedbackChange"]>

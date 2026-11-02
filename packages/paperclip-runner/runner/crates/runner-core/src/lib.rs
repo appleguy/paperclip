@@ -9,10 +9,14 @@ pub mod acpx_provider_checkpoint;
 pub mod acpx_provider_session;
 pub mod acpx_provider_state;
 pub mod acpx_sidecar_transport;
+pub mod antigravity_provider;
 pub mod aws_agentcore_provider;
 pub mod claude_managed_provider;
 pub mod codex_provider;
+#[cfg(unix)]
+pub mod codex_shared_socket;
 mod codex_startup_trust;
+mod codex_usage;
 mod configured_environment;
 mod credential_observer;
 pub mod dot_provider_backend;

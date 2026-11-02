@@ -1,4 +1,5 @@
 import { CoordinatorSidebar } from "./CoordinatorSidebar";
+import { useNativeSessionObserverAccess } from "../hooks/useNativeSessionObserverAccess";
 import { useCoordinatorWorkspaceEnabled } from "@/hooks/useCoordinatorWorkspaceEnabled";
 import {
   Inbox,
@@ -33,6 +34,7 @@ import { SidebarAgents } from "./SidebarAgents";
 import { SidebarProjects } from "./SidebarProjects";
 import { SidebarStarredProjects } from "./SidebarStarredProjects";
 import { useAgentChatEnabled } from "@/hooks/useAgentChatEnabled";
+import { useAgentChatNavigation } from "@/hooks/useAgentChatNavigation";
 import { SidebarRecentTasks } from "./SidebarRecentTasks";
 import { useDialogActions } from "../context/DialogContext";
 import { useCompany } from "../context/CompanyContext";
@@ -60,11 +62,14 @@ export function Sidebar({ children }: { children?: ReactNode }) {
 function ClassicSidebar({ children }: { children?: ReactNode }) {
   const { openNewIssue } = useDialogActions();
   const { enabled: agentChatEnabled } = useAgentChatEnabled();
+  const chatNavigation = useAgentChatNavigation();
+  const unreadChatCount = chatNavigation.chats.data?.filter(chat => chat.isUnreadForMe).length ?? 0;
   // Every labeled section is collapsible (session-scoped, default open) —
   // one policy across static nav groups and the data-driven sections.
   const [workOpen, setWorkOpen] = useState(true);
   const [organizationOpen, setOrganizationOpen] = useState(true);
   const { selectedCompanyId, selectedCompany } = useCompany();
+  const canObserveNativeSessions = useNativeSessionObserverAccess(selectedCompanyId);
   const { collapsed, peeking } = useSidebar();
   const { enabled: streamlinedUiEnabled } = useStreamlinedUiEnabled();
   const rail = collapsed && !peeking;
@@ -181,6 +186,8 @@ function ClassicSidebar({ children }: { children?: ReactNode }) {
               Cmd/Ctrl+K remains the keyboard path (command palette). */}
           <SidebarNavItem to="/search" label="Search" icon={Search} />
           <SidebarNavItem to="/dashboard" label="Dashboard" icon={LayoutDashboard} liveCount={liveRunCount} />
+          <SidebarNavItem to="/native-sessions" label="Native sessions" icon={MessagesSquare} />
+          {canObserveNativeSessions && <SidebarNavItem to="/native-sessions/claude" label="Claude sessions" icon={MessagesSquare} />}
           {!combinedInboxTasks ? (
             <SidebarNavItem
               to="/inbox"
@@ -192,7 +199,7 @@ function ClassicSidebar({ children }: { children?: ReactNode }) {
               alert={inboxBadge.failedRuns > 0}
             />
           ) : null}
-          {agentChatEnabled && !chatRail ? <SidebarNavItem to="/chats" label="Chat" icon={MessageCircle} /> : null}
+          {agentChatEnabled && !chatRail ? <SidebarNavItem to="/chats" label="Chat" icon={MessageCircle} badge={unreadChatCount} badgeLabel="unread chats" /> : null}
           {showDecisions ? (
             <SidebarNavItem
               to="/decisions"
@@ -215,7 +222,7 @@ function ClassicSidebar({ children }: { children?: ReactNode }) {
               agents you talk to live in the Chat surface's own secondary rail
               (ChatContextualSidebar), not in the primary nav. */}
           {chatRail ? (
-            <SidebarNavItem to="/chats" label="Chat" icon={MessageCircle} />
+            <SidebarNavItem to="/chats" label="Chat" icon={MessageCircle} badge={unreadChatCount} badgeLabel="unread chats" />
           ) : null}
           {/* Combined Inbox + Task List: Inbox is a view inside Tasks, so the
               unread/failed-run badge rides on Tasks. */}
