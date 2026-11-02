@@ -9678,18 +9678,19 @@ export function issueRoutes(
     if (!issue) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
     if (req.query.inspectSourceRunId !== undefined || req.query.inspectSourceActionId !== undefined) {
-      const selected = z.object({ inspectSourceRunId: z.string().uuid(), inspectSourceActionId: z.string().uuid().optional() })
+      const selected = z.object({ inspectSourceRunId: z.string().uuid().optional(), inspectSourceActionId: z.string().uuid().optional() })
+        .refine(value => value.inspectSourceRunId || value.inspectSourceActionId)
         .safeParse(req.query);
-      if (!selected.success) throw badRequest("A valid source run and optional recovery action are required.");
+      if (!selected.success) throw badRequest("A valid source run or recovery action is required.");
       const { inspectSourceRunId: runId, inspectSourceActionId: actionId } = selected.data;
       const rows = await db.select().from(issueRecoveryActions).where(and(
         eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
-        sql`${issueRecoveryActions.evidence}->>'runId' = ${runId}`,
+        runId ? sql`${issueRecoveryActions.evidence}->>'runId' = ${runId}` : undefined,
         actionId ? eq(issueRecoveryActions.id, actionId) : undefined,
       )).orderBy(desc(issueRecoveryActions.createdAt)).limit(actionId ? 1 : 20);
       if (actionId && !rows[0]) throw notFound("Recovery source not found.");
       const actions = rows.map(issueRecoveryActionReadModel);
-      const sourceInspection = actionId ? await inspectWorkspaceSource(db, {
+      const sourceInspection = actionId && runId ? await inspectWorkspaceSource(db, {
         companyId: issue.companyId, issueId: issue.id, runId, actionId,
       }) : undefined;
       res.json({ active: actions.find(action => ["active", "escalated"].includes(action.status)) ?? null,

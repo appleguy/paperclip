@@ -12,7 +12,7 @@ import * as legacy from "../heartbeat.js";
 import { createHeartbeatRunState } from "./run-state.js";
 import { pendingCaseHandoffForRun } from "./case-handoff-lifecycle.js";
 import * as extracted from "./retries.js";
-import { isLocalOpenCodeAdmissionDecline, localOpenCodeAdmissionRetryOptions } from "../local-opencode-admission-retry.js";
+import { isLocalOpenCodeAdmissionDecline, isLocalOpenCodePreInferenceRateLimit, localOpenCodeAdmissionRetryOptions } from "../local-opencode-admission-retry.js";
 import { legacyExecutionNeedsReconciliation } from "../legacy-execution-recovery.js";
 import type { HeartbeatRetryDependencies } from "./retries.js";
 
@@ -96,8 +96,36 @@ describe("local OpenCode admission retry", () => {
       "WRX80 admission declined (BUSY:external-engine); no inference sent",
       "WRX80 admission declined (BUSY:other-model-or-loading); no inference sent",
       "Mac Maya already serving another Paperclip run; no second request",
+      "OpenCode shared server has unresolved active sessions; no inference sent",
       "Mac Pro Maya-L admission refused: Model not advertised",
     ]) expect(isLocalOpenCodeAdmissionDecline({ ...busy, error })).toBe(true);
+  });
+  it("backs off a positively observed pre-inference 429, not arbitrary rate-limit text", () => {
+    const capacity = {
+      ...busy, exitCode: 1, error: "Too many requests",
+      resultJson: { adapterPreInferenceAdmission: {
+        kind: "opencode_capacity_refusal_v1", providerWorkStarted: false,
+      } },
+    };
+    expect(isLocalOpenCodePreInferenceRateLimit(capacity)).toBe(true);
+    expect(localOpenCodeAdmissionRetryOptions(capacity, () => 0)).toEqual({ maxAttempts: 6, delayMs: 150_000 });
+    expect(legacyExecutionNeedsReconciliation({
+      ...capacity, runtimeMode: "legacy", status: "failed",
+    })).toBe(false);
+    for (const failed of [
+      { ...capacity, resultJson: {} },
+      { ...capacity, resultJson: { adapterPreInferenceAdmission: { kind: "opencode_capacity_refusal_v1", providerWorkStarted: true } } },
+      { ...capacity, resultJson: { adapterPreInferenceAdmission: { kind: "other", providerWorkStarted: false } } },
+      { ...capacity, runnerProfileJson: { adapterDispatch: { adapterType: "claude_local" } } },
+      { ...capacity, exitCode: 75 },
+      { ...capacity, errorCode: "setup_failed" },
+    ]) {
+      expect(isLocalOpenCodePreInferenceRateLimit(failed)).toBe(false);
+      expect(localOpenCodeAdmissionRetryOptions(failed, () => 0)).toBeNull();
+      expect(legacyExecutionNeedsReconciliation({
+        ...failed, runtimeMode: "legacy", status: "failed",
+      })).toBe(true);
+    }
   });
   it("rejects non-local errors and post-dispatch failures", () => {
     expect(isLocalOpenCodeAdmissionDecline({ ...busy, error: "Too many requests", exitCode: 1 })).toBe(false);

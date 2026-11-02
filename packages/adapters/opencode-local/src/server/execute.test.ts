@@ -107,6 +107,31 @@ describe("OpenCode local skill injection", () => {
     expect(prompts[1]).toContain("Connection tools:");
   });
 
+  it.each([
+    ["completed tool", JSON.stringify({ type: "tool_use", sessionID: "previous", part: { state: { status: "completed", output: "wrote a file" } } })],
+    ["model text", JSON.stringify({ type: "text", sessionID: "previous", part: { text: "I already changed the workspace." } })],
+    ["model accounting", JSON.stringify({ type: "step_finish", sessionID: "previous", part: { tokens: { input: 5, output: 2 } } })],
+    ["unrecognized output", "non-JSON provider output"],
+  ])("never replays a turn after %s precedes an unknown-session failure", async (_activity, firstLine) => {
+    const commandPath = path.join(configHome, "fake-opencode-no-replay");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    runProcessMock.mockReset().mockResolvedValueOnce(probeResult({
+      exitCode: 1,
+      stdout: [firstLine, JSON.stringify({ type: "error", error: "unknown session" })].join("\n"),
+    }));
+    const result = await execute({
+      runId: "run-no-replay",
+      agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: { sessionId: "previous", sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { command: commandPath, cwd: configHome, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+      context: createPromptContextFixture(),
+      onLog: async () => {},
+    });
+    expect(runProcessMock).toHaveBeenCalledTimes(1);
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toContain("unknown session");
+  });
+
   it("injects runtime skills into the configured child HOME", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-configured-home-"));
     const processHome = path.join(root, "process-home");

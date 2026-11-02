@@ -37,6 +37,7 @@ import {
 import { serverVersion } from "../version.js";
 import { getStartupRecoveryState } from "../startup-recovery-state.js";
 import { nativeRestartRecoverySummary } from "../services/native-runtime/native-restart-recovery.js";
+import { readMonitorQuotaGauge } from "../services/monitor-quota-gauge.js";
 import {
   removeHotRestartIntent,
   writeHotRestartIntent,
@@ -427,6 +428,11 @@ export function healthRoutes(
       return;
     }
 
+    const monitorQuota = db ? await readMonitorQuotaGauge(db).catch((error) => {
+      logger.warn({ err: error }, "monitor quota gauge unavailable");
+      return undefined;
+    }) : undefined;
+
     res.json({
       status: healthStatus,
       version: serverVersion,
@@ -444,6 +450,7 @@ export function healthRoutes(
       serverInfo,
       startupRecovery,
       nativeRecovery,
+      ...(monitorQuota ? { monitorQuota } : {}),
       ...(databaseBackup ? { databaseBackup } : {}),
       ...(warnings ? { warnings } : {}),
       ...(devServer ? { devServer } : {}),

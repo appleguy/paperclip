@@ -57,6 +57,7 @@ import {
 } from "../legacy-execution-recovery.js";
 import { logger } from "../../middleware/logger.js";
 import { evaluateMonitorCoalescing, type MonitorCoalescingDecision } from "../monitor-coalescing.js";
+import { agentHourlyUsage, monitorQuotaExceeded, monitorQuotaLimits, MONITOR_HOURLY_WINDOW_MS } from "../monitor-quota-gauge.js";
 import { failRunnerGoalAction } from "../runner-goals.js";
 import { evaluateAgentInvokability } from "../agent-invokability.js";
 import { supportsUnscopedTimerHeartbeat } from "../heartbeat-policy.js";
@@ -642,7 +643,14 @@ export function createHeartbeatScheduling(
   async function postponeUnchangedIssueMonitor(
     claimed: IssueMonitorDispatchRow,
     input: { now: Date; actorType: "system" | "user" | "agent"; actorId: string },
-    decision: Extract<MonitorCoalescingDecision, { skip: true }>,
+    decision: Extract<MonitorCoalescingDecision, { skip: true }> | {
+      skip: true;
+      reason: "hourly_run_cap" | "hourly_comment_cap";
+      delayMs: number;
+      streak: number;
+      lastRunId: string;
+      usage: { runs: number; comments: number };
+    },
   ) {
     const nextCheckAt = new Date(input.now.getTime() + decision.delayMs);
     const nextCheckAtIso = nextCheckAt.toISOString();
@@ -662,13 +670,36 @@ export function createHeartbeatScheduling(
         updatedAt: input.now,
       }).where(issueMonitorClaimCondition(claimed)).returning({ id: issues.id });
       if (rows.length === 0) return false;
-      await logActivity(tx as unknown as Db, {
-        companyId: claimed.companyId, actorType: input.actorType,
-        actorId: input.actorId, action: "issue.monitor_coalesced",
-        entityType: "issue", entityId: claimed.id,
-        details: { reason: decision.reason, lastRunId: decision.lastRunId,
-          streak: decision.streak, nextCheckAt: nextCheckAtIso },
-      }, publications);
+      if ("usage" in decision) {
+        // One cap warning per agent/hour, not one per issue or scheduler tick.
+        const [alreadyLogged] = await tx.select({ id: activityLog.id })
+          .from(activityLog).where(and(
+            eq(activityLog.companyId, claimed.companyId),
+            eq(activityLog.entityType, "agent"),
+            eq(activityLog.entityId, claimed.assigneeAgentId!),
+            eq(activityLog.action, "issue.monitor_quota_paused"),
+            gte(activityLog.createdAt, new Date(Date.now() - MONITOR_HOURLY_WINDOW_MS)),
+          )).limit(1);
+        if (!alreadyLogged) {
+          await logActivity(tx as unknown as Db, {
+            companyId: claimed.companyId, actorType: input.actorType, actorId: input.actorId,
+            action: "issue.monitor_quota_paused",
+            entityType: "agent", entityId: claimed.assigneeAgentId!,
+            details: { reason: decision.reason, runs: decision.usage.runs,
+              comments: decision.usage.comments, issueId: claimed.id, nextCheckAt: nextCheckAtIso },
+          }, publications);
+          logger.warn({ agentId: claimed.assigneeAgentId, reason: decision.reason },
+            "hourly quota paused automatic issue monitor wakes");
+        }
+      } else {
+        await logActivity(tx as unknown as Db, {
+          companyId: claimed.companyId, actorType: input.actorType,
+          actorId: input.actorId, action: "issue.monitor_coalesced",
+          entityType: "issue", entityId: claimed.id,
+          details: { reason: decision.reason, lastRunId: decision.lastRunId,
+            streak: decision.streak, nextCheckAt: nextCheckAtIso },
+        }, publications);
+      }
       return true;
     });
     for (const publication of publications) publishActivity(publication);
@@ -765,6 +796,14 @@ export function createHeartbeatScheduling(
     try {
       if (input.source === "automation" && wakeReason === "issue_monitor_due" &&
           monitor?.serviceName !== PROVIDER_QUOTA_MONITOR_SERVICE_NAME) {
+        const usage = await agentHourlyUsage(db, targetAgentId, input.now);
+        const capReason = monitorQuotaExceeded(usage, monitorQuotaLimits());
+        if (capReason) {
+          return postponeUnchangedIssueMonitor(claimed, input, {
+            skip: true, reason: capReason, delayMs: MONITOR_HOURLY_WINDOW_MS,
+            streak: 0, lastRunId: "", usage,
+          });
+        }
         const coalescing = await evaluateMonitorCoalescing(db, {
           companyId: claimed.companyId, issueId: claimed.id,
           agentId: targetAgentId, now: input.now,

@@ -6,7 +6,7 @@ import { hasRequiredWorkspaceRecovery, preserveWorkspaceRestoreRecoveryMetadata,
 import { hasUnrestoredRemoteWorkspace, preserveLegacyWorkspaceRestoreSources, type LegacyWorkspaceRestoreSource } from "./legacy-workspace-restore-recovery.js";
 import { isPreDispatchReviewWaitVerified } from "./pre-dispatch-review-wait.js";
 import { isPreDispatchExecutionWaitVerified } from "./pre-dispatch-execution-wait.js";
-import { isLocalOpenCodeAdmissionDecline } from "./local-opencode-admission-retry.js";
+import { isLocalOpenCodeAdmissionDecline, isLocalOpenCodePreInferenceRateLimit } from "./local-opencode-admission-retry.js";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
 import { claimedAdapterType, hasConversationContinuationPolicy } from "./conversation-continuation.js";
@@ -77,7 +77,7 @@ export function legacyExecutionNeedsReconciliation(
       evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false) return false;
   // A wrapper-owned admission decline is before any model request. Let its
   // dedicated bounded backoff run without treating it as unknown provider work.
-  if (isLocalOpenCodeAdmissionDecline(run)) return false;
+  if (isLocalOpenCodeAdmissionDecline(run) || isLocalOpenCodePreInferenceRateLimit(run)) return false;
   if (executionFailureRetryCount(run) >= 2) return true;
   return !(
     evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false

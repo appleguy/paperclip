@@ -24,6 +24,7 @@ import { notifyDecisionTargetWork, notifyDecisionTargetIssueRemoval } from "./de
 import { assertOnboardingFirstTaskCreationAllowed, assertOnboardingFirstTaskDependenciesAllowed } from "./onboarding-first-task-admission.js";
 import { resolveConnectionIntentContinuationSource, resolveItemVerdictContinuationWake } from "./chat-interaction-continuation.js";
 import { insertIssueComment } from "./issue-comment-writes.js";
+import { hasMeaningfulIssueDelta } from "./monitor-coalescing.js";
 import { measureRunTransaction } from "./execution-transaction-timing.js";
 import { readNativeMonitorSource } from "./native-runtime/native-monitor-delivery.js";
 import { readNativeContinuationSource } from "./native-runtime/native-continuation-delivery.js";
@@ -13165,6 +13166,29 @@ export function issueService(db: Db) {
               )
             : (options?.metadata ?? null),
         );
+      // Server-owned comment discipline: a monitor/checkpoint turn cannot
+      // publish another status narrative without new issue input. The issue
+      // row is locked by the ordinary addComment transaction, so retries
+      // cannot race this decision. Preserve chat replies, external publication,
+      // attachments, historical imports and explicit operator messages.
+      if (authorType === "agent" && actor.agentId && createdByRunId &&
+          !issue.conversationAgentId && !options?.proactiveChatMessage &&
+          !options?.completionReply && !options?.authorizationReason &&
+          !options?.createdAt && !options?.presentation &&
+          (options?.attachmentIds?.length ?? 0) === 0) {
+        const [prior] = await dbOrTx.select().from(issueComments).where(and(
+          eq(issueComments.companyId, issue.companyId), eq(issueComments.issueId, issueId),
+          eq(issueComments.authorAgentId, actor.agentId), isNull(issueComments.deletedAt),
+        )).orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
+        if (prior) {
+          const monitorTurn = parseObject(createdByRun?.contextSnapshot).wakeReason === "issue_monitor_due";
+          if ((monitorTurn || prior.body === redactedBody) &&
+              !(await hasMeaningfulIssueDelta(dbOrTx as Db, issue.companyId,
+                issueId, actor.agentId, prior.createdAt))) {
+            return redactIssueComment(prior, currentUserRedactionOptions.enabled);
+          }
+        }
+      }
       let comment: typeof issueComments.$inferSelect | null = null;
       if (createdByRunId && !options?.proactiveChatMessage) {
         const existing = await dbOrTx
