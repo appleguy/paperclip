@@ -198,6 +198,11 @@ enum Command {
     Initialized {
         reply: mpsc::SyncSender<Result<(), SharedSocketError>>,
     },
+    ToolResponse {
+        call_id: String,
+        result: Value,
+        reply: mpsc::SyncSender<Result<(), SharedSocketError>>,
+    },
     Detach,
 }
 struct Pending {
@@ -216,6 +221,7 @@ pub struct SharedSocket {
     next_id: u64,
     failed: bool,
     peer: Option<ExpectedPeer>,
+    bootstrap_thread: Option<Arc<std::sync::Mutex<Option<String>>>>,
     #[cfg(test)]
     wake_count: Arc<AtomicUsize>,
 }
@@ -236,6 +242,8 @@ impl SharedSocket {
             EVENT_CAPACITY,
             EVENT_BYTES,
             None,
+            false,
+            false,
         )
     }
 
@@ -253,6 +261,48 @@ impl SharedSocket {
             EVENT_CAPACITY,
             EVENT_BYTES,
             Some(peer),
+            false,
+            false,
+        )
+    }
+
+    /// Opt-in exact-thread tool requests; authority and durable receipts remain
+    /// with the caller, and no request is answered merely by receiving it.
+    pub fn connect_authenticated_with_tools(
+        path: &Path,
+        timeout: Duration,
+        thread_id: String,
+        peer: ExpectedPeer,
+    ) -> Result<Self, SharedSocketError> {
+        Self::connect_with_limits(
+            path,
+            timeout,
+            thread_id,
+            None,
+            EVENT_CAPACITY,
+            EVENT_BYTES,
+            Some(peer),
+            true,
+            false,
+        )
+    }
+
+    /// Buffers bounded events until thread/start returns its native identity.
+    pub fn connect_bootstrap_authenticated_with_tools(
+        path: &Path,
+        timeout: Duration,
+        peer: ExpectedPeer,
+    ) -> Result<Self, SharedSocketError> {
+        Self::connect_with_limits(
+            path,
+            timeout,
+            String::new(),
+            None,
+            EVENT_CAPACITY,
+            EVENT_BYTES,
+            Some(peer),
+            true,
+            true,
         )
     }
 
@@ -264,10 +314,12 @@ impl SharedSocket {
         event_capacity: usize,
         event_limit: usize,
         peer: Option<ExpectedPeer>,
+        allow_tools: bool,
+        bootstrap: bool,
     ) -> Result<Self, SharedSocketError> {
         if !path.is_absolute()
             || timeout.is_zero()
-            || thread_id.is_empty()
+            || (thread_id.is_empty() && !bootstrap)
             || thread_id.len() > 240
             || thread_id.chars().any(char::is_control)
             || event_capacity == 0
@@ -275,6 +327,8 @@ impl SharedSocket {
         {
             return Err(SharedSocketError::InvalidInput);
         }
+        let bootstrap_thread = bootstrap.then(|| Arc::new(std::sync::Mutex::new(None::<String>)));
+        let worker_bootstrap_thread = bootstrap_thread.clone();
         let stream = UnixStream::connect(path).map_err(|_| SharedSocketError::ConnectFailed)?;
         let stream = match peer.as_ref() {
             Some(peer) => authenticate_stream(stream, peer)?,
@@ -314,6 +368,7 @@ impl SharedSocket {
         let worker = thread::spawn(move || {
             let mut socket = socket;
             let mut pending: Option<Pending> = None;
+            let mut tool_requests = std::collections::HashMap::<String, (Value, String)>::new();
             loop {
                 match rx.try_recv() {
                     Ok(Command::Detach) | Err(mpsc::TryRecvError::Disconnected) => break,
@@ -340,6 +395,37 @@ impl SharedSocket {
                             .map_err(|_| SharedSocketError::OutcomeUnknown);
                         let failed = result.is_err();
                         let _ = reply.send(result);
+                        if failed {
+                            break;
+                        }
+                    }
+                    Ok(Command::ToolResponse {
+                        call_id,
+                        result,
+                        reply,
+                    }) => {
+                        let sent =
+                            if let Some((id, request_thread)) = tool_requests.remove(&call_id) {
+                                let allowed = worker_bootstrap_thread
+                                    .as_ref()
+                                    .map(|value| {
+                                        value.lock().ok().and_then(|v| v.clone()).as_deref()
+                                            == Some(request_thread.as_str())
+                                    })
+                                    .unwrap_or(request_thread == thread_id);
+                                let frame = json!({"id":id,"result":result}).to_string();
+                                if !allowed || frame.len() > MAX_FRAME {
+                                    Err(SharedSocketError::InvalidInput)
+                                } else {
+                                    socket
+                                        .send(Message::Text(frame.into()))
+                                        .map_err(|_| SharedSocketError::OutcomeUnknown)
+                                }
+                            } else {
+                                Err(SharedSocketError::InvalidInput)
+                            };
+                        let failed = matches!(sent, Err(SharedSocketError::OutcomeUnknown));
+                        let _ = reply.send(sent);
                         if failed {
                             break;
                         }
@@ -400,9 +486,51 @@ impl SharedSocket {
                     _ => break,
                 };
                 if let Some(method) = value.get("method").and_then(Value::as_str) {
-                    let exact_thread = value.pointer("/params/threadId").and_then(Value::as_str)
-                        == Some(thread_id.as_str());
+                    let incoming_thread = value.pointer("/params/threadId").and_then(Value::as_str);
+                    let exact_thread = if let Some(binding) = worker_bootstrap_thread.as_ref() {
+                        match binding.lock().ok().and_then(|v| v.clone()) {
+                            Some(bound) => incoming_thread == Some(bound.as_str()),
+                            None => incoming_thread.is_some(),
+                        }
+                    } else {
+                        incoming_thread == Some(thread_id.as_str())
+                    };
                     if let Some(id) = value.get("id") {
+                        if allow_tools && exact_thread && method == "item/tool/call" {
+                            let call = value
+                                .pointer("/params/callId")
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty() && s.len() <= 240);
+                            let turn = value
+                                .pointer("/params/turnId")
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty() && s.len() <= 240);
+                            if let (Some(call), Some(_)) = (call, turn) {
+                                if tool_requests.len() >= event_capacity
+                                    || tool_requests.contains_key(call)
+                                {
+                                    break;
+                                }
+                                let size = text.len();
+                                if queued_bytes
+                                    .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                                        used.checked_add(size).filter(|next| *next <= event_limit)
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                tool_requests.insert(
+                                    call.to_owned(),
+                                    (id.clone(), incoming_thread.unwrap_or_default().to_owned()),
+                                );
+                                if event_tx.try_send((value, size)).is_err() {
+                                    queued_bytes.fetch_sub(size, Ordering::AcqRel);
+                                    break;
+                                }
+                            }
+                            continue;
+                        }
                         // Unknown/foreign requests never receive even a rejection.
                         let approval = matches!(
                             method,
@@ -460,6 +588,7 @@ impl SharedSocket {
             next_id: 1,
             failed: false,
             peer,
+            bootstrap_thread,
             #[cfg(test)]
             wake_count,
         })
@@ -531,18 +660,100 @@ impl SharedSocket {
             }
         }
     }
+    /// Send an already-durable semantic receipt to the matching native RPC.
+    pub fn respond_tool(&mut self, call_id: &str, result: Value) -> Result<(), SharedSocketError> {
+        if self.failed {
+            return Err(SharedSocketError::Closed);
+        }
+        if call_id.is_empty()
+            || call_id.len() > 240
+            || !result.is_object()
+            || result.to_string().len() > MAX_FRAME
+        {
+            return Err(SharedSocketError::InvalidInput);
+        }
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.commands
+            .send(Command::ToolResponse {
+                call_id: call_id.to_owned(),
+                result,
+                reply: tx,
+            })
+            .map_err(|_| SharedSocketError::Closed)?;
+        if self.wake.write_all(&[1]).is_err() {
+            self.failed = true;
+            return Err(SharedSocketError::OutcomeUnknown);
+        }
+        match rx.recv_timeout(self.timeout + Duration::from_secs(1)) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(SharedSocketError::InvalidInput)) => Err(SharedSocketError::InvalidInput),
+            _ => {
+                self.failed = true;
+                let _ = self.commands.try_send(Command::Detach);
+                let _ = self.wake.write_all(&[1]);
+                Err(SharedSocketError::OutcomeUnknown)
+            }
+        }
+    }
     pub fn receive_notification(
         &self,
         timeout: Duration,
     ) -> Result<Option<Value>, SharedSocketError> {
-        match self.events.recv_timeout(timeout) {
-            Ok((v, size)) => {
-                self.event_bytes.fetch_sub(size, Ordering::AcqRel);
-                Ok(Some(v))
+        let bound = if let Some(value) = &self.bootstrap_thread {
+            Some(
+                value
+                    .lock()
+                    .map_err(|_| SharedSocketError::Closed)?
+                    .clone()
+                    .ok_or(SharedSocketError::InvalidInput)?,
+            )
+        } else {
+            None
+        };
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self
+                .events
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            {
+                Ok((v, size)) => {
+                    self.event_bytes.fetch_sub(size, Ordering::AcqRel);
+                    // Daemon-originated MCP startup progress is neither provider work nor
+                    // owner input; a configured owner daemon emits it for every new thread.
+                    if v.get("id").is_none()
+                        && v.get("method").and_then(Value::as_str)
+                            == Some("mcpServer/startupStatus/updated")
+                    {
+                        continue;
+                    }
+                    if bound.as_ref().is_none_or(|thread| {
+                        v.pointer("/params/threadId").and_then(Value::as_str)
+                            == Some(thread.as_str())
+                    }) {
+                        return Ok(Some(v));
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => return Ok(None),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(SharedSocketError::Closed),
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(SharedSocketError::Closed),
         }
+    }
+    /// Bind exactly once after the authenticated thread/start response.
+    pub fn bind_bootstrap_thread(&mut self, thread_id: &str) -> Result<(), SharedSocketError> {
+        if thread_id.is_empty() || thread_id.len() > 240 || thread_id.chars().any(char::is_control)
+        {
+            return Err(SharedSocketError::InvalidInput);
+        }
+        let state = self
+            .bootstrap_thread
+            .as_ref()
+            .ok_or(SharedSocketError::InvalidInput)?;
+        let mut bound = state.lock().map_err(|_| SharedSocketError::Closed)?;
+        if bound.is_some() {
+            return Err(SharedSocketError::InvalidInput);
+        }
+        *bound = Some(thread_id.to_owned());
+        Ok(())
     }
     pub fn verify_peer(&self) -> Result<(), SharedSocketError> {
         let peer = self.peer.as_ref().ok_or(SharedSocketError::ConnectFailed)?;
@@ -585,6 +796,142 @@ mod tests {
     }
     fn send(ws: &mut tungstenite::WebSocket<UnixStream>, v: Value) {
         ws.send(Message::Text(v.to_string().into())).unwrap();
+    }
+    #[test]
+    fn tool_requests_are_exact_thread_and_receipt_correlated() {
+        let (path, l) = listener();
+        let server = thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            let mut ws = tungstenite::accept(s).unwrap();
+            send(
+                &mut ws,
+                json!({"id":1,"method":"item/tool/call","params":{"threadId":"foreign","turnId":"turn","callId":"foreign","tool":"tool","arguments":{}}}),
+            );
+            send(
+                &mut ws,
+                json!({"id":2,"method":"item/tool/call","params":{"threadId":"t","turnId":"turn","callId":"call","tool":"tool","arguments":{}}}),
+            );
+            let result: Value =
+                serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(result["id"], 2);
+            assert_eq!(result["result"]["success"], true);
+        });
+        let mut socket = SharedSocket::connect_with_limits(
+            &path,
+            Duration::from_secs(2),
+            "t".into(),
+            None,
+            8,
+            EVENT_BYTES,
+            None,
+            true,
+            false,
+        )
+        .unwrap();
+        let request = socket
+            .receive_notification(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(request["params"]["callId"], "call");
+        assert!(matches!(
+            socket.respond_tool("foreign", json!({"success":true,"contentItems":[]})),
+            Err(SharedSocketError::InvalidInput)
+        ));
+        socket
+            .respond_tool("call", json!({"success":true,"contentItems":[]}))
+            .unwrap();
+        assert!(socket
+            .respond_tool("call", json!({"success":true,"contentItems":[]}))
+            .is_err());
+        server.join().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+    #[test]
+    fn bootstrap_buffers_only_exact_thread_through_binding() {
+        let (path, l) = listener();
+        let server = thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            let mut ws = tungstenite::accept(s).unwrap();
+            send(
+                &mut ws,
+                json!({"id":1,"method":"item/tool/call","params":{"threadId":"foreign","turnId":"turn","callId":"foreign","tool":"tool","arguments":{}}}),
+            );
+            send(
+                &mut ws,
+                json!({"id":2,"method":"item/tool/call","params":{"threadId":"owned","turnId":"turn","callId":"call","tool":"tool","arguments":{}}}),
+            );
+            let result: Value =
+                serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(result["id"], 2);
+        });
+        let mut socket = SharedSocket::connect_with_limits(
+            &path,
+            Duration::from_secs(2),
+            String::new(),
+            None,
+            8,
+            EVENT_BYTES,
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(50));
+        socket.bind_bootstrap_thread("owned").unwrap();
+        assert!(socket.bind_bootstrap_thread("foreign").is_err());
+        let request = socket
+            .receive_notification(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(request["params"]["callId"], "call");
+        assert!(socket
+            .respond_tool("foreign", json!({"success":true,"contentItems":[]}))
+            .is_err());
+        socket
+            .respond_tool("call", json!({"success":true,"contentItems":[]}))
+            .unwrap();
+        server.join().unwrap();
+        let _ = std::fs::remove_file(path);
+    }
+    #[test]
+    fn mcp_startup_status_is_not_an_observed_notification() {
+        let (path, l) = listener();
+        let server = thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            let mut ws = tungstenite::accept(s).unwrap();
+            send(
+                &mut ws,
+                json!({"method":"mcpServer/startupStatus/updated","params":{"threadId":"owned","name":"x","status":"starting"}}),
+            );
+            send(
+                &mut ws,
+                json!({"method":"thread/status/changed","params":{"threadId":"owned"}}),
+            );
+            let _ = ws.read();
+        });
+        let socket = SharedSocket::connect_with_limits(
+            &path,
+            Duration::from_secs(2),
+            String::new(),
+            None,
+            8,
+            EVENT_BYTES,
+            None,
+            true,
+            true,
+        )
+        .unwrap();
+        thread::sleep(Duration::from_millis(50));
+        let mut socket = socket;
+        socket.bind_bootstrap_thread("owned").unwrap();
+        let first = socket
+            .receive_notification(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(first["method"], "thread/status/changed");
+        drop(socket);
+        server.join().unwrap();
+        let _ = std::fs::remove_file(path);
     }
     #[test]
     fn idle_events_and_approval_admission_scope() {
@@ -788,6 +1135,8 @@ mod tests {
             8,
             limit,
             None,
+            false,
+            false,
         )
         .unwrap();
         server.join().unwrap();

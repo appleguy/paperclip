@@ -417,6 +417,138 @@ pub struct SharedDaemonConfig {
     pub codex_home: PathBuf,
     #[serde(default)]
     pub peer: Option<ExpectedPeer>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub writer: Option<SharedDaemonWriter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_id: Option<String>,
+}
+
+/// A server-issued grant bound to the existing durable PRP run, not a Codex credential.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SharedDaemonWriter {
+    pub run_id: String,
+    pub normalized_session_id: String,
+    pub runner_instance_id: String,
+    pub grant_id: String,
+    pub epoch: u64,
+    pub observation_epoch_id: String,
+    /// Only a server-verified managed-thread bootstrap may enable tool calls.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub managed_tools: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_bootstrap_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Thread-local configuration, independently bound by the server to the admitted launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_config: Option<serde_json::Map<String, Value>>,
+}
+
+/// Shell commands inherit nothing from the shared daemon's environment: only the listed names and the explicit set values.
+fn shared_shell_environment_policy_valid(policy: &Value) -> bool {
+    let Some(policy) = policy.as_object() else { return false };
+    policy.get("inherit") == Some(&json!("none"))
+        && policy.keys().all(|k| matches!(k.as_str(), "inherit" | "ignore_default_excludes" | "include_only" | "set"))
+        && policy.get("ignore_default_excludes").is_none_or(Value::is_boolean)
+        && policy.get("include_only").is_none_or(|v| v.as_array().is_some_and(|names| names.len() <= 64 && names.iter().all(Value::is_string)))
+        && policy.get("set").is_none_or(|v| v.as_object().is_some_and(|set| set.len() <= 64 && set.values().all(Value::is_string)))
+}
+
+pub const SHARED_WRITABLE_PROFILE: &str = "paperclip-runner-workspace-only";
+pub const SHARED_READ_ONLY_PROFILE: &str = "paperclip-runner-workspace-read-only";
+
+impl SharedDaemonWriter {
+    fn thread_config_valid(&self, cwd: &str, read_only: bool) -> bool {
+        let cwd_path = std::path::Path::new(cwd);
+        if !cwd_path.is_absolute()
+            || cwd_path == std::path::Path::new("/")
+            || cwd_path.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+        {
+            return false;
+        }
+        let Some(config) = self.thread_config.as_ref() else {
+            return false;
+        };
+        if config
+            .keys()
+            .any(|k| k != "permissions" && k != "web_search" && k != "shell_environment_policy")
+            || config.get("web_search").is_some_and(|v| v != "disabled")
+            || !config
+                .get("shell_environment_policy")
+                .is_some_and(shared_shell_environment_policy_valid)
+        {
+            return false;
+        }
+        let Some(profiles) = config.get("permissions").and_then(Value::as_object) else {
+            return false;
+        };
+        if profiles.len() != 2 {
+            return false;
+        }
+        for (name, mode) in [
+            (SHARED_WRITABLE_PROFILE, "write"),
+            (SHARED_READ_ONLY_PROFILE, "read"),
+        ] {
+            let Some(profile) = profiles.get(name).and_then(Value::as_object) else {
+                return false;
+            };
+            if profile.keys().any(|k| k != "filesystem" && k != "network") {
+                return false;
+            }
+            let Some(fs) = profile.get("filesystem").and_then(Value::as_object) else {
+                return false;
+            };
+            if fs.len() > 256
+                || fs.get(":root") != Some(&json!("none"))
+                || fs.get(":minimal") != Some(&json!("read"))
+                || fs.get(":tmpdir") != Some(&json!("none"))
+                || fs.get(":workspace_roots") != Some(&json!({".": mode}))
+            {
+                return false;
+            }
+            for (path, value) in fs {
+                if path.starts_with(':') {
+                    if !matches!(
+                        path.as_str(),
+                        ":root" | ":minimal" | ":tmpdir" | ":workspace_roots"
+                    ) {
+                        return false;
+                    }
+                } else {
+                    let p = std::path::Path::new(path);
+                    if !p.is_absolute()
+                        || (p == std::path::Path::new("/") && value != "none")
+                        || path.len() > 4096
+                        || path.chars().any(char::is_control)
+                        || p.components().any(|c| {
+                            matches!(
+                                c,
+                                std::path::Component::ParentDir | std::path::Component::CurDir
+                            )
+                        })
+                        || !matches!(value.as_str(), Some("none" | "read" | "write"))
+                        || (value == "write"
+                            && (read_only || mode == "read" || !p.starts_with(cwd)))
+                    {
+                        return false;
+                    }
+                }
+            }
+            let Some(network) = profile.get("network").and_then(Value::as_object) else {
+                return false;
+            };
+            if network.len() != 1 || !network.get("enabled").is_some_and(Value::is_boolean) {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -509,18 +641,53 @@ impl CodexProviderConfig {
 
     pub fn validate(&self) -> Result<(), LocalRunnerError> {
         if let Some(shared) = &self.shared_daemon {
+            let bootstrap = shared.bootstrap_id.as_deref();
             if self.provider != "codex"
-                || !self.read_only
+                || (!self.read_only && bootstrap.is_none())
                 || !shared.socket_path.is_absolute()
                 || !shared.codex_home.is_absolute()
                 || shared.daemon_generation.is_empty()
                 || shared.daemon_generation.len() > 240
-                || shared.thread_id.is_empty()
+                || (shared.thread_id.is_empty() && bootstrap.is_none())
                 || shared.thread_id.len() > 240
-                || self.provider_session_id.as_deref() != Some(shared.thread_id.as_str())
+                || (bootstrap.is_none()
+                    && self.provider_session_id.as_deref() != Some(shared.thread_id.as_str()))
+                || (bootstrap.is_some()
+                    && (!shared.thread_id.is_empty()
+                        || self.provider_session_id.is_some()
+                        || self.model.is_none()
+                        || self.instructions.is_empty()
+                        || shared.writer.as_ref().is_none_or(|w| {
+                            !w.managed_tools
+                                || w.managed_bootstrap_id.as_deref() != bootstrap
+                                || !matches!(
+                                    w.reasoning_effort.as_deref(),
+                                    Some("minimal" | "low" | "medium" | "high" | "xhigh" | "ultra")
+                                )
+                                || !w.thread_config_valid(&self.cwd, self.read_only)
+                        })))
                 || !self.args.is_empty()
-                || !self.instructions.is_empty()
-                || self.model.is_some()
+                || (bootstrap.is_none() && (!self.instructions.is_empty() || self.model.is_some()))
+                || shared.writer.as_ref().is_some_and(|writer| {
+                    (writer.managed_tools
+                        && writer.managed_bootstrap_id.as_ref().is_none_or(|id| {
+                            id.is_empty() || id.len() > 128 || id.chars().any(char::is_control)
+                        }))
+                        || writer.epoch == 0
+                        || [
+                            &writer.run_id,
+                            &writer.normalized_session_id,
+                            &writer.runner_instance_id,
+                            &writer.grant_id,
+                            &writer.observation_epoch_id,
+                        ]
+                        .iter()
+                        .any(|value| {
+                            value.is_empty()
+                                || value.len() > 240
+                                || value.chars().any(char::is_control)
+                        })
+                })
                 || shared.peer.as_ref().is_none_or(|peer| {
                     peer.pid == 0
                         || peer.executable.as_os_str().is_empty()
@@ -3497,7 +3664,7 @@ fn retain_pending_runtime_request_bytes(current: usize, incoming: usize) -> Opti
         .filter(|total| *total <= MAX_PENDING_RUNTIME_REQUEST_BYTES)
 }
 
-fn codex_dynamic_tools(
+pub(crate) fn codex_dynamic_tools(
     authorized_tools: impl IntoIterator<Item = AuthorizedTool>,
 ) -> Result<(Vec<Value>, BTreeSet<String>), LocalRunnerError> {
     let mut dynamic_tools = Vec::new();
@@ -4321,6 +4488,63 @@ fn codex_question_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_thread_config_rejects_widening_and_general_configuration() {
+        let make = |config: Value| {
+            serde_json::from_value::<SharedDaemonWriter>(json!({
+                "runId":"r", "normalizedSessionId":"s", "runnerInstanceId":"i", "grantId":"g",
+                "epoch":1, "observationEpochId":"o", "threadConfig":config
+            }))
+            .unwrap()
+        };
+        let mut config = json!({"permissions": {
+            SHARED_WRITABLE_PROFILE: {"filesystem":{":root":"none",":minimal":"read",":tmpdir":"none",":workspace_roots":{".":"write"}},"network":{"enabled":false}},
+            SHARED_READ_ONLY_PROFILE: {"filesystem":{":root":"none",":minimal":"read",":tmpdir":"none",":workspace_roots":{".":"read"}},"network":{"enabled":false}}
+        }, "web_search":"disabled", "shell_environment_policy": {"inherit":"none","ignore_default_excludes":false,"include_only":["PATH"],"set":{"PATH":"/usr/bin:/bin"}}});
+        assert!(make(config.clone()).thread_config_valid("/workspace", false));
+        for env in [json!({"inherit":"all"}), json!({"inherit":"none","include_only":[1]}), json!({"inherit":"none","unknown":true})] {
+            let mut widened = config.clone();
+            widened["shell_environment_policy"] = env;
+            assert!(!make(widened).thread_config_valid("/workspace", false));
+        }
+        let mut no_env = config.clone();
+        no_env.as_object_mut().unwrap().remove("shell_environment_policy");
+        assert!(!make(no_env).thread_config_valid("/workspace", false));
+        for (pointer, value) in [
+            (
+                "/permissions/paperclip-runner-workspace-only/filesystem/:root",
+                json!("write"),
+            ),
+            (
+                "/permissions/paperclip-runner-workspace-only/filesystem/:workspace_roots",
+                json!({"/":"write"}),
+            ),
+            (
+                "/permissions/paperclip-runner-workspace-only/network/enabled",
+                json!("yes"),
+            ),
+            ("/web_search", json!("live")),
+        ] {
+            let mut changed = config.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            assert!(!make(changed).thread_config_valid("/workspace", false));
+        }
+        let mut foreign = config.clone();
+        foreign["permissions"][SHARED_WRITABLE_PROFILE]["filesystem"]["/outside"] = json!("write");
+        assert!(!make(foreign).thread_config_valid("/workspace", false));
+        let mut root = config.clone();
+        root["permissions"][SHARED_WRITABLE_PROFILE]["filesystem"]["/"] = json!("read");
+        assert!(!make(root).thread_config_valid("/workspace", false));
+        let mut unknown = config.clone();
+        unknown["permissions"][SHARED_WRITABLE_PROFILE]["extra"] = json!(true);
+        assert!(!make(unknown).thread_config_valid("/workspace", false));
+        let mut model = config.clone();
+        model["model"] = json!("other");
+        assert!(!make(model).thread_config_valid("/workspace", false));
+        config["model_reasoning_effort"] = json!("high");
+        assert!(!make(config).thread_config_valid("/workspace", false));
+    }
 
     #[test]
     #[cfg(unix)]
