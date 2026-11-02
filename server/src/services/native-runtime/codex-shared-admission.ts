@@ -12,6 +12,8 @@ import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 
 const record=(value:unknown):Record<string,unknown>=>value && typeof value==="object" && !Array.isArray(value) ? value as Record<string,unknown> : {};
 const digest=(value:unknown)=>createHash("sha256").update(JSON.stringify(value,(_key,item:unknown)=>item && typeof item==="object" && !Array.isArray(item) ? Object.fromEntries(Object.entries(item).sort(([a],[b])=>a.localeCompare(b))) : item)).digest("hex");
+/** The display name may change between wakes; it is not part of the admitted configuration. */
+const withoutThreadName=(template:Record<string,unknown>):Record<string,unknown>=>{const provider=record(template.provider),shared=record(provider.sharedDaemon);if (!("threadName" in shared)) return template;const {threadName:_name,...rest}=shared;return {...template,provider:{...provider,sharedDaemon:rest}};};
 
 /** Paperclip's model and configuration fingerprints are not provider sessions. */
 export function hasCodexSharedSessionIdentity(session: {sessionDisplayId: string | null; sessionParamsJson: unknown; goalJson: unknown}): boolean {
@@ -47,7 +49,7 @@ export function createCodexSharedAdmission(input:{db:Db;binding:CodexSharedGoalB
       // The runner may not generate, widen or edit the thread policy: it must equal the server's, byte for byte in meaning.
       if (!isDeepStrictEqual(writer.threadConfig,launch.threadConfig)) throw new Error("codex_shared_thread_config_mismatch");
       await input.attestDaemon();
-      const value=digest(request.runAttachTemplate);
+      const value=digest(withoutThreadName(request.runAttachTemplate));
       if (await beginCodexManagedThreadBootstrap(input.db,initial,{bootstrapId:input.bootstrapId,configurationDigest:value})!=="fresh") throw new Error("codex_shared_bootstrap_outcome_unknown");
       configurationDigest=value;
     },
@@ -74,13 +76,13 @@ export function createCodexSharedAdmission(input:{db:Db;binding:CodexSharedGoalB
 export type CodexSharedAdmission = ReturnType<typeof createCodexSharedAdmission>;
 export type CodexSharedServerOption = {
   environmentLeaseId:string;
-  daemon:{socketPath:string;daemonGeneration:string;threadId:string;codexHome:string;bootstrapId:string;peer:{pid:number;startSeconds:number;startMicroseconds:number;executable:string};writer:{runId:string;normalizedSessionId:string;runnerInstanceId:string;grantId:string;epoch:number;observationEpochId:string;managedTools:true;managedBootstrapId:string;reasoningEffort:string;threadConfig:Record<string,unknown>}};
+  daemon:{socketPath:string;daemonGeneration:string;threadId:string;codexHome:string;threadName?:string;bootstrapId:string;peer:{pid:number;startSeconds:number;startMicroseconds:number;executable:string};writer:{runId:string;normalizedSessionId:string;runnerInstanceId:string;grantId:string;epoch:number;observationEpochId:string;managedTools:true;managedBootstrapId:string;reasoningEffort:string;threadConfig:Record<string,unknown>}};
   admission:CodexSharedAdmission;
   attestDaemon():Promise<void>;
 };
 
 /** Claim a fresh task session for an explicitly selected, already registered daemon. */
-export async function claimRegisteredCodexSharedOption(input:{db:Db;companyId:string;agentId:string;issueId:string;runId:string;normalizedSessionId:string;runnerInstanceId:string;executionWorkspaceId:string;model:string;effort:string;leaseOwner:string;leaseAttempt:number;controller:{bootId:string;pid:number;processStartedAt:Date};delegationGrantId:string;hostId:string;codexExecutable:string;codexHome:string;runnerExecutable:string;home:string;launch:CodexSharedLaunchContract}):Promise<CodexSharedServerOption> {
+export async function claimRegisteredCodexSharedOption(input:{db:Db;companyId:string;agentId:string;issueId:string;runId:string;normalizedSessionId:string;runnerInstanceId:string;executionWorkspaceId:string;model:string;effort:string;leaseOwner:string;leaseAttempt:number;controller:{bootId:string;pid:number;processStartedAt:Date};delegationGrantId:string;hostId:string;codexExecutable:string;codexHome:string;runnerExecutable:string;home:string;launch:CodexSharedLaunchContract;threadName?:string}):Promise<CodexSharedServerOption> {
   if (!input.model || !["minimal","low","medium","high","xhigh","ultra"].includes(input.effort)) throw new Error("codex_shared_model_effort_invalid");
   const daemon=await inspectCodexSharedDaemon(input);
   const processGeneration=digest({daemonGeneration:daemon.daemonGeneration,peer:daemon.peer});
@@ -107,7 +109,7 @@ export async function claimRegisteredCodexSharedOption(input:{db:Db;companyId:st
 }
 
 /** Concrete server factory: peer identity comes from Runner's OS inspection. */
-export async function createAttestedCodexSharedOption(input:{db:Db;binding:Omit<CodexSharedGoalBinding,"threadId"|"processGeneration"|"protocolVersion">;bootstrapId:string;observationEpochId:string;launch:CodexSharedLaunchContract;codexExecutable:string;codexHome:string;runnerExecutable:string;home:string}):Promise<CodexSharedServerOption> {
+export async function createAttestedCodexSharedOption(input:{db:Db;binding:Omit<CodexSharedGoalBinding,"threadId"|"processGeneration"|"protocolVersion">;bootstrapId:string;observationEpochId:string;launch:CodexSharedLaunchContract;threadName?:string;codexExecutable:string;codexHome:string;runnerExecutable:string;home:string}):Promise<CodexSharedServerOption> {
   if (!input.binding.model || !["minimal","low","medium","high","xhigh","ultra"].includes(input.binding.effort)) throw new Error("codex_shared_model_effort_invalid");
   const inspect=()=>inspectCodexSharedDaemon({codexExecutable:input.codexExecutable,codexHome:input.codexHome,runnerExecutable:input.runnerExecutable,home:input.home});
   const daemon=await inspect();
@@ -116,5 +118,5 @@ export async function createAttestedCodexSharedOption(input:{db:Db;binding:Omit<
   await preflightCodexManagedThreadBootstrap(input.db,binding);
   const attestDaemon=async()=>{if (digest(await inspect())!==digest(daemon)) throw new Error("codex_shared_daemon_identity_changed");};
   const admission=createCodexSharedAdmission({...input,binding,attestDaemon});
-  return {environmentLeaseId:input.binding.environmentLeaseId!,daemon:{socketPath:daemon.socketPath,daemonGeneration:daemon.daemonGeneration,codexHome:daemon.codexHome,threadId:"",bootstrapId:input.bootstrapId,peer:daemon.peer,writer:{runId:input.binding.runId,normalizedSessionId:input.binding.normalizedSessionId,runnerInstanceId:input.binding.runnerInstanceId,grantId:input.binding.writerGrantId,epoch:input.binding.writerEpoch,observationEpochId:input.observationEpochId,managedTools:true,managedBootstrapId:input.bootstrapId,reasoningEffort:input.binding.effort,threadConfig:structuredClone(input.launch.threadConfig)}},admission,attestDaemon};
+  return {environmentLeaseId:input.binding.environmentLeaseId!,daemon:{socketPath:daemon.socketPath,daemonGeneration:daemon.daemonGeneration,codexHome:daemon.codexHome,threadId:"",bootstrapId:input.bootstrapId,...(input.threadName?{threadName:input.threadName}:{}),peer:daemon.peer,writer:{runId:input.binding.runId,normalizedSessionId:input.binding.normalizedSessionId,runnerInstanceId:input.binding.runnerInstanceId,grantId:input.binding.writerGrantId,epoch:input.binding.writerEpoch,observationEpochId:input.observationEpochId,managedTools:true,managedBootstrapId:input.bootstrapId,reasoningEffort:input.binding.effort,threadConfig:structuredClone(input.launch.threadConfig)}},admission,attestDaemon};
 }

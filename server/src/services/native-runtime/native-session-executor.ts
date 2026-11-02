@@ -264,6 +264,7 @@ import { noteNativeRunnerEvidence } from "./native-runner-evidence-signal.js";
 import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
 import { registerLiveRunnerGoalController } from "../runner-goal-control-broker.js";
 import { registerCodexSharedGoalController } from "./codex-shared-goal-controller.js";
+import { buildCodexSharedThreadName } from "./codex-shared-thread-name.js";
 import { claimRegisteredCodexSharedOption, type CodexSharedServerOption } from "./codex-shared-admission.js";
 import { resolveCurrentCodexSharedRegistration } from "./codex-shared-registration.js";
 import { nativeSystemInstructions, codexSemanticToolSpecs, authorizedToolSetForProvider } from "../../vendor/paperclip-runner/index.js";
@@ -12864,7 +12865,10 @@ async function createRunnerdBackendWithinSessionClaim(
     if (!sharedPath) throw new Error("codex_shared_registration_unavailable");
     const sharedWebSearchDisabled="webSearch" in provider && provider.webSearch==="disabled";
     const sharedThreadConfig=createSharedCodexThreadConfig({cwd:input.execution.workspace.cwd,readOnly:sharedReadOnly,webSearchDisabled:sharedWebSearchDisabled,networkAccess:input.runnerEnvironment?.PAPERCLIP_RUNNER_NETWORK_ACCESS==="enabled",codexHome,codexExecutable,path:sharedPath,agentHome:sharedRuntimeContext?.instructions.workingCopy?.rootPath,runtimeReadRoots:sharedRuntimeContext?[resolve(codexHome,"skills"),sharedRuntimeContext.instructions.bundle.rootPath,...(sharedRuntimeContext.instructions.workingCopy?[sharedRuntimeContext.instructions.workingCopy.rootPath]:[]),...sharedRuntimeContext.skills.map(skill=>skill.bundle.rootPath)]:[]});
-    const option=await claimRegisteredCodexSharedOption({db:input.db,companyId:binding.companyId,agentId:binding.agentId,issueId:binding.issueId,runId:binding.runId,normalizedSessionId:nativeSessionKey(input.execution),runnerInstanceId:input.runnerInstanceId,executionWorkspaceId:binding.executionWorkspaceId,model:provider.model,effort:provider.reasoningEffort,leaseOwner:lease.owner,leaseAttempt:lease.attempt,controller:lease.controller,delegationGrantId:grant,hostId,codexExecutable,codexHome,home,runnerExecutable:resolvePaperclipRunnerBinary(),launch:{cwd:input.execution.workspace.cwd,instructions:nativeSystemInstructions(input.execution),approvalPolicy:"never",readOnly:sharedReadOnly,webSearchDisabled:sharedWebSearchDisabled,threadConfig:sharedThreadConfig,authorizedTools:authorizedToolSetForProvider("codex",[...dynamicTools,...codexSemanticToolSpecs()])}});
+    const sharedAgentName=await input.db.select({name:agents.name}).from(agents).where(and(eq(agents.id,binding.agentId),eq(agents.companyId,binding.companyId))).limit(1).then(rows=>rows[0]?.name ?? "Agent");
+    const sharedTask=input.execution.task;
+    const sharedThreadName=buildCodexSharedThreadName({agentName:sharedAgentName,runId:binding.runId,issue:sharedTask.identifier?{identifier:sharedTask.identifier,title:sharedTask.title ?? ""}:null});
+    const option=await claimRegisteredCodexSharedOption({db:input.db,companyId:binding.companyId,agentId:binding.agentId,issueId:binding.issueId,runId:binding.runId,normalizedSessionId:nativeSessionKey(input.execution),runnerInstanceId:input.runnerInstanceId,executionWorkspaceId:binding.executionWorkspaceId,model:provider.model,effort:provider.reasoningEffort,leaseOwner:lease.owner,leaseAttempt:lease.attempt,controller:lease.controller,delegationGrantId:grant,hostId,codexExecutable,codexHome,home,runnerExecutable:resolvePaperclipRunnerBinary(),launch:{cwd:input.execution.workspace.cwd,instructions:nativeSystemInstructions(input.execution),approvalPolicy:"never",readOnly:sharedReadOnly,webSearchDisabled:sharedWebSearchDisabled,threadConfig:sharedThreadConfig,authorizedTools:authorizedToolSetForProvider("codex",[...dynamicTools,...codexSemanticToolSpecs()])},threadName:sharedThreadName});
     input={...input,codexShared:option};
     lease.onAdmitted(option);
   }

@@ -421,6 +421,9 @@ pub struct SharedDaemonConfig {
     pub writer: Option<SharedDaemonWriter>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bootstrap_id: Option<String>,
+    /// Display name only: sent best-effort after thread creation, never part of thread identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_name: Option<String>,
 }
 
 /// A server-issued grant bound to the existing durable PRP run, not a Codex credential.

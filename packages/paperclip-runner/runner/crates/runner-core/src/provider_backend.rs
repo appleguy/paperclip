@@ -2767,6 +2767,10 @@ impl CodexCommandExecutor {
                 "shared bootstrap socket changed",
             ));
         }
+        if let Some(name) = shared.thread_name.as_deref().map(str::trim).filter(|n| !n.is_empty() && n.chars().count() <= 200 && !n.chars().any(char::is_control)) {
+            // Cosmetic and best-effort: a rejected rename must never fail the run.
+            let _ = socket.request("thread/name/set", json!({"threadId":thread,"name":name}));
+        }
         socket
             .bind_bootstrap_thread(&thread)
             .map_err(|_| DurableRunnerError::invalid("shared bootstrap thread binding failed"))?;
