@@ -11,7 +11,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import {
-  buildPaperclipEnv, DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+  DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   joinPromptSections, renderTemplate, selectPaperclipPromptSections,
 } from "@paperclipai/adapter-utils/server-utils";
 
@@ -27,6 +27,9 @@ function asString(v: unknown, fallback: string): string {
 export function normalizeOneLine(value: string): string {
   // tmux paste-buffer with embedded newlines submits partial TUI prompts.
   return value.replace(/[\r\n\t]+/g, " ").replace(/\s{2,}/g, " ").trim();
+}
+export function pasteSettleMs(charCount: number): number {
+  return Math.min(3000, Math.max(350, 500 + Math.ceil(charCount / 1500) * 300));
 }
 export function parseRemoteUrl(screen: string): string | null {
   return screen.match(/https:\/\/antigravity\.google\.com\/r\/[a-zA-Z0-9-]+/)?.[0] ?? null;
@@ -72,6 +75,9 @@ async function send(socket: string, session: string, message: string, stateDir: 
   try {
     await tmux(socket, ["load-buffer", file]);
     await tmux(socket, ["paste-buffer", "-d", ...target(session)]);
+    // agy 1.4.12 processes long bracketed-paste input asynchronously. Sending
+    // Enter immediately can leave the entire issue prompt in its editor.
+    await sleep(pasteSettleMs(message.length));
     await tmux(socket, ["send-keys", ...target(session), "Enter"]);
   } finally {
     await fs.rm(file, { force: true });
@@ -149,18 +155,28 @@ async function deliver(ctx: AdapterExecutionContext, receipt: Receipt): Promise<
   // Paperclip-owned run-scoped auth stays entirely inside the server adapter.
   // The live agy TUI sees only an issue ID and receipt path, NEVER the token.
   if (!ctx.authToken) throw new Error("missing scoped agent token for report/closure");
-  const env = buildPaperclipEnv(ctx.agent, ctx.agentIdentity);
-  const api = new URL(env.PAPERCLIP_API_URL);
-  if (!["http:", "https:"].includes(api.protocol)) throw new Error("unsupported Paperclip API protocol");
+  // This adapter runs inside the same local Paperclip server process. Use the
+  // private loopback listener instead of the public HTTPS URL, whose local
+  // self-signed certificate is intentionally untrusted by Node fetch.
+  const port = Number(process.env.PAPERCLIP_LISTEN_PORT ?? process.env.PORT ?? "3100");
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("invalid local Paperclip listen port");
+  const api = new URL(`http://127.0.0.1:${port}`);
   const issue = encodeURIComponent(receipt.issueId);
   const invoke = async (method: string, suffix: string, body: unknown) => {
     const url = new URL(`/api/issues/${issue}${suffix}`, api);
-    const response = await fetch(url, {
-      method, redirect: "manual",
-      headers: { Authorization: `Bearer ${ctx.authToken}`, "X-Paperclip-Run-Id": ctx.runId, "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(15_000),
-    });
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        method, redirect: "manual",
+        headers: { Authorization: `Bearer ${ctx.authToken}`, "X-Paperclip-Run-Id": ctx.runId, "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(15_000),
+      });
+    } catch (error) {
+      const cause = error && typeof error === "object" && "cause" in error && error.cause instanceof Error
+        ? `: ${error.cause.message}` : "";
+      throw new Error(`Paperclip local ${method} ${suffix} network failed${cause}`);
+    }
     if (!response.ok) throw new Error(`Paperclip ${method} ${suffix} returned HTTP ${response.status}`);
   };
   await invoke("PUT", "/documents/report", {

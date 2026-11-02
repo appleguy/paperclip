@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isIdleScreen, normalizeOneLine, parseReceipt, parseRemoteUrl, parseRemoteConversationId } from "./execute.js";
+import { isIdleScreen, normalizeOneLine, parseReceipt, parseRemoteUrl, parseRemoteConversationId, pasteSettleMs } from "./execute.js";
 
 describe("agy single-RC dispatch safety", () => {
   it("parses shared /r/ base URL and drops conversation query", () => {
@@ -20,6 +20,12 @@ describe("agy single-RC dispatch safety", () => {
 
   it("forbids newline submissions that send early TUI turns", () => {
     expect(normalizeOneLine("first line\nsecond line\tthird")).toBe("first line second line third");
+  });
+
+  it("delays Enter to let long pasted prompts settle in the agy editor", () => {
+    expect(pasteSettleMs(10)).toBe(800);
+    expect(pasteSettleMs(12000)).toBe(2900);
+    expect(pasteSettleMs(20000)).toBe(3000);
   });
 
   it("recognizes idle vs generating TUI screens", () => {
