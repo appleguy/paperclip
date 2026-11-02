@@ -87,14 +87,22 @@ export class ClaudeInteractiveSession {
           launch={...launch,args};
         }
         const pty=await original.start(launch);
-        journal=new NativeOwnerCommandJournal({directory,sessionId:input.sessionId,processGeneration:pty.generation});
-        if (hook) {
-          const scope=(pty as ClaudeNativePty).launchScope;
-          if (!scope || scope.pid!==pty.pid || scope.generation!==pty.generation) throw new Error("Claude hook launch scope unavailable; reconcile launched session");
-          await ingress!.start({sessionId:input.sessionId,launchScope:scope});
-          hookStart=await hook.bind({sessionId:input.sessionId,launchScope:scope});
+        try {
+          journal=new NativeOwnerCommandJournal({directory,sessionId:input.sessionId,processGeneration:pty.generation});
+          if (hook) {
+            const scope=(pty as ClaudeNativePty).launchScope;
+            if (!scope || scope.pid!==pty.pid || scope.generation!==pty.generation) throw new Error("Claude hook launch scope unavailable; reconcile launched session");
+            await ingress!.start({sessionId:input.sessionId,launchScope:scope});
+            hookStart=await hook.bind({sessionId:input.sessionId,launchScope:scope});
+          }
+          return pty;
+        } catch (error) {
+          // Ownership has not been handed to the controller yet. Do not detach:
+          // failed hook verification must not leave a live, unmanaged process.
+          try { await pty.stop(); }
+          catch (cleanupError) { throw new AggregateError([error,cleanupError],"Claude launch failed and owned process cleanup is uncertain"); }
+          throw error;
         }
-        return pty;
       },
     };
     const ownerJournal: ClaudeInteractiveOwnerJournal={
