@@ -28,6 +28,9 @@ it("rolls over only a settled created identity and leaves another issue alone",a
   expect(row?.sessionParamsJson).toEqual({__paperclipSharedRunFence:nextRun});expect(row?.lastRunId).toBe(nextRun);
   const [other]=await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.id,otherId));expect(other?.sessionParamsJson).toEqual({codexSharedBootstrapV1:bootstrap});
   const [event]=await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId,nextRun));expect(event?.eventType).toBe("shared_session_rolled_over");expect(event?.payload).toEqual({oldThreadId:"old-thread"});
+  await db.update(agentTaskSessions).set({sessionParamsJson:{codexSharedBootstrapV1:{state:"starting",runId:oldRun}}}).where(eq(agentTaskSessions.id,otherId));
+  const unbound=await db.transaction(async tx=>{const [row]=await tx.select().from(agentTaskSessions).where(eq(agentTaskSessions.id,otherId)).for("update");return rolloverSettledCodexSession(tx,row!,nextRun);});
+  expect(unbound).toBe(true);
  } finally {await db.$client.end();await database.cleanup();}
 },60000);
 

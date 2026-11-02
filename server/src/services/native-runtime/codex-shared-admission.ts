@@ -23,13 +23,13 @@ export function hasCodexSharedSessionIdentity(session: {sessionDisplayId: string
 /** Called with the session row locked; uncertainty always remains in recovery. */
 export async function rolloverSettledCodexSession(tx: Parameters<Parameters<Db["transaction"]>[0]>[0], session: typeof agentTaskSessions.$inferSelect, nextRunId: string): Promise<boolean> {
   const params=record(session.sessionParamsJson), bootstrap=record(params.codexSharedBootstrapV1); const observed=record(params.codexSharedGoalV1); // A normally finished no-goal session keeps its observation record (sourceGoalDigest null); a real goal never rolls over.
-  if (bootstrap.state!=="created" || typeof bootstrap.threadId!=="string" || !bootstrap.threadId || bootstrap.runId!==session.lastRunId || (params.codexSharedGoalV1!==undefined && (observed.threadId!==bootstrap.threadId || observed.runId!==session.lastRunId || observed.sourceGoalDigest!==null)) || session.goalJson || Object.keys(params).some(key=>key!=="codexSharedBootstrapV1" && key!=="codexSharedGoalV1" && !key.startsWith("__paperclip")) || !session.lastRunId || session.lastRunId===nextRunId) return false;
+  if (!(bootstrap.state==="created" && typeof bootstrap.threadId==="string" && bootstrap.threadId || bootstrap.state==="starting" && bootstrap.threadId===undefined && params.codexSharedGoalV1===undefined) || bootstrap.runId!==session.lastRunId || (params.codexSharedGoalV1!==undefined && (observed.threadId!==bootstrap.threadId || observed.runId!==session.lastRunId || observed.sourceGoalDigest!==null)) || session.goalJson || Object.keys(params).some(key=>key!=="codexSharedBootstrapV1" && key!=="codexSharedGoalV1" && !key.startsWith("__paperclip")) || !session.lastRunId || session.lastRunId===nextRunId) return false;
   const [previous]=await tx.select({status:heartbeatRuns.status}).from(heartbeatRuns).where(and(eq(heartbeatRuns.id,session.lastRunId),eq(heartbeatRuns.companyId,session.companyId),eq(heartbeatRuns.agentId,session.agentId))).for("update",{noWait:true}).limit(1);
   if (!previous || !["succeeded","failed","cancelled","timed_out"].includes(previous.status)) return false;
   const actions=await tx.select().from(agentSessionGoalActions).where(and(eq(agentSessionGoalActions.companyId,session.companyId),eq(agentSessionGoalActions.sessionId,session.id))).for("update",{noWait:true});
   if (actions.some(action=>action.status!=="completed" || (record(action.resultJson).codexSharedGoalV1!==undefined && record(record(action.resultJson).codexSharedGoalV1).state!=="source_receipted"))) return false;
   await retireSharedIdentity(tx,session,nextRunId);
-  await appendHeartbeatRunEvent(tx as unknown as Db,{companyId:session.companyId,agentId:session.agentId,runId:nextRunId,eventType:"shared_session_rolled_over",stream:"system",payload:{oldThreadId:bootstrap.threadId}});
+  await appendHeartbeatRunEvent(tx as unknown as Db,{companyId:session.companyId,agentId:session.agentId,runId:nextRunId,eventType:"shared_session_rolled_over",stream:"system",payload:{oldThreadId:bootstrap.threadId ?? null}});
   return true;
 }
 
