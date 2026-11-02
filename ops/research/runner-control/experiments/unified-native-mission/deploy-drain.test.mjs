@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import { verifyOwned, jsonRequest, pauseOwned, selectStaleUnowned,
-  interruptStaleUnowned, waitForRestartReady } from "./deploy-drain.mjs";
+  interruptStaleUnowned, waitForRestartReady, retryHealthyIdentity } from "./deploy-drain.mjs";
 
 const id = "11111111-1111-4111-8111-111111111111";
 const issue = "22222222-2222-4222-8222-222222222222";
@@ -101,6 +101,32 @@ describe("pre-L2 stale orphan reconciliation", () => {
       "revalidated", "persist:planned", "POST /session/" + orphan + "/interrupt",
       "persist:interrupt-acknowledged", "GET /session/active", "persist:interrupted-and-idle",
     ]);
+  });
+});
+
+describe("concurrent kickstart during preflight pacing", () => {
+  it("retries starting health and transient GET failure without skipping identity", async () => {
+    let attempts = 0, tick = 0;
+    const identity = await retryHealthyIdentity(async () => {
+      attempts++;
+      if (attempts === 1) throw new Error("local GET transport unavailable");
+      if (attempts === 2) throw new Error("Paperclip process is not healthy or has no verified identity");
+      return { state: { serverPid: 6789 }, health: { status: "ok" } };
+    }, { timeoutMs: 240_000 }, { now: () => tick, sleep: async ms => { tick += ms; } });
+    assert.equal(identity.state.serverPid, 6789);
+    assert.equal(attempts, 3);
+    assert.equal(tick, 6_000);
+  });
+  it("bounds the retry and does not swallow unauthorized HTTP errors", async () => {
+    let tick = 0;
+    await assert.rejects(retryHealthyIdentity(async () => {
+      throw new Error("local GET transport unavailable");
+    }, { timeoutMs: 9_000 }, { now: () => tick, sleep: async ms => { tick += ms; } }),
+    /after 240 seconds/);
+    assert.equal(tick, 9_000);
+    await assert.rejects(retryHealthyIdentity(async () => {
+      throw new Error("local GET failed: status 403");
+    }), /status 403/);
   });
 });
 

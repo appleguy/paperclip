@@ -98,6 +98,29 @@ async function currentPayload() {
   return path.basename(await fs.readlink("/Volumes/NVM/Paperclip/cli/current"));
 }
 
+/** A different controller may kickstart while we are waiting for the 30-minute
+ * spacing gate. During that restart, HTTP can refuse connections or advertise
+ * "starting". Retry transient startup for up to four minutes; never mistake
+ * unknown identity for a healthy process or bypass the uptime pacing gate. */
+export async function retryHealthyIdentity(probe, { timeoutMs = 240_000 } = {},
+  controls = { now: Date.now, sleep }) {
+  const end = controls.now() + timeoutMs;
+  while (true) {
+    try {
+      return await probe();
+    } catch (error) {
+      if (!(error instanceof Error) ||
+        !(/local GET transport unavailable|Paperclip process is not healthy or has no verified identity/.test(error.message))) {
+        throw error;
+      }
+    }
+    const remaining = end - controls.now();
+    if (remaining <= 0) break;
+    await controls.sleep(Math.min(3_000, remaining));
+  }
+  throw new Error("Paperclip preflight health/process identity unavailable after 240 seconds");
+}
+
 /** A kickstart can serve HTTP 200 with status=starting before identity and
  * readiness converge. Require a new PID, exact payload and two stable healthy
  * observations 8 seconds apart; retry transient transport/starting responses. */
@@ -129,7 +152,7 @@ export async function waitForRestartReady(probe, { previousPid, sha, timeoutMs =
 }
 async function isVerified(client, sha) {
   ensure(/^[0-9a-f]{40}$/.test(sha), "expected exact commit SHA");
-  const { health, state } = await liveServer(client);
+  const { health, state } = await retryHealthyIdentity(() => liveServer(client));
   ensure(!state.draining, "another task drain is active");
   const receipt = await readJson(VERIFIED).catch(e => e.code === "ENOENT" ? null : Promise.reject(e));
   return receipt?.schema === 1 && receipt.sha === sha && receipt.serverPid === state.serverPid &&
@@ -419,7 +442,9 @@ async function main() {
   if (action === "check" || action === "pace") {
     const end = Date.now() + (action === "pace" ? 2_400_000 : 0);
     while (true) {
-      const { state } = await liveServer(client);
+      // A concurrent kickstart may temporarily report status=starting or
+      // refuse HTTP. Once it is healthy, restart uptime is measured again.
+      const { state } = await retryHealthyIdentity(() => liveServer(client));
       ensure(!state.draining, "another task drain is active");
       const age = uptimeSec(state.serverPid);
       if (age >= 1800) {
