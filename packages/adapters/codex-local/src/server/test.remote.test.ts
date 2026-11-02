@@ -336,8 +336,9 @@ describe("codex remote environment diagnostics", () => {
     expect(result.checks.some((check) => check.code === "codex_hello_probe_passed")).toBe(true);
     expect(result.checks.some((check) => check.code === "codex_hello_probe_skipped_custom_command")).toBe(false);
     expect(runAdapterExecutionTargetProcess).toHaveBeenCalledTimes(2);
-    expect(runAdapterExecutionTargetProcess.mock.calls[0]?.[2]).toBe(command);
-    expect(runAdapterExecutionTargetProcess.mock.calls[1]?.[2]).toBe(command);
+    const calls = runAdapterExecutionTargetProcess.mock.calls as unknown[][];
+    expect(calls[0]?.[2]).toBe(command);
+    expect(calls[1]?.[2]).toBe(command);
   });
 
   it("rejects a pre-0.166 Terra CLI without sending a model request", async () => {
@@ -356,7 +357,7 @@ describe("codex remote environment diagnostics", () => {
     expect(result.checks.some((check) => check.code === "codex_cli_version_incompatible")).toBe(true);
     expect(result.checks.some((check) => check.code === "codex_hello_probe_skipped_cli_version")).toBe(true);
     expect(runAdapterExecutionTargetProcess).toHaveBeenCalledTimes(1);
-    expect(runAdapterExecutionTargetProcess.mock.calls[0]?.[3]).toEqual(["--version"]);
+    expect((runAdapterExecutionTargetProcess.mock.calls as unknown[][])[0]?.[3]).toEqual(["--version"]);
   });
 
   it("skips the version probe for models without a verified floor", async () => {
