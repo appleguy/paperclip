@@ -305,6 +305,13 @@ export class LaunchdServiceManager implements ServiceManager {
     catch { return false; }
   }
 
+  private async guiJobLoaded(): Promise<boolean> {
+    try {
+      const output = (await this.runner("launchctl", ["print", `${this.domain}/${this.serviceName}`])).stdout;
+      return output.startsWith(`${this.domain}/${this.serviceName} = {`);
+    } catch { return false; }
+  }
+
   private async activeDomain(): Promise<string> {
     return await this.systemJobLoaded() ? "system" : this.domain;
   }
@@ -346,8 +353,14 @@ export class LaunchdServiceManager implements ServiceManager {
       await this.install({ startNow: true, startOnLogin: await this.isEnabled() });
       return;
     }
-    const domain = await this.activeDomain();
-    await this.launchctlAction(domain, "kickstart", `${domain}/${this.serviceName}`);
+    if (await this.systemJobLoaded()) {
+      await this.launchctlAction("system", "kickstart", `system/${this.serviceName}`);
+    } else if (await this.guiJobLoaded()) {
+      await this.launchctlAction(this.domain, "kickstart", `${this.domain}/${this.serviceName}`);
+    } else {
+      // The persistent root-owned definition is the recovery source after boot.
+      await this.launchctlAction("system", "bootstrap", "system", this.systemDefinitionPath);
+    }
   }
   async stop(): Promise<void> {
     const domain = await this.activeDomain();
@@ -355,6 +368,9 @@ export class LaunchdServiceManager implements ServiceManager {
   }
   async restart(): Promise<void> {
     const domain = await this.activeDomain();
+    if (domain !== "system" && await this.systemJobConfigured() && !(await this.guiJobLoaded())) {
+      throw new Error(`System LaunchDaemon ${this.serviceName} is not loaded; use 'paperclipai service start' to bootstrap it.`);
+    }
     // A staged system cutover deliberately disables the GUI plist on disk.
     // Never regenerate its RunAtLoad/KeepAlive while restarting the still-loaded GUI job.
     if (!(await this.systemJobConfigured())) await writeIfChanged(this.definitionPath, this.renderDefinition());
@@ -369,10 +385,13 @@ export class LaunchdServiceManager implements ServiceManager {
       const pid = pidMatch ? Number(pidMatch[1]) : null;
       return { platform: this.platform, serviceName: this.serviceName, installed: true, active: Boolean(pid), enabled: await this.isEnabled(domain), pid, detail: pid ? "running" : "loaded" };
     } catch {
-      const definition = domain === "system" ? this.systemDefinitionPath : this.definitionPath;
+      // A system daemon can be configured but not loaded, for example after
+      // a failed pre-login start. Report that service instead of the dormant GUI plist.
+      const fallbackDomain = domain === this.domain && await this.systemJobConfigured() ? "system" : domain;
+      const definition = fallbackDomain === "system" ? this.systemDefinitionPath : this.definitionPath;
       let installed = true;
       try { await fs.access(definition); } catch { installed = false; }
-      return { platform: this.platform, serviceName: this.serviceName, installed, active: false, enabled: installed && await this.isEnabled(domain), pid: null };
+      return { platform: this.platform, serviceName: this.serviceName, installed, active: false, enabled: installed && await this.isEnabled(fallbackDomain), pid: null };
     }
   }
 

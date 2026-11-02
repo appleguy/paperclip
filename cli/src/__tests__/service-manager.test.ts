@@ -216,6 +216,29 @@ describe("launchd lifecycle", () => {
     await expect(manager.uninstall()).rejects.toThrow("root-owned plist");
   });
 
+  it("boots an installed system daemon when both launchd jobs are unloaded", async () => {
+    const home = await temporaryDirectory();
+    const daemonDir = path.join(home, "LaunchDaemons");
+    const serviceName = "ing.paperclip.paperclipai.team-a";
+    const systemPlist = path.join(daemonDir, `${serviceName}.plist`);
+    const calls: string[] = [];
+    const runner: CommandRunner = async (command, args) => {
+      calls.push([command, ...args].join(" "));
+      if (command === "launchctl" && args[0] === "print") throw new Error("job not loaded");
+      return { stdout: "", stderr: "" };
+    };
+    const manager = new LaunchdServiceManager("team-a", runner, path.join(home, ".paperclip"), "/usr/bin/paperclipai", home, daemonDir);
+    await fs.mkdir(daemonDir, { recursive: true });
+    await fs.mkdir(path.dirname(manager.definitionPath), { recursive: true });
+    await fs.writeFile(systemPlist, "ROOT_OWNED_SYSTEM_DAEMON");
+    await fs.writeFile(manager.definitionPath, "GUI_AGENT_STAGED_OFF");
+    expect(await manager.status()).toMatchObject({ installed: true, active: false, pid: null });
+    await expect(manager.restart()).rejects.toThrow("use 'paperclipai service start'");
+    await manager.start();
+    expect(calls).toContain(`sudo -n launchctl bootstrap system ${systemPlist}`);
+    expect(await fs.readFile(manager.definitionPath, "utf8")).toBe("GUI_AGENT_STAGED_OFF");
+  });
+
   it("restarts a still-loaded GUI job without re-enabling its staged-on-disk login agent", async () => {
     const home = await temporaryDirectory();
     const daemonDir = path.join(home, "LaunchDaemons");
