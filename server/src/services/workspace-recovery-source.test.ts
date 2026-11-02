@@ -207,6 +207,36 @@ describe("workspace source verification diagnostics", () => {
     expect(await snapshot(f)).toEqual(before);
   });
 
+  it("reads a settled action by ID without requiring its mutable run identity or changing state", async () => {
+    const f = await seed(), changedRunId = randomUUID();
+    await db.update(issueRecoveryActions).set({ status: "cancelled", outcome: "cancelled",
+      resolutionNote: "Revalidated", resolvedAt: new Date(), evidence: { runId: changedRunId } })
+      .where(eq(issueRecoveryActions.id, f.actionId));
+    const before = await snapshot(f);
+    await request(app()).get(path(f)).expect(404);
+    const response = await request(app()).get(`/api/issues/${f.issueId}/recovery-actions?inspectSourceActionId=${f.actionId}`).expect(200);
+    expect(response.body.active).toBeNull();
+    expect(response.body.actions).toMatchObject([{ id: f.actionId, status: "cancelled", outcome: "cancelled",
+      resolutionNote: "Revalidated", evidence: { runId: changedRunId } }]);
+    expect(response.body.sourceInspection).toBeUndefined();
+    expect(await snapshot(f)).toEqual(before);
+  });
+
+  it("scopes action-only history to the authorized issue and company", async () => {
+    const f = await seed(), foreign = await seed(), otherIssueId = randomUUID();
+    await db.insert(issues).values({ id: otherIssueId, companyId: f.companyId, title: "Other issue", status: "todo" });
+    const actionOnly = (issueId: string, actionId: string) =>
+      `/api/issues/${issueId}/recovery-actions?inspectSourceActionId=${actionId}`;
+    const before = await snapshot(f);
+    await request(app()).get(actionOnly(otherIssueId, f.actionId)).expect(404);
+    await request(app()).get(actionOnly(f.issueId, foreign.actionId)).expect(404);
+    await request(app()).get(actionOnly(f.issueId, "not-a-uuid")).expect(400);
+    const denied = await request(app({ type: "agent", agentId: foreign.agentId, companyId: foreign.companyId,
+      source: "agent_key" })).get(actionOnly(f.issueId, f.actionId));
+    expect([403, 404]).toContain(denied.status);
+    expect(await snapshot(f)).toEqual(before);
+  });
+
   it("does not let another company's agent inspect the source", async () => {
     const f = await seed(), foreign = await seed();
     const response = await request(app({ type: "agent", agentId: foreign.agentId, companyId: foreign.companyId,

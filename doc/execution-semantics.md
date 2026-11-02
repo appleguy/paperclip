@@ -1734,8 +1734,11 @@ policy, an allowlisted policy value. Neither detail includes paths, provider
 allocation identifiers, credentials, or raw provider errors.
 
 The company/task-authorized `GET /api/issues/{id}/recovery-actions` accepts
-`inspectSourceRunId` to list at most 20 matching actions and an optional
-`inspectSourceActionId` to inspect one exact action. This opt-in path bypasses
+`inspectSourceRunId` to list at most 20 matching actions. With both
+`inspectSourceRunId` and `inspectSourceActionId`, it inspects that recorded
+source identity. `inspectSourceActionId` alone retrieves the exact action for
+the authorized task, including settled actions, independent of mutable run
+evidence; it does not run source inspection. This opt-in path bypasses
 read revalidation and performs no recovery writes, provider calls, filesystem
 inspection, or retries. It reads the existing source verifier without changing
 its guards. Inspection of more than eight recorded leases returns
