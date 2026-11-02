@@ -51,6 +51,9 @@ describe("built-in provider launch preparation", () => {
     const policy = { cwd: base.cwd, readOnly: false, disableWebSearch: true };
     const config = createSharedCodexThreadConfig({ ...base, disabledMcp: "z-server, alpha_1,z-server" }) as any;
     expect(config.mcp_servers).toEqual({ alpha_1: { enabled: false }, "z-server": { enabled: false } });
+    const stubbed = createSharedCodexThreadConfig({ ...base, disabledMcp: "plain,stubbed!" }) as any;
+    expect(stubbed.mcp_servers).toEqual({ plain: { enabled: false }, stubbed: { enabled: false, command: "/usr/bin/false" } });
+    expect(sharedThreadConfigViolation(stubbed, policy)).toBeNull();
     expect(sharedThreadConfigViolation(config, policy)).toBeNull();
     for (const invalid of ["foo,,bar", "foo.bar", "../foo", "foo bar", "__proto__."]) {
       expect(() => createSharedCodexThreadConfig({ ...base, disabledMcp: invalid })).toThrow("shared_codex_disable_mcp_invalid");

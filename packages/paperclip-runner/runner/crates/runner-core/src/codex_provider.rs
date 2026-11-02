@@ -483,7 +483,7 @@ impl SharedDaemonWriter {
             .any(|k| k != "permissions" && k != "web_search" && k != "shell_environment_policy" && k != "mcp_servers")
             || config.get("mcp_servers").is_some_and(|v| !v.as_object().is_some_and(|servers| servers.len() <= 256 && servers.iter().all(|(name, entry)| {
                 !name.is_empty() && name.len() <= 128 && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
-                    && entry.as_object().is_some_and(|entry| entry.len() == 1 && entry.get("enabled") == Some(&json!(false)))
+                    && entry.as_object().is_some_and(|entry| entry.get("enabled") == Some(&json!(false)) && (entry.len() == 1 || entry.len() == 2 && entry.get("command") == Some(&json!("/usr/bin/false"))))
             })))
             || config.get("web_search").is_some_and(|v| v != "disabled")
             || !config
@@ -4548,7 +4548,10 @@ mod tests {
         let mut with_mcp = config.clone();
         with_mcp["mcp_servers"] = json!({"fixture-server": {"enabled": false}});
         assert!(make(with_mcp.clone()).thread_config_valid("/workspace", false));
-        for invalid in [json!({"fixture": {"enabled": true}}), json!({"fixture": {"enabled": false, "command": "x"}}), json!({"bad.name": {"enabled": false}})] {
+        with_mcp["mcp_servers"] = json!({"fixture-server": {"enabled": false}, "stubbed": {"enabled": false, "command": "/usr/bin/false"}});
+        assert!(make(with_mcp.clone()).thread_config_valid("/workspace", false));
+        with_mcp["mcp_servers"] = json!({"fixture-server": {"enabled": false}});
+        for invalid in [json!({"fixture": {"enabled": true}}), json!({"fixture": {"enabled": false, "command": "x"}}), json!({"fixture": {"enabled": false, "command": "/usr/bin/false", "args": []}}), json!({"bad.name": {"enabled": false}})] {
             with_mcp["mcp_servers"] = invalid;
             assert!(!make(with_mcp.clone()).thread_config_valid("/workspace", false));
         }
