@@ -13181,7 +13181,7 @@ export function issueService(db: Db) {
           eq(issueComments.authorAgentId, actor.agentId), isNull(issueComments.deletedAt),
         )).orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(1);
         if (prior) {
-          const monitorTurn = parseObject(createdByRun.contextSnapshot).wakeReason === "issue_monitor_due";
+          const monitorTurn = parseObject(createdByRun?.contextSnapshot).wakeReason === "issue_monitor_due";
           if ((monitorTurn || prior.body === redactedBody) &&
               !(await hasMeaningfulIssueDelta(dbOrTx as Db, issue.companyId,
                 issueId, actor.agentId, prior.createdAt))) {

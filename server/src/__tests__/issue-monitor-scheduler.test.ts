@@ -29,6 +29,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { issueService } from "../services/issues.ts";
+import { readMonitorQuotaGauge } from "../services/monitor-quota-gauge.ts";
 import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
 import { PaperclipRunnerToolAuthority } from "../services/native-runtime/paperclip-runner-tool-authority.js";
 
@@ -253,6 +254,44 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
     return { companyId, agentId, issueId, nextCheckAt };
   }
+
+  it("pauses only the automatic monitor wake source when hourly run cap is reached", async () => {
+    const { companyId, agentId, issueId } = await seedFixture();
+    const now = new Date("2026-04-11T12:31:00Z");
+    await db.insert(heartbeatRuns).values(Array.from({ length: 12 }, (_, i) => ({
+      companyId, agentId, status: "succeeded",
+      createdAt: new Date(now.getTime() - (i + 1) * 60_000),
+      contextSnapshot: { issueId, wakeReason: "issue_monitor_due" },
+    })));
+    const gauge = await readMonitorQuotaGauge(db, now);
+    expect(gauge.agents).toEqual([expect.objectContaining({
+      agentId, adapterType: "process", runs: 12, comments: 0,
+    })]);
+    const result = await heartbeatService(db).tickIssueMonitors(now);
+    expect(result.triggered).toBe(0);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue.monitorNextCheckAt?.toISOString()).toBe("2026-04-11T13:31:00.000Z");
+    expect(issue.monitorAttemptCount).toBe(0);
+    expect((await db.select().from(agentWakeupRequests))).toHaveLength(0);
+    expect((await db.select().from(activityLog).where(eq(activityLog.action, "issue.monitor_quota_paused"))))
+      .toHaveLength(1);
+    const [agent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    expect(agent.status).toBe("active");
+  });
+
+  it("caps comment-heavy adapters without starting a replacement monitor run", async () => {
+    const { companyId, agentId, issueId } = await seedFixture();
+    const now = new Date("2026-04-11T12:31:00Z");
+    await db.insert(issueComments).values(Array.from({ length: 12 }, (_, i) => ({
+      companyId, issueId, authorAgentId: agentId, authorType: "agent" as const,
+      body: `Progress note ${i}`, createdAt: new Date(now.getTime() - (i + 1) * 60_000),
+    })));
+    expect((await heartbeatService(db).tickIssueMonitors(now)).triggered).toBe(0);
+    const [event] = await db.select().from(activityLog)
+      .where(eq(activityLog.action, "issue.monitor_quota_paused"));
+    expect(event.details?.reason).toBe("hourly_comment_cap");
+    expect((await db.select().from(agentWakeupRequests))).toHaveLength(0);
+  });
 
   it("dedupes no-delta monitor comments server-side but accepts human-triggered updates", async () => {
     const { companyId, issueId, agentId } = await seedFixture();
