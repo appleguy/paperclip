@@ -1,6 +1,7 @@
 export * from "./configured-environment.js";
 export * from "./catalog/index.js";
 export { CURSOR_DISTRIBUTION_PINS } from "./drivers/acpx/generated-profiles.js";
+export { KIMI_DISTRIBUTION_CLOSURE_SHA256 } from "./drivers/acpx/kimi-closure-pins.js";
 export * from "./contracts/control-plane-port.js";
 export * from "./contracts/completion-result.js";
 export * from "./contracts/codex.js";
@@ -40,6 +41,10 @@ export {
   RUNNER_PRP_PROTOCOL_MIN,
   RUNNER_PRP_PROTOCOL_MAX,
   inspectWarmRunTransition,
+  inspectStagedRunAttachment,
+  inspectRetainedRunInstructions,
+  inspectStagedRunAttachmentHeader,
+  type StagedRunAttachment,
   type DurablePrpControlPlaneOptions,
   type DurablePrpCheckpoint,
   decodeDurablePrpCheckpoint,
@@ -126,7 +131,7 @@ export * as acceptedCapabilitySemanticTools from "./semantic-tools/index.js";
 export * from "./compatibility.js";
 
 export { probeAcpxClaudeInstallation, probeAcpxGrokInstallation } from "./drivers/acpx/installation-integrity.js";
-export { probeAcpxPiInstallation } from "./drivers/acpx/profile-installation.js";
+export { probeAcpxPiInstallation, probeAcpxKimiInstallation } from "./drivers/acpx/profile-installation.js";
 export { PROVIDER_PACK_COMPATIBILITY, bundledRemoteProviderPackManifestPath, bundledRemoteRunnerBinary } from "./live/bundled-remote-provider-pack.js";
 
 export { RunnerdMuseDriver, describeRunnerdMuseDriver, type RunnerdMuseDriverOptions } from "./drivers/muse/runnerd-muse-driver.js";
@@ -134,7 +139,7 @@ export { RunnerdDotDriver, type RunnerdDotDriverOptions } from "./drivers/dot/ru
 
 export type { RunnerExecutionDriver } from "./control-plane/runner-execution-driver.js";
 
-export { bindRunnerLaunchResources, createRunnerProviderLaunch, runnerProviderLaunchRequirements, runnerLaunchRequirementsDigest, validatePreparedRunnerLaunch } from "./live/runner-provider-launch.js";
+export { RUNNER_GITHUB_LAUNCHER_VERSION, bindRunnerLaunchResources, createRunnerProviderLaunch, runnerProviderLaunchRequirements, runnerLaunchRequirementsDigest, validatePreparedRunnerLaunch } from "./live/runner-provider-launch.js";
 export { createSharedCodexThreadConfig } from "./live/shared-codex-thread-config-builder.js";
 export { sharedThreadConfigViolation } from "./live/shared-codex-thread-config.js";
 export type { SharedCodexThreadConfigPolicy } from "./live/shared-codex-thread-config-builder.js";

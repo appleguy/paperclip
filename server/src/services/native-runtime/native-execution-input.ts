@@ -152,8 +152,8 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput & { p
 export function buildNativeExecutionInput(input: BuildNativeExecutionInput & { provider?: Exclude<BuildNativeExecutionInput["provider"], "openai_dot" | "grok_bot" | "muse" | "antigravity_headless" | "opencode_shared_v2" | "claude_interactive"> }): NativeExecutionInputV5 | NativeExecutionInputV7 | NativeExecutionInputV9 | NativeExecutionInputV10;
 export function buildNativeExecutionInput(input: BuildNativeExecutionInput): NativeExecutionInputV5 | NativeExecutionInputV6 | NativeExecutionInputV7 | NativeExecutionInputV8 | NativeExecutionInputV9 | NativeExecutionInputV10 | NativeExecutionInputV11 | NativeExecutionInputV12 | NativeExecutionInputV13;
 export function buildNativeExecutionInput(input: BuildNativeExecutionInput): NativeExecutionInputV5 | NativeExecutionInputV6 | NativeExecutionInputV7 | NativeExecutionInputV8 | NativeExecutionInputV9 | NativeExecutionInputV10 | NativeExecutionInputV11 | NativeExecutionInputV12 | NativeExecutionInputV13 {
-  if (input.issue.workMode !== "standard" && input.issue.workMode !== "planning" && input.issue.workMode !== "ask") {
-    throw new Error("native_execution_input_invalid: issue work mode must be standard, planning, or ask");
+  if (input.issue.workMode !== "standard" && input.issue.workMode !== "planning" && input.issue.workMode !== "ask" && input.issue.workMode !== "skill_test") {
+    throw new Error("native_execution_input_invalid: issue work mode must be standard, planning, ask, or skill_test");
   }
   const mode = resolvePaperclipRunnerCursorMode(input.provider === "antigravity_headless" || input.provider === "opencode_shared_v2" || input.provider === "claude_interactive" ? undefined : input.provider, input.acpxAgent, input.acpxSessionMode);
   const piThinkingLevel = resolvePaperclipRunnerPiThinkingLevel(input.provider === "antigravity_headless" || input.provider === "opencode_shared_v2" || input.provider === "claude_interactive" ? undefined : input.provider, input.acpxAgent, input.piThinkingLevel);
