@@ -141,3 +141,5 @@ export type { SharedCodexThreadConfigPolicy } from "./live/shared-codex-thread-c
 export type { RunnerProviderLaunchRequirements, RunnerProviderLaunchEnvironment, PreparedRunnerProviderLaunch, RunnerLaunchPreparer } from "./live/runner-provider-launch.js";
 
 export { resolveGrokDisableWebSearch } from "./drivers/acpx/grok-web-search.js";
+export type { AntigravityMcpScope } from "./drivers/antigravity/native-mcp-workspace.js";
+export type { RunnerToolCall } from "./drivers/runner-tool-bridge.js";

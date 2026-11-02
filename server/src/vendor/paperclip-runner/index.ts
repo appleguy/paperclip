@@ -10,6 +10,8 @@
 type RunnerModule = typeof import("@paperclipai/paperclip-runner");
 
 export type {
+  AntigravityMcpScope,
+  RunnerToolCall,
   V2Authority,
   V2Binding,
   V2Cursor,

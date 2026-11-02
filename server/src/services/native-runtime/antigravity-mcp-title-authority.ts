@@ -3,8 +3,7 @@ import { setIssueTitleSchema } from "@paperclipai/shared";
 import { and, eq, gt, isNull, notInArray, or, sql } from "drizzle-orm";
 import { publishActivity } from "../activity-log.js";
 import { setIssueTitle } from "../issue-title.js";
-import type { AntigravityMcpScope } from "../../../../packages/paperclip-runner/src/drivers/antigravity/native-mcp-workspace.js";
-import type { RunnerToolCall } from "../../../../packages/paperclip-runner/src/drivers/runner-tool-bridge.js";
+import type { AntigravityMcpScope, RunnerToolCall } from "../../vendor/paperclip-runner/index.js";
 
 /** Narrow candidate: only the existing, transactionally receipted title operation.
  * The caller must independently attest and freeze native process/conversation identity. */
