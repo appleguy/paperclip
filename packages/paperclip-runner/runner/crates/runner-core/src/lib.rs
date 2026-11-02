@@ -16,6 +16,7 @@ pub mod codex_provider;
 #[cfg(unix)]
 pub mod codex_shared_socket;
 mod codex_startup_trust;
+mod codex_usage;
 mod configured_environment;
 mod credential_observer;
 pub mod dot_provider_backend;

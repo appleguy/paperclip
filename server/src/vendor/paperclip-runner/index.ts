@@ -110,8 +110,14 @@ export const nativeSystemInstructions = runner.nativeSystemInstructions;
 export const codexSemanticToolSpecs = runner.codexSemanticToolSpecs;
 export const authorizedToolSetForProvider = runner.authorizedToolSetForProvider;
 export const inspectWarmRunTransition = runner.inspectWarmRunTransition;
+export const inspectStagedRunAttachment = runner.inspectStagedRunAttachment;
+export const inspectRetainedRunInstructions = runner.inspectRetainedRunInstructions;
+export const inspectStagedRunAttachmentHeader = runner.inspectStagedRunAttachmentHeader;
+export type StagedRunAttachment = import("@paperclipai/paperclip-runner").StagedRunAttachment;
 export const readRunnerdArtifactBinding = runner.readRunnerdArtifactBinding;
 export const readLinuxProcessStartedAt = runner.readLinuxProcessStartedAt;
+export const NativeSessionCloseUnrecoverableError =
+  runner.NativeSessionCloseUnrecoverableError;
 export const NativeSessionCleanupQuarantinedError =
   runner.NativeSessionCleanupQuarantinedError;
 export const NativeSessionProtocolIntegrityError =
@@ -183,6 +189,7 @@ export const resolveGrokEffort = runner.resolveGrokEffort;
 export const QUALIFIED_ACPX_PROFILES = runner.QUALIFIED_ACPX_PROFILES;
 export const QUALIFIED_ACPX_VERSION = runner.QUALIFIED_ACPX_VERSION;
 export const CURSOR_DISTRIBUTION_PINS = runner.CURSOR_DISTRIBUTION_PINS;
+export const KIMI_DISTRIBUTION_CLOSURE_SHA256 = runner.KIMI_DISTRIBUTION_CLOSURE_SHA256;
 export const resolveSourceCodexHome = runner.resolveSourceCodexHome;
 export const resolveCodexCommand = runner.resolveCodexCommand;
 export const resolvePinnedCodexCommand = runner.resolvePinnedCodexCommand;

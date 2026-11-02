@@ -1,10 +1,9 @@
-import { coordinatorAttentionQueryKey } from "@/lib/coordinator-attention";
 import { useNativeSessionObserverAccess } from "../hooks/useNativeSessionObserverAccess";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Inbox, Bell, Boxes, ChevronRight, CircleCheck, FolderOpen, History, LayoutDashboard, MessageCircle, MoreHorizontal, Network, Pin, PinOff, Plus, Repeat, Search, Settings, Unplug } from "lucide-react";
 import type { Project } from "@paperclipai/shared";
-import { attentionApi } from "@/api/attention";
+import { useCoordinatorAttentionCount } from "@/hooks/useCoordinatorAttentionCount";
 import { issuesApi } from "@/api/issues";
 import { projectsApi } from "@/api/projects";
 import { useAgentChatNavigation } from "@/hooks/useAgentChatNavigation";
@@ -41,7 +40,7 @@ function ProjectRecent({ project }: { project: Project }) {
   const [expanded, setExpanded] = useState(false);
   const { data: tasks, isPending, error } = useQuery({
     queryKey: [...queryKeys.issues.listByProject(project.companyId, project.id), "coordinator-recents"],
-    queryFn: () => issuesApi.list(project.companyId, { projectId: project.id, limit: 12, sortField: "updated", sortDir: "desc" }),
+    queryFn: () => issuesApi.listCompact(project.companyId, { projection: "index", projectId: project.id, limit: 12, sortField: "updated", sortDir: "desc" }),
     enabled: expanded,
   });
   return <div>
@@ -65,6 +64,7 @@ function ProjectRecent({ project }: { project: Project }) {
 export function CoordinatorSidebar({ children }: { children?: ReactNode }) {
   const { companyId, userId, agents, chats, session } = useAgentChatNavigation();
   const canObserveNativeSessions = useNativeSessionObserverAccess(companyId);
+  const unreadChatCount = chats.data?.filter(chat => chat.isUnreadForMe).length ?? 0;
   const pinnedNavigation = usePinnedNavigation(userId);
   const [moreOpen, setMoreOpen] = useState(false);
   const moreContentRef = useRef<HTMLDivElement>(null);
@@ -75,7 +75,7 @@ export function CoordinatorSidebar({ children }: { children?: ReactNode }) {
   const { openNewIssue } = useDialogActions();
   const location = useLocation();
   const handleRecentScroll = useScrollbarWhileScrolling();
-  const { data: attention } = useQuery({ queryKey: coordinatorAttentionQueryKey(companyId!), queryFn: () => attentionApi.list(companyId!, { all: true }), enabled: !!companyId });
+  const attentionCount = useCoordinatorAttentionCount(companyId);
   const { data: projects } = useQuery({ queryKey: queryKeys.projects.list(companyId!), queryFn: () => projectsApi.list(companyId!), enabled: !!companyId });
   // Only project IDs and visit times are kept in memory. Labels and task lists
   // always come from the authorized API, scoped to the current person/company.
@@ -102,13 +102,13 @@ export function CoordinatorSidebar({ children }: { children?: ReactNode }) {
     <div className="design-sidebar-brand"><SidebarCompanyMenu showChevron={false} /></div>
     <nav className="design-sidebar-navigation" aria-label="Workspace navigation">
       <div className="design-sidebar-primary">
-        <SidebarNavItem className="design-sidebar-item" to="/chats" label="Chat" icon={MessageCircle} />
+        <SidebarNavItem className="design-sidebar-item" to="/chats" label="Chat" icon={MessageCircle} badge={unreadChatCount} badgeLabel="unread chats" />
         <div className="group/coordinator-new relative">
           <SidebarNavItem to="/issues" label="Tasks" icon={CircleCheck} className={cn("design-sidebar-item", !rail && "pr-9")} />
           {!rail && <button type="button" aria-label="New task" title="New task" onClick={() => openNewIssue()}
             className="absolute right-3 top-1/2 -translate-y-1/2 rounded-md p-1 text-muted-foreground opacity-0 transition-opacity group-hover/coordinator-new:opacity-100 group-focus-within/coordinator-new:opacity-100 pointer-coarse:opacity-100 hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-ring"><Plus className="size-4" /></button>}
         </div>
-        <SidebarNavItem className="design-sidebar-item" to="/decisions" label="Needs You" icon={Bell} badge={attention?.totalCount ?? 0} badgeLabel="decisions" />
+        <SidebarNavItem className="design-sidebar-item" to="/decisions" label="Needs You" icon={Bell} badge={attentionCount} badgeLabel="decisions" />
         <SidebarNavItem className="design-sidebar-item" to="/native-sessions" label="Native sessions" icon={MessageCircle} />
         {canObserveNativeSessions && <SidebarNavItem className="design-sidebar-item" to="/native-sessions/claude" label="Claude sessions" icon={MessageCircle} />}
         <Flyout open={moreOpen} onOpenChange={setMoreOpen}>
