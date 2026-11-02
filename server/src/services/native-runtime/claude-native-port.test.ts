@@ -60,6 +60,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const { port, authorizeWorkSessionResult } = await h.started;
     expect(h.launch).toHaveBeenCalledTimes(1);
     expect(h.launched[0]).toMatchObject({ sessionId: f.nativeSessionId, model: "sonnet", effort: "high", autoCompactTokens: 200000 });
+    expect(h.launched[0]!.remoteControlName).toContain("Agent · Task");
     expect(h.launched[0]!.mcp.tools.map((tool: { name: string }) => tool.name)).toEqual(expect.arrayContaining(["get_task_context", "set_task_title"]));
     // The Runner bridge publishes the completion tools itself and rejects them as caller tools.
     expect(h.launched[0]!.mcp.tools.map((tool: { name: string }) => tool.name)).not.toEqual(expect.arrayContaining(["paperclip_finish"]));

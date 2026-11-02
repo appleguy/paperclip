@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
-import type { Db } from "@paperclipai/db";
+import { agents, issues, type Db } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
 import type { ClaudeInteractiveNativePort, NativeExecutionInputV13, PrpEvent, PrpStructuredRunResult } from "../../vendor/paperclip-runner/index.js";
 import { PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA, PRP_COMPLETION_TOOL_DESCRIPTION } from "../../vendor/paperclip-runner/index.js";
 import { nativeSha256 } from "./canonical.js";
@@ -52,6 +53,11 @@ export async function startClaudeNativeSession(db: Db, input: StartClaudeNativeS
   const base = resolve(stateDirectory), stat = await lstat(base);
   if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0 || stat.uid !== process.getuid?.()) throw new Error("claude_state_directory_not_private");
   if (registry.has(b.companyId, b.runId)) throw new Error("claude_session_already_live");
+  const [agent] = await db.select({ name: agents.name }).from(agents).where(and(eq(agents.companyId, b.companyId), eq(agents.id, b.agentId))).limit(1);
+  const [issue] = await db.select({ identifier: issues.identifier, title: issues.title }).from(issues).where(and(eq(issues.companyId, b.companyId), eq(issues.id, b.issueId))).limit(1);
+  if (!agent || !issue) throw new Error("claude_session_name_scope_unavailable");
+  const namePart = (value: string) => value.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 75);
+  const remoteControlName = [issue.identifier || b.issueId.slice(0, 8), agent.name, issue.title].map(namePart).join(" · ");
 
   const identity = Object.freeze({ runId: b.runId, sessionId: nativeSessionId, companyId: b.companyId, issueId: b.issueId, agentId: b.agentId });
   const admit = createClaudeNativeAdmission(db, {
@@ -83,7 +89,7 @@ export async function startClaudeNativeSession(db: Db, input: StartClaudeNativeS
   let control: ClaudeLaunchedControl;
   try {
     control = await (input.launch ?? defaultLaunch)({
-      executable: input.host.claudeExecutable, cwd: resolve(cwd), sessionId: nativeSessionId, model: execution.provider.model,
+      executable: input.host.claudeExecutable, cwd: resolve(cwd), sessionId: nativeSessionId, remoteControlName, model: execution.provider.model,
       effort: execution.provider.effort, autoCompactTokens: execution.provider.autoCompactTokens, journalDirectory: directory,
       ownerAuthority: { authorize: async () => active.value }, home: input.host.home, claudeConfigDir: input.host.claudeConfigDir,
       sdk: await import("@anthropic-ai/claude-agent-sdk").then(({ getSessionInfo }) => ({ getSessionInfo, namespace: { home: input.host.home, claudeConfigDir: input.host.claudeConfigDir } })),
