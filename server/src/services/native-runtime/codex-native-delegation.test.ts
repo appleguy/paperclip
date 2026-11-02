@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { expect, it } from "vitest";
 import { agents, companies, projects, createDb, toolConnections, startEmbeddedPostgresTestDatabase } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
-import { assertCodexNativeDelegation, registerCodexNativeDelegation, revokeCodexNativeDelegation, type NativeDaemonHost } from "./codex-native-delegation.js";
+import { assertCodexNativeDelegation, registerCodexNativeDelegation, renewCodexSharedDelegations, revokeCodexNativeDelegation, type NativeDaemonHost } from "./codex-native-delegation.js";
 it("registers an exact daemon delegation and rejects foreign, rotated, expired and revoked scope",async()=>{
  const database=await startEmbeddedPostgresTestDatabase("codex-delegation-");const db=createDb(database.connectionString);
  try {
@@ -21,9 +21,14 @@ it("registers an exact daemon delegation and rejects foreign, rotated, expired a
   const [row]=await db.select().from(toolConnections).where(eq(toolConnections.id,result.connectionId));const config=row!.config;
   const delegation=config.codexNativeDelegation as Record<string,unknown>;
   await db.update(toolConnections).set({config:{...config,codexNativeDelegation:{...delegation,expiresAt:new Date(1).toISOString()}}}).where(eq(toolConnections.id,result.connectionId));
-  await expect(check(scope)).rejects.toThrow("scope_invalid");
-  await db.update(toolConnections).set({config}).where(eq(toolConnections.id,result.connectionId));
-  await revokeCodexNativeDelegation(db,{companyId,connectionId:result.connectionId,issuer:"board"});
+  await expect(check(scope)).rejects.toThrow("codex_shared_grant_stale: run renew-shared-grants");
+  const changedHost:NativeDaemonHost={hostId:"host",inspect:async()=>({...daemon,daemonGeneration:"replacement"})};
+  const [renewed]=await renewCodexSharedDelegations(db,changedHost,[agentId],{days:1});
+  expect(renewed?.previousConnectionId).toBe(result.connectionId);
   await expect(check(scope)).rejects.toThrow("unavailable");
+  await expect(check({...scope,processGeneration:renewed!.processGeneration,delegationGrantId:renewed!.grantId,delegationRevision:renewed!.revision})).resolves.toBeUndefined();
+  await revokeCodexNativeDelegation(db,{companyId,connectionId:renewed!.connectionId,issuer:"board"});
+  await expect(check(scope)).rejects.toThrow("unavailable");
+  expect(await renewCodexSharedDelegations(db,changedHost,[agentId],{days:1})).toEqual([]);
  } finally {await db.$client.end();await database.cleanup();}
 },60000);

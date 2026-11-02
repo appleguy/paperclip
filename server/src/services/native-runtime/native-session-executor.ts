@@ -249,7 +249,7 @@ import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
 import { registerLiveRunnerGoalController } from "../runner-goal-control-broker.js";
 import { registerCodexSharedGoalController } from "./codex-shared-goal-controller.js";
 import { claimRegisteredCodexSharedOption, type CodexSharedServerOption } from "./codex-shared-admission.js";
-import { resolveCodexSharedRegistration } from "./codex-shared-registration.js";
+import { resolveCurrentCodexSharedRegistration } from "./codex-shared-registration.js";
 import { nativeSystemInstructions, codexSemanticToolSpecs, authorizedToolSetForProvider } from "../../vendor/paperclip-runner/index.js";
 import { applyRunnerGoalPrpEvent, runnerGoalService } from "../runner-goals.js";
 import { createCodexSharedOverrunPause } from "./codex-shared-overrun-pause.js";
@@ -12465,7 +12465,7 @@ async function createRunnerdBackendWithinSessionClaim(
   }
   // Opt in explicitly registered agents through server-owned host settings.
   // Neither the agent's input nor a provider-supplied thread can select this.
-  const sharedRegistration=resolveCodexSharedRegistration(process.env,input.execution.binding.agentId);
+  const sharedRegistration=await resolveCurrentCodexSharedRegistration(process.env,input.db,input.execution.binding.companyId,input.execution.binding.agentId,resolvePaperclipRunnerBinary());
   if (sharedRegistration) {
     const provider=input.execution.provider, lease=input.codexSharedLease;
     const {grantId:grant,hostId,codexExecutable,codexHome,home}=sharedRegistration;
