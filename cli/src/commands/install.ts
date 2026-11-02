@@ -96,8 +96,7 @@ export function prepareGitInstallSkills(checkoutPath: string, workspacePackages:
     if (!packageJson.files?.includes("skills")) continue;
     if (!fs.existsSync(sourceSkills)) throw new Error("Missing root skills directory in " + checkoutPath);
     const targetSkills = path.join(packageDir, "skills");
-    fs.rmSync(targetSkills, { recursive: true, force: true });
-    fs.cpSync(sourceSkills, targetSkills, { recursive: true });
+    fs.cpSync(sourceSkills, targetSkills, { recursive: true, force: false });
   }
 }
 

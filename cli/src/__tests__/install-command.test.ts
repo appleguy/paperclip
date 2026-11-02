@@ -142,16 +142,41 @@ describe("managed install commands", () => {
       const target = path.join(checkout, entry.dir);
       fs.mkdirSync(path.join(target, "skills"), { recursive: true });
       fs.writeFileSync(path.join(target, "package.json"), JSON.stringify({ files: ["dist", "skills"] }));
-      fs.writeFileSync(path.join(target, "skills", "stale.txt"), "stale");
+      fs.writeFileSync(path.join(target, "skills", "package-owned.txt"), "keep");
     }
     prepareGitInstallSkills(checkout, packages);
     for (const entry of packages) {
       const target = path.join(checkout, entry.dir, "skills");
       expect(fs.readFileSync(path.join(target, "paperclip", "SKILL.md"), "utf8")).toBe("expected skill content");
-      expect(fs.existsSync(path.join(target, "stale.txt"))).toBe(false);
+      expect(fs.readFileSync(path.join(target, "package-owned.txt"), "utf8")).toBe("keep");
     }
     fs.rmSync(path.join(checkout, "skills"), { recursive: true });
     expect(() => prepareGitInstallSkills(checkout, packages)).toThrow("Missing root skills directory");
+  });
+
+  it("preserves Hermes task bridge and existing skill files when merging root skills", () => {
+    const checkout = path.join(root, "checkout");
+    const sharedSkill = path.join(checkout, "skills", "paperclip");
+    const hermesDir = path.join(checkout, "packages", "adapters", "hermes");
+    const hermesBridge = path.join(hermesDir, "skills", "paperclip-task-bridge");
+    fs.mkdirSync(sharedSkill, { recursive: true });
+    fs.writeFileSync(path.join(sharedSkill, "SKILL.md"), "shared instructions");
+    const sharedOnly = path.join(checkout, "skills", "new-shared-skill");
+    fs.mkdirSync(sharedOnly, { recursive: true });
+    fs.writeFileSync(path.join(sharedOnly, "SKILL.md"), "new shared instructions");
+    fs.mkdirSync(hermesBridge, { recursive: true });
+    fs.writeFileSync(path.join(hermesBridge, "SKILL.md"), "Hermes instructions");
+    fs.writeFileSync(path.join(hermesBridge, "paperclip-task.mjs"), "Hermes helper");
+    fs.mkdirSync(path.join(hermesDir, "skills", "paperclip"), { recursive: true });
+    fs.writeFileSync(path.join(hermesDir, "skills", "paperclip", "SKILL.md"), "Hermes override");
+    fs.writeFileSync(path.join(hermesDir, "package.json"), JSON.stringify({ files: ["dist", "skills"] }));
+    const packages = [{ dir: "packages/adapters/hermes", name: "@paperclipai/hermes-paperclip-adapter" }];
+    prepareGitInstallSkills(checkout, packages);
+    prepareGitInstallSkills(checkout, packages);
+    expect(fs.readFileSync(path.join(hermesBridge, "SKILL.md"), "utf8")).toBe("Hermes instructions");
+    expect(fs.readFileSync(path.join(hermesBridge, "paperclip-task.mjs"), "utf8")).toBe("Hermes helper");
+    expect(fs.readFileSync(path.join(hermesDir, "skills", "paperclip", "SKILL.md"), "utf8")).toBe("Hermes override");
+    expect(fs.readFileSync(path.join(hermesDir, "skills", "new-shared-skill", "SKILL.md"), "utf8")).toBe("new shared instructions");
   });
 
   it("hydrates a bundled Postgres native package before activation", async () => {
