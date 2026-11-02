@@ -6379,6 +6379,10 @@ impl CommandExecutor for CodexCommandExecutor {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    mod shared_thread_name_tests {
+        include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/shared_thread_name_tests.rs"));
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
