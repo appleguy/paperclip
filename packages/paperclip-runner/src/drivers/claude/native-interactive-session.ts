@@ -120,5 +120,10 @@ export class ClaudeInteractiveSession {
   /** Stops observation without terminating the owner's process; no automatic reattach. */
   hookObservationStatus() { return this.ingress?.status() ?? {state:"unavailable",provenance:"owned-descendant-attributed",settlement:"unproven",coverage:"incomplete"} as const; }
   async hookObservations() { if(!this.ingress) throw new Error("Claude hook observations unavailable"); return this.ingress.snapshot(); }
+  /** Keep ingress and MCP alive if process exit is uncertain, for reconciliation. */
+  async stopOwnedProcess(): Promise<void> {
+    await this.controller.stopOwnedProcess();
+    try { await this.ingress?.close(); } finally { await this.closeMcp?.(); }
+  }
   async detach(): Promise<void> { try { await this.controller.detach(); } finally { try { await this.ingress?.close(); } finally { await this.closeMcp?.(); } } }
 }

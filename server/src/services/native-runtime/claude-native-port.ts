@@ -15,7 +15,7 @@ export interface ClaudeNativeHost {
   /** Private (0700, owned) directory holding one exclusive journal directory per run. */
   stateDirectory: string; hookHelperExecutable: string;
 }
-export interface ClaudeLaunchedControl extends ClaudeLiveSessionControl { detach(): Promise<void> }
+export interface ClaudeLaunchedControl extends ClaudeLiveSessionControl { stopOwnedProcess(): Promise<void> }
 export interface StartClaudeNativeSessionInput {
   execution: NativeExecutionInputV13; runnerInstanceId: string; leaseOwner: string; attempt: number;
   controller: { bootId: string; pid: number; processStartedAt: Date };
@@ -125,9 +125,11 @@ export async function startClaudeNativeSession(db: Db, input: StartClaudeNativeS
       if (closed) return;
       if (!await admitted.settled(input.settleTimeoutMs ?? 5000)) throw new Error("claude_native_effects_unsettled");
       if (await admitted.unsettled() !== 0) throw new Error("claude_native_effects_unsettled");
+      active.value = false;
+      await control.stopOwnedProcess();
       closed = true;
-      unregister(); active.value = false;
-      try { await control.detach(); } finally { await admitted.close(); wake(); }
+      unregister();
+      try { await admitted.close(); } finally { wake(); }
     },
   });
   const authorizeWorkSessionResult = async ({ event, result, signal }: { event: PrpEvent; result: PrpStructuredRunResult; signal: AbortSignal }) => {
