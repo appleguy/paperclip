@@ -249,6 +249,7 @@ import { removeNativeHarnessBackup } from "./native-harness-backup-cleanup.js";
 import { registerLiveRunnerGoalController } from "../runner-goal-control-broker.js";
 import { registerCodexSharedGoalController } from "./codex-shared-goal-controller.js";
 import { claimRegisteredCodexSharedOption, type CodexSharedServerOption } from "./codex-shared-admission.js";
+import { resolveCodexSharedRegistration } from "./codex-shared-registration.js";
 import { nativeSystemInstructions, codexSemanticToolSpecs, authorizedToolSetForProvider } from "../../vendor/paperclip-runner/index.js";
 import { applyRunnerGoalPrpEvent, runnerGoalService } from "../runner-goals.js";
 import { createCodexSharedOverrunPause } from "./codex-shared-overrun-pause.js";
@@ -12462,14 +12463,13 @@ async function createRunnerdBackendWithinSessionClaim(
     authorityEpoch.revoke();
     throw error;
   }
-  // Opt in one explicitly registered agent through server-owned host settings.
+  // Opt in explicitly registered agents through server-owned host settings.
   // Neither the agent's input nor a provider-supplied thread can select this.
-  const sharedAgent=process.env.PAPERCLIP_CODEX_SHARED_AGENT_ID?.trim();
-  if (sharedAgent && sharedAgent===input.execution.binding.agentId) {
+  const sharedRegistration=resolveCodexSharedRegistration(process.env,input.execution.binding.agentId);
+  if (sharedRegistration) {
     const provider=input.execution.provider, lease=input.codexSharedLease;
-    const grant=process.env.PAPERCLIP_CODEX_SHARED_GRANT_ID?.trim(), hostId=process.env.PAPERCLIP_CODEX_SHARED_HOST_ID?.trim();
-    const codexExecutable=process.env.PAPERCLIP_CODEX_SHARED_EXECUTABLE?.trim(), codexHome=process.env.PAPERCLIP_CODEX_SHARED_CODEX_HOME?.trim(), home=process.env.PAPERCLIP_CODEX_SHARED_HOME?.trim();
-    if (input.codexShared || !lease || input.conversationMode || remoteTarget || retainedTransition || input.restartRecovery || provider.kind!=="codex" || !provider.model || !("reasoningEffort" in provider) || !provider.reasoningEffort || !input.execution.workspace.cwd || !grant || !hostId || !codexExecutable || !codexHome || !home) throw new Error("codex_shared_registration_unavailable");
+    const {grantId:grant,hostId,codexExecutable,codexHome,home}=sharedRegistration;
+    if (input.codexShared || !lease || input.conversationMode || remoteTarget || retainedTransition || input.restartRecovery || provider.kind!=="codex" || !provider.model || !("reasoningEffort" in provider) || !provider.reasoningEffort || !input.execution.workspace.cwd) throw new Error("codex_shared_registration_unavailable");
     const binding=input.execution.binding;
     // The server alone generates the managed thread's permission profile, shell environment and web-search policy; the runner
     // must echo it unchanged (exact digest-bound match), so no host environment can widen it.
