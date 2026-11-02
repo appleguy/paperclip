@@ -17,7 +17,7 @@ FINISH_TIMEOUT=${ACCEPT_FINISH_TIMEOUT:-2400}
 POLL_SEC=${ACCEPT_POLL_SEC:-12}
 MODE=${1:-}
 case "$MODE" in --run|--preflight) ;; *) echo "usage: $0 --run | --preflight" >&2; exit 2;; esac
-for prog in jq curl sort comm wc date launchctl; do
+for prog in jq curl sort comm wc date launchctl flock; do
   command -v "$prog" >/dev/null 2>&1 || { echo "Missing $prog" >&2; exit 2; }
 done
 [ -x "$CLI" ] || { echo "Missing $CLI" >&2; exit 2; }
@@ -128,6 +128,16 @@ if [ "$MODE" = --preflight ]; then
   printf 'EVIDENCE_DIR=%s\n' "$EVIDENCE"
   exit 0
 fi
+
+# Share the *same* deploy flock, from before issue creation until post-kickstart
+# health verification. A concurrent pc-deploy must win rather than have its
+# 30-minute paced drain invalidated by this harness's direct launchctl restart.
+DEPLOY_LOCK=/Volumes/NVM/AI_Agent_Runtime/tmp/pc-deploy.flock
+exec 9>"$DEPLOY_LOCK" || abort "cannot open shared deploy restart lock"
+if ! flock -x -n 9; then
+  abort "guarded pc-deploy owns the restart lock; no acceptance cases created or restart attempted"
+fi
+note "Acquired shared deploy restart exclusion before creating acceptance cases"
 
 # Only assignment-wake, no manual agent wake. Long first cases hold a real window
 # for live steering and service restart; every case is tiny, bounded and read-only.
@@ -248,6 +258,12 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   if [ -n "$STEER_CASE" ] || [ -n "$RESTART_CASE" ]; then break; fi
   sleep "$POLL_SEC"
 done
+
+# Do not hold the deploy exclusion while observing long-lived report completion.
+# The restart and its new healthy PID have already been checked above.
+flock -u 9 || abort "shared deploy restart exclusion could not be released"
+exec 9>&-
+note "Released shared deploy restart exclusion after restart verification"
 
 # Never wake/reopen or replay work; observe the autonomous queue for a bounded period.
 note "Awaiting six done statuses (maximum $FINISH_TIMEOUT seconds)"
