@@ -54,6 +54,7 @@ import {
   resolveLegacyPaperclipDesiredSkillNames,
 } from "@paperclipai/adapter-utils/server-utils";
 import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl, createOpenCodeJsonlParser } from "./parse.js";
+import { createOpenCodeAttemptProgressGuard } from "./attempt-progress.js";
 import {
   ensureOpenCodeModelConfiguredAndAvailable,
   isTruthyEnvFlag,
@@ -661,6 +662,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
 
       const consumeAccounting = createOpenCodeJsonlParser();
+      const progressGuard = createOpenCodeAttemptProgressGuard();
       let hasAccounting = false;
       const accountingLog = createUsageCheckpointLog(onLog, ctx.onUsage ?? (async () => {}), stdout => {
         hasAccounting = true;
@@ -683,7 +685,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         graceSec,
         onSpawn,
         onRuntimeProgress: ctx.onRuntimeProgress,
-        onLog: accountingLog,
+        onLog: async (stream, chunk) => {
+          if (stream === "stdout") progressGuard.observe(chunk);
+          await accountingLog(stream, chunk);
+        },
         runLogTail: paperclipBridge?.runLogTail,
         settleRunDisposition: paperclipBridge?.settleRunDisposition,
       });
@@ -703,7 +708,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         parsed.usageComplete = retained.usageComplete;
         parsed.costUsd = retained.costUsd;
       }
-      return { proc, rawStderr: proc.stderr, parsed };
+      parsed.sessionId ??= progressGuard.observedSessionId(proc.stdout);
+      return { proc, rawStderr: proc.stderr, parsed,
+        possibleWork: progressGuard.hasPossibleWork(proc.stdout) || parsed.hasNonErrorOutput,
+        capacityRefusal: progressGuard.preInferenceCapacityRefusal(proc.stdout),
+      };
     };
 
     const toResult = (
@@ -711,6 +720,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         proc: { exitCode: number | null; signal: string | null; timedOut: boolean; stdout: string; stderr: string; errorCode?: string | null };
         rawStderr: string;
         parsed: ReturnType<typeof parseOpenCodeJsonl>;
+        possibleWork: boolean;
+        capacityRefusal: boolean;
       },
       clearSessionOnMissingSession = false,
     ): AdapterExecutionResult => {
@@ -791,6 +802,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           adapterExecutionTimeout,
           stdout: attempt.proc.stdout,
           stderr: attempt.proc.stderr,
+          ...(attempt.capacityRefusal && synthesizedExitCode === 1 && !attempt.proc.signal
+            ? { adapterPreInferenceAdmission: {
+                kind: "opencode_capacity_refusal_v1", providerWorkStarted: false,
+              } }
+            : {}),
         },
         summary: attempt.parsed.summary,
         clearSession: Boolean(clearSessionOnMissingSession && !attempt.parsed.sessionId),
@@ -804,7 +820,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (
         sessionId &&
         initialFailed &&
-        !initial.parsed.hasNonErrorOutput &&
+        !initial.proc.signal &&
+        !initial.possibleWork &&
         isOpenCodeUnknownSessionError(initial.parsed.errorMessage ?? "", initial.rawStderr)
       ) {
         await onLog(
