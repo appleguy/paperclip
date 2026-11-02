@@ -18,7 +18,7 @@ import type {
   RunnerGoalProjection,
   RunnerGoalSnapshot,
 } from "@paperclipai/shared";
-import { queueLiveRunnerPrpCommand } from "../realtime/runner-prp-ws.js";
+import { hasConnectedRunnerPrpAuthority, queueLiveRunnerPrpCommand } from "../realtime/runner-prp-ws.js";
 import { dispatchLiveRunnerGoalControl } from "./runner-goal-control-broker.js";
 import { publishLiveEvent } from "./live-events.js";
 
@@ -310,7 +310,7 @@ export function runnerGoalService(
         eq(agentTaskSessions.adapterType, binding.agent.adapterType),
         eq(agentTaskSessions.taskKey, issueId),
       )).orderBy(desc(agentTaskSessions.updatedAt)).limit(1).then((rows) => rows[0] ?? null),
-      db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, runnerInstanceId: heartbeatRuns.runnerInstanceId }).from(heartbeatRuns).where(and(
         eq(heartbeatRuns.companyId, companyId),
         eq(heartbeatRuns.agentId, binding.agent.id),
         eq(heartbeatRuns.nativeIssueId, issueId),
@@ -328,7 +328,14 @@ export function runnerGoalService(
           .limit(1)
           .then((rows) => rows[0] ?? null)
       : null;
-    const goal = storedGoal(session);
+    const persistedGoal = storedGoal(session);
+    const workingNow = Boolean(
+      persistedGoal?.status === "active" && persistedGoal.workingNow && session?.goalObservedAt &&
+      activeRun?.status === "running" && activeRun.runnerInstanceId &&
+      session.goalSourceId === `${activeRun.runnerInstanceId}:${activeRun.id}` &&
+      hasConnectedRunnerPrpAuthority({companyId, issueId, agentId:binding.agent.id, runId:activeRun.id, runnerInstanceId:activeRun.runnerInstanceId})
+    );
+    const goal = persistedGoal ? { ...persistedGoal, workingNow } : null;
     const projectedPendingAction = pendingAction(pending?.action ?? null) ?? (
       goal?.status === "active" && !goal.workingNow && activeRun
         ? "continuing"
@@ -341,7 +348,7 @@ export function runnerGoalService(
       sessionId: session?.id ?? null,
       capability: storedCapability(session, capabilityForAgent(binding.agent)),
       goal,
-      workingNow: goal?.workingNow ?? false,
+      workingNow,
       activeRunId: activeRun?.id ?? null,
       pendingAction: projectedPendingAction,
       revision: session?.goalRevision ?? 0,

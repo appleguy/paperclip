@@ -172,6 +172,22 @@ export async function registerRunnerPrpAuthority(input: {
   };
 }
 
+/** True only for this exact current registration and its authenticated live Runner. */
+export function hasConnectedRunnerPrpAuthority(input: {
+  readonly companyId:string; readonly issueId:string; readonly agentId:string;
+  readonly runId:string; readonly runnerInstanceId:string;
+}): boolean {
+  const current = currentLiveAuthorities.get(liveAuthorityKey(input));
+  if (!current || current.runId !== input.runId) return false;
+  const registration = registrations.get(input.runId);
+  if (!registration || registration.generation !== current.generation ||
+      registration.companyId !== input.companyId || registration.issueId !== input.issueId ||
+      registration.agentId !== input.agentId) return false;
+  const identity = registration.authority.store.state.identity;
+  return identity.runId === input.runId && identity.runnerInstanceId === input.runnerInstanceId &&
+    registration.authority.activeRunnerConnectionCount() > 0;
+}
+
 export function queueLiveRunnerPrpCommand(input: {
   companyId: string;
   issueId: string;

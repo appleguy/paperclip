@@ -213,7 +213,7 @@ export function RunnerGoalWidget({ control }: { control: RunnerGoalControl }) {
                 {goal.status.replaceAll("_", " ")}
               </span>
             ) : null}
-            {goal?.workingNow ? (
+            {goal?.status === "active" && projection?.workingNow && projection.activeRunId && projection.observedAt ? (
               <span className="inline-flex items-center gap-1 text-xs text-primary" role="status">
                 <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-primary" /> Working now
               </span>
