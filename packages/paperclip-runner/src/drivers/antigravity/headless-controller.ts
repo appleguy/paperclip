@@ -66,6 +66,10 @@ export class AntigravityHeadlessController {
     if (!birth) { child.on("error", () => {}); child.kill(); throw new Error("Owned Antigravity process birth unavailable"); }
     return new AntigravityHeadlessController(child, options.conversationId, options.cwd, birth, readBirth, options.authorize, options.onEvent, options.onUncertain);
   }
+  /** Verifies this initialized child still has the OS birth recorded at launch. */
+  assertOwnedLive(): void {
+    if (this.failed || !this.ready || this.child.exitCode !== null || this.child.signalCode !== null || !this.child.pid || this.readBirth(this.child.pid) !== this.birth) throw new Error("Antigravity owned child unavailable");
+  }
   /** Accepted to local stdin only; provider consumption remains unknown until result. */
   submit(operationId: string, content: string): { operationId: string; disposition: "written_consumption_unknown" } {
     if (this.failed || this.child.exitCode !== null || this.child.signalCode !== null || !this.child.pid || this.readBirth(this.child.pid) !== this.birth || !this.ready || this.active || !operationId || this.seen.has(operationId)) throw new Error("Write unavailable");

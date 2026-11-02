@@ -217,6 +217,8 @@ export interface ExecuteNativeSessionOptions {
   /** Internal test seam; production uses the fixed 120-second platform policy. */
   runtimeInputLiveWindowMs?: number;
   onSession?: (session: NativeSession | null) => void;
+  /** Runs once the event consumer is live and before the first turn is submitted; a throw aborts the run with no turn. */
+  onEventConsumerReady?: () => Promise<void>;
   /** Observes why a retained session was removed from warm reuse. */
   onSessionQuarantined?: (reason: string) => Promise<void> | void;
   existingSession?: NativeSession;
@@ -224,6 +226,8 @@ export interface ExecuteNativeSessionOptions {
   keepSessionOpen?: boolean;
   /** Apply a structured session-goal control instead of starting an ordinary turn. */
   sessionGoalControl?: NativeSessionGoalControl | null;
+  /** Routes the explicit goal control through a caller-owned controller (shared Codex reserved-send path). */
+  applySessionGoalControl?: (control: NativeSessionGoalControl) => Promise<unknown>;
   /** Resume the active durable session goal after a bounded heartbeat rollover. */
   resumeSessionGoalHeartbeat?: boolean;
   /**
@@ -278,6 +282,8 @@ export interface ExecuteNativeSessionOptions {
     turnId: string | null;
     event: PrpEvent;
   }) => PrpStructuredRunResult | null;
+  /** Server-owned exact-lease receipt check for a work-session completion. */
+  authorizeWorkSessionResult?: (input: { event: PrpEvent; result: PrpStructuredRunResult; signal: AbortSignal }) => Promise<boolean>;
 }
 
 function isTurnTerminal(event: PrpEvent): boolean {
@@ -878,6 +884,7 @@ async function consumeTurn(
   resumeInterruptedTurn?: (event: PrpEvent, signal: AbortSignal) => Promise<boolean>,
   checkpointGovernedWait?: (wait: NonNullable<PersistedNativeSession["governedWait"]>, signal: AbortSignal) => Promise<void>,
   initialGovernedWait?: PersistedNativeSession["governedWait"],
+  authorizeWorkSessionResult?: ExecuteNativeSessionOptions["authorizeWorkSessionResult"],
 ) {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const appendAbort = new AbortController();
@@ -1187,6 +1194,12 @@ async function consumeTurn(
       }
       if (governedResult !== null && !isTurnTerminal(event) && !sessionGoalObserved) {
         if (resultSource === "semantic_result") {
+          if (["paperclip.native-execution-input.v12", "paperclip.native-execution-input.v13"].includes(input.schema) && authorizeWorkSessionResult &&
+              (await session.capabilities()).completionBoundary === "paperclip_work_session") {
+            if (!(await authorizeWorkSessionResult({ event, result: governedResult, signal: appendAbort.signal }))) throw new Error("native_work_session_receipt_unproven");
+            appendAbort.signal.throwIfAborted();
+            return { event, eventCount, highestContiguousSourceSeq, governedResult };
+          }
           // A completion tool reports task disposition, not provider termination.
           // Persist the final answer and authoritative terminal before finalizing.
           continue;
@@ -1205,7 +1218,7 @@ async function consumeTurn(
           goalControlObserved = true;
         }
         if (
-          goalControlObserved &&
+          (goalControlObserved || goalStatus(eventGoal ?? null) === "budget_limited") &&
           (providerFailure === null || providerFailure.recoverable) &&
           eventGoal !== undefined &&
           goalStatus(eventGoal) !== "active" &&
@@ -2524,6 +2537,7 @@ export async function executeNativeSession(
                 await checkpoint(signal);
               },
               governedWait,
+              options.authorizeWorkSessionResult,
             )
           : Promise.resolve({
               event: recoveryTerminal,
@@ -2539,6 +2553,7 @@ export async function executeNativeSession(
       // that later rejection becomes process-fatal under Node's strict policy.
       void consuming.catch(() => undefined);
       try {
+        await options.onEventConsumerReady?.();
         const shouldStartFreshTurn = !governedWait && (
           !recovered ||
           (!recoveredActiveTurnId &&
@@ -2549,7 +2564,7 @@ export async function executeNativeSession(
           // Explicit controls remain authoritative after controller loss. In
           // particular, pause/clear/edit must reach a recovered session even
           // while its provider turn is still active.
-          await applyNativeSessionGoalControl(session, options.sessionGoalControl);
+          await (options.applySessionGoalControl ?? ((control) => applyNativeSessionGoalControl(session, control)))(options.sessionGoalControl);
           await checkpoint();
         } else if (options.resumeSessionGoalHeartbeat && shouldStartFreshTurn) {
           const requestId = `recovery_${input.binding.runId}`;

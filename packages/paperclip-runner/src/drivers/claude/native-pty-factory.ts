@@ -1,6 +1,8 @@
 import { execFile } from "node:child_process";
 import { createRequire } from "node:module";
 import { promisify } from "node:util";
+import { realpathSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
 import type { ClaudeInteractivePty, ClaudeInteractivePtyFactory } from "./native-interactive-controller.js";
 
 const execFileAsync=promisify(execFile);
@@ -28,6 +30,7 @@ export async function verifyClaudePtyGeneration(pid:number,generation:string):Pr
   return await claudePtyProcessGeneration(pid)===generation;
 }
 export interface ClaudeNativePty extends ClaudeInteractivePty {
+  readonly launchScope: Readonly<{pid:number; generation:string; executable:string; cwd:string; home:string; config:string; source:"parent-attested-launch-scope"}>;
   /** Explicit local terminal input only; this is not a durable delivery receipt. */
   writeInput(text:string):void;
 }
@@ -56,6 +59,8 @@ export class ClaudeNativePtyFactory implements ClaudeInteractivePtyFactory {
     let module:PtyModule;
     try { module=this.options.loadPty?.() ?? require("node-pty") as PtyModule; } catch { throw new Error("node-pty is unavailable; install the pinned native dependency"); }
     const env=nativeSubscriptionEnvironment(process.env,input.environment);
+    if (!isAbsolute(input.executable) || !isAbsolute(input.cwd) || !env.HOME || !isAbsolute(env.HOME) || (env.CLAUDE_CONFIG_DIR && !isAbsolute(env.CLAUDE_CONFIG_DIR))) throw new Error("invalid Claude PTY launch scope");
+    const executable=realpathSync(input.executable), cwd=realpathSync(input.cwd), home=resolve(env.HOME), config=resolve(env.CLAUDE_CONFIG_DIR ?? resolve(home,".claude"));
     const pty=module.spawn(input.executable,[...input.args],{name:"xterm-256color",cols:100,rows:32,cwd:input.cwd,env});
     let exited=false, detached=false, stopped=false;
     pty.onExit(()=>{exited=true;});
@@ -63,7 +68,7 @@ export class ClaudeNativePtyFactory implements ClaudeInteractivePtyFactory {
     const generation=await claudePtyProcessGeneration(pty.pid);
     if (!generation || exited) throw new Error("Claude PTY process identity unavailable; reconcile launch");
     return {
-      pid:pty.pid,generation,
+      pid:pty.pid,generation,launchScope:Object.freeze({pid:pty.pid,generation,executable,cwd,home,config,source:"parent-attested-launch-scope" as const}),
       writeInput(text) {
         if (detached || stopped || exited) throw new Error("Claude PTY unavailable");
         if (typeof text!=="string" || Buffer.byteLength(text,"utf8")>65536) throw new Error("Claude PTY input too large");

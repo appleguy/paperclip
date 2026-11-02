@@ -3,6 +3,7 @@ import { resolveQualifiedAcpxProfile } from "./drivers/acpx/qualified-profiles.j
 import { describe, expect, it, vi } from "vitest";
 import { createCodexNativeSessionBackend } from "./backends/codex-native-backend.js";
 import { FakeCodexTransport, WORKSPACE } from "./drivers/codex/codex-app-server-driver.test-support.js";
+import { OpenCodeSharedNativeBackend } from "./drivers/opencode/shared-native-backend.js";
 
 import type { ControlPlanePort } from "./contracts/control-plane-port.js";
 import type { NativeExecutionInputV1, NativeExecutionInputV5 } from "./contracts/native-execution.js";
@@ -226,6 +227,27 @@ function highestContiguous(events: PrpEvent[]): number {
   while (sequences.has(cursor + 1)) cursor += 1;
   return cursor;
 }
+
+it.each([true, false])("requires an authenticated work-session receipt (accepted=%s)", async accepted => {
+  const execution = { ...preparedInput(), schema: "paperclip.native-execution-input.v12" as const,
+    session: { ...preparedInput().session, driverKind: "opencode_shared_v2" as const, lifecyclePolicy: { mode: "per_turn" as const, idleTimeoutMs: null } },
+    provider: { kind: "opencode_shared_v2" as const, model: "fixture/model", effort: "high", cliVersion: "2.2.5" as const }, homeMode: "preconfigured" as const };
+  const appended: PrpEvent[] = [];
+  const backend = new OpenCodeSharedNativeBackend({ identity, runnerInstanceId: "runner-recovery", providerSessionId: "ses_fixture", async verify() {},
+    async readReceipt() { return null; }, async dispatch() {}, async startObservation() {}, async close() {}, async waitForReceipt() { return { result, operationId: "a".repeat(64), recordedAt: "2026-08-09T00:00:00.000Z" }; },
+  });
+  const work = executeNativeSession({ input: execution, backend, controlPlane: {
+    async openRun() {}, async checkpointSession() {}, async completeRun() {},
+    async appendEvent(event) { appended.push(event); return { cursor: event.sourceSeq, highestContiguousSourceSeq: event.sourceSeq, disposition: "committed" }; },
+    async replayEvents() { return { events: [], highestContiguousSourceSeq: 0 }; },
+  }, runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery", timeoutMs: 1000,
+    authorizeWorkSessionResult: async ({ result: receipt }) => accepted && receipt.summary === result.summary,
+  });
+  if (accepted) {
+    await expect(work).resolves.toMatchObject({ result });
+    expect(appended.some(event => event.eventType === "turn.completed")).toBe(false);
+  } else await expect(work).rejects.toThrow("native_work_session_receipt_unproven");
+});
 
 describe("executeNativeSession recovery", () => {
   it.each([false, true].flatMap(recovered => [

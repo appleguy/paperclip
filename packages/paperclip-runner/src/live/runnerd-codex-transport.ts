@@ -1236,6 +1236,24 @@ export interface CapabilityRunnerdProcessEvidence {
 }
 
 export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionDriver {
+  /** Attested server-issued attachment; never populate from a provider response or agent input. */
+  sharedCodexDaemon?: {
+    socketPath:string;daemonGeneration:string;threadId:string;codexHome:string;
+    peer:{pid:number;startSeconds:number;startMicroseconds:number;executable:string};
+    bootstrapId?:string;
+    writer?:{runId:string;normalizedSessionId:string;runnerInstanceId:string;grantId:string;epoch:number;observationEpochId:string;managedTools?:boolean;managedBootstrapId?:string;reasoningEffort?:string;threadConfig?:Record<string,unknown>};
+  };
+  /** Server-owned DB authority. Bootstrap remains disabled unless all three steps are supplied. */
+  sharedCodexBootstrapAuthority?: {
+    reserve(input:{bootstrapId:string;runAttachTemplate:Record<string,unknown>}):Promise<void>;
+    bind(input:{bootstrapId:string;threadId:string}):Promise<void>;
+    attached(input:{bootstrapId:string;threadId:string}):Promise<void>;
+  };
+  /** Server-owned existing-goal-action admission; absent for normal Codex transports. */
+  authorizeSharedCodexGoalWrite?: (input:{requestId:string; threadId:string; objective:string; status:"paused"|"active"; tokenBudget?:number|null}) => Promise<{
+    writer:{grantId:string;epoch:number;observationEpochId:string};
+    expectedGoal:{objective:string;status:string;tokenBudget:number|null}|null;
+  }>;
   observability?: import("../drivers/agent-observability.js").ProviderObservabilityLaunch;
   homeMode?: "isolated" | "preconfigured";
   provider?: "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
@@ -3760,6 +3778,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   #deferredTurnStartEvents: DurableRecoveryCommittedEvent[] = [];
   #recoveryTurnBindingPending = false;
   #threadId = "";
+  #sharedBoundThreadId: string | null = null;
   #observedProviderModel: string | undefined;
   #sessionId: string | null = null;
   #providerIdentity: Record<string, unknown> | null = null;
@@ -3977,6 +3996,18 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   async request(
     method: string,
     params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    return this.#request(method, params);
+  }
+
+  async requestGoal(method:string, params:Record<string,unknown>, metadata:{requestId?:string}):Promise<Record<string,unknown>> {
+    return this.#request(method, params, metadata);
+  }
+
+  async #request(
+    method: string,
+    params: Record<string, unknown>,
+    goalMetadata?: {requestId?:string},
   ): Promise<Record<string, unknown>> {
     if (this.#closed) throw new Error("PRP Codex transport is closed");
     this.#throwIfFailed();
@@ -4196,7 +4227,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       return {
         thread: {
           id: this.#threadId,
-          sessionId: this.#sessionId,
+          sessionId: this.#reportedSessionId(),
           ...(this.#providerIdentity === null
             ? {}
             : { providerIdentity: structuredClone(this.#providerIdentity) }),
@@ -4213,13 +4244,20 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       };
     }
     if (method === "thread/goal/get") {
-      const result = await this.#commandResult("session.goal.get", params);
+      const result = await this.#commandResult("session.goal.get", { ...params, ...(goalMetadata?.requestId ? {requestId:goalMetadata.requestId} : {}) });
       return {
         goal: appServerThreadGoal(result.goal, this.#threadId),
       };
     }
     if (method === "thread/goal/set") {
-      const result = await this.#commandResult("session.goal.set", params);
+      let admission:Awaited<ReturnType<NonNullable<CapabilityRunnerdCodexTransportOptions["authorizeSharedCodexGoalWrite"]>>>|undefined;
+      if (this.options.authorizeSharedCodexGoalWrite) {
+        if (!goalMetadata?.requestId || typeof params.threadId!=="string" || typeof params.objective!=="string" || (params.status!=="paused" && params.status!=="active")) throw new Error("codex_shared_goal_write_not_admitted");
+        // "active" is a resume of a paused goal; the server authority matches it to the reserved action and its budget.
+        if (params.status==="active" && !(typeof params.tokenBudget==="number" && Number.isSafeInteger(params.tokenBudget))) throw new Error("codex_shared_goal_write_not_admitted");
+        admission=await this.options.authorizeSharedCodexGoalWrite({requestId:goalMetadata.requestId,threadId:params.threadId,objective:params.objective,status:params.status,...(typeof params.tokenBudget==="number" || params.tokenBudget===null ? {tokenBudget:params.tokenBudget} : {})});
+      }
+      const result = await this.#commandResult("session.goal.set", { ...params, ...(goalMetadata?.requestId ? {requestId:goalMetadata.requestId} : {}), ...(admission ?? {}) });
       const snapshot = record(result.snapshot);
       return {
         goal: appServerThreadGoal(
@@ -4229,7 +4267,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       };
     }
     if (method === "thread/goal/clear") {
-      await this.#commandResult("session.goal.clear", params);
+      await this.#commandResult("session.goal.clear", { ...params, ...(goalMetadata?.requestId ? {requestId:goalMetadata.requestId} : {}) });
       return {};
     }
     if (method === "session/budget/increase") {
@@ -4255,7 +4293,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         ...this.#preparedThreadWorkingDirectory(),
         thread: {
           id: this.#threadId,
-          sessionId: this.#sessionId,
+          sessionId: this.#reportedSessionId(),
           ...(this.#providerIdentity === null
             ? {}
             : { providerIdentity: structuredClone(this.#providerIdentity) }),
@@ -5449,13 +5487,19 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     }
     const prepared = await this.#prepareLaunch(params, identity, dynamicTools);
     const { runAttachTemplate } = prepared;
+    const sharedBootstrapId=this.options.sharedCodexDaemon?.bootstrapId;
+    const sharedAuthority=this.options.sharedCodexBootstrapAuthority;
+    if (sharedBootstrapId) {
+      if (!sharedAuthority) throw new Error("codex_shared_bootstrap_authority_missing");
+      await sharedAuthority.reserve({bootstrapId:sharedBootstrapId,runAttachTemplate:structuredClone(runAttachTemplate)});
+    }
     // Preserve the first generation's provider attachment seed independently
     // of bounded command history. The in-memory copy serves a live warm
     // continuation; the control-plane copy serves a controller/runner resume.
     this.#runAttachTemplate = structuredClone(runAttachTemplate);
     core.persistRunAttachTemplate(runAttachTemplate);
     core.queueCommand("run.prepare", runAttachTemplate);
-    core.queueCommand("session.open", { reuse: "same_session" });
+    if (!sharedBootstrapId) core.queueCommand("session.open", { reuse: "same_session" });
     const registration = this.options.controlPlaneRegistration
       ? await this.options.controlPlaneRegistration(core)
       : null;
@@ -5520,13 +5564,34 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     this.#publish();
     this.#pump = setInterval(() => this.#pumpEventsSafely(), 5);
     await this.#waitCommand("run.prepare", undefined, undefined, true);
+    let sharedThreadId:string|undefined;
+    if (sharedBootstrapId) {
+      const command=core.store.state.commands.find(candidate=>candidate.type==="run.prepare");
+      const result=record(record(command?.result).result);
+      sharedThreadId=typeof result.providerSessionId==="string" ? result.providerSessionId : undefined;
+      if (!sharedThreadId || sharedThreadId.length>240) throw new Error("codex_shared_bootstrap_receipt_invalid");
+      await sharedAuthority!.bind({bootstrapId:sharedBootstrapId,threadId:sharedThreadId});
+      this.#sharedBoundThreadId=sharedThreadId;
+      core.queueCommand("session.open", {reuse:"same_session"},undefined,true);
+      await core.flushCheckpoint();
+    }
     await this.#waitCommand("session.open", undefined, admissionDeadline, true);
+    if (sharedBootstrapId) await sharedAuthority!.attached({bootstrapId:sharedBootstrapId,threadId:sharedThreadId!});
     await this.#waitForProviderIdentity(undefined, admissionDeadline);
     this.#startupComplete = true;
     this.#diagnostic("runnerd authenticated to the durable PRP control plane");
     return this.#openedThreadResponse(params);
 
     }
+
+  /**
+   * A registered shared daemon reports no separate account session: its managed thread is the provider session, so the
+   * identity the driver requires is the server-bound thread id, and only that exact bound id.
+   */
+  #reportedSessionId(): string | null {
+    if (this.#sessionId !== null) return this.#sessionId;
+    return this.#sharedBoundThreadId !== null && this.#sharedBoundThreadId === this.#threadId ? this.#threadId : null;
+  }
 
   #openedThreadResponse(params: Record<string, unknown>): Record<string, unknown> {
     const provider = this.options.provider ?? "codex";
@@ -5536,7 +5601,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       ...this.#preparedThreadWorkingDirectory(),
       thread: {
         id: this.#threadId,
-        sessionId: this.#sessionId,
+        sessionId: this.#reportedSessionId(),
         ...(this.#providerIdentity === null
           ? {}
           : { providerIdentity: structuredClone(this.#providerIdentity) }),
@@ -6740,6 +6805,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       if (
         this.#threadId.length > 0 &&
         (this.#checkpointProviderIdentityExpectation !== null ||
+          this.#sharedBoundThreadId === this.#threadId ||
           this.#evidence.providerExecutionKind === "remote_service" ||
           this.#evidence.providerPid !== null) &&
         (expectedEventType === undefined ||
@@ -7200,8 +7266,14 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
     }
     this.#providerIdentityEventType = event.eventType;
     const started = record(record(event.envelope.payload).payload);
-    if (readProviderProcessOwnership(started)?.kind === "shared_daemon") {
-      throw new Error("shared daemon session requires explicit admitted native binding");
+    const ownership=readProviderProcessOwnership(started);
+    if (ownership?.kind === "shared_daemon") {
+      const shared=this.options.sharedCodexDaemon;
+      if (!shared || !shared.bootstrapId || !this.#sharedBoundThreadId || !this.options.sharedCodexBootstrapAuthority ||
+          ownership.threadId!==this.#sharedBoundThreadId || ownership.socketPath!==shared.socketPath ||
+          ownership.daemonGeneration!==shared.daemonGeneration || ownership.codexHome!==shared.codexHome) {
+        throw new Error("shared daemon session requires explicit admitted native binding");
+      }
     }
     const runtimeIdentity = record(started.runtimeIdentity);
     const descriptor = record(started.providerDescriptor);

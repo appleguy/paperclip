@@ -8,19 +8,21 @@ import { DurablePrpControlPlane, spawnRunner, type RunnerProcessHandle } from ".
 import { readRunnerdArtifactBinding } from "../../live/runnerd-codex-transport.js";
 import { RunnerdAntigravityPort } from "./runnerd-antigravity-port.js";
 import { AntigravityHeadlessController } from "./headless-controller.js";
+import { captureAntigravityWorkspace } from "./native-workspace-attestation.js";
 import { normalizeAntigravityToolObservation, type AntigravityToolObservation } from "./native-tool-observation.js";
 
 const capabilities:NativeSessionCapabilities={resume:false,typedEvents:true,steering:false,interruption:false,structuredResult:false,dynamicTools:false,usage:false,providerTermination:"confirmed",unsupported:["automatic recovery","shared interactive remote control","approval responses","structured Paperclip completion","managed tool accounting","native tool ingress fencing"]};
 export function describeAntigravityHeadlessBackend() { return {kind:"runner" as const,name:"antigravity_headless",version:"1.4.12",capabilities}; }
 /** Explicitly admitted, single native conversation and one Runner turn. */
 export class RunnerdAntigravityBackend implements NativeSessionBackend {
-  private readonly options:{identity:NativeRunIdentity;runnerInstanceId:string;environmentLeaseId:string;turnId:string;itemId:string;bindingId:string;bindingGeneration:number;conversationId?:string;cwd:string;stateDirectory:string;runnerBinary:string;executable:string;verifiedVersion:string;env:NodeJS.ProcessEnv;admit:(sourceEventId:string)=>boolean | Promise<boolean>;withAdmission?:(sourceEventId:string,dispatch:()=>void)=>Promise<void>;onToolObservation?:(observation:AntigravityToolObservation)=>void};
+  private readonly options:{identity:NativeRunIdentity;runnerInstanceId:string;environmentLeaseId:string;turnId:string;itemId:string;bindingId:string;bindingGeneration:number;conversationId?:string;cwd:string;stateDirectory:string;runnerBinary:string;executable:string;verifiedVersion:string;env:NodeJS.ProcessEnv;admit:(sourceEventId:string)=>boolean | Promise<boolean>;withAdmission?:(sourceEventId:string,dispatch:()=>void)=>Promise<void>;onToolObservation?:(observation:AntigravityToolObservation)=>void;onNativeReady?:(binding:Readonly<{conversationId:string;processGeneration:string;workspace:string;assertLive:()=>void}>)=>Promise<void>};
   constructor(options:RunnerdAntigravityBackend["options"]) { this.options={...options,identity:{...options.identity},env:{...options.env}}; }
   async descriptor(){return describeAntigravityHeadlessBackend();}
   async openSession(input:OpenNativeSessionInput):Promise<NativeSession>{
     const o=this.options;
     if(input.workingDirectory!==o.cwd || Object.keys(o.identity).some(key=>input.identity[key as keyof NativeRunIdentity]!==o.identity[key as keyof NativeRunIdentity]))throw new Error("Antigravity native authority mismatch");
     input.signal?.throwIfAborted();
+    const workspace=o.onNativeReady?captureAntigravityWorkspace(o.cwd):undefined;
     const runnerDir=join(o.stateDirectory,"runner"),journal=join(o.stateDirectory,"native-journal");
     // This implementation does not adopt old authority or recover a child.
     // An existing directory therefore fails before starting any process.
@@ -42,6 +44,7 @@ export class RunnerdAntigravityBackend implements NativeSessionBackend {
       let timer:ReturnType<typeof setTimeout>|undefined;
       let conversationId:string;
       try{conversationId=await Promise.race([ready,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error("Antigravity initialization timeout")),5000);})]);}finally{if(timer)clearTimeout(timer);}
+      if(o.onNativeReady){const owned=controller;const assertLive=()=>{workspace!.assertUnchanged();owned!.assertOwnedLive();};assertLive();await o.onNativeReady(Object.freeze({conversationId,processGeneration:owned!.generation,workspace:workspace!.path,assertLive}));assertLive();}
       port=new RunnerdAntigravityPort({controller,journalDirectory:journal,conversationId,processGeneration:controller.generation,bindingId:o.bindingId,bindingGeneration:o.bindingGeneration,runId:o.identity.runId,environmentLeaseId:o.environmentLeaseId,normalizedSessionId:o.identity.sessionId,turnId:o.turnId,admit:id=>id===admittedEvent,queueResult:(id,payload)=>{core.queueCommand("native_controller.observation",payload,id,true);}});
       input.signal?.throwIfAborted();
       const ticket=core.issueBootstrapTicket(60000);await core.flushCheckpoint();
@@ -57,7 +60,7 @@ export class RunnerdAntigravityBackend implements NativeSessionBackend {
       return {
         identity:()=>({...o.identity}),capabilities:async()=>({...capabilities}),
         async *events(){let index=0;while(!closed){while(index<events.length)yield events[index++]!;if(failure)throw failure;await new Promise<void>(resolve=>waiters.add(resolve));}},
-        async startTurn({message}){if(started)throw new Error("Antigravity turn already dispatched");started=true;core.queueCommand("turn.start",{text:message.text},startCommandId,true);await waitCommand(startCommandId);let timer:ReturnType<typeof setTimeout>|undefined;try{await Promise.race([dispatchResult,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error("Antigravity dispatch outcome unknown")),15000);})]);}finally{if(timer)clearTimeout(timer);}return {turnId:o.turnId};},
+        async startTurn({message}){if(o.onNativeReady)throw new Error("Antigravity managed tool ingress unsupported");if(started)throw new Error("Antigravity turn already dispatched");started=true;core.queueCommand("turn.start",{text:message.text},startCommandId,true);await waitCommand(startCommandId);let timer:ReturnType<typeof setTimeout>|undefined;try{await Promise.race([dispatchResult,new Promise<never>((_,reject)=>{timer=setTimeout(()=>reject(new Error("Antigravity dispatch outcome unknown")),15000);})]);}finally{if(timer)clearTimeout(timer);}return {turnId:o.turnId};},
         async result(){return null;},
         async snapshot(){return {backendKind:"runner",driverKind:"antigravity_headless",sessionId:o.identity.sessionId,identity:{...o.identity},providerSessionId:conversationId,workingDirectory:o.cwd,activeTurnId:started?o.turnId:null};},
         async close(){if(closed)return;closed=true;wake();try{await port!.closeOwned();const exitId=core.store.state.commands.find(c=>c.type==="native_controller.observation"&&c.payload.action==="antigravity.provider_exit")?.commandId;if(!exitId)throw new Error("Antigravity exit receipt missing");await waitCommand(exitId);core.queueCommand("runner.shutdown",{},"antigravity_shutdown",true);await waitCommand("antigravity_shutdown");const exit=await runner!.completion;if(exit.code!==0)throw new Error("Antigravity Runner shutdown failed");runner=undefined;}finally{if(runner){runner.child.kill("SIGTERM");await runner.completion.catch(()=>{});}await core.stop();}},

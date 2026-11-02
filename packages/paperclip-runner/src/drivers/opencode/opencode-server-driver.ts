@@ -2179,9 +2179,10 @@ class OpenCodeHarnessSession implements HarnessSession {
 }
 
 /** Retain the reusable gateway key in the runner; the harness gets a session-scoped capability. */
-async function startOpenCodeProviderProxy(baseUrl: string, key: string, model: string, environment: NodeJS.ProcessEnv) {
+export async function startOpenCodeProviderProxy(baseUrl: string, key: string, model: string, environment: NodeJS.ProcessEnv, restore?: { port: number; token: string }) {
   const upstreamUrl = new URL(`${baseUrl.replace(/\/+$/, "")}/chat/completions`);
-  const token = randomBytes(32).toString("base64url");
+  if (restore && (!Number.isSafeInteger(restore.port) || restore.port < 1 || restore.port > 65535 || !/^[A-Za-z0-9_-]{43}$/.test(restore.token))) throw new Error("Invalid OpenCode provider proxy restoration");
+  const token = restore?.token ?? randomBytes(32).toString("base64url");
   // Agent-local settings keep one runtime's transport configuration out of other sessions.
   const proxyEnv = {
     HTTP_PROXY: environment.http_proxy ?? environment.HTTP_PROXY ?? environment.all_proxy ?? environment.ALL_PROXY,
@@ -2213,6 +2214,9 @@ async function startOpenCodeProviderProxy(baseUrl: string, key: string, model: s
         response.writeHead(404).end();
         return;
       }
+      // Restoring a listener is not authority to restart provider work. A
+      // successor must reconcile the old operation before write admission.
+      if (restore) { response.writeHead(503).end("Provider dispatch not admitted"); return; }
       const chunks: Buffer[] = [];
       let bytes = 0;
       for await (const chunk of request) {
@@ -2263,7 +2267,7 @@ async function startOpenCodeProviderProxy(baseUrl: string, key: string, model: s
   try {
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
-      server.listen(0, "127.0.0.1", () => { server.off("error", reject); resolve(); });
+      server.listen({ port: restore?.port ?? 0, host: "127.0.0.1", exclusive: true }, () => { server.off("error", reject); resolve(); });
     });
   } catch (error) { agent.destroy(); throw error; }
   const address = server.address();

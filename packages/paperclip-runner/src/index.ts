@@ -16,6 +16,8 @@ export * from "./contracts/question-set.js";
 export * from "./contracts/runtime-context.js";
 export * from "./contracts/types.js";
 export * from "./backends/harness-driver-backend.js";
+export { nativeSystemInstructions } from "./backends/runtime-context.js";
+export { codexSemanticToolSpecs } from "./drivers/codex/codex-driver-values.js";
 export * from "./drivers/dot/dot-harness-driver.js";
 export { describeRunnerdNativeSessionBackend } from "./backends/codex-native-backend.js";
 export { createOpenCodeNativeSessionBackend } from "./backends/opencode-native-backend.js";
@@ -51,13 +53,32 @@ export {
 } from "./control-plane/durable-prp-control-plane.js";
 export type { DurableRecoveryIdentity } from "./control-plane/prp-transport-types.js";
 export * from "./drivers/codex/app-server-transport.js";
+export {
+  ManagedNativeCodexGoalBridge,
+  verifiedNativeGoalSnapshot,
+  type PaperclipGoalControlPin,
+  type GoalControlRequest,
+  type PaperclipGoalJournal,
+  type NativeGoalReceipt,
+} from "./drivers/codex/managed-native-goal-bridge.js";
+export {
+  SharedDaemonCodexAppServerTransport,
+  sharedDaemonTransportFactory,
+  type SharedDaemonIdentity,
+  type SharedDaemonTransportOptions,
+} from "./drivers/codex/shared-daemon-transport.js";
 export * from "./drivers/codex/codex-app-server-driver.js";
 export { resolveCodexCommand, resolvePinnedCodexCommand } from "./drivers/codex/codex-command.js";
 export { runnerBinaryTarget } from "./live/runner-binary.js";
 export * from "./drivers/opencode/opencode-server-driver.js";
 export * from "./drivers/opencode/mcp-bridge.js";
 export { OpenCodeV2Shared } from "./drivers/opencode/opencode-v2-shared.js";
+export { ClaudeInteractiveNativeBackend } from "./drivers/claude/native-interactive-backend.js";
+export type { ClaudeInteractiveNativePort } from "./drivers/claude/native-interactive-backend.js";
+export { OpenCodeSharedNativeBackend } from "./drivers/opencode/shared-native-backend.js";
+export type { OpenCodeSharedNativePort } from "./drivers/opencode/shared-native-backend.js";
 export type { V2Authority, V2Binding, V2Cursor, V2Event } from "./drivers/opencode/opencode-v2-shared.js";
+export * from "./drivers/claude/native-interactive-runner.js";
 export * from "./drivers/acpx/qualified-profiles.js";
 export { parseAcpxCandidateAdmission, type AcpxCandidateAdmission } from "./drivers/acpx/candidate-admission.js";
 export { startAntigravityBrowserLogin, verifyAntigravityCredential, sanitizeAntigravityCredential } from "./drivers/acpx/antigravity-auth.js";
@@ -77,6 +98,7 @@ export {
   probeNativeRunnerEnvironment,
   NativeEnvironmentProbeCleanupError,
   runnerCodexDynamicToolsFit,
+  authorizedToolSetForProvider,
   defaultCapabilityRunnerdBinary,
   readRunnerdArtifactBinding,
   drainRetainedRunnerdMaintenanceOperations,
@@ -113,6 +135,9 @@ export { RunnerdDotDriver, type RunnerdDotDriverOptions } from "./drivers/dot/ru
 export type { RunnerExecutionDriver } from "./control-plane/runner-execution-driver.js";
 
 export { bindRunnerLaunchResources, createRunnerProviderLaunch, runnerProviderLaunchRequirements, runnerLaunchRequirementsDigest, validatePreparedRunnerLaunch } from "./live/runner-provider-launch.js";
+export { createSharedCodexThreadConfig } from "./live/shared-codex-thread-config-builder.js";
+export { sharedThreadConfigViolation } from "./live/shared-codex-thread-config.js";
+export type { SharedCodexThreadConfigPolicy } from "./live/shared-codex-thread-config-builder.js";
 export type { RunnerProviderLaunchRequirements, RunnerProviderLaunchEnvironment, PreparedRunnerProviderLaunch, RunnerLaunchPreparer } from "./live/runner-provider-launch.js";
 
 export { resolveGrokDisableWebSearch } from "./drivers/acpx/grok-web-search.js";

@@ -14,6 +14,8 @@ export const NATIVE_EXECUTION_INPUT_SCHEMA_V2 = "paperclip.native-execution-inpu
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V3 = "paperclip.native-execution-input.v3" as const;
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V10 = "paperclip.native-execution-input.v10" as const;
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V11 = "paperclip.native-execution-input.v11" as const;
+export const NATIVE_EXECUTION_INPUT_SCHEMA_V12 = "paperclip.native-execution-input.v12" as const;
+export const NATIVE_EXECUTION_INPUT_SCHEMA_V13 = "paperclip.native-execution-input.v13" as const;
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V9 = "paperclip.native-execution-input.v9" as const;
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V8 = "paperclip.native-execution-input.v8" as const;
 export const NATIVE_EXECUTION_INPUT_SCHEMA_V6 = "paperclip.native-execution-input.v6" as const;
@@ -283,13 +285,27 @@ export interface NativeExecutionInputV11 extends Omit<NativeExecutionInputV10, "
   session: Omit<NativeExecutionInputV10["session"], "driverKind"> & { driverKind: "antigravity_headless" };
 }
 
+export interface NativeExecutionInputV12 extends Omit<NativeExecutionInputV10, "schema" | "provider" | "session"> {
+  schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA_V12;
+  provider: { kind: "opencode_shared_v2"; model: string; effort: string; cliVersion: "2.2.5" };
+  session: Omit<NativeExecutionInputV10["session"], "driverKind"> & { driverKind: "opencode_shared_v2" };
+}
+
+/** Genuine Claude interactive session: the server launches it, the owner keeps native input, and only an
+ * authenticated paperclip_finish/paperclip_block receipt completes the work session. */
+export interface NativeExecutionInputV13 extends Omit<NativeExecutionInputV10, "schema" | "provider" | "session"> {
+  schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA_V13;
+  provider: { kind: "claude_interactive"; model: string; effort: "low" | "medium" | "high" | "max"; autoCompactTokens: number };
+  session: Omit<NativeExecutionInputV10["session"], "driverKind"> & { driverKind: "claude_interactive_v1" };
+}
+
 export interface NativeExecutionInputV8 extends Omit<NativeExecutionInputV6, "schema" | "provider" | "session"> {
   schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA_V8;
   provider: { kind: "muse"; model: null; binding: MuseBindingSnapshot; bridgeRevision: "muse-v1" };
   session: Omit<NativeExecutionInputV6["session"], "driverKind"> & { driverKind: "muse_external" };
 }
 
-export type NativeExecutionInput = NativeExecutionInputV1 | NativeExecutionInputV2 | NativeExecutionInputV3 | NativeExecutionInputV4 | NativeExecutionInputV5 | NativeExecutionInputV6 | NativeExecutionInputV7 | NativeExecutionInputV8 | NativeExecutionInputV9 | NativeExecutionInputV10 | NativeExecutionInputV11;
+export type NativeExecutionInput = NativeExecutionInputV1 | NativeExecutionInputV2 | NativeExecutionInputV3 | NativeExecutionInputV4 | NativeExecutionInputV5 | NativeExecutionInputV6 | NativeExecutionInputV7 | NativeExecutionInputV8 | NativeExecutionInputV9 | NativeExecutionInputV10 | NativeExecutionInputV11 | NativeExecutionInputV12 | NativeExecutionInputV13;
 
 /** The only task data that may enter provider-visible model input. */
 export interface NativeModelEnvelopeV1 {
@@ -431,6 +447,28 @@ function parseMuseNativeExecutionInput(input: Record<string, unknown>): NativeEx
 
 export function parseNativeExecutionInput(value: unknown): NativeExecutionInput {
   const input = record(value, "input");
+  if (input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V12) {
+    const provider = record(input.provider, "input.provider");
+    exactKeys(provider, ["kind", "model", "effort", "cliVersion"], "input.provider");
+    const session = record(input.session, "input.session");
+    if (provider.kind !== "opencode_shared_v2" || provider.cliVersion !== "2.2.5" || typeof provider.model !== "string" || !provider.model.trim() || typeof provider.effort !== "string" || !provider.effort.trim() || session.driverKind !== "opencode_shared_v2" || typeof session.normalizedSessionId !== "string" || !session.normalizedSessionId || !Array.isArray(input.credentialBindings) || input.credentialBindings.length !== 0) throw new NativeExecutionInputError("OpenCode shared v12 requires a pinned provider, explicit model and effort, session identity, and no credential bindings");
+    const common = parseNativeExecutionInput({ ...input, schema: NATIVE_EXECUTION_INPUT_SCHEMA_V10, provider: { kind: "codex", model: null, approvalPolicy: "never" }, session: { ...session, driverKind: "codex_app_server" } }) as NativeExecutionInputV10;
+    return { ...common, schema: NATIVE_EXECUTION_INPUT_SCHEMA_V12, provider: { kind: "opencode_shared_v2", model: provider.model, effort: provider.effort, cliVersion: "2.2.5" }, session: { ...common.session, driverKind: "opencode_shared_v2" } };
+  }
+  if (input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V13) {
+    const provider = record(input.provider, "input.provider");
+    exactKeys(provider, ["kind", "model", "effort", "autoCompactTokens"], "input.provider");
+    const session = record(input.session, "input.session");
+    if (provider.kind !== "claude_interactive" || typeof provider.model !== "string" || !/^[a-zA-Z0-9._-]{1,128}$/.test(provider.model) || !["low", "medium", "high", "max"].includes(String(provider.effort))
+      || !Number.isSafeInteger(provider.autoCompactTokens) || (provider.autoCompactTokens as number) < 1 || session.driverKind !== "claude_interactive_v1"
+      || typeof session.normalizedSessionId !== "string" || !session.normalizedSessionId || !Array.isArray(input.credentialBindings) || input.credentialBindings.length !== 0) {
+      throw new NativeExecutionInputError("Claude interactive v13 requires an explicit model, effort and auto-compact limit, the claude_interactive_v1 driver, a session identity, and no credential bindings");
+    }
+    const common = parseNativeExecutionInput({ ...input, schema: NATIVE_EXECUTION_INPUT_SCHEMA_V10, provider: { kind: "codex", model: null, approvalPolicy: "never" }, session: { ...session, driverKind: "codex_app_server" } }) as NativeExecutionInputV10;
+    return { ...common, schema: NATIVE_EXECUTION_INPUT_SCHEMA_V13,
+      provider: { kind: "claude_interactive", model: provider.model, effort: provider.effort as "low" | "medium" | "high" | "max", autoCompactTokens: provider.autoCompactTokens as number },
+      session: { ...common.session, driverKind: "claude_interactive_v1" } };
+  }
   if (input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V11) {
     const provider = record(input.provider, "input.provider");
     exactKeys(provider, ["kind", "model", "cliVersion"], "input.provider");

@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { parseNativeRuntimeContext, retargetNativeSystemInstructions } from "../contracts/runtime-context.js";
 import { resolve } from "node:path";
 import { codexExecutableReadOnlyRoots } from "../drivers/codex/codex-security-config.js";
 import { createIsolatedCodexAppServerArgs } from "../drivers/codex/codex-app-server-driver.js";
+import { sharedThreadConfigViolation } from "./shared-codex-thread-config.js";
 import { validatePreparedLaunchWorkingDirectory } from "../drivers/codex/codex-boundaries.js";
 import { usesPreconfiguredHome } from "../drivers/preconfigured-home.js";
 import { resolveQualifiedAcpxProfile } from "../drivers/acpx/qualified-profiles.js";
@@ -26,6 +28,7 @@ export interface RunnerProviderLaunchRequirements {
     "piThinkingLevel" | "claudeEffort" | "grokEffort" | "grokDisableWebSearch" | "managedProfile" | "agentCoreProfile" | "opencodePermissionMode" | "disableCodexWebSearch">;
   instructions: string;
   runtimeContext: NativeRuntimeContextSnapshot | null;
+  sharedCodexDaemon?: NonNullable<CapabilityRunnerdCodexTransportOptions["sharedCodexDaemon"]>;
 }
 
 /** A prepared descriptor belongs to one exact request and contains no launch secrets. */
@@ -52,6 +55,7 @@ export function runnerProviderLaunchRequirements(
     identity, provider: options.provider ?? "codex",
     model: typeof params.model === "string" ? params.model : null,
     instructions, runtimeContext,
+    ...(options.sharedCodexDaemon ? {sharedCodexDaemon:structuredClone(options.sharedCodexDaemon)} : {}),
     settings: {
       acpxAgent: options.acpxAgent, acpxMode: options.acpxMode,
       acpxPermissionMode: options.acpxPermissionMode,
@@ -110,7 +114,15 @@ export function validatePreparedRunnerLaunch(
   if (descriptor.kind !== requirements.provider || descriptor.model !== requirements.model) reject();
   if (requirements.provider === "codex" && (descriptor.approvalPolicy !== requirements.approvalPolicy
     || Boolean(descriptor.readOnly) !== requirements.readOnly)) reject();
-  if (requirements.provider === "codex" && requirements.settings.disableCodexWebSearch === true) {
+  const sharedDescriptor = requirements.provider === "codex" && requirements.sharedCodexDaemon?.bootstrapId
+    ? (descriptor.sharedDaemon as { writer?: { threadConfig?: unknown } } | undefined) : undefined;
+  if (sharedDescriptor) {
+    // Shared-daemon args stay empty: Core's web-search choice and the permission profile ride in the per-thread config.
+    if (!Array.isArray(descriptor.args) || descriptor.args.length !== 0) reject();
+    if (sharedThreadConfigViolation(sharedDescriptor.writer?.threadConfig, {
+      cwd: typeof descriptor.cwd === "string" ? descriptor.cwd : "", readOnly: requirements.readOnly,
+      disableWebSearch: requirements.settings.disableCodexWebSearch === true })) reject();
+  } else if (requirements.provider === "codex" && requirements.settings.disableCodexWebSearch === true) {
     if (!Array.isArray(descriptor.args) || descriptor.args.some(arg => typeof arg !== "string")) reject();
     const args = descriptor.args as string[];
     const commandIndex = args.indexOf("app-server");
@@ -134,7 +146,10 @@ export function validatePreparedRunnerLaunch(
   const hostFields = new Set(["command", "args", "sidecarCommand", "sidecarArgs", "runtimeDirectory", "cwd",
     "preconfiguredHome", "externallySandboxed", "runtimeContext", "instructions"]);
   for (const [key, value] of Object.entries(expected)) {
-    if (!hostFields.has(key) && JSON.stringify(value) !== JSON.stringify(descriptor[key])) reject();
+    if (key === "sharedDaemon") {
+      // The thread config is server-generated and digest-bound inside the requirements: the host may not alter any part of it.
+      if (!isDeepStrictEqual(value, descriptor[key])) reject();
+    } else if (!hostFields.has(key) && JSON.stringify(value) !== JSON.stringify(descriptor[key])) reject();
   }
   if ("cwd" in expected) {
     try { validatePreparedLaunchWorkingDirectory(descriptor.cwd); }
@@ -182,6 +197,20 @@ export function createRunnerProviderLaunch(
   input: RunnerProviderLaunchEnvironment,
 ): Record<string, unknown> {
   const { identity, instructions: baseInstructions, runtimeContext, settings, provider } = requirements;
+  if (requirements.sharedCodexDaemon) {
+    const shared=requirements.sharedCodexDaemon;
+    if (provider!=="codex" || (!requirements.readOnly && !shared.bootstrapId)) throw new Error("runner_shared_codex_launch_requirements_invalid");
+    if (shared.bootstrapId) {
+      if (shared.threadId || !requirements.model || !baseInstructions.trim() || !shared.writer?.managedTools || shared.writer.managedBootstrapId!==shared.bootstrapId) throw new Error("runner_shared_codex_launch_requirements_invalid");
+      // The registered daemon was not launched with Paperclip's -c arguments: the thread carries its own permission profile,
+      // generated by the server (createSharedCodexThreadConfig) and bound by the requirements digest. The host only echoes it.
+      if (!shared.writer.threadConfig || typeof shared.writer.threadConfig !== "object" || Array.isArray(shared.writer.threadConfig)) throw new Error("runner_shared_codex_launch_requirements_invalid");
+      const sharedDaemon = structuredClone(shared);
+      return {kind:"codex",provider:"codex",driver:"codex_app_server",providerVersion:"codex-app-server-v1",command:input.codexCommand,args:[],cwd:input.cwd,model:requirements.model,approvalPolicy:requirements.approvalPolicy,readOnly:requirements.readOnly,instructions:baseInstructions,runtimeContext,sharedDaemon};
+    }
+    if (requirements.model!==null || baseInstructions.trim() || runtimeContext!==null) throw new Error("runner_shared_codex_launch_requirements_invalid");
+    return {kind:"codex",provider:"codex",driver:"codex_app_server",providerVersion:"codex-app-server-v1",command:input.codexCommand,args:[],cwd:input.cwd,model:null,approvalPolicy:requirements.approvalPolicy,readOnly:true,instructions:"",providerSessionId:shared.threadId,sharedDaemon:structuredClone(shared)};
+  }
   const acpxAgent = provider === "acpx" ? settings.acpxAgent ?? "codex" : null;
   const requestedModel = requirements.model ?? "";
   const includeCodexCollaborationInstructions = provider === "codex" &&

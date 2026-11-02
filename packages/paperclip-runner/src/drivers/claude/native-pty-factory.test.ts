@@ -41,6 +41,8 @@ it.skipIf(process.platform!=="darwin" || !ptyPath)("starts a native owned PTY, e
     expect(sentEnv).not.toHaveProperty("ANTHROPIC_API_KEY");
     expect(sentEnv).not.toHaveProperty("OPENAI_API_KEY");
     expect(sentEnv?.LC_ALL).toBe("C");
+    expect(pty.launchScope).toMatchObject({pid:pty.pid,generation:pty.generation,home:sentEnv?.HOME,config:sentEnv?.CLAUDE_CONFIG_DIR ?? `${sentEnv?.HOME}/.claude`,source:"parent-attested-launch-scope"});
+    expect(Object.isFrozen(pty.launchScope)).toBe(true);
     expect(await verifyClaudePtyGeneration(pty.pid,pty.generation)).toBe(true);
     pty.writeInput("SCO337_PTY_OK\r");
     await Promise.race([seen,new Promise<never>((_,reject)=>setTimeout(()=>reject(new Error("PTY output timeout")),3000))]);

@@ -54,7 +54,7 @@ export type ClaudeInteractiveStatus = {
 const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const safeModel=/^[a-zA-Z0-9._-]{1,128}$/;
 
-/** Opt-in no-tools, 140k-or-less qualification profile, not a full executor or HarnessDriver.
+/** Opt-in no-tools qualification profile, not a full executor or HarnessDriver.
  * The PTY factory chooses an authorized environment; this boundary never copies
  * credentials, supplies prompts, or asserts the RC server accepted a connection. */
 export class ClaudeInteractiveController {
@@ -62,7 +62,7 @@ export class ClaudeInteractiveController {
   private stopAttempted=false;
   private constructor(private readonly config:ClaudeInteractiveLaunch, private readonly pty:ClaudeInteractivePty, private readonly verifier:ClaudeInteractiveVerifier, private readonly ownerAuthority?:ClaudeInteractiveOwnerAuthority, private readonly ownerJournal?:ClaudeInteractiveOwnerJournal) {}
   static async launch(input:ClaudeInteractiveLaunch, factory:ClaudeInteractivePtyFactory | undefined, verifier:ClaudeInteractiveVerifier, ownerAuthority?:ClaudeInteractiveOwnerAuthority, ownerJournal?:ClaudeInteractiveOwnerJournal):Promise<ClaudeInteractiveController> {
-    if (!isAbsolute(input.executable) || !isAbsolute(input.cwd) || !uuid.test(input.sessionId) || !safeModel.test(input.model) || !["low","medium","high","max"].includes(input.effort) || !Number.isSafeInteger(input.autoCompactTokens) || input.autoCompactTokens < 100_000 || input.autoCompactTokens > 140_000) throw new Error("invalid Claude interactive launch configuration");
+    if (!isAbsolute(input.executable) || !isAbsolute(input.cwd) || !uuid.test(input.sessionId) || !safeModel.test(input.model) || !["low","medium","high","max"].includes(input.effort) || !Number.isSafeInteger(input.autoCompactTokens) || input.autoCompactTokens < 100_000 || input.autoCompactTokens > 200_000) throw new Error("invalid Claude interactive launch configuration");
     const config=Object.freeze({...input,executable:resolve(input.executable),cwd:resolve(input.cwd)});
     const args=["--remote-control","--session-id",config.sessionId,"--autocompact",String(config.autoCompactTokens),"--model",config.model,"--effort",config.effort,"--setting-sources","","--settings","{}","--strict-mcp-config","--no-chrome","--tools",""];
     const pty=await (factory ?? new ClaudeNativePtyFactory()).start({executable:config.executable,cwd:config.cwd,args});

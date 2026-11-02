@@ -19,6 +19,8 @@ import {
 } from "./codex-acpx-native-backend.js";
 import { createOpenCodeNativeSessionBackend } from "./opencode-native-backend.js";
 import { RunnerdAntigravityBackend } from "../drivers/antigravity/runnerd-antigravity-backend.js";
+import { ClaudeInteractiveNativeBackend, type ClaudeInteractiveNativePort } from "../drivers/claude/native-interactive-backend.js";
+import { OpenCodeSharedNativeBackend, type OpenCodeSharedNativePort } from "../drivers/opencode/shared-native-backend.js";
 
 /** Explicit native headless selection; this is not the ACPX provider path. */
 export function createAntigravityHeadlessBackend(options: ConstructorParameters<typeof RunnerdAntigravityBackend>[0]): NativeSessionBackend {
@@ -31,6 +33,10 @@ export interface NativeBackendFactoryOptions extends Omit<
 > {
   /** Supplied only by the server after it has claimed the exact run lease. */
   antigravityAuthority?: ConstructorParameters<typeof RunnerdAntigravityBackend>[0];
+  /** Server-owned capability, supplied only after its lease and host are bound. */
+  opencodeSharedAuthority?: { port: OpenCodeSharedNativePort; model: string; effort: string; version: "2.2.5" };
+  /** Server-owned capability: a real launched Claude session bound to the claimed run. */
+  claudeInteractiveAuthority?: { port: ClaudeInteractiveNativePort; model: string; effort: string };
   museRunnerOptions?: Omit<RunnerdMuseDriverOptions, "execution" | "dynamicTools" | "dynamicToolHandler" | "completionFeedback" | "onSpawn">;
   dotRunnerOptions?: Omit<RunnerdDotDriverOptions, "execution" | "dynamicTools" | "dynamicToolHandler" | "completionFeedback" | "onSpawn">;
   codexTransportFactory?: (context?: {
@@ -62,6 +68,17 @@ export function createNativeSessionBackend(
   input: NativeExecutionInput,
   options: NativeBackendFactoryOptions = {},
 ): NativeSessionBackend {
+  if (input.schema === "paperclip.native-execution-input.v13") {
+    const authority = options.claudeInteractiveAuthority, identity = authority?.port.identity;
+    if (!authority || !identity || identity.runId !== input.binding.runId || identity.companyId !== input.binding.companyId || identity.issueId !== input.binding.issueId || identity.agentId !== input.binding.agentId
+      || identity.sessionId !== input.session.normalizedSessionId || authority.model !== input.provider.model || authority.effort !== input.provider.effort) throw new Error("Claude interactive v13 requires an admitted server-owned native backend");
+    return new ClaudeInteractiveNativeBackend(authority.port);
+  }
+  if (input.schema === "paperclip.native-execution-input.v12") {
+    const authority = options.opencodeSharedAuthority, identity = authority?.port.identity;
+    if (!authority || !identity || identity.runId !== input.binding.runId || identity.companyId !== input.binding.companyId || identity.issueId !== input.binding.issueId || identity.agentId !== input.binding.agentId || identity.sessionId !== input.session.normalizedSessionId || (options.runnerInstanceId !== undefined && authority.port.runnerInstanceId !== options.runnerInstanceId) || authority.model !== input.provider.model || authority.effort !== input.provider.effort || authority.version !== input.provider.cliVersion) throw new Error("OpenCode shared v2 requires an admitted server-owned native backend");
+    return new OpenCodeSharedNativeBackend(authority.port);
+  }
   if (input.schema === "paperclip.native-execution-input.v11") {
     const authority = options.antigravityAuthority;
     if (!authority || !authority.withAdmission || authority.identity.runId !== input.binding.runId || authority.identity.companyId !== input.binding.companyId || authority.identity.issueId !== input.binding.issueId || authority.identity.agentId !== input.binding.agentId || authority.cwd !== input.workspace.cwd || (input.session.normalizedSessionId !== null && authority.identity.sessionId !== input.session.normalizedSessionId) || authority.verifiedVersion !== input.provider.cliVersion) {

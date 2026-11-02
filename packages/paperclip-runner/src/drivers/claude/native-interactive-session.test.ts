@@ -21,7 +21,7 @@ describe("Claude interactive session composition",()=>{
   it("uses the real controller and journal with exact identity; no-tools and detach retain the owner process",async()=>{
     const dir=await temp();try{
       const f=fixture(dir), session=await ClaudeInteractiveSession.launch(f.options);
-      expect(f.start.mock.calls[0]![0]).toMatchObject({cwd,args:expect.arrayContaining(["--remote-control","--session-id",sessionId,"--autocompact","140000","--tools",""])});
+      expect(f.start.mock.calls[0]![0]).toMatchObject({cwd,args:expect.arrayContaining(["--remote-control","--session-id",sessionId,"--autocompact","200000","--tools",""])});
       expect(await session.observe()).toMatchObject({nativeSessionId:sessionId,processGeneration:generation,identity:"provisional"});
       f.ownedSdkInit.mockResolvedValue({source:"owned-sdk-init",sessionId,cwd,pid,generation});
       expect(await session.observe()).toMatchObject({identity:"verified"});
