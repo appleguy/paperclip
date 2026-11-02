@@ -35,7 +35,9 @@ export function transition(state: AgentLifecycleState, command: LifecycleCommand
     if (["ready", "preparing", "verifying", "resuming"].includes(state)) return "pausing";
   } else if (command === "resume") {
     if (state === "ready" || state === "resuming") return state;
-    if (state === "paused") return "resuming";
+    // Undo an in-flight manual pause without depending on the old pause worker
+    // finishing first. Its versioned completion is fenced by the new operation.
+    if (state === "paused" || state === "pausing") return "resuming";
   } else if (command === "complete") {
     switch (state) {
       case "preparing": return "verifying";

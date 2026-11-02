@@ -757,6 +757,36 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     expect((await current(agent.id)).lifecycleState).toBe("ready");
   });
 
+  it("POST resume reverses an in-flight manual pause and becomes dispatchable", async () => {
+    const work = worker();
+    const lifecycle = createAgentLifecycle(db);
+    const agent = await hire();
+    await work.process(agent.id);
+    const paused = await lifecycle.pauseAgent(agent.id);
+    expect(paused).toMatchObject({ lifecycleState: "pausing", status: "paused", lifecycleHolds: ["manual"] });
+    const app = express(); app.use(express.json());
+    app.use((req, _res, next) => {
+      req.actor = { type: "board", source: "local_implicit", userId: "board", companyIds: [companyId] }; next();
+    });
+    app.use("/api", agentRoutes(db)); app.use(errorHandler);
+    const response = await request(app).post(`/api/agents/${agent.id}/resume`).send({}).expect(200);
+    expect(response.body).toMatchObject({ lifecycleState: "resuming", lifecycleHolds: [], pauseReason: null });
+    await work.process(agent.id);
+    expect(await current(agent.id)).toMatchObject({ lifecycleState: "ready", status: "idle",
+      lifecycleHolds: [], pauseReason: null, pausedAt: null });
+  });
+
+  it("repairs legacy ready-but-paused compatibility status on resume", async () => {
+    const work = worker(); const lifecycle = createAgentLifecycle(db);
+    const agent = await hire(); await work.process(agent.id);
+    await db.update(agents).set({ lifecycleState: "ready", status: "paused",
+      lifecycleHolds: ["manual"], pauseReason: "manual", pausedAt: new Date() }).where(eq(agents.id, agent.id));
+    const resumed = await lifecycle.resumeAgent(agent.id);
+    expect(resumed).toMatchObject({ lifecycleState: "ready", status: "idle",
+      lifecycleHolds: [], pauseReason: null, pausedAt: null });
+    expect(await current(agent.id)).toMatchObject({ lifecycleState: "ready", status: "idle" });
+  });
+
   it("defers automatic policy changes while a task holds the agent lock", async () => {
     const agent = await hire("paused");
     await db.transaction(async tx => {
