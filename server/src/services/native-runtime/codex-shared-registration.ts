@@ -40,7 +40,7 @@ export function resolveCodexSharedRegistration(env: NodeJS.ProcessEnv, agentId: 
 }
 import { connectionGrants, toolConnections, type Db } from "@paperclipai/db";
 import { and, desc, eq } from "drizzle-orm";
-import { codexDaemonGeneration, localNativeDaemonHost, registerCodexNativeDelegation } from "./codex-native-delegation.js";
+import { codexDaemonGeneration, localNativeDaemonHost, ensureCodexNativeDelegation } from "./codex-native-delegation.js";
 
 
 /** Resolve the current attestation for an explicitly opted-in agent. */
@@ -51,6 +51,11 @@ export async function resolveCurrentCodexSharedRegistration(env:NodeJS.ProcessEn
   const projectId=issueProjectId ? await issueProjectId() : undefined;
   if (issueProjectId && !projectId) return null;
   const host=localNativeDaemonHost({...registration,runnerExecutable:typeof runnerExecutable==="function"?runnerExecutable():runnerExecutable});
+  const issuer=env.PAPERCLIP_CODEX_SHARED_ISSUER_USER_ID?.trim();
+  if (scope && projectId && issuer) {
+    const ensured=await ensureCodexNativeDelegation(db,host,{companyId,projectId,agentId,model:scope.model,effort:scope.effort,issuer,expiresAt:new Date(Date.now()+30*86400_000)});
+    return {...registration,grantId:ensured.grantId};
+  }
   const processGeneration=codexDaemonGeneration(await host.inspect());
   const rows=await db.select({id:connectionGrants.id,config:toolConnections.config}).from(connectionGrants).innerJoin(toolConnections,and(eq(toolConnections.id,connectionGrants.connectionId),eq(toolConnections.companyId,connectionGrants.companyId))).where(and(eq(connectionGrants.companyId,companyId),eq(connectionGrants.kind,"agent"),eq(connectionGrants.subjectAgentId,agentId),eq(connectionGrants.status,"active"),eq(toolConnections.enabled,true),eq(toolConnections.status,"active"))).orderBy(desc(connectionGrants.createdAt),desc(connectionGrants.id));
   const selected=rows.find(row=>{
@@ -59,12 +64,7 @@ export async function resolveCurrentCodexSharedRegistration(env:NodeJS.ProcessEn
     const value=d as Record<string,unknown>;
     return value.schema==="paperclip.codex-native-delegation.v1" && value.agentId===agentId && (projectId===undefined || value.projectId===projectId) && (!scope || (value.model===scope.model && value.effort===scope.effort)) && value.hostId===registration.hostId && value.processGeneration===processGeneration && typeof value.expiresAt==="string" && Number.isFinite(Date.parse(value.expiresAt)) && Date.parse(value.expiresAt)>Date.now();
   });
-  if (!selected && scope && projectId) {
-    const issuer=env.PAPERCLIP_CODEX_SHARED_ISSUER_USER_ID?.trim();
-    if (!issuer) throw new Error("codex_shared_issuer_unset: configure PAPERCLIP_CODEX_SHARED_ISSUER_USER_ID");
-    const created=await registerCodexNativeDelegation(db,host,{companyId,projectId,agentId,model:scope.model,effort:scope.effort,issuer,expiresAt:new Date(Date.now()+30*86400_000)});
-    return {...registration,grantId:created.grantId};
-  }
+  if (!selected && scope && projectId && !issuer) throw new Error("codex_shared_issuer_unset: configure PAPERCLIP_CODEX_SHARED_ISSUER_USER_ID");
   if (!selected) throw new Error("codex_shared_grant_stale: run renew-shared-grants");
   return {...registration,grantId:selected.id};
 }
