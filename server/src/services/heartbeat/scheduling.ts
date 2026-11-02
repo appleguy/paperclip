@@ -56,6 +56,7 @@ import {
   terminalizeLegacyExecution,
 } from "../legacy-execution-recovery.js";
 import { logger } from "../../middleware/logger.js";
+import { evaluateMonitorCoalescing, type MonitorCoalescingDecision } from "../monitor-coalescing.js";
 import { failRunnerGoalAction } from "../runner-goals.js";
 import { evaluateAgentInvokability } from "../agent-invokability.js";
 import { supportsUnscopedTimerHeartbeat } from "../heartbeat-policy.js";
@@ -638,6 +639,42 @@ export function createHeartbeatScheduling(
     }
   }
 
+  async function postponeUnchangedIssueMonitor(
+    claimed: IssueMonitorDispatchRow,
+    input: { now: Date; actorType: "system" | "user" | "agent"; actorId: string },
+    decision: Extract<MonitorCoalescingDecision, { skip: true }>,
+  ) {
+    const nextCheckAt = new Date(input.now.getTime() + decision.delayMs);
+    const nextCheckAtIso = nextCheckAt.toISOString();
+    const publications: ActivityPublication[] = [];
+    const changed = await db.transaction(async tx => {
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);
+      await notifyStatusCardIssueChange(tx, claimed.companyId);
+      const rows = await tx.update(issues).set({
+        monitorWakeRequestedAt: null,
+        monitorNextCheckAt: nextCheckAt,
+        executionPolicy: sql`jsonb_set(coalesce(${issues.executionPolicy}, '{}'::jsonb), '{monitor}',
+          coalesce(${issues.executionPolicy}->'monitor', '{}'::jsonb) ||
+          jsonb_build_object('nextCheckAt', ${nextCheckAtIso}::text))`,
+        executionState: sql`jsonb_set(coalesce(${issues.executionState}, '{}'::jsonb), '{monitor}',
+          coalesce(${issues.executionState}->'monitor', '{}'::jsonb) ||
+          jsonb_build_object('nextCheckAt', ${nextCheckAtIso}::text))`,
+        updatedAt: input.now,
+      }).where(issueMonitorClaimCondition(claimed)).returning({ id: issues.id });
+      if (rows.length === 0) return false;
+      await logActivity(tx as unknown as Db, {
+        companyId: claimed.companyId, actorType: input.actorType,
+        actorId: input.actorId, action: "issue.monitor_coalesced",
+        entityType: "issue", entityId: claimed.id,
+        details: { reason: decision.reason, lastRunId: decision.lastRunId,
+          streak: decision.streak, nextCheckAt: nextCheckAtIso },
+      }, publications);
+      return true;
+    });
+    for (const publication of publications) publishActivity(publication);
+    return { outcome: "skipped" as const, reason: changed ? decision.reason : "monitor_replaced" };
+  }
+
   async function dispatchClaimedIssueMonitor(
     claimed: IssueMonitorDispatchRow,
     input: {
@@ -726,6 +763,16 @@ export function createHeartbeatScheduling(
     }
 
     try {
+      if (input.source === "automation" && wakeReason === "issue_monitor_due" &&
+          monitor?.serviceName !== PROVIDER_QUOTA_MONITOR_SERVICE_NAME) {
+        const coalescing = await evaluateMonitorCoalescing(db, {
+          companyId: claimed.companyId, issueId: claimed.id,
+          agentId: targetAgentId, now: input.now,
+        });
+        if (coalescing.skip) {
+          return postponeUnchangedIssueMonitor(claimed, input, coalescing);
+        }
+      }
       if (monitor?.serviceName === PROVIDER_QUOTA_MONITOR_SERVICE_NAME) {
         // Normalized monitor projections redact externalRef. Read the claimed
         // persisted policy only on this server-owned quota recovery path.
