@@ -253,6 +253,37 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     return { companyId, agentId, issueId, nextCheckAt };
   }
 
+  it("coalesces unchanged monitor wakes with exponential backoff until human input", async () => {
+    const { companyId, issueId, agentId } = await seedFixture();
+    const runAt = new Date("2026-04-11T12:28:00.000Z");
+    await db.insert(heartbeatRuns).values({
+      companyId, agentId, status: "succeeded",
+      createdAt: runAt, startedAt: runAt,
+      finishedAt: new Date(runAt.getTime() + 30_000),
+      contextSnapshot: { issueId, wakeReason: "issue_monitor_due" },
+    });
+    const heartbeat = heartbeatService(db);
+    expect((await heartbeat.tickIssueMonitors(new Date("2026-04-11T12:31:00Z"))).triggered).toBe(0);
+    let [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue.monitorNextCheckAt?.toISOString()).toBe("2026-04-11T12:36:00.000Z");
+    expect(issue.executionPolicy?.monitor?.nextCheckAt).toBe("2026-04-11T12:36:00.000Z");
+    expect(issue.monitorAttemptCount).toBe(0);
+    expect(await db.select().from(agentWakeupRequests)).toHaveLength(0);
+
+    expect((await heartbeat.tickIssueMonitors(new Date("2026-04-11T12:37:00Z"))).triggered).toBe(0);
+    [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue.monitorNextCheckAt?.toISOString()).toBe("2026-04-11T12:47:00.000Z");
+    expect((await db.select().from(activityLog).where(eq(activityLog.action, "issue.monitor_coalesced")))
+      .map(row => row.details?.streak)).toEqual([1, 2]);
+
+    await db.insert(issueComments).values({
+      companyId, issueId, authorType: "user", authorUserId: "local-board",
+      createdAt: new Date("2026-04-11T12:40:00Z"), body: "External check passed",
+    });
+    expect((await heartbeat.tickIssueMonitors(new Date("2026-04-11T12:48:00Z"))).triggered).toBe(1);
+    expect((await db.select().from(agentWakeupRequests)).filter(w => w.reason === "issue_monitor_due")).toHaveLength(1);
+  });
+
   it("triggers due issue monitors once and clears the one-shot schedule", async () => {
     const { issueId, agentId } = await seedFixture();
     const heartbeat = heartbeatService(db);
@@ -385,8 +416,16 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
     const heartbeat = heartbeatService(db);
     const tickAt = new Date(Date.parse(monitor.nextCheckAt) + 1_000);
-    expect((await heartbeat.tickTimers(tickAt)).enqueued).toBe(1);
-    expect((await heartbeat.tickTimers(new Date(tickAt.getTime() + 1_000))).enqueued).toBe(0);
+    expect((await heartbeat.tickTimers(tickAt)).enqueued).toBe(0);
+    const [coalesced] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(coalesced.monitorNextCheckAt!.getTime()).toBeGreaterThan(tickAt.getTime());
+    await db.insert(issueComments).values({
+      companyId, issueId, authorType: "user", authorUserId: "local-board",
+      createdAt: new Date(tickAt.getTime() + 1_000), body: "New external result",
+    });
+    const freshAt = new Date(tickAt.getTime() + 6 * 60_000);
+    expect((await heartbeat.tickTimers(freshAt)).enqueued).toBe(1);
+    expect((await heartbeat.tickTimers(new Date(freshAt.getTime() + 1_000))).enqueued).toBe(0);
     const [triggered] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(triggered.monitorNextCheckAt).toBeNull();
     expect(triggered.monitorAttemptCount).toBe(1);
