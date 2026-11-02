@@ -7,6 +7,7 @@ repo=/Volumes/NVM/Paperclip
 tmp=/Volumes/NVM/AI_Agent_Runtime/tmp
 flock=/opt/homebrew/bin/flock
 helper=$repo/master/ops/research/runner-control/experiments/unified-native-mission/deploy-drain.mjs
+restore_helper=$repo/master/ops/research/runner-control/experiments/unified-native-mission/deploy-restore-install.mjs
 deploy_branch=sco-337-native-runner-20261101
 source_branch=fix/git-installer-bundled-workspaces-20261030
 if [ "${PC_DEPLOY_IN_LOCK:-}" != 1 ]; then
@@ -40,7 +41,7 @@ manifest="$tmp/pc-deploy-drain-$$.json"
 restore_old_payload() {
   [ -n "$original" ] || return 1
   if [ "$(current)" != "$original" ]; then
-    cli update --rollback || return 1
+    node "$restore_helper" restore "$original" "$short" || return 1
   fi
   [ "$(current)" = "$original" ] || {
     echo "pc-deploy: rollback payload mismatch" >&2; return 1;

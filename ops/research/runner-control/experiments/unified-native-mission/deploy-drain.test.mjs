@@ -136,6 +136,7 @@ describe("installed deploy shell contract", () => {
     assert.match(source, /install --ref "\$sha"/);
     assert.match(source, /source_branch=fix\/git-installer-bundled-workspaces-20261030/);
     assert.match(source, /rollback_restart/);
-    assert.doesNotMatch(source, /rm -rf "\$lock"|git add -A|git reset --hard|git clean -f/);
+    assert.match(source, /node "\$restore_helper" restore "\$original" "\$short"/);
+    assert.doesNotMatch(source, /cli update --rollback|rm -rf "\$lock"|git add -A|git reset --hard|git clean -f/);
   });
 });
