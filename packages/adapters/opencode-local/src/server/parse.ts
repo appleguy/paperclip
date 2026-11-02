@@ -38,6 +38,9 @@ export function createOpenCodeJsonlParser() {
   let missingCost = false;
   let usageReported = false;
   let missingUsage = false;
+  // A stale-session retry may run the assignment again. Only a pure session
+  // lookup failure is safe: any other output could represent model/tool work.
+  let hasNonErrorOutput = false;
 
   return (stdout: string) => {
     for (const rawLine of stdout.split(/\r?\n/)) {
@@ -45,7 +48,11 @@ export function createOpenCodeJsonlParser() {
       if (!line) continue;
 
       const event = parseJson(line);
-      if (!event) continue;
+      if (!event) {
+        hasNonErrorOutput = true;
+        continue;
+      }
+      if (asString(event.type, "") !== "error") hasNonErrorOutput = true;
 
       const currentSessionId = asString(event.sessionID, "").trim();
       if (currentSessionId) sessionId = currentSessionId;
@@ -102,6 +109,7 @@ export function createOpenCodeJsonlParser() {
       costUsd: missingCost ? null : costUsd,
       errorMessage: errors.length > 0 ? errors.join("\n") : null,
       toolErrors,
+      hasNonErrorOutput,
     };
   };
 }

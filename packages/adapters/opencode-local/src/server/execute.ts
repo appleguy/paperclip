@@ -804,7 +804,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (
         sessionId &&
         initialFailed &&
-        isOpenCodeUnknownSessionError(initial.proc.stdout, initial.rawStderr)
+        !initial.parsed.hasNonErrorOutput &&
+        isOpenCodeUnknownSessionError(initial.parsed.errorMessage ?? "", initial.rawStderr)
       ) {
         await onLog(
           "stdout",
