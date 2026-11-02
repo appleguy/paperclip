@@ -63,6 +63,7 @@ const safeModel=/^[a-zA-Z0-9._-]{1,128}$/;
 export class ClaudeInteractiveController {
   private detached=false;
   private stopAttempted=false;
+  private stopSeenUncertain=false;
   private constructor(private readonly config:ClaudeInteractiveLaunch, private readonly pty:ClaudeInteractivePty, private readonly verifier:ClaudeInteractiveVerifier, private readonly ownerAuthority?:ClaudeInteractiveOwnerAuthority, private readonly ownerJournal?:ClaudeInteractiveOwnerJournal) {}
   static async launch(input:ClaudeInteractiveLaunch, factory:ClaudeInteractivePtyFactory | undefined, verifier:ClaudeInteractiveVerifier, ownerAuthority?:ClaudeInteractiveOwnerAuthority, ownerJournal?:ClaudeInteractiveOwnerJournal):Promise<ClaudeInteractiveController> {
     if (!isAbsolute(input.executable) || !isAbsolute(input.cwd) || !uuid.test(input.sessionId) || !safeModel.test(input.model) || !["low","medium","high","max"].includes(input.effort) || !Number.isSafeInteger(input.autoCompactTokens) || input.autoCompactTokens < 100_000 || input.autoCompactTokens > 200_000) throw new Error("invalid Claude interactive launch configuration");
@@ -106,13 +107,14 @@ export class ClaudeInteractiveController {
   }
   async stopOwnedProcess():Promise<void> {
     if (this.detached || this.stopAttempted) throw new Error("Claude interactive controller is detached or stopping");
-    if (!this.pty.hasExited?.() && !await this.verifier.process(this.pty.pid,this.pty.generation)) throw new Error("Claude interactive process identity changed");
+    // After an uncertain attempt the process may already be gone; the PTY owns that decision (it resolves a vanished process).
+    if (!this.stopSeenUncertain && !this.pty.hasExited?.() && !await this.verifier.process(this.pty.pid,this.pty.generation)) throw new Error("Claude interactive process identity changed");
     this.stopAttempted=true;
     try {
       await this.pty.stop();
     } catch (error) {
       // A failed stop stays retriable (the next call re-verifies identity); an owned handle that confirms exit latches.
-      if (!this.pty.hasExited?.()) this.stopAttempted=false;
+      if (!this.pty.hasExited?.()) { this.stopAttempted=false; this.stopSeenUncertain=true; }
       throw error;
     }
   }

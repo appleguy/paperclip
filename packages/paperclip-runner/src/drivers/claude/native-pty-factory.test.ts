@@ -1,6 +1,7 @@
+import {spawn} from "node:child_process";
 import {createRequire} from "node:module";
 import {expect,it,vi} from "vitest";
-import {ClaudeNativePtyFactory,nativeSubscriptionEnvironment,verifyClaudePtyGeneration} from "./native-pty-factory.js";
+import {ClaudeNativePtyFactory,claudePtyProcessGeneration,nativeSubscriptionEnvironment,verifyClaudePtyGeneration} from "./native-pty-factory.js";
 import {ClaudeInteractiveController} from "./native-interactive-controller.js";
 const require=createRequire(import.meta.url);
 let ptyPath=process.env.CLAUDE_TEST_PTY_MODULE;
@@ -81,3 +82,28 @@ it.skipIf(process.platform!=="darwin" || !ptyPath)("starts a native owned PTY, e
     await vi.waitFor(async()=>expect(await verifyClaudePtyGeneration(pty.pid,pty.generation)).toBe(false),{timeout:3000,interval:30});
   }
 });
+it.skipIf(process.platform!=="darwin")("keeps an uncertain stop retriable instead of latching",async()=>{
+  const generation=await claudePtyProcessGeneration(process.pid);
+  let onExit!:()=>void; const kill=vi.fn();
+  const factory=new ClaudeNativePtyFactory({loadPty:()=>({spawn:()=>({pid:process.pid,onData:()=>({dispose(){}}),onExit:(fn:()=>void)=>{onExit=fn;return {dispose(){}};},write(){},kill})}),probeGeneration:async()=>generation});
+  const pty=await factory.start({executable:"/bin/sh",cwd:"/Volumes/NVM/AI_Agent_Runtime/tmp",args:[]});
+  // The exit event never arrives and identity stays intact: SIGTERM and SIGKILL are both unconfirmed.
+  await expect(pty.stop()).rejects.toThrow("exit unconfirmed after SIGKILL");
+  expect(kill.mock.calls.map(c=>c[0])).toEqual(["SIGTERM","SIGKILL"]);
+  expect(()=>pty.writeInput("x")).toThrow("unavailable"); // a signalled process takes no more input
+  await expect(pty.stop()).rejects.toThrow("exit unconfirmed after SIGKILL"); // retried, not "unavailable"
+  onExit();
+  await pty.stop();
+  await expect(pty.stop()).rejects.toThrow("unavailable");
+},15000);
+it.skipIf(process.platform!=="darwin")("resolves a retried stop when the process vanished after an uncertain attempt",async()=>{
+  const child=spawn("/bin/sleep",["30"],{stdio:"ignore"});
+  const generation=await claudePtyProcessGeneration(child.pid!);
+  const factory=new ClaudeNativePtyFactory({loadPty:()=>({spawn:()=>({pid:child.pid!,onData:()=>({dispose(){}}),onExit:()=>({dispose(){}}),write(){},kill(){}})}),probeGeneration:async()=>generation});
+  const pty=await factory.start({executable:"/bin/sh",cwd:"/Volumes/NVM/AI_Agent_Runtime/tmp",args:[]});
+  await expect(pty.stop()).rejects.toThrow("exit unconfirmed after SIGKILL");
+  const gone=new Promise(resolve=>child.once("exit",resolve));
+  child.kill("SIGKILL"); await gone;
+  await pty.stop(); // gone after an uncertain attempt: success, not "identity changed"
+  await expect(pty.stop()).rejects.toThrow("unavailable");
+},15000);

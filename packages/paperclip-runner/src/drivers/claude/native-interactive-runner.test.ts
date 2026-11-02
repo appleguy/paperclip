@@ -1,6 +1,6 @@
 import {afterEach,describe,expect,it,vi} from "vitest";
 import {ClaudeInteractiveSession} from "./native-interactive-session.js";
-import {ClaudeInteractiveRunner,type ClaudeInteractiveRunnerOptions} from "./native-interactive-runner.js";
+import {ClaudeInteractiveCleanupUncertainError,ClaudeInteractiveRunner,type ClaudeInteractiveRunnerOptions} from "./native-interactive-runner.js";
 const id="f8f9af47-d5c8-4a93-a5d8-791c20dfa9d8";
 const options:ClaudeInteractiveRunnerOptions={executable:"/bin/claude",cwd:"/work",sessionId:id,model:"sonnet",effort:"low",journalDirectory:"/tmp/journal",ownerAuthority:{authorize:async()=>true},home:"/home/test",sdk:{getSessionInfo:async()=>undefined,namespace:{home:"/home/test"}},hookHelperExecutable:"/bin/helper"};
 function mockSession(){
@@ -27,4 +27,6 @@ describe("opt-in native interactive Runner controller",()=>{
   vi.spyOn(ClaudeInteractiveSession,"launch").mockRejectedValue(new Error("launch failed"));
   await expect(ClaudeInteractiveRunner.launch({...options,mcp:{scope:{companyId:"c",runId:"r",taskId:"t",leaseId:"l",nativeSessionId:id},tools:[],dispatch:async()=>null}})).rejects.toThrow("launch failed");
  });
+
+ it("keeps the session tracked for retry when cleanup fails",async()=>{const s=mockSession();s.hookStart.sessionId="11111111-1111-4111-8111-111111111111";s.stopOwnedProcess.mockRejectedValueOnce(new Error("exit unconfirmed"));const error=await ClaudeInteractiveRunner.launch(options).catch(e=>e);expect(error).toBeInstanceOf(ClaudeInteractiveCleanupUncertainError);await error.runner.stopOwnedProcess();expect(s.stopOwnedProcess).toHaveBeenCalledTimes(2);await expect(error.runner.identity()).rejects.toThrow("detached");});
 });
