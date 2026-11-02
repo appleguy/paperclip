@@ -353,7 +353,7 @@ async function main() {
     const s = await held(client, record);
     ensure(s.pendingWakes === 0, "new wakes are still in flight");
     const { planned } = await snapshot(client);
-    ensure(planned.length === record.runs.length, "run inventory changed during fenced drain");
+    ensure(planned.length <= record.runs.length, "new run appeared during fenced drain");
     for (const entry of planned) {
       const owned = record.runs.find(item => item.runId === entry.runId &&
         item.sessionId === entry.sessionId && item.url === entry.url);
