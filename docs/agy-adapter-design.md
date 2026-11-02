@@ -13,7 +13,7 @@ Scratch workspace: `/Volumes/NVM/Paperclip/tmp/agy-rc-paperclip-scratch`, own tm
 
 | Test | Result | Evidence |
 | --- | --- | --- |
-| Interactive RC start | PASS | TUI showed `Remote control on for this session` and stable `https://antigravity.google.com/r/fb274ae1-52ad-4f62-b498-021d3de06678-v2` |
+| Interactive RC start | PASS | TUI showed `Remote control on for this session` and stable `https://antigravity.google.com/r/<private-instance-id>` |
 | Prompt from interactive pane | PASS | Exact response `AGY_TMUX_TASK_ONE_518` |
 | New task conversation | PASS | `/new` changed the workspace's `last_conversations.json` ID; a question about prior-turn token answered `NEW_ISOLATED_519`, not the prior token |
 | RC URL continuity | PASS | `/remote-control` after `/new` gave the same base `/r/fb274ae1-...` with a new `?p=c%2F<conversation>` suffix |
@@ -46,7 +46,7 @@ The headless `--input-format stream-json` protocol reads multiple NDJSON message
 - `packages/shared/src/constants.ts`: expose adapter type.
 - `docs/agy-adapter-design.md`: tracked research, design and evidence. Mirrored to canonical `/Volumes/NVM/Paperclip/ops/research/runner-control/agy-adapter-design.md`.
 
-**Config for validated scratch TUI:** `{ "model":"gemini-3.8-flash-low", "cwd":"/Volumes/NVM/Paperclip/tmp/agy-rc-paperclip-scratch", "tmuxSocket":"pc-agy-exp", "tmuxSession":"agy", "stateDir":"/Volumes/NVM/Paperclip/tmp/agy-rc-paperclip-scratch/.paperclip-adapter-state", "expectedRemoteControlUrl":"https://antigravity.google.com/r/fb274ae1-52ad-4f62-b498-021d3de06678-v2", "timeoutSec":600 }`. Production should prefer a separately owned workspace and process rather than reusing the scratch test unless migrating owner-live links intentionally.
+**Config for validated scratch TUI:** `{ "model":"gemini-3.8-flash-low", "cwd":"/Volumes/NVM/Paperclip/tmp/agy-rc-paperclip-scratch", "tmuxSocket":"pc-agy-exp", "tmuxSession":"agy", "stateDir":"/Volumes/NVM/Paperclip/tmp/agy-rc-paperclip-scratch/.paperclip-adapter-state", "expectedRemoteControlUrl":"https://antigravity.google.com/r/<private-instance-id>", "timeoutSec":600 }`. Production should prefer a separately owned workspace and process rather than reusing the scratch test unless migrating owner-live links intentionally.
 
 ## Important boundaries and risks
 
