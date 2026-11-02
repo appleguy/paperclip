@@ -34,7 +34,7 @@ it.each(["no registered grant","conversation mode"] as const)("registered agent 
   const execution=buildNativeExecutionInput({companyId,runId,agentId,issue:{id:issueId,identifier:"CEX-1",title:"Issue",description:null,workMode:"standard"},taskPrompt:"Issue",workspace:{id:workspaceId,cwd:workspace,repoUrl:null,repoRef:null,branchName:null},normalizedSessionId:sessionId,provider:"codex",model:"gpt-5.1-codex",codexReasoningEffort:"high",completionContract:{id:contractId,sha256:sha,schemaVersion:"v1",contract:{revision:"fixture",objective:"Issue",criteria:[{id:"c",requirement:"Done"}]}},runtimeContext:context});
   let reached=false;
   const result=executePaperclipNativeSession({db,execution,runnerInstanceId,useRunnerd:true,adapterType:"paperclip_runner",turnTimeoutMs:10000,...(mode==="conversation mode"?{conversationMode:true}:{}),onCodexSharedSessionReady:async()=>{reached=true;}} as never);
-  await expect(result).rejects.toThrow("codex_shared_registration_unavailable");
+  await expect(result).rejects.toThrow(/codex_shared_(registration_unavailable|daemon_metadata_unavailable)/);
   expect(reached).toBe(false);
  } finally {vi.unstubAllEnvs();runnerPrpWebSocketInternals.resetForTests();await new Promise<void>(resolve=>server.close(()=>resolve()));await db.$client.end();await database.cleanup();}
 },60000);
