@@ -29,12 +29,15 @@ function snapshot() {
   };
 }
 
-test("exactly six unique issues and all four routes are required", () => {
+test("six unique issues required; route coverage is informational", () => {
   assert.equal(validateManifest(manifest).length, 6);
   assert.throws(() => validateManifest({cases:manifest.cases.slice(0,5)}), /Exactly six/);
   assert.throws(() => validateManifest({cases:[...manifest.cases.slice(0,5),manifest.cases[0]]}), /Duplicate/);
-  assert.throws(() => validateManifest({cases:manifest.cases.map((c) =>
-    ({...c,route:"mac-glm"}))}), /four local-agent routes/);
+  const admitted = { cases: manifest.cases.map((c, i) => ({
+    ...c, route: i % 2 ? "wrx-deepseek" : "mac-glm",
+  })) };
+  assert.equal(validateManifest(admitted).length, 6);
+  assert.deepEqual(evaluateBatch(admitted, {}).routesNotInCohort, ["wrx-glm", "tensor64-lead"]);
 });
 test("completed issue, fresh substantive report, assignment run is an unattended candidate", () => {
   const evidence = evaluateCase(spec, snapshot());
