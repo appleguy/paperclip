@@ -12848,11 +12848,12 @@ async function createRunnerdBackendWithinSessionClaim(
   }
   // Opt in explicitly registered agents through server-owned host settings.
   // Neither the agent's input nor a provider-supplied thread can select this.
-  const sharedRegistrationCandidate=await resolveCurrentCodexSharedRegistration(process.env,input.db,input.execution.binding.companyId,input.execution.binding.agentId,resolvePaperclipRunnerBinary);
   // Delegation grants are bound per project and goal; an issue without both stays on the agent's ordinary Runner route.
-  const sharedIssueScope=sharedRegistrationCandidate
-    ? await input.db.select({projectId:issues.projectId,goalId:issues.goalId}).from(issues).where(and(eq(issues.id,input.execution.binding.issueId),eq(issues.companyId,input.execution.binding.companyId))).limit(1).then(rows=>rows[0])
-    : undefined;
+  let sharedIssueScope:{projectId:string|null;goalId:string|null}|undefined;
+  const sharedRegistrationCandidate=await resolveCurrentCodexSharedRegistration(process.env,input.db,input.execution.binding.companyId,input.execution.binding.agentId,resolvePaperclipRunnerBinary,async()=>{
+    sharedIssueScope=await input.db.select({projectId:issues.projectId,goalId:issues.goalId}).from(issues).where(and(eq(issues.id,input.execution.binding.issueId),eq(issues.companyId,input.execution.binding.companyId))).limit(1).then(rows=>rows[0]);
+    return sharedIssueScope?.projectId;
+  });
   const sharedRegistration=sharedRegistrationCandidate && sharedIssueScope?.projectId && sharedIssueScope.goalId ? sharedRegistrationCandidate : null;
   if (sharedRegistration) {
     const provider=input.execution.provider, lease=input.codexSharedLease;

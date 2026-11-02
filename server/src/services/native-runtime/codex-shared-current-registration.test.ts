@@ -17,6 +17,16 @@ describe("current shared registration",()=>{
     expect(result?.grantId).toBe("new-id");
     await expect(resolveCurrentCodexSharedRegistration(env,db([row("old-id",codexDaemonGeneration(daemon),expiry)]),"company","agent","/runner")).rejects.toThrow("codex_shared_grant_stale: run renew-shared-grants");
   });
+  it("selects the grant bound to the issue project and keeps a projectless issue off the route",async()=>{
+    vi.mocked(inspectCodexSharedDaemon).mockResolvedValue(daemon);
+    const expiry=new Date(Date.now()+60000).toISOString(), generation=codexDaemonGeneration(daemon);
+    const forProject=(id:string,projectId:string)=>({id,config:{codexNativeDelegation:{...row(id,generation,expiry).config.codexNativeDelegation,projectId}}});
+    const rows=[forProject("grant-b","project-b"),forProject("grant-a","project-a")];
+    expect((await resolveCurrentCodexSharedRegistration(env,db(rows),"company","agent","/runner",async()=>"project-a"))?.grantId).toBe("grant-a");
+    expect((await resolveCurrentCodexSharedRegistration(env,db(rows),"company","agent","/runner",async()=>"project-b"))?.grantId).toBe("grant-b");
+    expect(await resolveCurrentCodexSharedRegistration(env,db(rows),"company","agent","/runner",async()=>null)).toBeNull();
+    await expect(resolveCurrentCodexSharedRegistration(env,db(rows),"company","agent","/runner",async()=>"project-c")).rejects.toThrow("codex_shared_grant_stale");
+  });
   it("rejects an expired grant and keeps non-enrolled agents off the route",async()=>{
     vi.mocked(inspectCodexSharedDaemon).mockResolvedValue(daemon);
     await expect(resolveCurrentCodexSharedRegistration(env,db([row("old-id",codexDaemonGeneration(daemon),new Date(1).toISOString())]),"company","agent","/runner")).rejects.toThrow("codex_shared_grant_stale: run renew-shared-grants");

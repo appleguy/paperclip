@@ -43,9 +43,12 @@ import { codexDaemonGeneration, localNativeDaemonHost } from "./codex-native-del
 
 
 /** Resolve the current attestation for an explicitly opted-in agent. */
-export async function resolveCurrentCodexSharedRegistration(env:NodeJS.ProcessEnv,db:Db,companyId:string,agentId:string,runnerExecutable:string|(()=>string)) {
+export async function resolveCurrentCodexSharedRegistration(env:NodeJS.ProcessEnv,db:Db,companyId:string,agentId:string,runnerExecutable:string|(()=>string),issueProjectId?:()=>Promise<string|null|undefined>) {
   const registration=resolveCodexSharedRegistration(env,agentId);
   if (!registration) return null;
+  // Grants are bound per project: pick the grant for the issue's project, and keep a projectless issue on the ordinary route.
+  const projectId=issueProjectId ? await issueProjectId() : undefined;
+  if (issueProjectId && !projectId) return null;
   const host=localNativeDaemonHost({...registration,runnerExecutable:typeof runnerExecutable==="function"?runnerExecutable():runnerExecutable});
   const processGeneration=codexDaemonGeneration(await host.inspect());
   const rows=await db.select({id:connectionGrants.id,config:toolConnections.config}).from(connectionGrants).innerJoin(toolConnections,and(eq(toolConnections.id,connectionGrants.connectionId),eq(toolConnections.companyId,connectionGrants.companyId))).where(and(eq(connectionGrants.companyId,companyId),eq(connectionGrants.kind,"agent"),eq(connectionGrants.subjectAgentId,agentId),eq(connectionGrants.status,"active"),eq(toolConnections.enabled,true),eq(toolConnections.status,"active"))).orderBy(desc(connectionGrants.createdAt),desc(connectionGrants.id));
@@ -53,7 +56,7 @@ export async function resolveCurrentCodexSharedRegistration(env:NodeJS.ProcessEn
     const d=row.config.codexNativeDelegation;
     if (!d || typeof d!=="object" || Array.isArray(d)) return false;
     const value=d as Record<string,unknown>;
-    return value.schema==="paperclip.codex-native-delegation.v1" && value.agentId===agentId && value.hostId===registration.hostId && value.processGeneration===processGeneration && typeof value.expiresAt==="string" && Number.isFinite(Date.parse(value.expiresAt)) && Date.parse(value.expiresAt)>Date.now();
+    return value.schema==="paperclip.codex-native-delegation.v1" && value.agentId===agentId && (projectId===undefined || value.projectId===projectId) && value.hostId===registration.hostId && value.processGeneration===processGeneration && typeof value.expiresAt==="string" && Number.isFinite(Date.parse(value.expiresAt)) && Date.parse(value.expiresAt)>Date.now();
   });
   if (!selected) throw new Error("codex_shared_grant_stale: run renew-shared-grants");
   return {...registration,grantId:selected.id};
