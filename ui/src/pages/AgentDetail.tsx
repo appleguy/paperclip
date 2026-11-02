@@ -108,6 +108,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { Input } from "@/components/ui/input";
 import { RunTranscriptView, type TranscriptMode } from "../components/transcript/RunTranscriptView";
 import { AgentToolsTab } from "./AgentToolsTab";
+import { AgentLiveInspector } from "./AgentLiveInspector";
 import { AgentChannelsPanel } from "../components/chat/AgentChannelsPanel";
 import {
   LIVE_TRANSCRIPT_RENDER_LIMIT,
@@ -1437,6 +1438,10 @@ export function AgentDetail() {
         />
         {resolvedCompanyId && <AgentConnectionInstructions companyId={resolvedCompanyId} agentId={agent.id} />}
         </div>
+      )}
+
+      {activeView === "inspector" && resolvedCompanyId && (
+        <AgentLiveInspector key={agent.id} agentId={agent.id} companyId={resolvedCompanyId} agentRouteId={canonicalAgentRef} adapterType={agent.adapterType} />
       )}
 
       {activeView === "runtime" && (

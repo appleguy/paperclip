@@ -4,6 +4,7 @@ export type AgentDetailView =
   | "overview"
   | "instructions"
   | "skills"
+  | "inspector"
   | "runtime"
   | "secrets"
   | "tools"
@@ -31,6 +32,7 @@ export const AGENT_DETAIL_NAVIGATION: ReadonlyArray<{
   {
     label: "Runtime",
     items: [
+      { value: "inspector", label: "Live Inspector" },
       { value: "runtime", label: "Harness / Runtime" },
       { value: "secrets", label: "Secrets" },
       { value: "tools", label: "Tools" },
@@ -51,6 +53,7 @@ export const AGENT_DETAIL_NAVIGATION: ReadonlyArray<{
 export function parseAgentDetailView(value: string | null): AgentLocalDetailView {
   if (value === "instructions" || value === "prompts") return "instructions";
   if (value === "skills") return "skills";
+  if (value === "inspector" || value === "live") return "inspector";
   if (value === "runtime" || value === "configure" || value === "configuration") return "runtime";
   if (value === "secrets") return "secrets";
   if (value === "tools") return "tools";

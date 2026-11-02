@@ -61,6 +61,14 @@ export interface CostsProps {
   hideBudgetsTab?: boolean;
 }
 
+function quotaPct(value: number): string {
+  return value > 0 && value < 0.1 ? value.toFixed(3) : value.toFixed(1);
+}
+function remainingQuotaPct(used: number): string {
+  const remaining = Math.max(0, 100 - used);
+  return used > 0 && used < 0.1 ? remaining.toFixed(3) : remaining.toFixed(1);
+}
+
 function currentWeekRange(): { from: string; to: string } {
   const now = new Date();
   const day = now.getDay();
@@ -424,6 +432,45 @@ export function Costs({
     refetchInterval: 300_000,
     staleTime: 60_000,
   });
+
+  const quotaDeadlineEvents = useMemo(() => {
+    const items: Array<{ at: number; displayAt?: number; label: string; stake: string; source: string }> = [];
+    const now = Date.now();
+    const observed = Date.parse(sentinelData?.observedAt ?? "");
+    for (const pool of sentinelData?.pools ?? []) {
+      if (pool.pool === "session" || pool.pool.endsWith(":5h")) continue;
+      const at = Date.parse(pool.resetsAt ?? "");
+      if (!Number.isFinite(at) || at <= now) continue;
+      if (pool.provider === "antigravity" && pool.pool === "gemini:weekly"
+          && pool.usedPercent === 0 && Number.isFinite(observed)
+          && Math.abs(at - observed - 7 * 86_400_000) < 300_000) continue;
+      const name = pool.provider === "antigravity" ? "Antigravity" : pool.provider === "codex" ? "Codex" : "Claude";
+      items.push({ at, label: name + " · " + pool.pool,
+        stake: pool.usedPercent == null ? "Allowance unknown" : remainingQuotaPct(pool.usedPercent) + "% remaining",
+        source: "subscription allowance" });
+    }
+    for (const offer of sentinelData?.creditOffers ?? []) {
+      const at = Date.parse(offer.expiresAt ?? "");
+      if (!Number.isFinite(at) || at <= now) continue;
+      const amount = offer.balanceLastReportedUsd == null ? "Balance unknown"
+        : "Up to $" + offer.balanceLastReportedUsd.toFixed(2) + " last reported";
+      items.push({ at, displayAt: at - 1000, label: offer.label,
+        stake: amount + " · " + offer.source + "; not live verified",
+        source: "promotional credit" });
+    }
+    if (sentinelData?.bankedReset?.expiresAt) {
+      const at = Date.parse(sentinelData.bankedReset.expiresAt);
+      if (Number.isFinite(at) && at > now) {
+        const count = sentinelData.bankedReset.available;
+        const expected = sentinelData.bankedResetDispute?.ownerExpected;
+        items.push({ at, label: "Codex · banked resets",
+          stake: expected != null && expected !== count ? "Disputed: reader " + count + ", owner expects " + expected
+            : count == null ? "Count unknown" : count + " reset(s) reported",
+          source: "manual redemption" });
+      }
+    }
+    return items.sort((a,b) => a.at-b.at).slice(0,12);
+  }, [sentinelData]);
 
   // Quota Sentinel is the primary subscription allowance display.
   // Avoid competing native quota labels and permissions errors when it has data.
@@ -1078,11 +1125,11 @@ export function Costs({
                     {(["antigravity", "codex", "claude"] as const).map(provider => (
                       <div key={provider} className="space-y-3">
                         <h3 className="font-semibold">{provider === "codex" ? "ChatGPT / Codex" : provider === "claude" ? "Claude" : "Antigravity"}</h3>
-                        {sentinelData.pools.filter(p => p.provider === provider).map(p => (
+                        {sentinelData.pools.filter(p => p.provider === provider && p.pool !== "session" && !p.pool.endsWith(":5h")).map(p => (
                           <div key={p.pool} className="space-y-1 text-sm">
                             <div className="flex justify-between gap-3">
                               <span>{p.pool}</span>
-                              <span className="tabular-nums">{p.usedPercent == null ? "Unknown" : `${p.usedPercent.toFixed(1)}% used`}</span>
+                              <span className="tabular-nums">{p.usedPercent == null ? "Unknown" : `${quotaPct(p.usedPercent)}% used`}</span>
                             </div>
                             <div className="h-2 rounded bg-muted overflow-hidden">
                               {p.usedPercent != null && <div className="h-full bg-primary" style={{ width: `${p.usedPercent}%` }} />}
@@ -1096,6 +1143,38 @@ export function Costs({
                       </div>
                     ))}
                   </div>}
+              {sentinelData?.bankedReset && (
+                <div data-testid="quota-banked-resets" className="mt-4 border-t pt-4 text-sm">
+                  <div className="font-semibold">Codex banked resets: {sentinelData.bankedReset.available ?? "Unknown"}</div>
+                  <div className="text-xs text-muted-foreground">
+                    {sentinelData.bankedReset.expiresAt
+                      ? `Expires ${new Date(sentinelData.bankedReset.expiresAt).toLocaleString("en-US", { timeZone: "America/Los_Angeles", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" })}`
+                      : "Expiry unknown"}
+                    {" · Manual redemption only; Paperclip never redeems automatically"}
+                  </div>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+          <Card data-testid="quota-deadline-timeline">
+            <CardHeader>
+              <CardTitle>Upcoming quota deadlines</CardTitle>
+              <CardDescription>Chronological allowance and credit expirations. Rare five-hour limits are grouped at the bottom of the standalone dashboard.</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <ol className="ml-2 space-y-4 border-l-2 border-border pl-5">
+                {quotaDeadlineEvents.length ? quotaDeadlineEvents.map(event => (
+                  <li key={event.label + event.at} className="relative">
+                    <span aria-hidden="true" className="absolute -left-7 top-1.5 h-3 w-3 rounded-full bg-primary ring-2 ring-background" />
+                    <div className="text-xs text-muted-foreground">
+                      {new Date(event.displayAt ?? event.at).toLocaleString("en-US", { timeZone: "America/Los_Angeles", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" })}
+                    </div>
+                    <div className="font-medium">{event.label}</div>
+                    <div className="text-sm text-muted-foreground">{event.stake}</div>
+                  </li>
+                )) : <li className="text-sm text-muted-foreground">No known upcoming deadlines. Missing values are not zero.</li>}
+              </ol>
+              <p className="mt-4 text-xs text-muted-foreground">Promotional Cloud Session Credit balances are separate from Claude subscription quota and reflect the last available report, not necessarily the live account balance.</p>
             </CardContent>
           </Card>
           {showCustomPrompt ? (

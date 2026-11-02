@@ -33,6 +33,7 @@ const localIcons = {
   overview: Sparkles,
   instructions: BookOpenText,
   skills: Library,
+  inspector: Activity,
   runtime: Settings2,
   secrets: ShieldCheck,
   tools: Wrench,

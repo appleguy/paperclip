@@ -13,6 +13,7 @@ describe("agent detail navigation", () => {
       "overview",
       "instructions",
       "skills",
+      "inspector",
       "runtime",
       "secrets",
       "tools",
@@ -26,6 +27,8 @@ describe("agent detail navigation", () => {
 
   it("canonicalizes legacy local paths", () => {
     expect(parseAgentDetailView("advanced")).toBe("advanced");
+    expect(parseAgentDetailView("inspector")).toBe("inspector");
+    expect(agentDetailHref("glm", "inspector")).toBe("/agents/glm/inspector");
     expect(agentDetailHref("codie", "advanced")).toBe("/agents/codie/advanced");
     expect(parseAgentDetailView("dashboard")).toBe("overview");
     expect(parseAgentDetailView("configuration")).toBe("runtime");

@@ -411,6 +411,9 @@ describe("Shared Costs surfaces", () => {
       source: "quota-sentinel",
       observedAt: "2026-10-30T22:30:00Z",
       stale: false,
+      bankedReset: { available: 2, expiresAt: "2026-11-06T23:04:58Z", ordinaryResetAt: "2026-11-05T10:04:17Z", redeemNoLaterThan: "2026-11-06T21:04:58Z", automaticRedemption: false },
+      bankedResetDispute: { ownerExpected: 1, source: "owner_reported" },
+      creditOffers: [{ id: "cloud", label: "Claude Cloud Session Credits", balanceLastReportedUsd: 92, observedAt: "2026-10-31T19:36:00Z", expiresAt: "2026-11-05T08:00:00Z", source: "owner_reported", status: "reported_unverified" }],
       pools: [
         { provider: "antigravity", pool: "3p:weekly", usedPercent: 76.8, resetsAt: "2026-11-04T04:14:42Z", state: "behind_pace" },
         { provider: "codex", pool: "weekly", usedPercent: 18, resetsAt: "2026-11-05T10:04:17Z", state: "behind_pace" },
@@ -431,9 +434,15 @@ describe("Shared Costs surfaces", () => {
     const panel = container.querySelector('[data-testid="quota-sentinel-panel"]')!;
     expect(panel.textContent).toContain("ChatGPT / Codex");
     expect(panel.textContent).toContain("Claude");
+    expect(panel.querySelector('[data-testid="quota-banked-resets"]')?.textContent).toContain("Codex banked resets: 2");
+    expect(panel.textContent).toContain("Manual redemption only");
+    expect(container.querySelector('[data-testid="quota-deadline-timeline"]')?.textContent).toContain("Claude Cloud Session Credits");
+    expect(container.querySelector('[data-testid="quota-deadline-timeline"]')?.textContent).toContain("Up to $92.00");
+    expect(container.querySelector('[data-testid="quota-deadline-timeline"]')?.textContent).toContain("Disputed");
+    expect(panel.textContent).not.toContain("Session · 5h");
     expect(panel.textContent).toContain("Nov 6, 2026");
     expect(panel.textContent).toContain("3:00 AM PST");
-    expect(panel.textContent).toContain("Unknown");
+    expect(panel.textContent).not.toContain("Unknown"); // Short session window is intentionally separated.
     expect(container.textContent).not.toContain("Subscription quota is currently unavailable");
     expect(container.textContent).not.toContain("5h limit");
     queryClient.clear();

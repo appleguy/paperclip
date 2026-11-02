@@ -116,6 +116,14 @@ export interface HeartbeatRunListOptions {
   summary?: boolean;
 }
 
+export interface NativeRunReasoning {
+  available: boolean;
+  source: "opencode_sqlite" | null;
+  sessionId: string | null;
+  truncated: boolean;
+  parts: Array<{ id: string; seq: number; ts: string; text: string; truncated: boolean }>;
+}
+
 export interface ProviderTraceInspection {
   trace: ProviderTraceMetadata | null;
   entries: Array<Record<string, unknown>>;
@@ -163,6 +171,7 @@ export const heartbeatsApi = {
       `/heartbeat-runs/${runId}/log?offset=${encodeURIComponent(String(offset))}&limitBytes=${encodeURIComponent(String(limitBytes))}${options?.alignStartToRecord ? "&alignStartToRecord=true" : ""}`,
       options,
     ),
+  nativeReasoning: (runId: string) => api.get<NativeRunReasoning>(`/heartbeat-runs/${encodeURIComponent(runId)}/native-reasoning`),
   workspaceOperations: (runId: string) =>
     api.get<WorkspaceOperation[]>(
       `/heartbeat-runs/${runId}/workspace-operations`,
