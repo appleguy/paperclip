@@ -98,10 +98,20 @@ export function bindRunnerLaunchResources(
 }
 
 export function runnerLaunchRequirementsDigest(requirements: RunnerProviderLaunchRequirements): string {
-  const canonical = JSON.stringify(requirements, (_key, value: unknown) =>
+  const identity = requirements.sharedCodexDaemon
+    ? { ...requirements, sharedCodexDaemon: sharedDaemonIdentity(requirements.sharedCodexDaemon) }
+    : requirements;
+  const canonical = JSON.stringify(identity, (_key, value: unknown) =>
     value && typeof value === "object" && !Array.isArray(value)
       ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) : value);
   return `sha256:${createHash("sha256").update(canonical).digest("hex")}`;
+}
+
+/** Only the top-level display name is mutable; nested thread policy remains identity-bound. */
+function sharedDaemonIdentity(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const { threadName: _threadName, ...identity } = value as Record<string, unknown>;
+  return identity;
 }
 
 /** The environment may resolve paths, but it cannot change Core's selected policy. */
@@ -159,7 +169,7 @@ export function validatePreparedRunnerLaunch(
   for (const [key, value] of Object.entries(expected)) {
     if (key === "sharedDaemon") {
       // The thread config is server-generated and digest-bound inside the requirements: the host may not alter any part of it.
-      if (!isDeepStrictEqual(value, descriptor[key])) reject();
+      if (!isDeepStrictEqual(sharedDaemonIdentity(value), sharedDaemonIdentity(descriptor[key]))) reject();
     } else if (!hostFields.has(key) && JSON.stringify(value) !== JSON.stringify(descriptor[key])) reject();
   }
   if ("cwd" in expected) {

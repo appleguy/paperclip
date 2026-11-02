@@ -21,6 +21,16 @@ const environment: RunnerProviderLaunchEnvironment = {
 };
 
 describe("built-in provider launch preparation", () => {
+  it("carries a shared thread display name without including it in launch identity", () => {
+    const shared={socketPath:"/private/socket",daemonGeneration:"generation",threadId:"thread",codexHome:"/private/home",threadName:"Old name",peer:{pid:12,startSeconds:1,startMicroseconds:2,executable:"/private/codex"}};
+    const selected=runnerProviderLaunchRequirements({provider:"codex",sharedCodexDaemon:shared},requirements.identity,{permissions:"paperclip-runner-workspace-read-only"},null,"");
+    const renamed={...selected,sharedCodexDaemon:{...shared,threadName:"New name"}};
+    expect(runnerLaunchRequirementsDigest(selected)).toBe(runnerLaunchRequirementsDigest(renamed));
+    const launch=createRunnerProviderLaunch(renamed,environment);
+    expect(launch.sharedDaemon).toMatchObject({threadName:"New name"});
+    expect(()=>validatePreparedRunnerLaunch(selected,{configurationId:"test",requirementsDigest:runnerLaunchRequirementsDigest(selected),provider:launch})).not.toThrow();
+    expect(runnerLaunchRequirementsDigest({...renamed,sharedCodexDaemon:{...shared,threadId:"other"}})).not.toBe(runnerLaunchRequirementsDigest(selected));
+  });
   it("exposes only the registered agent home alongside PATH", () => {
     const base = { cwd: environment.cwd, readOnly: false, webSearchDisabled: true, networkAccess: false,
       codexHome: "/private/home", codexExecutable: "/bin/sh", path: "/usr/bin:/bin" };

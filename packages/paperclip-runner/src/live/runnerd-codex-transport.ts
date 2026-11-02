@@ -1240,6 +1240,8 @@ export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionD
   /** Attested server-issued attachment; never populate from a provider response or agent input. */
   sharedCodexDaemon?: {
     socketPath:string;daemonGeneration:string;threadId:string;codexHome:string;
+    /** Display metadata, independent of the daemon and thread identity. */
+    threadName?:string;
     peer:{pid:number;startSeconds:number;startMicroseconds:number;executable:string};
     bootstrapId?:string;
     writer?:{runId:string;normalizedSessionId:string;runnerInstanceId:string;grantId:string;epoch:number;observationEpochId:string;managedTools?:boolean;managedBootstrapId?:string;reasoningEffort?:string;threadConfig?:Record<string,unknown>};
