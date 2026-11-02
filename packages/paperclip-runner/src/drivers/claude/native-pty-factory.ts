@@ -39,6 +39,8 @@ export interface ClaudeNativePtyOptions {
   onOutput?:(data:string)=>void;
   /** Test seam; production resolves the declared node-pty dependency. */
   loadPty?:()=>PtyModule;
+  /** Test seam for a failed process-birth lookup. */
+  probeGeneration?:(pid:number)=>Promise<string | null>;
 }
 const permittedEnv=new Set(["PATH","HOME","CLAUDE_CONFIG_DIR","XDG_CONFIG_HOME","XDG_DATA_HOME","XDG_STATE_HOME","XDG_CACHE_HOME","LANG","LANGUAGE","TERM","COLORTERM","TMPDIR","SSL_CERT_FILE","SSL_CERT_DIR","NODE_EXTRA_CA_CERTS"]);
 /** Never pass provider API keys, Paperclip grants, or arbitrary caller environment. */
@@ -63,12 +65,24 @@ export class ClaudeNativePtyFactory implements ClaudeInteractivePtyFactory {
     const executable=realpathSync(input.executable), cwd=realpathSync(input.cwd), home=resolve(env.HOME), config=resolve(env.CLAUDE_CONFIG_DIR ?? resolve(home,".claude"));
     const pty=module.spawn(input.executable,[...input.args],{name:"xterm-256color",cols:100,rows:32,cwd:input.cwd,env});
     let exited=false, detached=false, stopped=false;
-    pty.onExit(()=>{exited=true;});
+    let resolveExit!:()=>void;
+    const exit=new Promise<void>(resolve=>{resolveExit=resolve;});
+    pty.onExit(()=>{exited=true;resolveExit();});
     pty.onData(data=>{if (!detached) { try { this.options.onOutput?.(data); } catch { /* output consumers cannot terminate the owner session */ } }});
-    const generation=await claudePtyProcessGeneration(pty.pid);
-    if (!generation || exited) throw new Error("Claude PTY process identity unavailable; reconcile launch");
+    const generation=await (this.options.probeGeneration ?? claudePtyProcessGeneration)(pty.pid);
+    if (!generation || exited) {
+      if (!exited) {
+        pty.kill("SIGTERM"); // Direct child handle; no PID lookup is used.
+        let timer:ReturnType<typeof setTimeout> | undefined;
+        try {
+          const confirmed=await Promise.race([exit.then(()=>true),new Promise<false>(resolve=>{timer=setTimeout(()=>resolve(false),2000);})]);
+          if (!confirmed) throw new Error("Claude PTY exit unconfirmed after failed process identity probe");
+        } finally { if (timer) clearTimeout(timer); }
+      }
+      throw new Error("Claude PTY process identity unavailable; reconcile launch");
+    }
     return {
-      pid:pty.pid,generation,launchScope:Object.freeze({pid:pty.pid,generation,executable,cwd,home,config,source:"parent-attested-launch-scope" as const}),
+      pid:pty.pid,generation,hasExited:()=>exited,launchScope:Object.freeze({pid:pty.pid,generation,executable,cwd,home,config,source:"parent-attested-launch-scope" as const}),
       writeInput(text) {
         if (detached || stopped || exited) throw new Error("Claude PTY unavailable");
         if (typeof text!=="string" || Buffer.byteLength(text,"utf8")>65536) throw new Error("Claude PTY input too large");
@@ -76,10 +90,21 @@ export class ClaudeNativePtyFactory implements ClaudeInteractivePtyFactory {
       },
       async detach(){ if(detached || stopped) throw new Error("Claude PTY unavailable"); detached=true; },
       async stop(){
-        if(detached || stopped || exited) throw new Error("Claude PTY unavailable");
+        if(detached || stopped) throw new Error("Claude PTY unavailable");
+        if(exited) { stopped=true; return; }
         if (!await verifyClaudePtyGeneration(pty.pid,generation)) throw new Error("Claude PTY process identity changed");
         stopped=true;
         pty.kill("SIGTERM");
+        const waitExit=async()=>{
+          let timer:ReturnType<typeof setTimeout> | undefined;
+          try { return await Promise.race([exit.then(()=>true),new Promise<false>(resolve=>{timer=setTimeout(()=>resolve(false),2000);})]); }
+          finally { if(timer) clearTimeout(timer); }
+        };
+        if (!await waitExit()) {
+          if (!await verifyClaudePtyGeneration(pty.pid,generation)) throw new Error("Claude PTY exit unconfirmed; process identity changed");
+          pty.kill("SIGKILL");
+          if (!await waitExit()) throw new Error("Claude PTY exit unconfirmed after SIGKILL");
+        }
       },
     };
   }

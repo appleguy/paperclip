@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
-import { agents, companies, createDb, environmentLeases, executionWorkspaces, heartbeatRuns, issues, nativeRunFinalizations } from "@paperclipai/db";
+import { agents, companies, createDb, environmentLeases, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations } from "@paperclipai/db";
 import { ClaudeInteractiveNativeBackend } from "@paperclipai/paperclip-runner";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { CONTROL_PLANE_CONFORMANCE_RESULT } from "../../vendor/paperclip-runner/testing.js";
@@ -42,7 +42,7 @@ const support = await getEmbeddedPostgresTestSupport();
   function start(f: Awaited<ReturnType<typeof seed>>, extra: Record<string, unknown> = {}) {
     const registry = new ClaudeLiveSessionRegistry();
     const control = { identity: vi.fn(async () => ({ pid: 1 })), ownerInput: vi.fn(async () => ({ write: "attempted", delivery: "unknown", completion: "unproven" })),
-      interrupt: vi.fn(async () => ({})), settlement: () => ({}), capabilities: () => ({ tools: "scoped_admitted_run" }), detach: vi.fn(async () => {}) };
+      interrupt: vi.fn(async () => ({})), settlement: () => ({}), capabilities: () => ({ tools: "scoped_admitted_run" }), stopOwnedProcess: vi.fn(async () => {}) };
     const launched: Array<Record<string, any>> = [];
     const launch = vi.fn(async (options: Record<string, unknown>) => { launched.push(options); return control; });
     const feedback = vi.fn(async () => "accepted");
@@ -60,6 +60,14 @@ const support = await getEmbeddedPostgresTestSupport();
     const { port, authorizeWorkSessionResult } = await h.started;
     expect(h.launch).toHaveBeenCalledTimes(1);
     expect(h.launched[0]).toMatchObject({ sessionId: f.nativeSessionId, model: "sonnet", effort: "high", autoCompactTokens: 200000 });
+    const requestedName = h.launched[0]!.remoteControlName;
+    expect(requestedName).toContain("Agent");
+    expect(requestedName).toContain(f.runId.slice(0, 8));
+    expect(requestedName).not.toContain("Task");
+    const eventsForRun = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.runId));
+    expect(eventsForRun).toEqual(expect.arrayContaining([expect.objectContaining({ eventType: "claude.remote_control.requested", payload: {
+      requestedName, requestedSessionId: f.nativeSessionId, connectionState: "unobservable",
+    } })]));
     expect(h.launched[0]!.mcp.tools.map((tool: { name: string }) => tool.name)).toEqual(expect.arrayContaining(["get_task_context", "set_task_title"]));
     // The Runner bridge publishes the completion tools itself and rejects them as caller tools.
     expect(h.launched[0]!.mcp.tools.map((tool: { name: string }) => tool.name)).not.toEqual(expect.arrayContaining(["paperclip_finish"]));
@@ -101,7 +109,7 @@ const support = await getEmbeddedPostgresTestSupport();
       eventType: "run.result.proposed", sourceEventId: events[0]!.sourceEventId, sourceSeq: 1, payload: events[0]!.payload, emittedAt: "x" } as never,
       result: events[0]!.payload as never, signal: new AbortController().signal })).toBe(false);
     await session.close({ reason: "test" });
-    expect(h.control.detach).toHaveBeenCalledTimes(1);
+    expect(h.control.stopOwnedProcess).toHaveBeenCalledTimes(1);
     expect(h.registry.has(f.companyId, f.runId)).toBe(false);
     // Adoption dies with the executor session.
     await expect(managed.input(f.companyId, "board", request, "owner-2", "late")).rejects.toMatchObject({ status: 404 });
@@ -116,11 +124,11 @@ const support = await getEmbeddedPostgresTestSupport();
     const running = rpc(h.started as never, h.launched, "report_progress", "slow", { n: 1 });
     await vi.waitFor(() => expect(execute).toHaveBeenCalledTimes(1));
     await expect(port.close()).rejects.toThrow("claude_native_effects_unsettled");
-    expect(h.control.detach).not.toHaveBeenCalled();
+    expect(h.control.stopOwnedProcess).not.toHaveBeenCalled();
     expect(h.registry.has(f.companyId, f.runId)).toBe(true);
     release(); await running;
     await port.close();
-    expect(h.control.detach).toHaveBeenCalledTimes(1);
+    expect(h.control.stopOwnedProcess).toHaveBeenCalledTimes(1);
     expect(h.registry.has(f.companyId, f.runId)).toBe(false);
   }, 30_000);
 
@@ -131,11 +139,11 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(h.registry.has(f.companyId, f.runId)).toBe(true);
     h.control.identity.mockRejectedValueOnce(new Error("claude_process_identity_changed"));
     await expect(new ClaudeInteractiveNativeBackend(port).openSession({ identity: port.identity })).rejects.toThrow("claude_process_identity_changed");
-    expect(h.control.detach).toHaveBeenCalledTimes(1);
+    expect(h.control.stopOwnedProcess).toHaveBeenCalledTimes(1);
     expect(h.registry.has(f.companyId, f.runId)).toBe(false);
     // Idempotent: the executor's fallback close must not detach again.
     await port.close();
-    expect(h.control.detach).toHaveBeenCalledTimes(1);
+    expect(h.control.stopOwnedProcess).toHaveBeenCalledTimes(1);
     // The relaunch of a run that may have partially run stays refused.
     await expect(start(f).started).rejects.toThrow("claude_session_already_launched");
   }, 30_000);
@@ -145,13 +153,13 @@ const support = await getEmbeddedPostgresTestSupport();
     const a = start(mismatch);
     const { port: mismatchPort } = await a.started;
     await expect(new ClaudeInteractiveNativeBackend(mismatchPort).openSession({ identity: { ...mismatchPort.identity, runId: randomUUID() } })).rejects.toThrow("claude_interactive_backend_identity_mismatch");
-    expect(a.control.detach).toHaveBeenCalledTimes(1);
+    expect(a.control.stopOwnedProcess).toHaveBeenCalledTimes(1);
     const aborted = await seed();
     const b = start(aborted);
     const { port: abortedPort } = await b.started;
     const controller = new AbortController(); controller.abort(new Error("shutdown"));
     await expect(new ClaudeInteractiveNativeBackend(abortedPort).openSession({ identity: abortedPort.identity, signal: controller.signal })).rejects.toThrow("shutdown");
-    expect(b.control.detach).toHaveBeenCalledTimes(1);
+    expect(b.control.stopOwnedProcess).toHaveBeenCalledTimes(1);
     expect(b.registry.has(aborted.companyId, aborted.runId)).toBe(false);
   }, 30_000);
 
@@ -166,11 +174,11 @@ const support = await getEmbeddedPostgresTestSupport();
     h.control.identity.mockRejectedValueOnce(new Error("claude_process_identity_changed"));
     // The original verification error wins; the refused settlement is not reported over it.
     await expect(new ClaudeInteractiveNativeBackend(port).openSession({ identity: port.identity })).rejects.toThrow("claude_process_identity_changed");
-    expect(h.control.detach).not.toHaveBeenCalled();
+    expect(h.control.stopOwnedProcess).not.toHaveBeenCalled();
     expect(h.registry.has(f.companyId, f.runId)).toBe(true);
     release(); await running;
     await port.close();
-    expect(h.control.detach).toHaveBeenCalledTimes(1);
+    expect(h.control.stopOwnedProcess).toHaveBeenCalledTimes(1);
     expect(h.registry.has(f.companyId, f.runId)).toBe(false);
   }, 30_000);
 
@@ -181,5 +189,12 @@ const support = await getEmbeddedPostgresTestSupport();
     await expect(h.started).rejects.toThrow();
     expect(h.launch).not.toHaveBeenCalled();
     expect(h.registry.has(f.companyId, f.runId)).toBe(false);
+  });
+
+  it("retains the live mapping when owned process exit is unconfirmed", async () => {
+    const f = await seed(), h = start(f), { port } = await h.started;
+    h.control.stopOwnedProcess.mockRejectedValueOnce(new Error("exit unconfirmed"));
+    await expect(port.close()).rejects.toThrow("exit unconfirmed");
+    expect(h.registry.has(f.companyId, f.runId)).toBe(true);
   });
 });

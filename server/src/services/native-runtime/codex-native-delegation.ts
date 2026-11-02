@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { agents, projects, toolApplications, toolConnections, connectionGrants, type Db } from "@paperclipai/db";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { inspectCodexSharedDaemon } from "./codex-shared-daemon.js";
 
 const object=(v:unknown):Record<string,unknown>=>v && typeof v==="object" && !Array.isArray(v) ? v as Record<string,unknown> : {};
@@ -12,6 +12,9 @@ export function localNativeDaemonHost(input:{hostId:string;codexExecutable:strin
   if (!input.hostId.trim()) throw new Error("codex_delegation_host_missing");
   return {hostId:input.hostId,inspect:()=>inspectCodexSharedDaemon(input)};
 }
+/** A grant this close to expiry is replaced up front so a turn that selects it cannot hit the authority check after it lapses. */
+const DELEGATION_RENEW_MARGIN_MS=60*60_000;
+
 export async function registerCodexNativeDelegation(db:Db,host:NativeDaemonHost,input:{companyId:string;projectId:string;agentId:string;model:string;effort:string;issuer:string;expiresAt:Date}) {
   if (![input.companyId,input.projectId,input.agentId,input.model,input.effort,input.issuer,host.hostId].every(v=>typeof v==="string" && v.trim().length>0 && v.length<=240) || !(input.expiresAt instanceof Date) || !Number.isFinite(input.expiresAt.getTime()) || input.expiresAt.getTime()<=Date.now()) throw new Error("codex_delegation_invalid");
   const daemon=await host.inspect(); const processGeneration=codexDaemonGeneration(daemon);
@@ -32,6 +35,29 @@ async function insertDelegation(tx:Tx,host:NativeDaemonHost,input:{companyId:str
     const [grant]=await tx.insert(connectionGrants).values({companyId:input.companyId,connectionId:id,kind:"agent",subjectAgentId:input.agentId,status:"active",createdByUserId:input.issuer}).returning({id:connectionGrants.id});
     if (codexDaemonGeneration(await host.inspect())!==processGeneration || Date.now()>=input.expiresAt.getTime()) throw new Error("codex_delegation_daemon_changed");
     return {connectionId:id,grantId:grant!.id,revision,processGeneration};
+}
+
+/** Serialize automatic issuance across server processes for one agent/project. */
+export async function ensureCodexNativeDelegation(db:Db,host:NativeDaemonHost,input:{companyId:string;projectId:string;agentId:string;model:string;effort:string;issuer:string;expiresAt:Date}) {
+  return db.transaction(async tx=>{
+    const key=`codex-shared:${input.companyId}:${input.agentId}:${input.projectId}`;
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`);
+    const generation=codexDaemonGeneration(await host.inspect());
+    const rows=await tx.select({id:connectionGrants.id,connectionId:toolConnections.id,config:toolConnections.config}).from(connectionGrants)
+      .innerJoin(toolConnections,and(eq(toolConnections.id,connectionGrants.connectionId),eq(toolConnections.companyId,connectionGrants.companyId)))
+      .where(and(eq(connectionGrants.companyId,input.companyId),eq(connectionGrants.kind,"agent"),eq(connectionGrants.subjectAgentId,input.agentId),eq(connectionGrants.status,"active"),eq(toolConnections.enabled,true),eq(toolConnections.status,"active")));
+    const scoped=rows.filter(row=>{const d=object(row.config.codexNativeDelegation);return d.schema==="paperclip.codex-native-delegation.v1" && d.agentId===input.agentId && d.projectId===input.projectId && d.hostId===host.hostId;});
+    const valid=scoped.find(row=>{const d=object(row.config.codexNativeDelegation);return d.model===input.model && d.effort===input.effort && d.processGeneration===generation && typeof d.expiresAt==="string" && Number.isFinite(Date.parse(d.expiresAt)) && Date.parse(d.expiresAt)>Date.now()+DELEGATION_RENEW_MARGIN_MS;});
+    const result=valid ? {grantId:valid.id} : await insertDelegation(tx,host,input,generation);
+    for (const row of scoped) {
+      if (row.id===result.grantId) continue;
+      const d=object(row.config.codexNativeDelegation);
+      if (d.processGeneration===generation && typeof d.expiresAt==="string" && Number.isFinite(Date.parse(d.expiresAt)) && Date.parse(d.expiresAt)>Date.now()+DELEGATION_RENEW_MARGIN_MS) continue;
+      await tx.update(connectionGrants).set({status:"revoked",revokedByUserId:input.issuer,revokedAt:new Date()}).where(and(eq(connectionGrants.companyId,input.companyId),eq(connectionGrants.id,row.id)));
+      await tx.update(toolConnections).set({enabled:false,updatedAt:new Date()}).where(and(eq(toolConnections.companyId,input.companyId),eq(toolConnections.id,row.connectionId)));
+    }
+    return result;
+  });
 }
 
 /** Renew only active administrator-issued intents, including expired attestations. */

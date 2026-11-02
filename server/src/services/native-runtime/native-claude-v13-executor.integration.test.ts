@@ -110,8 +110,7 @@ describe("executor v13 Claude interactive pre-admission", () => {
     }
   }, 90_000);
 
-  // KNOWN LEAK (parked, {{dt}}): the executor fails closed ("hook ingress unavailable") but the launched claude stays alive >40s. it.fails keeps the evidence without breaking the suite; flip to it when fixed.
-  (existsSync(HOOK_HELPER) ? it.fails : it.skip)("with a claude that stays alive but never attests, fails closed and reaps the owned process", async () => {
+  (existsSync(HOOK_HELPER) ? it : it.skip)("with a claude that stays alive but never attests, fails closed and reaps the owned process", async () => {
     const root = await mkdtemp("/Volumes/NVM/AI_Agent_Runtime/tmp/c-");
     const savedPath = process.env.PATH;
     let pid: number | null = null;

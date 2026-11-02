@@ -25,7 +25,8 @@ export class ClaudeInteractiveRunner {
     try { session=await ClaudeInteractiveSession.launch({...rest,mcpBinding,ownedSdkInit:undefined}); }
     catch (error) { await mcpBinding?.close().catch(()=>{}); throw error; }
     if (!session.hookStart || session.hookStart.sessionId!==options.sessionId || session.hookStart.event!=="SessionStart" || session.hookStart.peer!=="darwin-kernel-pid-uid-and-live-ancestry" || session.hookStart.namespace!=="parent-attested-launch-scope") {
-      await session.detach().catch(()=>{});
+      try { await session.stopOwnedProcess(); }
+      catch (error) { throw new AggregateError([error],"Claude hook identity unavailable and owned process cleanup is uncertain"); }
       throw new Error("Claude native hook identity unavailable; reconcile owned session");
     }
     return new ClaudeInteractiveRunner(session,options.sessionId,mcpBinding!==undefined);
@@ -53,5 +54,8 @@ export class ClaudeInteractiveRunner {
   async startTurn():Promise<never> {throw new HarnessCapabilityUnavailableError("startTurn","interactive Claude has no authenticated PRP turn settlement");}
   async detach():Promise<void> {
     await this.exclusive(async()=>{await this.session.detach();this.detached=true;});
+  }
+  async stopOwnedProcess():Promise<void> {
+    await this.exclusive(async()=>{await this.session.stopOwnedProcess();this.detached=true;});
   }
 }

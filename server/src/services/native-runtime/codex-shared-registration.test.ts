@@ -25,11 +25,18 @@ describe("resolveCodexSharedRegistration", () => {
   });
 
   it("rejects malformed registrations instead of silently changing routes", () => {
-    for (const grants of ["{", "[]", '{"a":null}', '{"a":" "}']) {
+    for (const grants of ["{", "[]", '{"a":" "}']) {
       expect(() => resolveCodexSharedRegistration({ ...host, PAPERCLIP_CODEX_SHARED_GRANTS: grants }, "a")).toThrow("codex_shared_registration_unavailable");
     }
     expect(() => resolveCodexSharedRegistration({ PAPERCLIP_CODEX_SHARED_AGENT_ID: "a" }, "a")).toThrow("codex_shared_registration_unavailable");
     expect(() => resolveCodexSharedRegistration({ PAPERCLIP_CODEX_SHARED_GRANTS: '{"a":"g"}' }, "a")).toThrow("codex_shared_registration_unavailable");
     expect(resolveCodexSharedRegistration({}, "a")).toBeNull();
+  });
+  it("enables new agents globally while respecting explicit denials and grants", () => {
+    const env = {...host, PAPERCLIP_CODEX_SHARED_DEFAULT:"1", PAPERCLIP_CODEX_SHARED_GRANTS:'{"a":false,"b":null,"c":"override"}'};
+    expect(resolveCodexSharedRegistration(env,"a")).toBeNull();
+    expect(resolveCodexSharedRegistration(env,"b")).toBeNull();
+    expect(resolveCodexSharedRegistration(env,"c")?.grantId).toBe("override");
+    expect(resolveCodexSharedRegistration(env,"new")?.grantId).toBe("");
   });
 });

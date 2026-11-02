@@ -10,6 +10,34 @@ it("allows only native subscription settings from inherited and explicit environ
   const explicit={HOME:"/approved",PAPERCLIP_API_KEY:"secret2",ANTHROPIC_AUTH_TOKEN:"secret",PRIVATE_IDENTITY:"private",XDG_CONFIG_HOME:"/config"};
   expect(nativeSubscriptionEnvironment(base,explicit)).toEqual({PATH:"/bin",HOME:"/approved",CLAUDE_CONFIG_DIR:"/claude",LANG:"en_US.UTF-8",LC_ALL:"C",XDG_CONFIG_HOME:"/config"});
 });
+it.skipIf(process.platform!=="darwin")("waits for owned child exit when the birth probe fails",async()=>{
+  let onExit!:()=>void;
+  let exited=false;
+  const kill=vi.fn(()=>{setTimeout(()=>{exited=true;onExit();},10);});
+  const factory=new ClaudeNativePtyFactory({loadPty:()=>({spawn:()=>({pid:123,onData:()=>({dispose(){}}),onExit:(fn:()=>void)=>{onExit=fn;return {dispose(){}};},write(){},kill})}),probeGeneration:async()=>null});
+  await expect(factory.start({executable:"/bin/sh",cwd:"/Volumes/NVM/AI_Agent_Runtime/tmp",args:[]})).rejects.toThrow("process identity unavailable");
+  expect(kill).toHaveBeenCalledWith("SIGTERM");
+  expect(exited).toBe(true);
+});
+it.skipIf(process.platform!=="darwin")("reports an unconfirmed exit after a failed birth probe",async()=>{
+  const kill=vi.fn();
+  const factory=new ClaudeNativePtyFactory({loadPty:()=>({spawn:()=>({pid:123,onData:()=>({dispose(){}}),onExit:()=>({dispose(){}}),write(){},kill})}),probeGeneration:async()=>null});
+  await expect(factory.start({executable:"/bin/sh",cwd:"/Volumes/NVM/AI_Agent_Runtime/tmp",args:[]})).rejects.toThrow("exit unconfirmed");
+  expect(kill).toHaveBeenCalledTimes(1);
+},5000);
+it.skipIf(process.platform!=="darwin" || !ptyPath)("reaps an owned process that ignores SIGTERM",async()=>{
+  let ready!:()=>void;
+  const seen=new Promise<void>(resolve=>{ready=resolve;});
+  const factory=new ClaudeNativePtyFactory({loadPty:()=>require(ptyPath!),onOutput:data=>{if(data.includes("READY"))ready();}});
+  const pty=await factory.start({executable:"/bin/sh",cwd:"/Volumes/NVM/AI_Agent_Runtime/tmp",args:["-c","trap '' TERM; echo READY; exec /bin/sleep 30"]});
+  try {
+    await Promise.race([seen,new Promise<never>((_,reject)=>setTimeout(()=>reject(new Error("PTY readiness timeout")),3000))]);
+    await pty.stop();
+    expect(await verifyClaudePtyGeneration(pty.pid,pty.generation)).toBe(false);
+  } finally {
+    if (await verifyClaudePtyGeneration(pty.pid,pty.generation)) process.kill(pty.pid,"SIGKILL");
+  }
+},10000);
 it.skipIf(process.platform!=="darwin" || !ptyPath)("routes owner input through the controller to a real PTY",async()=>{
   const module=require(ptyPath!);
   let resolveSeen!:()=>void;

@@ -11,7 +11,7 @@ import { ClaudeHookEventIngress } from "./native-hook-event-ingress.js";
 import type { openClaudeNativeMcpBinding } from "./claude-native-mcp-binding.js";
 
 export interface ClaudeInteractiveSessionOptions {
-  executable: string; cwd: string; sessionId: string; model: string;
+  executable: string; cwd: string; sessionId: string; model: string; remoteControlName?: string;
   effort: ClaudeInteractiveLaunch["effort"]; autoCompactTokens?: number;
   journalDirectory: string; ownerAuthority: ClaudeInteractiveOwnerAuthority;
   home: string; claudeConfigDir?: string;
@@ -87,14 +87,22 @@ export class ClaudeInteractiveSession {
           launch={...launch,args};
         }
         const pty=await original.start(launch);
-        journal=new NativeOwnerCommandJournal({directory,sessionId:input.sessionId,processGeneration:pty.generation});
-        if (hook) {
-          const scope=(pty as ClaudeNativePty).launchScope;
-          if (!scope || scope.pid!==pty.pid || scope.generation!==pty.generation) throw new Error("Claude hook launch scope unavailable; reconcile launched session");
-          await ingress!.start({sessionId:input.sessionId,launchScope:scope});
-          hookStart=await hook.bind({sessionId:input.sessionId,launchScope:scope});
+        try {
+          journal=new NativeOwnerCommandJournal({directory,sessionId:input.sessionId,processGeneration:pty.generation});
+          if (hook) {
+            const scope=(pty as ClaudeNativePty).launchScope;
+            if (!scope || scope.pid!==pty.pid || scope.generation!==pty.generation) throw new Error("Claude hook launch scope unavailable; reconcile launched session");
+            await ingress!.start({sessionId:input.sessionId,launchScope:scope});
+            hookStart=await hook.bind({sessionId:input.sessionId,launchScope:scope});
+          }
+          return pty;
+        } catch (error) {
+          // Ownership has not been handed to the controller yet. Do not detach:
+          // failed hook verification must not leave a live, unmanaged process.
+          try { await pty.stop(); }
+          catch (cleanupError) { throw new AggregateError([error,cleanupError],"Claude launch failed and owned process cleanup is uncertain"); }
+          throw error;
         }
-        return pty;
       },
     };
     const ownerJournal: ClaudeInteractiveOwnerJournal={
@@ -102,7 +110,7 @@ export class ClaudeInteractiveSession {
       written(operationId) { if (!journal) throw new Error("Claude owner journal unavailable"); return journal.written(operationId); },
     };
     try {
-      const controller=await ClaudeInteractiveController.launch({executable:input.executable,cwd:input.cwd,sessionId:input.sessionId,model:input.model,effort:input.effort,autoCompactTokens:input.autoCompactTokens ?? 200_000},factory,verifier,input.ownerAuthority,ownerJournal);
+      const controller=await ClaudeInteractiveController.launch({executable:input.executable,cwd:input.cwd,sessionId:input.sessionId,remoteControlName:input.remoteControlName,model:input.model,effort:input.effort,autoCompactTokens:input.autoCompactTokens ?? 200_000},factory,verifier,input.ownerAuthority,ownerJournal);
       returned=true;
       return new ClaudeInteractiveSession(controller,hookStart,ingress,input.mcpBinding ? closeMcp : undefined);
     } finally { try { await hook?.dispose(); } finally { if(!returned) { try { await ingress?.close(); } finally { await closeMcp(); } } } }
@@ -112,5 +120,10 @@ export class ClaudeInteractiveSession {
   /** Stops observation without terminating the owner's process; no automatic reattach. */
   hookObservationStatus() { return this.ingress?.status() ?? {state:"unavailable",provenance:"owned-descendant-attributed",settlement:"unproven",coverage:"incomplete"} as const; }
   async hookObservations() { if(!this.ingress) throw new Error("Claude hook observations unavailable"); return this.ingress.snapshot(); }
+  /** Keep ingress and MCP alive if process exit is uncertain, for reconciliation. */
+  async stopOwnedProcess(): Promise<void> {
+    await this.controller.stopOwnedProcess();
+    try { await this.ingress?.close(); } finally { await this.closeMcp?.(); }
+  }
   async detach(): Promise<void> { try { await this.controller.detach(); } finally { try { await this.ingress?.close(); } finally { await this.closeMcp?.(); } } }
 }

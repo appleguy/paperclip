@@ -2,20 +2,22 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
-import type { Db } from "@paperclipai/db";
+import { agents, issues, type Db } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
 import type { ClaudeInteractiveNativePort, NativeExecutionInputV13, PrpEvent, PrpStructuredRunResult } from "../../vendor/paperclip-runner/index.js";
 import { PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA, PRP_COMPLETION_TOOL_DESCRIPTION } from "../../vendor/paperclip-runner/index.js";
 import { nativeSha256 } from "./canonical.js";
 import { createClaudeNativeAdmission, type ClaudeNativeAdmissionOptions } from "./claude-native-admission.js";
 import { claudeLiveSessions, type ClaudeLiveSessionControl, type ClaudeLiveSessionRegistry } from "./claude-native-live-sessions.js";
 import { readClaudeTerminalReceipt, type ClaudeSemanticJournalBinding } from "./claude-native-semantic-journal.js";
+import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 
 export interface ClaudeNativeHost {
   claudeExecutable: string; home: string; claudeConfigDir?: string;
   /** Private (0700, owned) directory holding one exclusive journal directory per run. */
   stateDirectory: string; hookHelperExecutable: string;
 }
-export interface ClaudeLaunchedControl extends ClaudeLiveSessionControl { detach(): Promise<void> }
+export interface ClaudeLaunchedControl extends ClaudeLiveSessionControl { stopOwnedProcess(): Promise<void> }
 export interface StartClaudeNativeSessionInput {
   execution: NativeExecutionInputV13; runnerInstanceId: string; leaseOwner: string; attempt: number;
   controller: { bootId: string; pid: number; processStartedAt: Date };
@@ -52,6 +54,11 @@ export async function startClaudeNativeSession(db: Db, input: StartClaudeNativeS
   const base = resolve(stateDirectory), stat = await lstat(base);
   if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0 || stat.uid !== process.getuid?.()) throw new Error("claude_state_directory_not_private");
   if (registry.has(b.companyId, b.runId)) throw new Error("claude_session_already_live");
+  const [agent] = await db.select({ name: agents.name }).from(agents).where(and(eq(agents.companyId, b.companyId), eq(agents.id, b.agentId))).limit(1);
+  const [issue] = await db.select({ identifier: issues.identifier }).from(issues).where(and(eq(issues.companyId, b.companyId), eq(issues.id, b.issueId))).limit(1);
+  if (!agent || !issue) throw new Error("claude_session_name_scope_unavailable");
+  const namePart = (value: string) => value.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 75);
+  const remoteControlName = [issue.identifier || b.issueId.slice(0, 8), agent.name, b.runId.slice(0, 8)].map(namePart).join(" · ");
 
   const identity = Object.freeze({ runId: b.runId, sessionId: nativeSessionId, companyId: b.companyId, issueId: b.issueId, agentId: b.agentId });
   const admit = createClaudeNativeAdmission(db, {
@@ -73,6 +80,11 @@ export async function startClaudeNativeSession(db: Db, input: StartClaudeNativeS
     const record = await open(join(directory, "launch.json"), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
     try { await record.writeFile(JSON.stringify({ version: 1, runId: b.runId, companyId: b.companyId, sessionId: nativeSessionId, workspace: resolve(cwd), state: "launch_reserved" })); await record.sync(); }
     finally { await record.close(); }
+    // This is the requested name and local conversation ID, not a provider connection receipt.
+    await appendHeartbeatRunEvent(db, { companyId: b.companyId, runId: b.runId, agentId: b.agentId,
+      eventType: "claude.remote_control.requested", stream: "system", level: "info",
+      message: `Claude Remote Control requested: ${remoteControlName}`,
+      payload: { requestedName: remoteControlName, requestedSessionId: nativeSessionId, connectionState: "unobservable" } });
 
   } catch (error) { await admitted.close(); throw error; }
   const journal: ClaudeSemanticJournalBinding = Object.freeze({ companyId: b.companyId, issueId: b.issueId, runId: b.runId, nativeSessionId,
@@ -83,7 +95,7 @@ export async function startClaudeNativeSession(db: Db, input: StartClaudeNativeS
   let control: ClaudeLaunchedControl;
   try {
     control = await (input.launch ?? defaultLaunch)({
-      executable: input.host.claudeExecutable, cwd: resolve(cwd), sessionId: nativeSessionId, model: execution.provider.model,
+      executable: input.host.claudeExecutable, cwd: resolve(cwd), sessionId: nativeSessionId, remoteControlName, model: execution.provider.model,
       effort: execution.provider.effort, autoCompactTokens: execution.provider.autoCompactTokens, journalDirectory: directory,
       ownerAuthority: { authorize: async () => active.value }, home: input.host.home, claudeConfigDir: input.host.claudeConfigDir,
       sdk: await import("@anthropic-ai/claude-agent-sdk").then(({ getSessionInfo }) => ({ getSessionInfo, namespace: { home: input.host.home, claudeConfigDir: input.host.claudeConfigDir } })),
@@ -125,9 +137,11 @@ export async function startClaudeNativeSession(db: Db, input: StartClaudeNativeS
       if (closed) return;
       if (!await admitted.settled(input.settleTimeoutMs ?? 5000)) throw new Error("claude_native_effects_unsettled");
       if (await admitted.unsettled() !== 0) throw new Error("claude_native_effects_unsettled");
+      active.value = false;
+      await control.stopOwnedProcess();
       closed = true;
-      unregister(); active.value = false;
-      try { await control.detach(); } finally { await admitted.close(); wake(); }
+      unregister();
+      try { await admitted.close(); } finally { wake(); }
     },
   });
   const authorizeWorkSessionResult = async ({ event, result, signal }: { event: PrpEvent; result: PrpStructuredRunResult; signal: AbortSignal }) => {
