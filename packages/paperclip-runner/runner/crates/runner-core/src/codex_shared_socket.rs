@@ -718,11 +718,11 @@ impl SharedSocket {
             {
                 Ok((v, size)) => {
                     self.event_bytes.fetch_sub(size, Ordering::AcqRel);
-                    // Daemon-originated MCP startup progress is neither provider work nor
-                    // owner input; a configured owner daemon emits it for every new thread.
+                    // Display-name changes and MCP startup progress do not affect the
+                    // thread's execution or represent an intervention.
                     if v.get("id").is_none()
-                        && v.get("method").and_then(Value::as_str)
-                            == Some("mcpServer/startupStatus/updated")
+                        && matches!(v.get("method").and_then(Value::as_str),
+                            Some("mcpServer/startupStatus/updated" | "thread/name/updated"))
                     {
                         continue;
                     }
@@ -894,7 +894,7 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
     #[test]
-    fn mcp_startup_status_is_not_an_observed_notification() {
+    fn benign_notifications_do_not_hide_execution_notifications() {
         let (path, l) = listener();
         let server = thread::spawn(move || {
             let (s, _) = l.accept().unwrap();
@@ -902,6 +902,10 @@ mod tests {
             send(
                 &mut ws,
                 json!({"method":"mcpServer/startupStatus/updated","params":{"threadId":"owned","name":"x","status":"starting"}}),
+            );
+            send(
+                &mut ws,
+                json!({"method":"thread/name/updated","params":{"threadId":"owned","name":"new name"}}),
             );
             send(
                 &mut ws,
