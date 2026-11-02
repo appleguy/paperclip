@@ -40,7 +40,7 @@ vi.mock("../runner-goals.js", async (importOriginal) => {
  *   owner              - the already-running owner daemon (~/.codex, brew codex). Submits exactly ONE turn.
  * The owner mode never starts, restarts or stops the owner daemon and never reads ~/.codex credentials; the daemon
  * authenticates itself. The embedded Postgres, registration, grant and issue live only inside this process.
- * Stop conditions (recorded, then asserted): a second turn start, any tool call, any goal that is not paused,
+ * Stop conditions (recorded, then asserted): a second turn start, an unrequested tool call, any goal that is not paused,
  * model/effort other than gpt-6-luna/low. The turn itself is bounded by turnTimeoutMs; the executor is called once
  * (no heartbeat orchestration, so no retry or continuation exists).
  */
@@ -89,9 +89,11 @@ const ownerMode = process.env.PAPERCLIP_C1_HOST === "owner";
     let goalSettle: string | null = null;
     const stopMode = process.env.PAPERCLIP_C1_STOP === "1"; // Stop proof: interrupt mid-stream via cancelNativeSession
     const killMode = process.env.PAPERCLIP_C1_KILL === "1"; // Kill proof: SIGKILL this process's runnerd child mid-turn
+    const toolMode = process.env.PAPERCLIP_C1_TOOLS === "1" || process.env.PAPERCLIP_C1_STEER === "1";
     let killResult: unknown = "not_requested";
     const prompt = killMode ? "C1 kill canary: write a 1500 word essay about lighthouses. Do not call any tool." : process.env.PAPERCLIP_C1_STEER === "1" ? "C1 steer canary: run the shell command sleep 80 and wait for it to finish. Then reply with the single word DONE, and also obey any extra instruction the owner sent while you waited." : process.env.PAPERCLIP_C1_TOOLS === "1" ? "C1 tools canary: create the file c1-tool.txt in the current directory containing exactly the word OK using a file edit, then run the shell command cat c1-tool.txt, then reply with the single word DONE." : stopMode ? "C1 stop canary: write a 1500 word essay about lighthouses. Do not call any tool." : "C1 canary: reply with the single word OK. Do not call any tool.";
     let stopResult: unknown = "not_requested";
+    let stopRequest: Promise<void> | undefined;
     const execution = buildNativeExecutionInput({ companyId, runId, agentId, issue: { id: issueId, identifier: "CCA-1", title: "C1 canary (disposable)", description: null, workMode: "standard" }, taskPrompt: prompt, workspace: { id: workspaceId, cwd: workspace, repoUrl: null, repoRef: null, branchName: null }, normalizedSessionId: sessionId, provider: "codex", model: MODEL, codexReasoningEffort: EFFORT, completionContract: { id: contractId, sha256: sha, schemaVersion: "v1", contract: { revision: "c1", objective: "C1 canary", criteria: [{ id: "c", requirement: "Reply OK" }] } }, runtimeContext: context });
     const sessionRow = async () => (await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.taskKey, issueId)))[0];
     const activeMode = process.env.PAPERCLIP_C1_ACTIVE === "1"; // ACTIVE proof: paused create with budget, then runtime resume (no plain turn)
@@ -115,7 +117,7 @@ const ownerMode = process.env.PAPERCLIP_C1_HOST === "owner";
         if (event.eventType.startsWith("session.goal") || event.eventType.startsWith("goal")) { goalEvents.push(event.eventType + ":" + JSON.stringify((event.payload as any)?.goal?.status ?? (event.payload as any)?.status ?? null)); if (!activeMode && /active/.test(goalEvents[goalEvents.length - 1]!)) violations.push("goal_active"); }
         if (event.eventType === "turn.started") turnStarts.push(event.eventType);
         if (killMode && event.eventType === "turn.started" && killResult === "not_requested") { killResult = "requested"; void promisify(execFile)("pgrep", ["-P", String(process.pid), "-f", "paperclip-runnerd"]).then(({ stdout }) => { const pid = Number(stdout.trim().split("\n")[0]); if (!Number.isInteger(pid) || pid <= 1) throw new Error("no_runnerd_child"); process.kill(pid, "SIGKILL"); killResult = { killedPid: pid }; }).catch((error) => { killResult = "error:" + String(error?.message ?? error); }); }
-        if (stopMode && event.eventType === "turn.started" && stopResult === "not_requested") { stopResult = "requested"; void (activeMode ? settleLiveRunnerGoalBeforeInterrupt(db, { companyId, issueId, agentId }).then((r) => { goalSettle = r; }, (error: unknown) => { goalSettle = "error:" + String((error as Error)?.message ?? error).slice(0, 300); }) : Promise.resolve()).then(() => cancelNativeSession(runId, "owner_stop")).then((value) => { stopResult = value; }, (error) => { stopResult = "error:" + String(error?.message ?? error); }); }
+        if (stopMode && event.eventType === "turn.started" && stopResult === "not_requested") { stopResult = "requested"; stopRequest = (activeMode ? settleLiveRunnerGoalBeforeInterrupt(db, { companyId, issueId, agentId }).then((r) => { goalSettle = r; }, (error: unknown) => { goalSettle = "error:" + String((error as Error)?.message ?? error).slice(0, 300); }) : Promise.resolve()).then(() => cancelNativeSession(runId, "owner_stop")).then((value) => { stopResult = value; }, (error) => { stopResult = "error:" + String(error?.message ?? error); }); }
         if (/^tool\./.test(event.eventType) || /tool_call/.test(event.eventType)) tools.push(event.eventType);
       },
       onUsage: async (receipt) => { usage.push(receipt); },
@@ -134,6 +136,7 @@ const ownerMode = process.env.PAPERCLIP_C1_HOST === "owner";
     if (!ownerMode) { await expect(result).rejects.toThrow("harness_stop_before_turn"); expect(wired).toBe(true); expect(turnStarts).toHaveLength(0); const persisted = (await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId))).map((row) => `${row.seq}:${row.eventType}`); process.stdout.write(`C1_PERSISTED ${JSON.stringify(persisted)}\n`); process.stdout.write(`C1_WIRE projectedEdit=${projectedEdit} projection=${JSON.stringify(projected)} goalEvents=${JSON.stringify(goalEvents)}\n`); return; }
     // Owner mode: exactly one turn. Whatever the outcome, no retry; failures are asserted below, not repeated.
     const outcome = await result.then((value) => ({ value, error: null as unknown }), (error) => ({ value: null, error }));
+    await stopRequest;
     const rows = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
     const started = rows.filter((row) => row.eventType === "turn.started");
     const finalSession = await sessionRow();
@@ -150,10 +153,44 @@ const ownerMode = process.env.PAPERCLIP_C1_HOST === "owner";
     await writeFile(join(root, "c1-proof.json"), JSON.stringify({ proof, usage }, null, 2));
     process.stdout.write(`C1_PROOF ${join(root, "c1-proof.json")}\n`);
     if (!activeMode && (turnStarts.length > 1 || started.length > 1)) violations.push("second_turn");
-    if (tools.length > 0) violations.push("tool_call_outside_grant");
+    if (!toolMode && (tools.length > 0 || rows.some((row) => /^tool\./.test(row.eventType) || /tool_call/.test(row.eventType)))) violations.push("tool_call_outside_grant");
     const status = (finalSession?.goalJson as any)?.status; if (!activeMode && status && status !== "paused") violations.push("goal_not_paused");
     expect(violations).toEqual([]);
     if (!activeMode) expect(turnStarts).toHaveLength(1);
+    if (stopMode) {
+      expect(stopResult).toBe(true);
+      expect(proof.runEventTypes).toContain("turn.interrupted");
+      expect(proof.outcomeError).toContain("native_finalization_missing");
+      expect(proof.runStatus).toBe("failed");
+      expect(proof.issueStatus).toBe("in_progress");
+      if (activeMode) expect(goalSettle).not.toMatch(/^error:/);
+    } else if (killMode) {
+      expect(killResult).toEqual({ killedPid: expect.any(Number) });
+      expect(proof.outcomeError).toBeTruthy();
+      expect(proof.runStatus).toBe("failed");
+      expect(proof.issueStatus).toBe("blocked");
+      expect(proof.finalizationRow?.phase).toBe("terminal_failure");
+    } else {
+      expect(outcome.error).toBeNull();
+      expect(proof.runEventTypes).toContain("turn.completed");
+      expect(proof.runEventTypes).toContain("run.result.accepted");
+      expect(proof.issueStatus).toBe("in_progress");
+      // This harness observes usage receipts directly; heartbeat completeRun owns persisted cost accounting.
+      expect(usage).toEqual(expect.arrayContaining([expect.objectContaining({
+        provider: "openai", model: MODEL, usage: expect.objectContaining({ inputTokens: expect.any(Number), outputTokens: expect.any(Number) }),
+      })]));
+      expect(usage.some((receipt: any) => receipt.provider === "openai" && receipt.model === MODEL && (receipt.usage?.inputTokens > 0 || receipt.usage?.outputTokens > 0))).toBe(true);
+      if (toolMode) {
+        expect(proof.runEventTypes).toContain("tool.execution.started");
+        expect(proof.runEventTypes).toContain("tool.execution.completed");
+      }
+      if (finalize) {
+        expect(finalize).toMatchObject({ finalizeError: null, accountError: null, runStatus: "succeeded", issueStatus: "in_progress" });
+        expect(finalize.comments).toEqual(expect.arrayContaining([expect.any(String)]));
+      } else {
+        expect(proof.runStatus).toBe("running");
+      }
+    }
   } finally {
     vi.unstubAllEnvs(); runnerPrpWebSocketInternals.resetForTests(); await new Promise<void>((resolve) => server.close(() => resolve()));
     // The owner daemon is never stopped; only the throwaway isolated daemon is.
