@@ -10,6 +10,10 @@
 type RunnerModule = typeof import("@paperclipai/paperclip-runner");
 
 export type {
+  V2Authority,
+  V2Binding,
+  V2Cursor,
+  V2Event,
   AcpxCandidateAdmission,
   DotHarnessDriver,
   DotAssignment,
@@ -88,6 +92,9 @@ const sourceUrl = new URL(
   import.meta.url,
 );
 const runner = (await import(sourceUrl.href)) as RunnerModule;
+
+export const OpenCodeV2Shared = runner.OpenCodeV2Shared;
+export const startOpenCodeMcpBridge = runner.startOpenCodeMcpBridge;
 
 export const DurablePrpControlPlane = runner.DurablePrpControlPlane;
 export const decodeDurablePrpCheckpoint = runner.decodeDurablePrpCheckpoint;

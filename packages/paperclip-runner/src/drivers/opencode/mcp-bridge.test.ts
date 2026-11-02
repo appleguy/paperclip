@@ -31,6 +31,23 @@ async function rpc(
 }
 
 describe("OpenCode MCP bridge", () => {
+  it("admits shared calls only after session and live peer authority checks, including replays", async () => {
+    let live = true;
+    const handler = vi.fn(async () => ({ ok: true }));
+    const admitSharedCall = vi.fn(async (input: { sessionId: string; remoteAddress: string; remotePort: number; localAddress: string; localPort: number }) => {
+      if (!live || input.sessionId !== "ses_expected" || input.remoteAddress !== "127.0.0.1" || input.localAddress !== "127.0.0.1" || !input.remotePort || !input.localPort) throw new Error("secret internal diagnostic");
+    });
+    const bridge = await startOpenCodeMcpBridge({ tools: [{ name: "read", inputSchema: { type: "object" } }], admitSharedCall, handler });
+    bridges.push(bridge);
+    const call = (sessionId?: string) => ({ id: "same", method: "tools/call", params: { name: "read", arguments: {}, ...(sessionId ? { _meta: { "ai.opencode/sessionID": sessionId } } : {}) } });
+    expect(await (await rpc(bridge, call())).json()).toMatchObject({ result: { isError: true } });
+    expect(await (await rpc(bridge, call("ses_foreign"))).json()).toMatchObject({ result: { isError: true, content: [{ text: "Shared session admission failed." }] } });
+    expect(await (await rpc(bridge, call("ses_expected"))).json()).toMatchObject({ result: { content: [{ text: '{"ok":true}' }] } });
+    live = false;
+    expect(await (await rpc(bridge, call("ses_expected"))).json()).toMatchObject({ result: { isError: true } });
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(admitSharedCall).toHaveBeenCalledTimes(3);
+  });
   it("binds to loopback, requires authentication, and exposes only its closed catalog", async () => {
     const bridge = await startOpenCodeMcpBridge({
       secret: "session-secret",

@@ -56,6 +56,8 @@ export { resolveCodexCommand, resolvePinnedCodexCommand } from "./drivers/codex/
 export { runnerBinaryTarget } from "./live/runner-binary.js";
 export * from "./drivers/opencode/opencode-server-driver.js";
 export * from "./drivers/opencode/mcp-bridge.js";
+export { OpenCodeV2Shared } from "./drivers/opencode/opencode-v2-shared.js";
+export type { V2Authority, V2Binding, V2Cursor, V2Event } from "./drivers/opencode/opencode-v2-shared.js";
 export * from "./drivers/acpx/qualified-profiles.js";
 export { parseAcpxCandidateAdmission, type AcpxCandidateAdmission } from "./drivers/acpx/candidate-admission.js";
 export { startAntigravityBrowserLogin, verifyAntigravityCredential, sanitizeAntigravityCredential } from "./drivers/acpx/antigravity-auth.js";
