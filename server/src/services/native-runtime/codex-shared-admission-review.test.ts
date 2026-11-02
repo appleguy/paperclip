@@ -3,6 +3,17 @@ import { expect, it } from "vitest";
 import { agents, agentTaskSessions, companies, createDb, goals, heartbeatRuns, issues, nativeRunFinalizations, projects, startEmbeddedPostgresTestDatabase } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import { beginCodexManagedThreadBootstrap, type CodexSharedGoalBinding } from "./codex-shared-goal-authority.js";
+import { hasCodexSharedSessionIdentity } from "./codex-shared-admission.js";
+
+it("distinguishes Paperclip metadata from provider identity", () => {
+ const base = {sessionDisplayId:null, goalJson:null, sessionParamsJson:{__paperclipConfiguredModel:"model",__paperclipConfigFingerprint:"fingerprint"}};
+ expect(hasCodexSharedSessionIdentity(base)).toBe(false);
+ for (const key of ["codexSharedBootstrapV1", "codexSharedGoalV1", "sessionId"]) {
+  expect(hasCodexSharedSessionIdentity({...base,sessionParamsJson:{...base.sessionParamsJson,[key]:{}}})).toBe(true);
+ }
+ expect(hasCodexSharedSessionIdentity({...base,sessionDisplayId:"thread"})).toBe(true);
+ expect(hasCodexSharedSessionIdentity({...base,goalJson:{}})).toBe(true);
+});
 it("does not reserve bootstrap when the issue checkout is not committed to the run",async()=>{
  const database=await startEmbeddedPostgresTestDatabase("codex-admission-review-");const db=createDb(database.connectionString);
  try {

@@ -11,6 +11,11 @@ import { sharedThreadConfigViolation } from "../../vendor/paperclip-runner/index
 const record=(value:unknown):Record<string,unknown>=>value && typeof value==="object" && !Array.isArray(value) ? value as Record<string,unknown> : {};
 const digest=(value:unknown)=>createHash("sha256").update(JSON.stringify(value,(_key,item:unknown)=>item && typeof item==="object" && !Array.isArray(item) ? Object.fromEntries(Object.entries(item).sort(([a],[b])=>a.localeCompare(b))) : item)).digest("hex");
 
+/** Paperclip's model and configuration fingerprints are not provider sessions. */
+export function hasCodexSharedSessionIdentity(session: {sessionDisplayId: string | null; sessionParamsJson: unknown; goalJson: unknown}): boolean {
+  return Boolean(session.sessionDisplayId || session.goalJson || Object.keys(record(session.sessionParamsJson)).some(key => !key.startsWith("__paperclip")));
+}
+
 /** Server-owned capability for the existing PRP prepare -> bind -> open path. */
 export type CodexSharedLaunchContract = Readonly<{cwd:string;instructions:string;authorizedTools:Record<string,unknown>;approvalPolicy:"never";readOnly:boolean;webSearchDisabled:boolean;threadConfig:Record<string,unknown>}>;
 export function createCodexSharedAdmission(input:{db:Db;binding:CodexSharedGoalBinding;bootstrapId:string;observationEpochId:string;launch:CodexSharedLaunchContract;attestDaemon():Promise<void>}) {
@@ -77,7 +82,7 @@ export async function claimRegisteredCodexSharedOption(input:{db:Db;companyId:st
     if (typeof revision!=="string") throw new Error("codex_delegation_unavailable");
     await assertCodexNativeDelegation(tx,{companyId:input.companyId,agentId:input.agentId,projectId:issue.projectId,model:input.model,effort:input.effort,hostId:input.hostId,processGeneration,delegationGrantId:input.delegationGrantId,delegationRevision:revision});
     const [existing]=await tx.select().from(agentTaskSessions).where(and(eq(agentTaskSessions.companyId,input.companyId),eq(agentTaskSessions.agentId,input.agentId),eq(agentTaskSessions.adapterType,"paperclip_runner"),eq(agentTaskSessions.taskKey,input.issueId))).for("update",{noWait:true}).limit(1);
-    if (existing && (existing.sessionDisplayId || Object.keys(record(existing.sessionParamsJson)).length || existing.goalJson)) throw new Error("codex_shared_existing_session_requires_recovery");
+    if (existing && hasCodexSharedSessionIdentity(existing)) throw new Error("codex_shared_existing_session_requires_recovery");
     const taskSessionId=existing?.id ?? randomUUID();
     if (existing) await tx.update(agentTaskSessions).set({lastRunId:input.runId,updatedAt:sql`clock_timestamp()`}).where(eq(agentTaskSessions.id,taskSessionId));
     else await tx.insert(agentTaskSessions).values({id:taskSessionId,companyId:input.companyId,agentId:input.agentId,adapterType:"paperclip_runner",taskKey:input.issueId,lastRunId:input.runId,sessionParamsJson:{}});
