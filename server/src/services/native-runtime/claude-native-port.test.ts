@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
-import { agents, companies, createDb, environmentLeases, executionWorkspaces, heartbeatRuns, issues, nativeRunFinalizations } from "@paperclipai/db";
+import { agents, companies, createDb, environmentLeases, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations } from "@paperclipai/db";
 import { ClaudeInteractiveNativeBackend } from "@paperclipai/paperclip-runner";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { CONTROL_PLANE_CONFORMANCE_RESULT } from "../../vendor/paperclip-runner/testing.js";
@@ -60,7 +60,14 @@ const support = await getEmbeddedPostgresTestSupport();
     const { port, authorizeWorkSessionResult } = await h.started;
     expect(h.launch).toHaveBeenCalledTimes(1);
     expect(h.launched[0]).toMatchObject({ sessionId: f.nativeSessionId, model: "sonnet", effort: "high", autoCompactTokens: 200000 });
-    expect(h.launched[0]!.remoteControlName).toContain("Agent · Task");
+    const requestedName = h.launched[0]!.remoteControlName;
+    expect(requestedName).toContain("Agent");
+    expect(requestedName).toContain(f.runId.slice(0, 8));
+    expect(requestedName).not.toContain("Task");
+    const eventsForRun = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.runId));
+    expect(eventsForRun).toEqual(expect.arrayContaining([expect.objectContaining({ eventType: "claude.remote_control.requested", payload: {
+      requestedName, requestedSessionId: f.nativeSessionId, connectionState: "unobservable",
+    } })]));
     expect(h.launched[0]!.mcp.tools.map((tool: { name: string }) => tool.name)).toEqual(expect.arrayContaining(["get_task_context", "set_task_title"]));
     // The Runner bridge publishes the completion tools itself and rejects them as caller tools.
     expect(h.launched[0]!.mcp.tools.map((tool: { name: string }) => tool.name)).not.toEqual(expect.arrayContaining(["paperclip_finish"]));

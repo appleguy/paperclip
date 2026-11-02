@@ -10,6 +10,7 @@ import { nativeSha256 } from "./canonical.js";
 import { createClaudeNativeAdmission, type ClaudeNativeAdmissionOptions } from "./claude-native-admission.js";
 import { claudeLiveSessions, type ClaudeLiveSessionControl, type ClaudeLiveSessionRegistry } from "./claude-native-live-sessions.js";
 import { readClaudeTerminalReceipt, type ClaudeSemanticJournalBinding } from "./claude-native-semantic-journal.js";
+import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 
 export interface ClaudeNativeHost {
   claudeExecutable: string; home: string; claudeConfigDir?: string;
@@ -54,10 +55,10 @@ export async function startClaudeNativeSession(db: Db, input: StartClaudeNativeS
   if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0 || stat.uid !== process.getuid?.()) throw new Error("claude_state_directory_not_private");
   if (registry.has(b.companyId, b.runId)) throw new Error("claude_session_already_live");
   const [agent] = await db.select({ name: agents.name }).from(agents).where(and(eq(agents.companyId, b.companyId), eq(agents.id, b.agentId))).limit(1);
-  const [issue] = await db.select({ identifier: issues.identifier, title: issues.title }).from(issues).where(and(eq(issues.companyId, b.companyId), eq(issues.id, b.issueId))).limit(1);
+  const [issue] = await db.select({ identifier: issues.identifier }).from(issues).where(and(eq(issues.companyId, b.companyId), eq(issues.id, b.issueId))).limit(1);
   if (!agent || !issue) throw new Error("claude_session_name_scope_unavailable");
   const namePart = (value: string) => value.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 75);
-  const remoteControlName = [issue.identifier || b.issueId.slice(0, 8), agent.name, issue.title].map(namePart).join(" · ");
+  const remoteControlName = [issue.identifier || b.issueId.slice(0, 8), agent.name, b.runId.slice(0, 8)].map(namePart).join(" · ");
 
   const identity = Object.freeze({ runId: b.runId, sessionId: nativeSessionId, companyId: b.companyId, issueId: b.issueId, agentId: b.agentId });
   const admit = createClaudeNativeAdmission(db, {
@@ -79,6 +80,11 @@ export async function startClaudeNativeSession(db: Db, input: StartClaudeNativeS
     const record = await open(join(directory, "launch.json"), constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0), 0o600);
     try { await record.writeFile(JSON.stringify({ version: 1, runId: b.runId, companyId: b.companyId, sessionId: nativeSessionId, workspace: resolve(cwd), state: "launch_reserved" })); await record.sync(); }
     finally { await record.close(); }
+    // This is the requested name and local conversation ID, not a provider connection receipt.
+    await appendHeartbeatRunEvent(db, { companyId: b.companyId, runId: b.runId, agentId: b.agentId,
+      eventType: "claude.remote_control.requested", stream: "system", level: "info",
+      message: `Claude Remote Control requested: ${remoteControlName}`,
+      payload: { requestedName: remoteControlName, requestedSessionId: nativeSessionId, connectionState: "unobservable" } });
 
   } catch (error) { await admitted.close(); throw error; }
   const journal: ClaudeSemanticJournalBinding = Object.freeze({ companyId: b.companyId, issueId: b.issueId, runId: b.runId, nativeSessionId,
