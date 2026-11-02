@@ -28,6 +28,7 @@ export function isLocalOpenCodeAdmissionDecline(run: Candidate): boolean {
     /^WRX80 admission declined \(BUSY:(?:GPU|external-engine|other-model-or-loading)\); no inference sent$/.test(firstLine) ||
     firstLine === "Maya Paperclip host/model already owned; no inference sent" ||
     firstLine === "Mac Maya already serving another Paperclip run; no second request" ||
+    firstLine === "OpenCode shared server has unresolved active sessions; no inference sent" ||
     firstLine === "Mac Pro Maya-L admission refused: Model not advertised"
   );
 }

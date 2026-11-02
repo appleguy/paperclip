@@ -96,6 +96,7 @@ describe("local OpenCode admission retry", () => {
       "WRX80 admission declined (BUSY:external-engine); no inference sent",
       "WRX80 admission declined (BUSY:other-model-or-loading); no inference sent",
       "Mac Maya already serving another Paperclip run; no second request",
+      "OpenCode shared server has unresolved active sessions; no inference sent",
       "Mac Pro Maya-L admission refused: Model not advertised",
     ]) expect(isLocalOpenCodeAdmissionDecline({ ...busy, error })).toBe(true);
   });

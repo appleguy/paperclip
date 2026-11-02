@@ -55,6 +55,7 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl, createOpenCodeJsonlParser } from "./parse.js";
 import { createOpenCodeAttemptProgressGuard } from "./attempt-progress.js";
+import { OpenCodeSharedSessionWait, prepareSharedOpenCodeSession } from "./shared-session-recovery.js";
 import {
   ensureOpenCodeModelConfiguredAndAvailable,
   isTruthyEnvFlag,
@@ -517,6 +518,33 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       (runtimeSessionCwd.length === 0 || path.resolve(runtimeSessionCwd) === path.resolve(effectiveExecutionCwd)) &&
       adapterExecutionTargetSessionMatches(runtimeRemoteExecution, runtimeExecutionTarget);
     const sessionId = canResumeSession ? runtimeSessionId : null;
+    let sharedSession: Awaited<ReturnType<typeof prepareSharedOpenCodeSession>> | null = null;
+    const sharedConfigPath = asString(config.sharedServerRecoveryConfigPath, "").trim();
+    if (sharedConfigPath) {
+      // Opt-in only for the local persistent OpenCode server. Any unpaired
+      // active provider turn fails before inference; never manufacture a fork.
+      try {
+        const taskId = wakeTaskId ?? asString(runtime.taskKey, "").trim();
+        if (executionTargetIsRemote || !taskId || !path.isAbsolute(sharedConfigPath))
+          throw new OpenCodeSharedSessionWait();
+        sharedSession = await prepareSharedOpenCodeSession({
+          configPath: sharedConfigPath, stateDir: path.dirname(sharedConfigPath), agentId: agent.id,
+          taskId, runId, cwd: effectiveExecutionCwd,
+          requestedSessionId: sessionId,
+          signal: ctx.signal,
+        });
+      } catch (error) {
+        if (!(error instanceof OpenCodeSharedSessionWait)) {
+          // File/auth errors are not evidence that a provider is idle.
+          await onLog("stderr", "[paperclip] Shared OpenCode recovery preflight unavailable; no inference sent.\n");
+        }
+        return {
+          exitCode: 75, signal: null, timedOut: false,
+          errorMessage: "OpenCode shared server has unresolved active sessions; no inference sent",
+          resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+        };
+      }
+    }
     if (executionTargetIsRemote && runtimeSessionId && !canResumeSession) {
       await onLog(
         "stdout",
@@ -591,6 +619,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         : renderTemplate(promptTemplate, templateData);
       const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
       const basePrompt = joinPromptSections([
+        // On a recovered server session, keep the model's prior tool outcomes
+        // in context instead of treating the assignment as a fresh execution.
+        sharedSession?.resumed && resumedSession
+          ? "Controller restart recovery: inspect the existing session history. Do not repeat any completed tool actions; continue only unfinished work."
+          : "",
         instructionsPrefix,
         renderedBootstrapPrompt,
         wakePrompt,
@@ -623,7 +656,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const buildArgs = (resumeSessionId: string | null) => {
       const args = ["run", "--format", "json"];
       if (printLogs) args.push("--print-logs");
-      if (resumeSessionId) args.push("--session", resumeSessionId);
+      if (resumeSessionId ?? sharedSession?.sessionId) args.push("--session", (resumeSessionId ?? sharedSession?.sessionId)!);
       if (model) args.push("--model", model);
       if (variant) args.push("--variant", variant);
       // OpenCode prefers the inherited PWD over process.cwd(). Use the realized
@@ -708,7 +741,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         parsed.usageComplete = retained.usageComplete;
         parsed.costUsd = retained.costUsd;
       }
-      parsed.sessionId ??= progressGuard.observedSessionId(proc.stdout);
+      parsed.sessionId ??= progressGuard.observedSessionId(proc.stdout) ?? sharedSession?.sessionId ?? null;
       return { proc, rawStderr: proc.stderr, parsed,
         possibleWork: progressGuard.hasPossibleWork(proc.stdout) || parsed.hasNonErrorOutput,
         capacityRefusal: progressGuard.preInferenceCapacityRefusal(proc.stdout),
@@ -814,11 +847,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
 
     try {
-      const initial = await runAttempt(sessionId);
+      const initial = await runAttempt(sharedSession?.resumed ? sharedSession.sessionId : sessionId);
+      await sharedSession?.finish(initial.proc);
       const initialFailed =
         !initial.proc.timedOut && ((initial.proc.exitCode ?? 0) !== 0 || Boolean(initial.parsed.errorMessage));
       if (
         sessionId &&
+        !sharedSession &&
         initialFailed &&
         !initial.proc.signal &&
         !initial.possibleWork &&

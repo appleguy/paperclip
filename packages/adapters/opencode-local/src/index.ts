@@ -101,6 +101,7 @@ Core fields:
 - command (string, optional): defaults to "opencode"
 - extraArgs (string[], optional): additional CLI args
 - env (object, optional): KEY=VALUE environment variables
+- sharedServerRecoveryConfigPath (string, opt-in): absolute local path to the existing persistent OpenCode server JSON ({url, passwordFile}). Enables a durable per-agent/task session binding before CLI dispatch, exact-session interrupt on SIGTERM, and same-session resume after controller restart. Unknown active sessions and unverifiable ownership fail closed before inference. The host must be loopback and the agent's CLI wrapper must honor --session without creating another session.
 
 Operational fields:
 - timeoutSec (number, optional): run timeout in seconds
