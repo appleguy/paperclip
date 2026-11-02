@@ -3,7 +3,15 @@ import { dirname } from "node:path";
 import { parse } from "smol-toml";
 
 /** Config keys a shared-daemon `thread/start.config` may carry; everything else in the launch arguments stays launch-only. */
-const THREAD_CONFIG_KEYS = new Set(["permissions", "shell_environment_policy", "web_search"]);
+const THREAD_CONFIG_KEYS = new Set(["permissions", "shell_environment_policy", "web_search", "mcp_servers"]);
+export const SHARED_MCP_NAME = /^[A-Za-z0-9_-]{1,128}$/;
+
+export function parseSharedDisabledMcp(value: string | undefined): string[] {
+  if (value === undefined || value === "") return [];
+  const names = value.split(",").map((name) => name.trim());
+  if (names.length > 256 || names.some((name) => !SHARED_MCP_NAME.test(name))) throw new Error("shared_codex_disable_mcp_invalid");
+  return [...new Set(names)].sort();
+}
 export const SHARED_WRITABLE_PROFILE = "paperclip-runner-workspace-only";
 export const SHARED_READ_ONLY_PROFILE = "paperclip-runner-workspace-read-only";
 
@@ -50,6 +58,7 @@ const SHELL_POLICY_KEYS = new Set(["inherit", "ignore_default_excludes", "includ
 export function sharedThreadConfigViolation(config: unknown, policy: { cwd: string; readOnly: boolean; disableWebSearch: boolean }): string | null {
   if (!isRecord(config)) return "config_missing";
   if (Object.keys(config).some((key) => !THREAD_CONFIG_KEYS.has(key))) return "config_key_unknown";
+  if (config.mcp_servers !== undefined && (!isRecord(config.mcp_servers) || Object.keys(config.mcp_servers).length > 256 || Object.entries(config.mcp_servers).some(([name, entry]) => !SHARED_MCP_NAME.test(name) || !isRecord(entry) || Object.keys(entry).length !== 1 || entry.enabled !== false))) return "mcp_servers_invalid";
   if (config.web_search !== undefined && config.web_search !== "disabled") return "web_search_widened";
   if (policy.disableWebSearch && config.web_search !== "disabled") return "web_search_not_disabled";
   const profiles = config.permissions;

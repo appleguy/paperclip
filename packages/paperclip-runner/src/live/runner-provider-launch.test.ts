@@ -45,6 +45,21 @@ describe("built-in provider launch preparation", () => {
     config.shell_environment_policy.set.SECRET = "value";
     expect(sharedThreadConfigViolation(config, policy)).toBe("shell_environment_invalid");
   });
+  it("builds only explicitly disabled MCP entries and rejects malformed names or overrides", () => {
+    const base = { cwd: environment.cwd, readOnly: false, webSearchDisabled: true, networkAccess: false,
+      codexHome: "/private/home", codexExecutable: "/bin/sh", path: "/usr/bin:/bin" };
+    const policy = { cwd: base.cwd, readOnly: false, disableWebSearch: true };
+    const config = createSharedCodexThreadConfig({ ...base, disabledMcp: "z-server, alpha_1,z-server" }) as any;
+    expect(config.mcp_servers).toEqual({ alpha_1: { enabled: false }, "z-server": { enabled: false } });
+    expect(sharedThreadConfigViolation(config, policy)).toBeNull();
+    for (const invalid of ["foo,,bar", "foo.bar", "../foo", "foo bar", "__proto__."]) {
+      expect(() => createSharedCodexThreadConfig({ ...base, disabledMcp: invalid })).toThrow("shared_codex_disable_mcp_invalid");
+    }
+    for (const invalid of [{ alpha: { enabled: true } }, { alpha: { enabled: false, command: "x" } }, { "bad.name": { enabled: false } }]) {
+      expect(sharedThreadConfigViolation({ ...config, mcp_servers: invalid }, policy)).toBe("mcp_servers_invalid");
+    }
+    expect(createSharedCodexThreadConfig(base)).not.toHaveProperty("mcp_servers");
+  });
   it("pins the explicitly attested shared daemon into readonly launch requirements",()=>{
     const shared={socketPath:"/private/socket",daemonGeneration:"generation",threadId:"thread",codexHome:"/private/home",peer:{pid:12,startSeconds:1,startMicroseconds:2,executable:"/private/codex"},writer:{runId:"run",normalizedSessionId:"session",runnerInstanceId:"runner",grantId:"grant",epoch:1,observationEpochId:"observation"}};
     const selected=runnerProviderLaunchRequirements({provider:"codex",sharedCodexDaemon:shared},requirements.identity,{permissions:"paperclip-runner-workspace-read-only"},null,"");
@@ -57,7 +72,7 @@ describe("built-in provider launch preparation", () => {
     expect(()=>validatePreparedRunnerLaunch(selected,{configurationId:"test",requirementsDigest:runnerLaunchRequirementsDigest(selected),provider:{...launch,sharedDaemon:{...selected.sharedCodexDaemon,threadId:"foreign"}}})).toThrow("requirements_mismatch");
   });
   it.each([false, true])("binds Core's web-search policy and a narrow permission profile into the shared bootstrap thread config (readOnly=%s)", readOnly => {
-    const serverConfig=(networkAccess=false)=>createSharedCodexThreadConfig({cwd:environment.cwd,readOnly,webSearchDisabled:true,networkAccess,codexHome:"/private/home",codexExecutable:"/bin/sh",path:"/usr/bin:/bin"});
+    const serverConfig=(networkAccess=false)=>createSharedCodexThreadConfig({cwd:environment.cwd,readOnly,webSearchDisabled:true,networkAccess,codexHome:"/private/home",codexExecutable:"/bin/sh",path:"/usr/bin:/bin",disabledMcp:"fixture"});
     const bootstrapWith=(threadConfig:Record<string,unknown>)=>({socketPath:"/private/socket",daemonGeneration:"generation",threadId:"",codexHome:"/private/home",bootstrapId:"boot",peer:{pid:12,startSeconds:1,startMicroseconds:2,executable:"/bin/sh"},writer:{runId:"run",normalizedSessionId:"session",runnerInstanceId:"runner",grantId:"grant",epoch:1,observationEpochId:"observation",managedTools:true,managedBootstrapId:"boot",reasoningEffort:"high",threadConfig}});
     const bootstrap=bootstrapWith(serverConfig());
     const selected=runnerProviderLaunchRequirements({provider:"codex",disableCodexWebSearch:true,sharedCodexDaemon:bootstrap},requirements.identity,{model:"selected-model",permissions:readOnly?"paperclip-runner-workspace-read-only":"paperclip-runner-workspace-only"},null,"Follow the assigned instructions.");
@@ -70,6 +85,7 @@ describe("built-in provider launch preparation", () => {
     const mutate=(change:(config:Record<string,any>)=>void)=>{ const copy=structuredClone(launch); change(copy.sharedDaemon.writer.threadConfig); return {...prepared,provider:copy as unknown as Record<string,unknown>}; };
     const profile=readOnly?"paperclip-runner-workspace-read-only":"paperclip-runner-workspace-only";
     for (const change of [
+      (config:Record<string,any>)=>{ delete config.mcp_servers.fixture; },
       // Mutations that stay inside the shape validator's vocabulary but differ from the server-generated policy.
       (config:Record<string,any>)=>{ config.permissions[profile].network.enabled=true; },
       (config:Record<string,any>)=>{ config.permissions[profile].filesystem["/Users/attacker/.ssh"]="read"; },

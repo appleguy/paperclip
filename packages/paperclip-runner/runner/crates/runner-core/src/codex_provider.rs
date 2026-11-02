@@ -480,7 +480,11 @@ impl SharedDaemonWriter {
         };
         if config
             .keys()
-            .any(|k| k != "permissions" && k != "web_search" && k != "shell_environment_policy")
+            .any(|k| k != "permissions" && k != "web_search" && k != "shell_environment_policy" && k != "mcp_servers")
+            || config.get("mcp_servers").is_some_and(|v| !v.as_object().is_some_and(|servers| servers.len() <= 256 && servers.iter().all(|(name, entry)| {
+                !name.is_empty() && name.len() <= 128 && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+                    && entry.as_object().is_some_and(|entry| entry.len() == 1 && entry.get("enabled") == Some(&json!(false)))
+            })))
             || config.get("web_search").is_some_and(|v| v != "disabled")
             || !config
                 .get("shell_environment_policy")
@@ -4541,6 +4545,13 @@ mod tests {
             SHARED_READ_ONLY_PROFILE: {"filesystem":{":root":"none",":minimal":"read",":tmpdir":"none",":workspace_roots":{".":"read"}},"network":{"enabled":false}}
         }, "web_search":"disabled", "shell_environment_policy": {"inherit":"none","ignore_default_excludes":false,"include_only":["PATH"],"set":{"PATH":"/usr/bin:/bin"}}});
         assert!(make(config.clone()).thread_config_valid("/workspace", false));
+        let mut with_mcp = config.clone();
+        with_mcp["mcp_servers"] = json!({"fixture-server": {"enabled": false}});
+        assert!(make(with_mcp.clone()).thread_config_valid("/workspace", false));
+        for invalid in [json!({"fixture": {"enabled": true}}), json!({"fixture": {"enabled": false, "command": "x"}}), json!({"bad.name": {"enabled": false}})] {
+            with_mcp["mcp_servers"] = invalid;
+            assert!(!make(with_mcp.clone()).thread_config_valid("/workspace", false));
+        }
         for env in [json!({"inherit":"all"}), json!({"inherit":"none","include_only":[1]}), json!({"inherit":"none","unknown":true})] {
             let mut widened = config.clone();
             widened["shell_environment_policy"] = env;
