@@ -839,11 +839,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     model && (!isBedrockAuth(modelEnv) || isBedrockModelId(model)),
   );
 
+  // Opt-in automatic named Remote Control for every claude_local run (host env only; a per-run config env cannot enable it).
+  const rcNamePart = (value: string) => value.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 75);
+  const rcTaskId =
+    (typeof context.taskId === "string" && context.taskId.trim()) ||
+    (typeof context.issueId === "string" && context.issueId.trim()) || "";
+  const remoteControlName = process.env.PAPERCLIP_CLAUDE_RC_DEFAULT === "1"
+    ? [rcTaskId.slice(0, 8) || runId.slice(0, 8), agent.name, runId.slice(0, 8)].map(rcNamePart).join(" · ")
+    : undefined;
   const buildClaudeArgs = (
     resumeSessionId: string | null,
     attemptInstructionsFilePath: string | undefined,
   ) => {
     const args = ["--print", "--output-format", "stream-json", "--verbose"];
+    if (remoteControlName) args.push("--remote-control", remoteControlName);
     if (config.managedAiConnection) args.push("--setting-sources", "user");
     if (resumeSessionId) args.push("--resume", resumeSessionId);
     args.push(...buildClaudeExecutionPermissionArgs({

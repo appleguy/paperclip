@@ -108,6 +108,12 @@ export class ClaudeInteractiveController {
     if (this.detached || this.stopAttempted) throw new Error("Claude interactive controller is detached or stopping");
     if (!this.pty.hasExited?.() && !await this.verifier.process(this.pty.pid,this.pty.generation)) throw new Error("Claude interactive process identity changed");
     this.stopAttempted=true;
-    await this.pty.stop();
+    try {
+      await this.pty.stop();
+    } catch (error) {
+      // A failed stop stays retriable (the next call re-verifies identity); an owned handle that confirms exit latches.
+      if (!this.pty.hasExited?.()) this.stopAttempted=false;
+      throw error;
+    }
   }
 }
