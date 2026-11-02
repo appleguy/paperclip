@@ -1,9 +1,35 @@
 import { randomUUID } from "node:crypto";
 import { expect, it } from "vitest";
-import { agents, agentTaskSessions, companies, createDb, goals, heartbeatRuns, issues, nativeRunFinalizations, projects, startEmbeddedPostgresTestDatabase } from "@paperclipai/db";
+import { agents, agentSessionGoalActions, agentTaskSessions, companies, createDb, goals, heartbeatRunEvents, heartbeatRuns, issues, nativeRunFinalizations, projects, startEmbeddedPostgresTestDatabase } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import { beginCodexManagedThreadBootstrap, type CodexSharedGoalBinding } from "./codex-shared-goal-authority.js";
-import { hasCodexSharedSessionIdentity } from "./codex-shared-admission.js";
+import { hasCodexSharedSessionIdentity, rolloverSettledCodexSession } from "./codex-shared-admission.js";
+
+it("rolls over only a settled created identity and leaves another issue alone",async()=>{
+ const database=await startEmbeddedPostgresTestDatabase("codex-rollover-");const db=createDb(database.connectionString);
+ try {
+  const companyId=randomUUID(),agentId=randomUUID(),oldRun=randomUUID(),nextRun=randomUUID(),sessionId=randomUUID(),otherId=randomUUID();
+  await db.insert(companies).values({id:companyId,name:"Test",issuePrefix:"ROL"});
+  await db.insert(agents).values({id:agentId,companyId,name:"Test",role:"engineer",adapterType:"paperclip_runner"});
+  await db.insert(heartbeatRuns).values([{id:oldRun,companyId,agentId,status:"succeeded"},{id:nextRun,companyId,agentId,status:"running"}]);
+  const bootstrap={state:"created",threadId:"old-thread",runId:oldRun};
+  await db.insert(agentTaskSessions).values([{id:sessionId,companyId,agentId,adapterType:"paperclip_runner",taskKey:"first",lastRunId:oldRun,sessionParamsJson:{codexSharedBootstrapV1:bootstrap}},{id:otherId,companyId,agentId,adapterType:"paperclip_runner",taskKey:"second",lastRunId:oldRun,sessionParamsJson:{codexSharedBootstrapV1:bootstrap}}]);
+  const attempt=()=>db.transaction(async tx=>{const [row]=await tx.select().from(agentTaskSessions).where(eq(agentTaskSessions.id,sessionId)).for("update");return rolloverSettledCodexSession(tx,row!,nextRun);});
+  await db.update(agentTaskSessions).set({sessionParamsJson:{codexSharedBootstrapV1:{...bootstrap,state:"starting"}}}).where(eq(agentTaskSessions.id,sessionId));
+  expect(await attempt()).toBe(false);
+  await db.update(agentTaskSessions).set({sessionParamsJson:{codexSharedBootstrapV1:bootstrap,codexSharedGoalV1:{observationEpoch:{state:"open"}}}}).where(eq(agentTaskSessions.id,sessionId));
+  expect(await attempt()).toBe(false);
+  await db.update(agentTaskSessions).set({sessionParamsJson:{codexSharedBootstrapV1:bootstrap}}).where(eq(agentTaskSessions.id,sessionId));
+  await db.insert(agentSessionGoalActions).values({companyId,sessionId,requestId:"pending",action:"create",payloadJson:{}});
+  expect(await attempt()).toBe(false);
+  await db.update(agentSessionGoalActions).set({status:"completed"}).where(eq(agentSessionGoalActions.sessionId,sessionId));
+  expect(await attempt()).toBe(true);
+  const [row]=await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.id,sessionId));
+  expect(row?.sessionParamsJson).toEqual({__paperclipSharedRunFence:nextRun});expect(row?.lastRunId).toBe(nextRun);
+  const [other]=await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.id,otherId));expect(other?.sessionParamsJson).toEqual({codexSharedBootstrapV1:bootstrap});
+  const [event]=await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId,nextRun));expect(event?.eventType).toBe("shared_session_rolled_over");expect(event?.payload).toEqual({oldThreadId:"old-thread"});
+ } finally {await db.$client.end();await database.cleanup();}
+},60000);
 
 it("distinguishes Paperclip metadata from provider identity", () => {
  const base = {sessionDisplayId:null, goalJson:null, sessionParamsJson:{__paperclipConfiguredModel:"model",__paperclipConfigFingerprint:"fingerprint"}};

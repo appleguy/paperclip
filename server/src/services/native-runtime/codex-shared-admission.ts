@@ -1,12 +1,14 @@
 import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { isAbsolute } from "node:path";
-import { agentTaskSessions, connectionGrants, environmentLeases, heartbeatRuns, issues, nativeRunFinalizations, toolConnections, type Db } from "@paperclipai/db";
+import { agentSessionGoalActions, agentTaskSessions, connectionGrants, environmentLeases, heartbeatRuns, issues, nativeRunFinalizations, toolConnections, type Db } from "@paperclipai/db";
 import { and, eq, gt, isNull, or, sql } from "drizzle-orm";
 import { assertCodexNativeDelegation } from "./codex-native-delegation.js";
 import { activateCodexSharedObservation, authorizeReservedCodexGoalWrite, beginCodexManagedThreadBootstrap, beginCodexSharedObservation, completeCodexManagedThreadBootstrap, preflightCodexManagedThreadBootstrap, type CodexSharedGoalBinding } from "./codex-shared-goal-authority.js";
 import { inspectCodexSharedDaemon } from "./codex-shared-daemon.js";
 import { sharedThreadConfigViolation } from "../../vendor/paperclip-runner/index.js";
+import { retireSharedIdentity } from "../heartbeat/run-state.js";
+import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 
 const record=(value:unknown):Record<string,unknown>=>value && typeof value==="object" && !Array.isArray(value) ? value as Record<string,unknown> : {};
 const digest=(value:unknown)=>createHash("sha256").update(JSON.stringify(value,(_key,item:unknown)=>item && typeof item==="object" && !Array.isArray(item) ? Object.fromEntries(Object.entries(item).sort(([a],[b])=>a.localeCompare(b))) : item)).digest("hex");
@@ -14,6 +16,19 @@ const digest=(value:unknown)=>createHash("sha256").update(JSON.stringify(value,(
 /** Paperclip's model and configuration fingerprints are not provider sessions. */
 export function hasCodexSharedSessionIdentity(session: {sessionDisplayId: string | null; sessionParamsJson: unknown; goalJson: unknown}): boolean {
   return Boolean(session.sessionDisplayId || session.goalJson || Object.keys(record(session.sessionParamsJson)).some(key => !key.startsWith("__paperclip")));
+}
+
+/** Called with the session row locked; uncertainty always remains in recovery. */
+export async function rolloverSettledCodexSession(tx: Parameters<Parameters<Db["transaction"]>[0]>[0], session: typeof agentTaskSessions.$inferSelect, nextRunId: string): Promise<boolean> {
+  const params=record(session.sessionParamsJson), bootstrap=record(params.codexSharedBootstrapV1);
+  if (bootstrap.state!=="created" || typeof bootstrap.threadId!=="string" || !bootstrap.threadId || bootstrap.runId!==session.lastRunId || params.codexSharedGoalV1!==undefined || session.goalJson || Object.keys(params).some(key=>key!=="codexSharedBootstrapV1" && !key.startsWith("__paperclip")) || !session.lastRunId || session.lastRunId===nextRunId) return false;
+  const [previous]=await tx.select({status:heartbeatRuns.status}).from(heartbeatRuns).where(and(eq(heartbeatRuns.id,session.lastRunId),eq(heartbeatRuns.companyId,session.companyId),eq(heartbeatRuns.agentId,session.agentId))).for("update",{noWait:true}).limit(1);
+  if (!previous || !["succeeded","failed","cancelled","timed_out"].includes(previous.status)) return false;
+  const actions=await tx.select().from(agentSessionGoalActions).where(and(eq(agentSessionGoalActions.companyId,session.companyId),eq(agentSessionGoalActions.sessionId,session.id))).for("update",{noWait:true});
+  if (actions.some(action=>action.status!=="completed" || (record(action.resultJson).codexSharedGoalV1!==undefined && record(record(action.resultJson).codexSharedGoalV1).state!=="source_receipted"))) return false;
+  await retireSharedIdentity(tx,session,nextRunId);
+  await appendHeartbeatRunEvent(tx as unknown as Db,{companyId:session.companyId,agentId:session.agentId,runId:nextRunId,eventType:"shared_session_rolled_over",stream:"system",payload:{oldThreadId:bootstrap.threadId}});
+  return true;
 }
 
 /** Server-owned capability for the existing PRP prepare -> bind -> open path. */
@@ -82,9 +97,9 @@ export async function claimRegisteredCodexSharedOption(input:{db:Db;companyId:st
     if (typeof revision!=="string") throw new Error("codex_delegation_unavailable");
     await assertCodexNativeDelegation(tx,{companyId:input.companyId,agentId:input.agentId,projectId:issue.projectId,model:input.model,effort:input.effort,hostId:input.hostId,processGeneration,delegationGrantId:input.delegationGrantId,delegationRevision:revision});
     const [existing]=await tx.select().from(agentTaskSessions).where(and(eq(agentTaskSessions.companyId,input.companyId),eq(agentTaskSessions.agentId,input.agentId),eq(agentTaskSessions.adapterType,"paperclip_runner"),eq(agentTaskSessions.taskKey,input.issueId))).for("update",{noWait:true}).limit(1);
-    if (existing && hasCodexSharedSessionIdentity(existing)) throw new Error("codex_shared_existing_session_requires_recovery");
+    if (existing && hasCodexSharedSessionIdentity(existing) && !await rolloverSettledCodexSession(tx,existing,input.runId)) throw new Error("codex_shared_existing_session_requires_recovery");
     const taskSessionId=existing?.id ?? randomUUID();
-    if (existing) await tx.update(agentTaskSessions).set({lastRunId:input.runId,updatedAt:sql`clock_timestamp()`}).where(eq(agentTaskSessions.id,taskSessionId));
+    if (existing) await tx.update(agentTaskSessions).set({lastRunId:input.runId,...(!hasCodexSharedSessionIdentity(existing) && typeof record(existing.sessionParamsJson).__paperclipSharedRunFence==="string" ? {sessionParamsJson:{...record(existing.sessionParamsJson),__paperclipSharedRunFence:input.runId}} : {}),updatedAt:sql`clock_timestamp()`}).where(eq(agentTaskSessions.id,taskSessionId));
     else await tx.insert(agentTaskSessions).values({id:taskSessionId,companyId:input.companyId,agentId:input.agentId,adapterType:"paperclip_runner",taskKey:input.issueId,lastRunId:input.runId,sessionParamsJson:{}});
     return {companyId:input.companyId,agentId:input.agentId,issueId:input.issueId,runId:input.runId,projectId:issue.projectId,goalId:issue.goalId,normalizedSessionId:input.normalizedSessionId,runnerInstanceId:input.runnerInstanceId,executionWorkspaceId:input.executionWorkspaceId,environmentLeaseId:resources[0]!.id,taskSessionId,delegationGrantId:input.delegationGrantId,delegationRevision:revision,hostId:input.hostId,model:input.model,effort:input.effort,writerGrantId:input.runId,writerEpoch:lease.controllerGeneration,leaseOwner:input.leaseOwner,leaseAttempt:input.leaseAttempt,controllerBootId:input.controller.bootId,controllerPid:input.controller.pid,controllerProcessStartedAt:input.controller.processStartedAt,controllerGeneration:lease.controllerGeneration};
   });

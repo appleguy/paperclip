@@ -60,6 +60,17 @@ import { isUnsafeSessionWorkspaceCwd } from "../session-workspace-cwd.js";
 export const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON =
   "execution_review_participant_recovery";
 
+/** The caller holds the task-session row lock and has established settlement. */
+export async function retireSharedIdentity(tx: Parameters<Parameters<Db["transaction"]>[0]>[0], session: typeof agentTaskSessions.$inferSelect, nextRunId: string) {
+  const { codexSharedBootstrapV1: _bootstrap, ...params } = session.sessionParamsJson ?? {};
+  await tx.update(agentTaskSessions).set({
+    sessionParamsJson: { ...params, __paperclipSharedRunFence: nextRunId },
+    sessionDisplayId: null,
+    lastRunId: nextRunId,
+    updatedAt: sql`clock_timestamp()`,
+  }).where(eq(agentTaskSessions.id, session.id));
+}
+
 const heartbeatRunProcessGroupIdColumn =
   heartbeatRuns.processGroupId ?? sql<number | null>`NULL`.as("processGroupId");
 
@@ -1664,17 +1675,19 @@ export function createHeartbeatRunState(db: Db) {
     if (existing) {
       const sharedKeys = ["codexSharedBootstrapV1", "codexSharedGoalV1"] as const;
       const previous = existing.sessionParamsJson ?? {};
+      if (typeof previous.__paperclipSharedRunFence === "string" && previous.__paperclipSharedRunFence !== input.lastRunId) return null;
       const hasSharedIdentity = sharedKeys.some((key) => Object.hasOwn(previous, key));
       // A late completion from the previous wake must not overwrite its successor.
       if (hasSharedIdentity && existing.lastRunId !== input.lastRunId) return null;
       const params = { ...(input.sessionParamsJson ?? {}) };
+      if (typeof previous.__paperclipSharedRunFence === "string") params.__paperclipSharedRunFence = previous.__paperclipSharedRunFence;
       for (const key of sharedKeys) {
         if (!Object.hasOwn(params, key) && Object.hasOwn(previous, key)) params[key] = previous[key];
       }
       return tx
         .update(agentTaskSessions)
         .set({
-          sessionParamsJson: hasSharedIdentity ? params : input.sessionParamsJson,
+          sessionParamsJson: hasSharedIdentity || typeof previous.__paperclipSharedRunFence === "string" ? params : input.sessionParamsJson,
           sessionDisplayId: input.sessionDisplayId,
           lastRunId: input.lastRunId,
           lastError: input.lastError,
@@ -1761,7 +1774,7 @@ export function createHeartbeatRunState(db: Db) {
       if (sessions.some(({ params }) => params && Object.hasOwn(params, "opencodeSharedV2"))) {
         throw new Error("opencode_shared_session_requires_lease");
       }
-      if (sessions.some(({ params }) => params && (Object.hasOwn(params, "codexSharedBootstrapV1") || Object.hasOwn(params, "codexSharedGoalV1")))) {
+      if (sessions.some(({ params }) => params && (Object.hasOwn(params, "codexSharedBootstrapV1") || Object.hasOwn(params, "codexSharedGoalV1") || Object.hasOwn(params, "__paperclipSharedRunFence")))) {
         throw new Error("codex_shared_session_requires_recovery");
       }
       const goals = await tx.select({ id: agentTaskSessions.id }).from(agentTaskSessions)
@@ -1771,7 +1784,7 @@ export function createHeartbeatRunState(db: Db) {
       // COMMITTED. Keep the deletion predicate independently safe as well.
       return tx.delete(agentTaskSessions).where(and(...conditions,
         sql`not (coalesce(${agentTaskSessions.sessionParamsJson}, '{}'::jsonb) ? 'opencodeSharedV2')`,
-        sql`not (coalesce(${agentTaskSessions.sessionParamsJson}, '{}'::jsonb) ?| array['codexSharedBootstrapV1', 'codexSharedGoalV1'])`,
+        sql`not (coalesce(${agentTaskSessions.sessionParamsJson}, '{}'::jsonb) ?| array['codexSharedBootstrapV1', 'codexSharedGoalV1', '__paperclipSharedRunFence'])`,
       )).returning().then((rows) => rows.length);
     });
   }
