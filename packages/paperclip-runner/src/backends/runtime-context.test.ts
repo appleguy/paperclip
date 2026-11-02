@@ -60,6 +60,24 @@ describe("native runtime context files", () => {
     ).toContain("Stay inside the bundle.");
   });
 
+  it.each(["agent_files", undefined])("uses read-only home instructions for shared Codex (%s)", (kind) => {
+    const root = mkdtempSync(join(tmpdir(), "paperclip-runtime-context-"));
+    temporaryRoots.push(root);
+    writeFileSync(join(root, "AGENTS.md"), "Agent instructions.");
+    const input = runtimeInput(root, "AGENTS.md");
+    if (!("runtimeContext" in input)) throw new Error("missing context");
+    input.runtimeContext.instructions.workingCopy = { rootPath: "/agent-home", entryPath: "AGENTS.md", ...(kind ? { kind: "agent_files" as const } : {}) };
+    const shared = { ...input, provider: { kind: "codex" as const, model: null, approvalPolicy: "never" as const, sharedDaemon: true as const } };
+    for (const text of [nativeSystemInstructions(shared), nativeTaskConstraints(shared).join("\n")]) {
+      expect(text).toContain("read-only");
+      expect(text).toContain("workspace or issue documents");
+      expect(text).not.toContain("editable agent instruction file");
+      expect(text).not.toContain("Changes save");
+    }
+    expect(nativeSystemInstructions(input)).not.toContain("read-only on this route");
+    expect(nativeTaskConstraints(input).join("\n")).not.toContain("workspace or issue documents");
+  });
+
   it("requires semantic completion before the final assistant response", () => {
     const constraints = nativeTaskConstraints(
       {} as unknown as NativeExecutionInput,

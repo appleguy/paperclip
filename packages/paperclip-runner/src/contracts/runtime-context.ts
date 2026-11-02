@@ -4,6 +4,7 @@ import {
   PAPERCLIP_EDITABLE_INSTRUCTIONS_PROMPT,
   PAPERCLIP_EXECUTION_PROMPT,
   PAPERCLIP_INSTRUCTION_SIBLING_ROOT_PROMPT,
+  PAPERCLIP_READ_ONLY_AGENT_DIRECTORY_PROMPT,
 } from "./runtime-context-prompts.js";
 import { GENERATED_RUNTIME_CONTEXT_FIELDS } from "./generated-runtime-context-contract.js";
 
@@ -184,12 +185,14 @@ function renderInstructionPaths(prompt: string, paths: { rootPath: string; entry
   return prompt.replace(/\{(rootPath|entryPath)\}/g, (_placeholder, key: "rootPath" | "entryPath") => paths[key]);
 }
 
-export function composeNativeSystemInstructions(context: NativeRuntimeContextSnapshot, entryContent: string): string {
+export function composeNativeSystemInstructions(context: NativeRuntimeContextSnapshot, entryContent: string, readOnlyAgentHome = false): string {
   return [
     context.prompt.text,
     entryContent.trim(),
     context.connectionInstructions?.text,
-    context.instructions.workingCopy?.kind === "agent_files"
+    context.instructions.workingCopy && readOnlyAgentHome
+      ? renderInstructionPaths(PAPERCLIP_READ_ONLY_AGENT_DIRECTORY_PROMPT, context.instructions.workingCopy)
+      : context.instructions.workingCopy?.kind === "agent_files"
       ? renderInstructionPaths(PAPERCLIP_AGENT_DIRECTORY_PROMPT, context.instructions.workingCopy)
       : context.instructions.workingCopy
       ? renderInstructionPaths(PAPERCLIP_EDITABLE_INSTRUCTIONS_PROMPT, context.instructions.workingCopy)
@@ -205,7 +208,8 @@ export function retargetNativeSystemInstructions(
   current: NativeRuntimeContextSnapshot | null,
 ): string {
   const priorPrefix = prior.prompt.text;
-  const priorSuffix = composeNativeSystemInstructions(prior, "").slice(priorPrefix.length);
+  const readOnlyAgentHome = instructions.endsWith(composeNativeSystemInstructions(prior, "", true).slice(priorPrefix.length));
+  const priorSuffix = composeNativeSystemInstructions(prior, "", readOnlyAgentHome).slice(priorPrefix.length);
   // Legacy callers can supply opaque system instructions. Only the composer's
   // exact framing identifies a trusted asset block; never rewrite their text.
   if (!instructions.startsWith(priorPrefix) || !instructions.endsWith(priorSuffix)) {
@@ -216,7 +220,7 @@ export function retargetNativeSystemInstructions(
   // Keep custom entry bytes intact, including historical path examples or an
   // identical paragraph quoted inside the entry. Only replace the final block.
   return (current?.prompt.text ?? priorPrefix) + custom + (current
-    ? composeNativeSystemInstructions(current, "").slice(current.prompt.text.length)
+    ? composeNativeSystemInstructions(current, "", readOnlyAgentHome).slice(current.prompt.text.length)
     : "");
 }
 

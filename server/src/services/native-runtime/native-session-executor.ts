@@ -12477,6 +12477,9 @@ async function createRunnerdBackendWithinSessionClaim(
     const provider=input.execution.provider, lease=input.codexSharedLease;
     const {grantId:grant,hostId,codexExecutable,codexHome,home}=sharedRegistration;
     if (input.codexShared || !lease || input.conversationMode || remoteTarget || retainedTransition || input.restartRecovery || provider.kind!=="codex" || !provider.model || !("reasoningEffort" in provider) || !provider.reasoningEffort || !input.execution.workspace.cwd) throw new Error("codex_shared_registration_unavailable");
+    const sharedProvider={...provider,sharedDaemon:true as const};
+    input={...input,execution:{...input.execution,provider:sharedProvider} as NativeExecutionInput};
+    if (!input.execution.workspace.cwd) throw new Error("codex_shared_registration_unavailable");
     const binding=input.execution.binding;
     // The server alone generates the managed thread's permission profile, shell environment and web-search policy; the runner
     // must echo it unchanged (exact digest-bound match), so no host environment can widen it.

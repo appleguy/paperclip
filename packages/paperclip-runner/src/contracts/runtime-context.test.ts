@@ -7,6 +7,7 @@ import {
   canonicalNativeRuntimeContextDigest,
   composeNativeSystemInstructions,
   parseNativeRuntimeContext,
+  retargetNativeSystemInstructions,
 } from "./runtime-context.js";
 
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
@@ -37,6 +38,13 @@ function savedContext(revision: string, text: string) {
 }
 
 describe("persisted native execution prompts", () => {
+  it("retargets a shared route's read-only instruction paths", () => {
+    const base = parseNativeRuntimeContext(savedContext("saved", "Prompt"));
+    const prior = { ...base, instructions: { ...base.instructions, workingCopy: { rootPath: "/old", entryPath: "AGENTS.md", kind: "agent_files" as const } } };
+    const current = { ...prior, instructions: { ...prior.instructions, workingCopy: { ...prior.instructions.workingCopy, rootPath: "/new" } } };
+    const initial = composeNativeSystemInstructions(prior, "Entry", true);
+    expect(retargetNativeSystemInstructions(initial, prior, current)).toBe(composeNativeSystemInstructions(current, "Entry", true));
+  });
   it.each([
     ["snapshot-before-upgrade", "Saved instructions from before the upgrade."],
     ["future-prompt-fixture", "  Saved instructions absent from this release.\n"],

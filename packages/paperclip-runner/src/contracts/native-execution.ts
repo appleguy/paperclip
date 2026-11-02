@@ -119,7 +119,7 @@ export interface NativeAcpxProfileSnapshot {
 }
 
 export type NativeProviderConfig =
-  | { kind: "codex"; model: string | null; approvalPolicy?: NativeCodexApprovalPolicy }
+  | { kind: "codex"; model: string | null; approvalPolicy?: NativeCodexApprovalPolicy; sharedDaemon?: true }
   | { kind: "opencode"; model: string; permissionMode?: NativeOpenCodePermissionMode }
   | {
       kind: "claude_managed";
@@ -151,7 +151,7 @@ export type NativeProviderConfig =
     };
 
 export type NativeProviderConfigV4 =
-  | { kind: "codex"; model: string | null; approvalPolicy: NativeCodexApprovalPolicy }
+  | { kind: "codex"; model: string | null; approvalPolicy: NativeCodexApprovalPolicy; sharedDaemon?: true }
   | { kind: "opencode"; model: string; permissionMode: NativeOpenCodePermissionMode }
   | Extract<NativeProviderConfig, { kind: "claude_managed" | "aws_agentcore" }>
   | {
