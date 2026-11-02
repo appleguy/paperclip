@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isIdleScreen, normalizeOneLine, parseReceipt, parseRemoteUrl } from "./execute.js";
+import { isIdleScreen, normalizeOneLine, parseReceipt, parseRemoteUrl, parseRemoteConversationId } from "./execute.js";
 
 describe("agy single-RC dispatch safety", () => {
   it("parses shared /r/ base URL and drops conversation query", () => {
@@ -7,6 +7,15 @@ describe("agy single-RC dispatch safety", () => {
       "https://antigravity.google.com/r/abc-123-v2",
     );
     expect(parseRemoteUrl("not connected")).toBeNull();
+  });
+
+  it("reads the live /remote-control conversation even before cache updates", () => {
+    const screen = "p=c%2F11111111-1111-4111-8111-111111111111\\n" +
+      "> /new\\n> /remote-control\\n" +
+      "https://antigravity.google.com/r/fake-v2?\\n" +
+      "p=c%2F22222222-2222-4222-8222-222222222222";
+    expect(parseRemoteConversationId(screen)).toBe("22222222-2222-4222-8222-222222222222");
+    expect(parseRemoteConversationId("no active RC")).toBeNull();
   });
 
   it("forbids newline submissions that send early TUI turns", () => {

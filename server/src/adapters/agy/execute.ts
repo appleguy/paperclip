@@ -31,6 +31,11 @@ export function normalizeOneLine(value: string): string {
 export function parseRemoteUrl(screen: string): string | null {
   return screen.match(/https:\/\/antigravity\.google\.com\/r\/[a-zA-Z0-9-]+/)?.[0] ?? null;
 }
+export function parseRemoteConversationId(screen: string): string | null {
+  // /remote-control prints the live ID before the first prompt, unlike the stale cache.
+  const ids = [...screen.matchAll(/p=c%2F([a-f0-9-]{36})/gi)];
+  return ids.length ? ids[ids.length - 1]![1] : null;
+}
 export function isIdleScreen(screen: string): boolean {
   const end = screen.trimEnd().slice(-700);
   return /(?:^|\n)>\s*\n[─\s]*\n\? for shortcuts/m.test(end) &&
@@ -78,6 +83,17 @@ async function waitIdle(socket: string, session: string, deadline: number): Prom
     await sleep(900);
   }
   return false;
+}
+async function inspectRemoteConversation(socket: string, session: string, stateDir: string): Promise<{ url: string; id: string }> {
+  await send(socket, session, "/remote-control", stateDir);
+  await sleep(500);
+  if (!(await waitIdle(socket, session, Date.now() + 12_000)))
+    throw new Error("agy /remote-control did not return to idle");
+  const screen = await pane(socket, session);
+  const url = parseRemoteUrl(screen);
+  const id = parseRemoteConversationId(screen);
+  if (!url || !id) throw new Error("agy /remote-control did not expose the instance URL and conversation ID");
+  return { url, id };
 }
 async function ensureSession(socket: string, session: string, cwd: string, stateDir: string): Promise<string> {
   let exists = true;
@@ -127,16 +143,6 @@ async function acquire(stateDir: string, deadline: number): Promise<() => Promis
     }
   }
   throw new Error("agy single Remote Control session busy: serialization timeout");
-}
-
-async function currentConversationId(cwd: string): Promise<string | null> {
-  try {
-    const body = JSON.parse(await fs.readFile(
-      path.join(os.homedir(), ".gemini/antigravity-cli/cache/last_conversations.json"), "utf8",
-    )) as Record<string, unknown>;
-    const id = body[path.resolve(cwd)];
-    return typeof id === "string" ? id : null;
-  } catch { return null; }
 }
 
 async function deliver(ctx: AdapterExecutionContext, receipt: Receipt): Promise<void> {
@@ -196,21 +202,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (!rcUrl) throw new Error("agy RC URL unavailable: use /remote-control in its TUI, then retry");
     const expected = asString(cfg.expectedRemoteControlUrl, rcUrl);
     if (expected !== rcUrl) throw new Error("agy RC URL changed; refusing to dispatch to an unverified session");
-    const beforeId = await currentConversationId(cwd);
-    // One TUI process, one /r/ URL, isolated conversations via /new.
+    const before = await inspectRemoteConversation(socket, session, stateDir);
+    if (before.url !== rcUrl) throw new Error("agy RC instance URL changed during inspection");
+    // Verify /new via /remote-control's live conversation ID, NOT the cache:
+    // last_conversations.json is updated only after a model turn in agy 1.4.12.
     await send(socket, session, "/new", stateDir);
-    // The TUI can still show its old idle prompt before slash-command dispatch.
-    // Require the workspace-scoped conversation ID to rotate, not just an idle repaint.
-    let newConversationId: string | null = null;
-    for (let attempt = 0; attempt < 40; attempt++) {
-      newConversationId = await currentConversationId(cwd);
-      if (newConversationId && newConversationId !== beforeId) break;
-      await sleep(250);
-    }
-    if (!newConversationId || newConversationId === beforeId)
-      throw new Error("agy /new did not create a fresh task conversation; refusing to merge task histories");
+    await sleep(500);
     if (!(await waitIdle(socket, session, Date.now() + 12_000)))
       throw new Error("agy /new did not settle to an idle prompt");
+    const fresh = await inspectRemoteConversation(socket, session, stateDir);
+    if (fresh.url !== rcUrl || fresh.id === before.id)
+      throw new Error("agy /new did not isolate a conversation under the same RC instance");
     const receiptPath = path.join(stateDir, `receipt-${ctx.runId}.json`);
     const promptBase = asString(cfg.promptTemplate, DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE);
     const { taskContextNote, wakePrompt } = selectPaperclipPromptSections(ctx.context);
@@ -257,9 +259,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
     if (!receipt || !(await waitIdle(socket, session, Date.now() + 1500)))
       return failure("agy did not produce a validated completion receipt at an idle TUI; checkpoint retained", true);
-    const conversationId = await currentConversationId(cwd);
-    if (beforeId && conversationId === beforeId)
-      throw new Error("agy /new did not create a distinct conversation ID; leaving checkpoint for inspection");
+    const conversationId = fresh.id;
     await deliver(ctx, receipt);
     await ctx.onLog("stdout", `[agy] Done ${issueId}: ${receipt.summary}; conversation=${conversationId ?? "unknown"}\n`);
     await fs.rm(activePath); // completed only after authenticated report + issue closure
