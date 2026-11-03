@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { adoptableActive, inputGuard, isEmptyInputBox, isIdleScreen, normalizeOneLine, parseReceipt, parseRemoteUrl, parseRemoteConversationId, pasteSettleMs } from "./execute.js";
+import { adoptableActive, inputGuard, isEmptyInputBox, isIdleScreen, normalizeOneLine, parseReceipt, parseRemoteUrl, parseRemoteConversationId, pasteSettleMs, STALE_IDLE } from "./execute.js";
 
 describe("agy single-RC dispatch safety", () => {
   it("parses shared /r/ base URL and drops conversation query", () => {
@@ -105,7 +105,7 @@ describe("agy single-RC dispatch safety", () => {
     expect(inputGuard(["────────────", ">", "────────────", "esc to cancel"].join("\n"), idle, "/work", now).allowed).toBe(false);
   });
 
-  it("allows a >=5-minute idle signal with an empty editor, but not a short stale one", () => {
+  it("allows a >=5-minute idle signal; a short stale one needs the stable-screen check", () => {
     const now = Date.parse("2026-11-02T23:00:00Z");
     const screen = ["────────────", ">", "────────────", "agy idle"].join("\n");
     const status = {
@@ -113,7 +113,7 @@ describe("agy single-RC dispatch safety", () => {
       idleSince: new Date(now - 45_000).toISOString(), cwd: "/work",
       conversationId: "c1", pendingInputCount: 0, toolConfirmationPending: false,
     };
-    expect(inputGuard(screen, status, "/work", now).allowed).toBe(false);
+    expect(inputGuard(screen, status, "/work", now)).toEqual({ allowed: true, reason: STALE_IDLE });
     expect(inputGuard(screen, {
       ...status, observedAt: new Date(now - 300_001).toISOString(),
       idleSince: new Date(now - 300_001).toISOString(),

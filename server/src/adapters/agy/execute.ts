@@ -104,10 +104,14 @@ export function inputGuard(
     return refuse("agy idle timestamps invalid");
   const fresh = now - observed <= 15_000;
   const longIdle = now - idleSince >= 300_000;
-  return fresh || longIdle
-    ? { allowed: true, reason: fresh ? "current idle + empty input" : "idle >=5min + empty input" }
-    : refuse("agy idle signal stale for less than five minutes");
+  if (fresh || longIdle)
+    return { allowed: true, reason: fresh ? "current idle + empty input" : "idle >=5min + empty input" };
+  // agy rewrites its statusLine only on state changes, so right after a turn the idle
+  // snapshot is stale. Owner amendment 1 permits typing when the input is empty; the
+  // caller must confirm the empty editor is stable across two captures (STALE_IDLE).
+  return { allowed: true, reason: STALE_IDLE };
 }
+export const STALE_IDLE = "idle statusLine (stale) + empty input; stable-screen check required";
 export type Receipt = { runId: string; issueId: string; status: string; summary: string; report: string };
 export function parseReceipt(raw: string, runId: string, issueId: string): Receipt {
   const parsed: unknown = JSON.parse(raw);
@@ -155,7 +159,15 @@ async function inputReadiness(
   let snapshot: unknown = null;
   try { snapshot = JSON.parse(await fs.readFile(path.join(stateDir, "status-line.json"), "utf8")); }
   catch { /* Missing/unreadable statusLine is NOT proof that agy is idle. */ }
-  return inputGuard(await pane(socket, session), snapshot, cwd, Date.now(), expectedConversationId);
+  const screen = await pane(socket, session);
+  const verdict = inputGuard(screen, snapshot, cwd, Date.now(), expectedConversationId);
+  if (!verdict.allowed || verdict.reason !== STALE_IDLE) return verdict;
+  // Stale idle snapshot: require the same empty, non-busy screen 1.5s later
+  // (no owner keystrokes, no new turn rendering) before any pane input.
+  await sleep(1500);
+  return (await pane(socket, session)) === screen
+    ? verdict
+    : { allowed: false, reason: "agy screen changed during stale-idle stability check" };
 }
 
 export async function send(
