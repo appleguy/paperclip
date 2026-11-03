@@ -47,7 +47,7 @@ function explicitStopRequested(signal?: AbortSignal): boolean {
 }
 
 const emptyParsed = (sessionId: string | null, errorMessage: string | null): ReturnType<typeof parseOpenCodeJsonl> => ({
-  sessionId, summary: "", usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 }, usageReported: false,
+  sessionId, summary: "", usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, peakContextTokens: 0 }, usageReported: false,
   usageComplete: false, costUsd: null, errorMessage, toolErrors: [], hasNonErrorOutput: false,
 });
 
@@ -98,7 +98,7 @@ async function collectOutcome(
   const created = mine?.time?.created;
   const ops = typeof created === "number" ? list.filter((m) => m?.type === "assistant" && (m?.time?.created ?? 0) >= created) : [];
   ops.sort((a, b) => (a.time?.created ?? 0) - (b.time?.created ?? 0));
-  const usage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 };
+  const usage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, peakContextTokens: 0 };
   let usageReported = false;
   let cost: number | null = 0;
   const texts: string[] = [];
@@ -112,6 +112,7 @@ async function collectOutcome(
       usage.inputTokens += nums[0] + nums[3];
       usage.outputTokens += nums[1] + nums[4];
       usage.cachedInputTokens += nums[2];
+      usage.peakContextTokens = Math.max(usage.peakContextTokens, nums[0] + nums[2] + nums[3]);
       usageReported = true;
     }
     if (typeof m.cost === "number" && Number.isFinite(m.cost) && m.cost >= 0) cost = (cost ?? 0) + m.cost;
@@ -258,7 +259,7 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
   try {
     out = await collectOutcome(f, server.url, server.passwordFile, conversationId, msgId);
   } catch {
-    out = { texts: [], usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 }, usageReported: false, costUsd: null, sessionOutcome: null };
+    out = { texts: [], usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, peakContextTokens: 0 }, usageReported: false, costUsd: null, sessionOutcome: null };
   }
   const summary = out.texts.join("\n\n");
   if (summary) await onLog("stdout", summary + "\n");
