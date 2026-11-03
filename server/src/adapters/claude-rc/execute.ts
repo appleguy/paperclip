@@ -14,7 +14,7 @@ import {
   joinPromptSections, renderTemplate, selectPaperclipPromptSections,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
-  acquire, adoptableActive, deliver, normalizeOneLine, pane, parseReceipt, tmux,
+  acquire, adoptableActive, deliver, normalizeOneLine, parseReceipt, tmux,
   type Receipt,
 } from "../agy/execute.js";
 import {
@@ -36,6 +36,11 @@ function asString(v: unknown, fallback: string): string {
  * prompt, active permission menu or half-written owner message never qualifies.
  * Claude's static "Try ..." placeholder is not typed owner input.
  */
+/** Screen text without dim (ghost prompt suggestion) spans or other escapes. */
+async function claudePane(socket: string, session: string): Promise<string> {
+  const raw = await tmux(socket, ["capture-pane", "-t", session, "-p", "-J", "-e", "-S", "-150"]);
+  return raw.replace(/\x1b\[2m[^\x1b]*/g, "").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
+}
 export function isClaudeIdle(screen: string): boolean {
   const tail = screen.replace(/\r/g, "").trimEnd().split("\n").slice(-18);
   const i = tail.findLastIndex(l => /^\s*❯/.test(l));
@@ -68,7 +73,7 @@ async function newestConversation(cwd: string): Promise<string | null> {
 }
 async function waitIdle(socket: string, session: string, deadline: number): Promise<boolean> {
   while (Date.now() < deadline) {
-    try { if (isClaudeIdle(await pane(socket, session))) return true; } catch { return false; }
+    try { if (isClaudeIdle(await claudePane(socket, session))) return true; } catch { return false; }
     await sleep(900);
   }
   return false;
@@ -77,7 +82,7 @@ async function waitIdle(socket: string, session: string, deadline: number): Prom
 /** Named, private tmux buffer; no prompt in argv and no shared paste buffer. */
 async function sendClaudePane(socket: string, session: string, message: string, stateDir: string): Promise<void> {
   if (/[\r\n]/.test(message)) throw new Error("multiline TUI submission refused");
-  if (!isClaudeIdle(await pane(socket, session)))
+  if (!isClaudeIdle(await claudePane(socket, session)))
     throw new Error("Claude input guard refused: owner input nonempty or TUI not idle");
   const inputFile = path.join(stateDir, `claude-input-${process.pid}.txt`);
   const buffer = `paperclip-claude-${process.pid}`;
@@ -145,7 +150,7 @@ async function ensureSession(
     // session, where the screen may hold the owner's own prompt.
     const until = Date.now() + 20_000;
     while (Date.now() < until) {
-      const s = await pane(socket, session).catch(() => "");
+      const s = await claudePane(socket, session).catch(() => "");
       if (/Loading development channels/i.test(s) && /I am using this for local development/i.test(s)) {
         await tmux(socket, ["send-keys", "-t", session, "Enter"]);
         break;
@@ -155,7 +160,7 @@ async function ensureSession(
     }
   }
   if (!rejoinOnly && !(await waitIdle(socket, session, Date.now() + 300_000))) {
-    const s = await pane(socket, session);
+    const s = await claudePane(socket, session);
     if (/trust the files|Do you trust/i.test(s))
       throw new Error("Claude workspace trust prompt: approve this dedicated workspace in the terminal, then retry");
     throw new Error("Claude TUI not idle; leave the owner's live work intact");
@@ -164,7 +169,7 @@ async function ensureSession(
   // The RC URL line can render after the editor turns idle; give it a moment.
   let url: string | null = null;
   for (const until = Date.now() + 15_000; ;) {
-    url = parseClaudeRcUrl(await pane(socket, session).catch(() => ""));
+    url = parseClaudeRcUrl(await claudePane(socket, session).catch(() => ""));
     if (url || Date.now() >= until) break;
     await sleep(750);
   }
@@ -281,7 +286,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const mode = await routeChannelInput(ctx.runId, prompt, false, {
         ready: channel.ready, status: channel.status, submit: channel.submit,
         fallback: async () => {
-          if (!isClaudeIdle(await pane(socket, session))) {
+          if (!isClaudeIdle(await claudePane(socket, session))) {
             throw new Error("channel unavailable and Claude editor is not empty+idle; no fallback");
           }
           await recordFallback(activePath, active);
@@ -301,7 +306,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         receipt = parseReceipt(raw, receiptRunId, issueId);
         if (await waitIdle(socket, session, Date.now() + 4000)) break;
       } else if (adopted) {
-        idleWithoutReceipt = isClaudeIdle(await pane(socket, session)) ? idleWithoutReceipt + 1 : 0;
+        idleWithoutReceipt = isClaudeIdle(await claudePane(socket, session)) ? idleWithoutReceipt + 1 : 0;
         if (idleWithoutReceipt >= 5)
           return failure("Claude adopted dispatch idle without a receipt; checkpoint retained for reconciliation");
       }
