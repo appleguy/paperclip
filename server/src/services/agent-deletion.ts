@@ -71,8 +71,8 @@ export async function deleteAgentDependencies(tx: Db, companyId: string, id: str
   await tx.execute(sql`update activity_log set run_id = null where run_id in ${ownRuns}`);
   await tx.execute(sql`update finance_events set heartbeat_run_id = null where heartbeat_run_id in ${ownRuns}`);
   await tx.execute(sql`delete from native_run_finalizations where run_id in ${ownRuns}`);
-  await tx.execute(sql`delete from native_run_results where run_id in ${ownRuns}`);
   await tx.execute(sql`delete from work_assessments where run_id in ${ownRuns}`);
+  await tx.execute(sql`delete from native_run_results where run_id in ${ownRuns}`);
   // cost_events reference both the agent and its runs; agent-usage rows cannot be
   // detached (cost_events_usage_kind_check requires agent_id), so they go with the agent.
   await tx.delete(costEvents).where(or(

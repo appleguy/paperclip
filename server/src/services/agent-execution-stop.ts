@@ -7,6 +7,8 @@ import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
 
 /** Cancellation changes admission. Process and lease evidence controls cleanup. */
+const STALE_UNACKNOWLEDGED_CANCEL_MS = 2 * 60 * 60 * 1000;
+
 export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
   if (!agentIds.length) return true;
   const runs = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
@@ -51,6 +53,9 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
     }
     if (processAlive || groupAlive) return false;
     if (run.status !== "cancelled" || !run.startedAt) continue;
+    // No process, group, lease or coordinator remains. A cancellation that was never acknowledged
+    // and has been idle this long will not be acknowledged later, so it must not hold termination forever.
+    if (Date.now() - (run.updatedAt ?? run.finishedAt ?? run.startedAt).getTime() > STALE_UNACKNOWLEDGED_CANCEL_MS) continue;
     if (run.runtimeMode === "native" && !run.processPid && !run.processGroupId &&
         !await hasNativeLocalProcessStop(db, run.companyId, run.id) &&
         !await isCancelledNativeStartup(db, run, coordinators.find(row => row.runId === run.id))) return false;
