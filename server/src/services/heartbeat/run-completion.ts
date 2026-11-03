@@ -574,6 +574,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
             rawInputIncludesCached: false,
             rawCachedInputTokens: rawUsage.cachedInputTokens,
             rawOutputTokens: rawUsage.outputTokens,
+            ...(adapterResult.usage?.peakContextTokens ? { peakContextTokens: Math.floor(adapterResult.usage.peakContextTokens) } : {}),
           }
         : {}),
       ...(sessionUsageResolution.derivedFromSessionTotals

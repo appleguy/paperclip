@@ -33,6 +33,7 @@ export function createOpenCodeJsonlParser() {
     inputTokens: 0,
     cachedInputTokens: 0,
     outputTokens: 0,
+    peakContextTokens: 0,
   };
   let costUsd: number | null = null;
   let missingCost = false;
@@ -74,7 +75,8 @@ export function createOpenCodeJsonlParser() {
         if (counts.every(value => typeof value === "number" && Number.isSafeInteger(value) && value >= 0)) {
           const [input, output, cached, written, reasoning] = counts as number[];
           const next = { inputTokens: usage.inputTokens + input + written,
-            outputTokens: usage.outputTokens + output + reasoning, cachedInputTokens: usage.cachedInputTokens + cached };
+            outputTokens: usage.outputTokens + output + reasoning, cachedInputTokens: usage.cachedInputTokens + cached,
+            peakContextTokens: Math.max(usage.peakContextTokens, input + written + cached) };
           if (Object.values(next).every(Number.isSafeInteger)) { Object.assign(usage, next); usageReported = true; }
           else missingUsage = true;
         } else missingUsage = true;

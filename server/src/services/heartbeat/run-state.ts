@@ -1428,7 +1428,10 @@ export function createHeartbeatRunState(db: Db) {
     const latestRawUsage = readRawUsageTotals(latestRun?.usageJson);
     // Historical Codex/Gemini raw input includes cache reads. Only add the
     // separate cache counter when the writer explicitly saved exclusive input.
-    const latestRawInputTokens = (latestRawUsage?.inputTokens ?? 0) +
+    // A multi-step run's summed input re-counts the same context every step; when the adapter
+    // reports the largest single-step context, that is what the session really holds.
+    const peakContextTokens = Math.floor(asNumber(parseObject(latestRun?.usageJson).peakContextTokens, 0));
+    const latestRawInputTokens = peakContextTokens > 0 ? peakContextTokens : (latestRawUsage?.inputTokens ?? 0) +
       (latestRun?.usageJson?.rawInputIncludesCached === false ? latestRawUsage?.cachedInputTokens ?? 0 : 0);
     const sessionAgeHours =
       latestRun && oldestRun

@@ -37,6 +37,7 @@ describe("parseOpenCodeJsonl", () => {
       inputTokens: 120,
       cachedInputTokens: 20,
       outputTokens: 50,
+      peakContextTokens: 140,
     });
     expect(parsed.costUsd).toBeCloseTo(0.0025, 6);
     expect(parsed.errorMessage).toContain("model unavailable");

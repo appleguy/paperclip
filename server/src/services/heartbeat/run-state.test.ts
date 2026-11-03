@@ -525,6 +525,20 @@ describePostgres("heartbeat run state database wiring", () => {
     expect(decision.handoffMarkdown).not.toContain("omit this");
   });
 
+  it("compacts on peak step context, not the per-run sum of re-sent context", async () => {
+    const { companyId, agent, issue, state } = await fixture();
+    await db.insert(heartbeatRuns).values({
+      companyId, agentId: agent.id, invocationSource: "assignment", sessionIdAfter: "peak",
+      usageJson: { rawInputTokens: 90, rawCachedInputTokens: 500, rawInputIncludesCached: false, peakContextTokens: 40 },
+    });
+    const withLimit = (maxRawInputTokens: number) => state.evaluateSessionCompaction({
+      agent: { ...agent, runtimeConfig: { heartbeat: { sessionCompaction: { maxRawInputTokens } } } },
+      sessionId: "peak", issueId: issue.id,
+    });
+    expect((await withLimit(100)).rotate).toBe(false);
+    expect(await withLimit(40)).toMatchObject({ rotate: true, reason: "session raw input reached 40 tokens (threshold 40)" });
+  });
+
   it.each(["superseded", "cancelled"] as const)("fences %s conversation session writes and clears", async (scenario) => {
     const { companyId, agent, issue, state } = await fixture();
     await db.update(issues).set({

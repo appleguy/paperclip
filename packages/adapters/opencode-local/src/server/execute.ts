@@ -524,7 +524,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     let sharedSession: Awaited<ReturnType<typeof prepareSharedOpenCodeSession>> | null = null;
     const sharedConfigPath = asString(config.sharedServerRecoveryConfigPath, "").trim();
     // Opt-in native runtime: no child process, HTTP driver against the shared server (nar/nar-attempt.ts).
-    const narTaskId = wakeTaskId ?? asString(runtime.taskKey, "").trim();
+    // A taskless wake (manual/on-demand, no issue) still gets a stable per-agent conversation scope
+    // instead of failing "NAR runtime unavailable" before any inference.
+    const narTaskId = wakeTaskId ?? (asString(runtime.taskKey, "").trim() || `agent-${agent.id}`);
     const narMode = config.nativeRuntime === "nar" && sharedConfigPath.length > 0;
     const wakeIssue = parseObject(parseObject(context.paperclipWake).issue);
     if (narMode && (executionTargetIsRemote || !narTaskId || !path.isAbsolute(sharedConfigPath))) {
