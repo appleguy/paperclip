@@ -6,6 +6,7 @@ import type { prepareManagedAiRuntime } from "../ai-connection-runtime.js";
 import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompatible } from "../ai-connection-session.js";
 import { createNativeSessionHandoffLoader } from "../native-runtime/native-session-handoff.js";
 import { agentInstructionsService } from "../agent-instructions.js";
+import { managedGoalPromptContext } from "../opencode-goal-controller.js";
 import {
   describeSessionResetReason, shouldResetTaskSessionForWake, isCanonicalSessionIdForAdapter,
   normalizeResumeParamsForAdapter, normalizeSessionParams, requiresCanonicalSessionIds,
@@ -315,6 +316,11 @@ export async function resolveHeartbeatAdapterSession(input: HeartbeatAdapterSess
     delete context.paperclipSessionRotationReason;
     delete context.paperclipPreviousSessionId;
   }
+
+  // A Paperclip-managed goal (OpenCode has no provider goal) rides in this run's prompt; a paused or cleared one drops out.
+  const managedGoal = managedGoalPromptContext(agent.adapterType, taskSession?.goalJson);
+  if (managedGoal) context.paperclipRunnerGoal = managedGoal;
+  else delete context.paperclipRunnerGoal;
 
   const taskSessionCredentialCompatible = !managedAiRuntime || managedAiSessionIdentityCompatible(
     taskSession?.sessionParamsJson?.paperclipAiCredentialIdentity,

@@ -635,6 +635,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ? ""
         : renderTemplate(promptTemplate, templateData);
       const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+      // OpenCode has no session goal, so the board's goal for this issue is stated in every run's prompt.
+      const goalObjective = asString(parseObject(context.paperclipRunnerGoal).objective, "").trim();
+      const goalNote = goalObjective
+        ? `Standing goal for this issue, set by the board and in force until it is changed, paused or cleared:\n${goalObjective}`
+        : "";
       const basePrompt = joinPromptSections([
         // On a recovered server session, keep the model's prior tool outcomes
         // in context instead of treating the assignment as a fresh execution.
@@ -646,6 +651,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         renderedBootstrapPrompt,
         wakePrompt,
         taskContextNote,
+        goalNote,
         sessionHandoffNote,
         renderedPrompt,
       ]);
@@ -657,6 +663,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           bootstrapPromptChars: renderedBootstrapPrompt.length,
           wakePromptChars: wakePrompt.length,
           taskContextChars: taskContextNote.length,
+          goalChars: goalNote.length,
           sessionHandoffChars: sessionHandoffNote.length,
           heartbeatPromptChars: renderedPrompt.length,
         },

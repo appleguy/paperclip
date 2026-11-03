@@ -109,6 +109,50 @@ describeEmbeddedPostgres("runner goal service", () => {
     expect(await db.select().from(agentSessionGoalActions)).toHaveLength(0);
   });
 
+  it("manages an OpenCode goal in Paperclip: set, edit, pause, resume and clear complete without a runner", async () => {
+    const binding = await seed();
+    await db.update(agents).set({ adapterType: "opencode_local", adapterConfig: {} });
+    const enqueueOfflineControl = vi.fn(async () => {});
+    const dispatchLiveControl = vi.fn(() => null);
+    const service = runnerGoalService(db, { enqueueOfflineControl, dispatchLiveControl });
+    const act = (revision: number, request: Record<string, unknown>) =>
+      service.act(binding.companyId, binding.issueId, {
+        requestId: randomUUID(), agentId: binding.agentId, expectedRevision: revision, ...request,
+      } as Parameters<typeof service.act>[2]);
+
+    const initial = await service.projection(binding.companyId, binding.issueId);
+    expect(initial?.capability).toMatchObject({
+      availability: "available", verified: true, reasonCode: "paperclip_managed_goal",
+      actions: ["set", "pause", "resume", "clear"],
+    });
+
+    const created = await act(0, { action: "create", objective: "Ship the parser" });
+    expect(created.status).toBe("completed");
+    expect(created.projection).toMatchObject({ goal: { objective: "Ship the parser", status: "active" }, revision: 1, pendingAction: null });
+
+    const edited = await act(1, { action: "edit", objective: "Ship the parser and its tests" });
+    expect(edited.projection.goal).toMatchObject({ objective: "Ship the parser and its tests", status: "active" });
+
+    const paused = await act(2, { action: "pause" });
+    expect(paused.projection.goal?.status).toBe("paused");
+    const resumed = await act(3, { action: "resume" });
+    expect(resumed.projection.goal?.status).toBe("active");
+
+    // The recovery sweep must not wake an agent for a managed goal, and nothing is dispatched to a runner.
+    const [session] = await db.select().from(agentTaskSessions);
+    expect(session).toMatchObject({ goalStatus: "active", goalDesiredState: null, goalRevision: 4 });
+    expect(enqueueOfflineControl).not.toHaveBeenCalled();
+    expect(dispatchLiveControl).not.toHaveBeenCalled();
+
+    const cleared = await act(4, { action: "clear" });
+    expect(cleared.projection).toMatchObject({ goal: null, revision: 5 });
+    const actions = await db.select().from(agentSessionGoalActions);
+    expect(actions).toHaveLength(5);
+    expect(actions.every((row) => row.status === "completed")).toBe(true);
+
+    await expect(act(5, { action: "create", objective: "x", tokenBudget: 100 })).rejects.toMatchObject({ code: "goal_token_budget_unsupported" });
+  });
+
   it("revisions failed goal starts and ignores repeated failure delivery", async () => {
     const binding = await seed();
     const service = runnerGoalService(db, {

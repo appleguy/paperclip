@@ -82,6 +82,32 @@ describe("OpenCode local skill injection", () => {
     expect(prompt).not.toContain("Create child issues");
   });
 
+  it("states the Paperclip-managed goal in the prompt only while one is set", async () => {
+    const commandPath = path.join(configHome, "fake-opencode");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const promptFor = async (context: Record<string, unknown>) => {
+      runProcessMock.mockReset();
+      runProcessMock.mockResolvedValue(probeResult({ stdout: JSON.stringify({
+        type: "text", sessionID: "goal-session", part: { text: "Reply" },
+      }) }));
+      let prompt = "";
+      await execute({
+        runId: "goal-run",
+        agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { command: commandPath, cwd: configHome, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+        context,
+        onLog: async () => {},
+        onMeta: async (meta) => { prompt = String(meta.prompt ?? ""); },
+      });
+      return prompt;
+    };
+    const withGoal = await promptFor({ paperclipRunnerGoal: { objective: "Land the renderer fix" } });
+    expect(withGoal).toContain("Standing goal for this issue");
+    expect(withGoal).toContain("Land the renderer fix");
+    expect(await promptFor({})).not.toContain("Standing goal for this issue");
+  });
+
   it("delivers assignment context on an ordinary task turn and rebuilds it after resume fallback", async () => {
     const commandPath = path.join(configHome, "fake-opencode-context");
     await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });

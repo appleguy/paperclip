@@ -21,6 +21,7 @@ import type {
 import { hasConnectedRunnerPrpAuthority, queueLiveRunnerPrpCommand } from "../realtime/runner-prp-ws.js";
 import { dispatchLiveRunnerGoalControl } from "./runner-goal-control-broker.js";
 import { publishLiveEvent } from "./live-events.js";
+import { managedGoalControllerFor, OPENCODE_GOAL_SOURCE_ID } from "./opencode-goal-controller.js";
 
 const ACTIVE_RUN_STATUSES = ["queued", "scheduled_retry", "running"] as const;
 const OPEN_ACTION_STATUSES = ["pending", "delivering", "delivered"] as const;
@@ -50,6 +51,8 @@ function asRecord(value: unknown): Record<string, unknown> | null {
 }
 
 function capabilityForAgent(agent: AgentBinding): RunnerGoalCapability {
+  const managed = managedGoalControllerFor(agent);
+  if (managed) return managed.capability;
   const config = asRecord(agent.adapterConfig) ?? {};
   const engine = typeof config.engine === "string" ? config.engine : null;
   const sessionMode = typeof config.mode === "string" ? config.mode : "persistent";
@@ -336,8 +339,9 @@ export function runnerGoalService(
       hasConnectedRunnerPrpAuthority({companyId, issueId, agentId:binding.agent.id, runId:activeRun.id, runnerInstanceId:activeRun.runnerInstanceId})
     );
     const goal = persistedGoal ? { ...persistedGoal, workingNow } : null;
+    // A Paperclip-managed goal rides in each run's prompt; no runner reports it, so it is never "continuing".
     const projectedPendingAction = pendingAction(pending?.action ?? null) ?? (
-      goal?.status === "active" && !goal.workingNow && activeRun
+      goal?.status === "active" && !goal.workingNow && activeRun && !managedGoalControllerFor(binding.agent)
         ? "continuing"
         : null
     );
@@ -413,6 +417,7 @@ export function runnerGoalService(
         }
         return {
           repeated: true,
+          managed: false,
           session,
           status: existingAction.status,
           result: asRecord(existingAction.resultJson),
@@ -448,6 +453,41 @@ export function runnerGoalService(
         throw new RunnerGoalActionError("goal_not_found", "There is no current session goal.");
       }
 
+      const managed = managedGoalControllerFor(binding.agent!);
+      if (managed) {
+        // The goal lives in this row and every run's prompt reads it, so there is nothing to deliver: complete now.
+        const now = new Date();
+        const nextGoal = managed.next(currentGoal, request, now);
+        const completedRevision = session.goalRevision + 1;
+        await tx.update(agentTaskSessions).set({
+          goalJson: nextGoal as unknown as Record<string, unknown> | null,
+          goalStatus: nextGoal?.status ?? null,
+          // The recovery sweep wakes sessions whose desired state is "active"; a managed goal has no provider session to resume.
+          goalDesiredState: null,
+          goalSourceId: nextGoal ? OPENCODE_GOAL_SOURCE_ID : null,
+          goalObservedAt: now,
+          goalRevision: completedRevision,
+          updatedAt: now,
+        }).where(eq(agentTaskSessions.id, session.id));
+        const [done] = await tx.insert(agentSessionGoalActions).values({
+          companyId,
+          sessionId: session.id,
+          requestId: request.requestId,
+          action: request.action,
+          payloadJson: request,
+          status: "completed",
+          deliveredAt: now,
+          completedAt: now,
+        }).returning();
+        return {
+          repeated: false,
+          managed: true,
+          session: { ...session, goalRevision: completedRevision },
+          status: done!.status,
+          result: null as Record<string, unknown> | null,
+        };
+      }
+
       const nextRevision = session.goalRevision + 1;
       const desiredState = request.action === "pause"
         ? "paused"
@@ -474,11 +514,23 @@ export function runnerGoalService(
       }).returning();
       return {
         repeated: false,
+        managed: false,
         session: { ...session, goalRevision: nextRevision },
         status: action!.status,
         result: { projection: pendingProjection },
       };
     });
+
+    if (accepted.managed) {
+      const settled = await projection(companyId, issueId, request.agentId);
+      if (!settled) throw new RunnerGoalActionError("issue_not_found", "Issue not found.");
+      publishLiveEvent({
+        companyId,
+        type: "agent.session.goal.changed",
+        payload: settled as unknown as Record<string, unknown>,
+      });
+      return { requestId: request.requestId, status: "completed", projection: settled };
+    }
 
     const originalProjection = accepted.result?.projection as RunnerGoalProjection | undefined;
     if (accepted.repeated) {
