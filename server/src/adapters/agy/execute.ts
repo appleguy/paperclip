@@ -306,14 +306,14 @@ export async function deliver(ctx: AdapterExecutionContext, receipt: Receipt, ti
   if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("invalid local Paperclip listen port");
   const api = new URL(`http://127.0.0.1:${port}`);
   const issue = encodeURIComponent(receipt.issueId);
-  const invoke = async (method: string, suffix: string, body: unknown) => {
+  const invoke = async (method: string, suffix: string, body: unknown): Promise<unknown> => {
     const url = new URL(`/api/issues/${issue}${suffix}`, api);
     let response: Response;
     try {
       response = await fetch(url, {
         method, redirect: "manual",
         headers: { Authorization: `Bearer ${ctx.authToken}`, "X-Paperclip-Run-Id": ctx.runId, "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         signal: AbortSignal.timeout(15_000),
       });
     } catch (error) {
@@ -321,11 +321,17 @@ export async function deliver(ctx: AdapterExecutionContext, receipt: Receipt, ti
         ? `: ${error.cause.message}` : "";
       throw new Error(`Paperclip local ${method} ${suffix} network failed${cause}`);
     }
+    if (response.status === 404 && method === "GET") return null;
     if (!response.ok) throw new Error(`Paperclip ${method} ${suffix} returned HTTP ${response.status}`);
+    return method === "GET" ? await response.json().catch(() => null) : null;
   };
+  // A rerun on an issue that already has a report must send the revision it replaces, or PUT returns 409.
+  const existing = await invoke("GET", "/documents/report", undefined) as { latestRevisionId?: unknown } | null;
+  const baseRevisionId = typeof existing?.latestRevisionId === "string" ? existing.latestRevisionId : undefined;
   await invoke("PUT", "/documents/report", {
     title, format: "markdown", body: receipt.report,
     changeSummary: `${label} run ${ctx.runId}`,
+    ...(baseRevisionId ? { baseRevisionId } : {}),
   });
   await invoke("PATCH", "", { status: "done" });
 }
