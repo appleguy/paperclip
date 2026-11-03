@@ -1,0 +1,8 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "/opt/homebrew/bin/node /Volumes/NVM/Paperclip/master/server/src/adapters/agy/statusline.cjs /Users/tech/.paperclip/agy-rc-state/status-line.json /Users/tech/.paperclip/agy-rc-workspace",
+    "enabled": true,
+    "stack_with_default": true
+  }
+}

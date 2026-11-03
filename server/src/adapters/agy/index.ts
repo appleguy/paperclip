@@ -40,7 +40,14 @@ Config:
 - model: gemini-3.8-flash-low (other models refused)
 - tmuxSocket (default paperclip-agy-rc); tmuxSession (default agy)
 - stateDir (default ~/.paperclip/agy-rc-state): private lock, active checkpoint,
-  one completion receipt per run; prune successful receipts after 7 days
+  per-agent status-line.json and one completion receipt per run; prune
+  successful receipts after 7 days
+- statusLine setup: merge statusline.settings.template.json as documented in
+  statusline-install.md next to this adapter. The adapter never edits
+  ~/.gemini/antigravity-cli/settings.json itself.
+- input safety: statusLine agent_state must be idle AND the captured TUI input
+  must be empty; a stale idle signal qualifies only after >=5 minutes.
+  Every submission uses tmux bracketed paste (-p -r) and a named buffer.
 - expectedRemoteControlUrl: optional stable /r/ instance URL guard
 - timeoutSec (30-3600, default 600)
 

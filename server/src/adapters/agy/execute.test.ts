@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { adoptableActive, isIdleScreen, normalizeOneLine, parseReceipt, parseRemoteUrl, parseRemoteConversationId, pasteSettleMs } from "./execute.js";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { adoptableActive, inputGuard, isEmptyInputBox, isIdleScreen, normalizeOneLine, parseReceipt, parseRemoteUrl, parseRemoteConversationId, pasteSettleMs } from "./execute.js";
 
 describe("agy single-RC dispatch safety", () => {
   it("parses shared /r/ base URL and drops conversation query", () => {
@@ -57,6 +61,90 @@ describe("agy single-RC dispatch safety", () => {
     expect(() => parseReceipt(r, "r1", "i2")).toThrow(/exact run/);
     expect(() => parseReceipt(JSON.stringify({ ...JSON.parse(r), report: "short" }), "r1", "i1")).toThrow(/250/);
     expect(() => parseReceipt(JSON.stringify({ ...JSON.parse(r), status: "blocked" }), "r1", "i1")).toThrow(/done/);
+  });
+  it("allows a fresh idle status only when the current editor is empty", () => {
+    const now = Date.parse("2026-11-02T23:00:00Z");
+    const snapshot = {
+      schemaVersion: 1, agentState: "idle", observedAt: new Date(now).toISOString(),
+      idleSince: new Date(now).toISOString(), cwd: "/work", conversationId: "c1",
+      pendingInputCount: 0, toolConfirmationPending: false,
+    };
+    const empty = ["previous > input", "────────────", ">", "────────────", "agy idle"].join("\n");
+    expect(isEmptyInputBox(empty)).toBe(true);
+    expect(inputGuard(empty, snapshot, "/work", now, "c1").allowed).toBe(true);
+    expect(inputGuard(empty, snapshot, "/wrong", now, "c1").allowed).toBe(false);
+    expect(inputGuard(empty, snapshot, "/work", now, "other").allowed).toBe(false);
+    expect(inputGuard(empty, null, "/work", now).allowed).toBe(false);
+  });
+
+  it("refuses half-typed or wrapped input even with a long-idle signal", () => {
+    const now = Date.parse("2026-11-02T23:00:00Z");
+    const old = new Date(now - 6 * 60_000).toISOString();
+    const idle = {
+      schemaVersion: 1, agentState: "idle", observedAt: old, idleSince: old,
+      cwd: "/work", conversationId: "c1", pendingInputCount: 0, toolConfirmationPending: false,
+    };
+    for (const editor of ["> half typed", "> draft\ncontinued on next line"]) {
+      const screen = ["────────────", editor, "────────────", "agy idle"].join("\n");
+      expect(inputGuard(screen, idle, "/work", now).allowed).toBe(false);
+    }
+  });
+
+  it("refuses a busy agent or pending owner input despite an empty editor", () => {
+    const now = Date.parse("2026-11-02T23:00:00Z");
+    const screen = ["────────────", ">", "────────────", "agy idle"].join("\n");
+    const idle = {
+      schemaVersion: 1, agentState: "idle", observedAt: new Date(now).toISOString(),
+      idleSince: new Date(now - 6 * 60_000).toISOString(), cwd: "/work",
+      conversationId: "c1", pendingInputCount: 0, toolConfirmationPending: false,
+    };
+    expect(inputGuard(screen, { ...idle, agentState: "working" }, "/work", now).allowed).toBe(false);
+    expect(inputGuard(screen, { ...idle, agentState: "tool_use" }, "/work", now).allowed).toBe(false);
+    expect(inputGuard(screen, { ...idle, pendingInputCount: 1 }, "/work", now).allowed).toBe(false);
+    expect(inputGuard(screen, { ...idle, toolConfirmationPending: true }, "/work", now).allowed).toBe(false);
+    expect(inputGuard(["────────────", ">", "────────────", "esc to cancel"].join("\n"), idle, "/work", now).allowed).toBe(false);
+  });
+
+  it("allows a >=5-minute idle signal with an empty editor, but not a short stale one", () => {
+    const now = Date.parse("2026-11-02T23:00:00Z");
+    const screen = ["────────────", ">", "────────────", "agy idle"].join("\n");
+    const status = {
+      schemaVersion: 1, agentState: "idle", observedAt: new Date(now - 45_000).toISOString(),
+      idleSince: new Date(now - 45_000).toISOString(), cwd: "/work",
+      conversationId: "c1", pendingInputCount: 0, toolConfirmationPending: false,
+    };
+    expect(inputGuard(screen, status, "/work", now).allowed).toBe(false);
+    expect(inputGuard(screen, {
+      ...status, observedAt: new Date(now - 300_001).toISOString(),
+      idleSince: new Date(now - 300_001).toISOString(),
+    }, "/work", now).allowed).toBe(true);
+  });
+
+  it("persists only scoped agy statusLine fields and preserves idleSince", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "agy-statusline-test-"));
+    const dest = path.join(dir, "agent1", "status-line.json");
+    const script = path.join(import.meta.dirname, "statusline.cjs");
+    const input = (agent_state: string, cwd = "/work", conversation_id = "c1") => JSON.stringify({
+      agent_state, cwd, conversation_id, email: "not-persisted@example.com",
+      pending_input_count: 0, tool_confirmation_pending: false,
+    });
+    const run = (value: string) => spawnSync(process.execPath, [script, dest, "/work"], { input: value, encoding: "utf8" });
+    try {
+      expect(run(input("idle")).status).toBe(0);
+      const first = JSON.parse(await readFile(dest, "utf8"));
+      expect(first.agentState).toBe("idle");
+      expect(first.idleSince).toBe(first.observedAt);
+      expect(first.email).toBeUndefined();
+      expect(run(input("idle")).status).toBe(0);
+      const second = JSON.parse(await readFile(dest, "utf8"));
+      expect(second.idleSince).toBe(first.idleSince);
+      expect(run(input("working")).status).toBe(0);
+      expect((JSON.parse(await readFile(dest, "utf8"))).idleSince).toBeNull();
+      expect(run(input("idle", "/someone-else")).status).toBe(0);
+      expect((JSON.parse(await readFile(dest, "utf8"))).agentState).toBe("working");
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
   it("adopts only the same issue's checkpoint after a crash, never another issue's", () => {
     const run = "8e5cbb55-1e72-4dda-a4f5-f0b050c2ee6c";
