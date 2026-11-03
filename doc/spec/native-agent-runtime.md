@@ -1,8 +1,14 @@
-# Paperclip Native Agent Runtime (NAR) - specification v0.2
+# Paperclip Native Agent Runtime (NAR) - specification v0.3
 
 Status: REVISED DRAFT for owner review; target path `doc/spec/native-agent-runtime.md`. Design only: nothing here is implemented, deployed or security-accepted.
 Date: 2026-11-03. Supersedes v0.1 (836 lines).
 Scope: Claude Code, agy, OpenCode (local lanes: WRX80 DeepSeek :19402, Mac GLM :19403) and Codex. ChatGPT Web is manual Chat-mode copy/paste only and is outside the runtime.
+
+## Changelog v0.3 (owner, 2026-11-03)
+
+1. Done bar is co-presence (owner amendment): Paperclip drives a real native session while the owner's phone (Remote Control) and TUI stay attached and live on the same session with one history; restarts rejoin and never replay.
+2. ACP core plus draft RFD #533 "Multi-Client Session Attach" adopted as the naming and semantics for the driver surface and Paperclip's co-presence layer, matched as closely as the draft allows (new section 3.4).
+3. Steering-race, arbitration and dedupe conformance (U11, C6) moved out of scope; they stay listed for history only.
 
 ## Changelog vs v0.1
 
@@ -179,6 +185,47 @@ Contract notes [I]: `submit` never returns a universal `written: true`; the grad
 
 Rules that follow: agy's screen/paste path is never marked equivalent to a structured transport; it is "legacy, degraded" until a real inbound interface is shown (candidate evidence: agy 1.4.11 `finished_reason` in stream-json for headless runs, 1.4.7 hook `lastUserInput`, 1.4.4 MCP `_meta` root conversation id [D]; none gives push into a running RC session). ACP v2 draft insertion/`messageId` and `state_update` semantics [D] are cited as a compatible receipt model, not a dependency. OpenCode phone steering and Codex thread visibility are not proven by a Herdr screenshot.
 
+### 3.4 ACP alignment (ACP core + draft RFD #533 multi-client attach)
+
+Decision (owner, 2026-11-03): adopt ACP method names and the draft RFD #533 attach model wherever they fit, so a future ACP-native agent or client plugs in without a translation layer. Tracked source: agentclientprotocol RFD PR #533 (opened 2026-02-18, draft, approved by one maintainer 2026-03-06, not merged as of 2026-11-03), with Message ID RFD #536 for `afterMessageId`. If the merged text diverges, follow the merged text and record the delta here.
+
+Roles. Paperclip is the multiplexer: it holds the one upstream session per conversation and is the only party that talks to the provider driver. Paperclip's own run executor is an attached client. Vendor-native surfaces (Claude Remote Control and TUI, agy TUI/RC, OpenCode TUI/web, Codex TUI) do not speak ACP; they are external co-present clients attached through the vendor's own mechanism and are reported in `connectedClients` with `clientInfo.name` set to the vendor surface and `external: true` (Paperclip extension).
+
+Driver mapping (section 3.2 names stay as the TypeScript surface; the wire and docs use ACP names):
+
+| NAR driver call | ACP method / notification |
+|---|---|
+| `bindConversation(mode=new)` | `session/new` |
+| `bindConversation(mode=resume)` | `session/load` |
+| `submit(op)` | `session/prompt` (op_id carried as the prompt's message id, RFD #536) |
+| `observe(cursor)` | `session/update` stream |
+| `interrupt` | `session/cancel` |
+| `relayPermission` | `session/request_permission` |
+| `readOutcome(opId)` | `turn_complete` for that message id, else history read |
+
+Co-presence layer (RFD #533 shapes):
+
+- `session/attach {sessionId, clientInfo, clientId?, historyPolicy: full | pending_only | none | after_message, afterMessageId?}` returns `{connectedClients, history}`. Default `full`.
+- `session/detach {sessionId, clientId}`.
+- Notifications to every attached client: all `session/update` traffic, plus `prompt_received` (echo of a prompt from any client, including owner prompts typed on the phone or TUI when the vendor exposes them), `turn_complete`, `permission_resolved`, `client_disconnected`.
+- Permissions: an unresolved `session/request_permission` is re-issued to a newly attaching client; the first valid answer wins; a late answer is discarded and gets `permission_resolved`. This matches Claude's channel permission relay (first valid answer wins) and replaces the CAS arbitration language in section 5 for co-presence purposes.
+- Any attached client may prompt (RFD #533 has no role field). Paperclip does not arbitrate between its prompts and the owner's; see the native-copresence rule below.
+
+Restart rejoin is attach. When a Paperclip run restarts, it calls the equivalent of `session/attach` with `historyPolicy: after_message` and `afterMessageId` = the deterministic message id of its last submitted prompt. If that message is in flight or answered, it rejoins and reads the outcome; it never re-sends. This is what the shipped NAR rejoin fix (e2771a59d, `driver.inflightMessage()`) already does for OpenCode and is the contract for every driver.
+
+Per-runtime transport under this model:
+
+| Runtime | Upstream path used by Paperclip | Owner co-presence surface |
+|---|---|---|
+| OpenCode GLM/DeepSeek | server HTTP API (session/message/event) | OpenCode TUI/web/phone attached to the same server session |
+| Claude Code | MCP channel (`notifications/claude/channel`, channel permission relay) | Remote Control and TUI on the same session |
+| agy | headless stream-json on the same conversation if it resumes it; else shared input written only when empty or idle 5+ minutes | agy TUI / Remote Control |
+| Codex (after 2026-11-05) | one shared app-server; Paperclip is the only client that calls `turn/start` | Codex TUI (read view) on the same app-server thread |
+
+Native-copresence rule: prefer a non-typing path; if Paperclip must write the shared input field, it may do so only when the field is empty or idle 5+ minutes. Steering races, arbitration and dedupe of concurrent owner/Paperclip prompts are out of scope.
+
+Capability discovery: RFD #533 has no capability flag; clients detect support by calling attach and handling an error. Paperclip additionally advertises `agentCapabilities.sessionCapabilities.attach: true` (the acp-mux convention) on its own surface.
+
 ## 4. Claude driver (first implementation)
 
 ### 4.1 Control plane
@@ -327,7 +374,7 @@ Amendments found while implementing (v0.2.1):
 - U8 Stop/idle/phone reply/transport success never completes a run.
 - U9 Conversation identity: new issue gets a different id; same-issue re-entry adopts the same id with no new-conversation op and no prompt; foreign cwd/agent/model conversation is refused.
 - U10 Paperclip restart mid-turn: reattach to the live host, settle the original op from the ledger, no resend.
-- U11 Concurrent owner steering: owner input during a run is recorded as competing activity, never attributed to an op, never causes replay.
+- U11 (OUT OF SCOPE v0.3, native-copresence) Concurrent owner steering: owner input during a run is recorded as competing activity, never attributed to an op, never causes replay.
 - U12 Secrets hygiene: no token, password or key in argv, env, logs, events or receipts.
 - U13 Non-interference: unrelated panes, sessions, listeners and launch jobs are untouched by provision, recovery and cancel.
 
@@ -339,7 +386,7 @@ Channel input (Claude):
 - C3 Channel-server restart under a preserved host process: reconnect through the authenticated local path, re-prove epoch, no loss of ledger, no duplicate delivery of an `emitted_local` op.
 - C4 Duplicate op_id across channel and hook: the same full op_id arriving twice produces one `hook_observed` and one Receipt application.
 - C5 Denied permission without receipt: deny a request; assert a Stop/hook may occur but no Receipt is applied and the run holds (mirrors the live deny case).
-- C6 Phone/channel race: owner approves on the phone while the channel decides the same request; per-class single authority holds, ambiguity holds, a later conflicting decision never undoes a native action.
+- C6 (OUT OF SCOPE v0.3, native-copresence; first valid answer wins per section 3.4) Phone/channel race: owner approves on the phone while the channel decides the same request; per-class single authority holds, ambiguity holds, a later conflicting decision never undoes a native action.
 - C7 Hook-origin spoof: owner types text imitating the channel marker and an op_id; it is classified as owner input, not a Paperclip op; a marker alone never authorizes a managed tool.
 - C8 Resumed traffic: `--resume` keeps session, Remote Control URL, channel, hooks (SessionStart `resume` source tested) and owner text still arrives as plain text.
 - C9 Duplicate/reused permission request_id on resume, delayed allow after lease loss, completion tool requested during an owner-only turn: all denied or held.
