@@ -5,12 +5,29 @@
  */
 import { DatabaseSync } from "node:sqlite";
 
-const PROFILES: Readonly<Record<string, string>> = {
+const DEFAULT_PROFILES: Readonly<Record<string, string>> = {
   "native-fleet/wrx80/glm-5.3-flash-colibri":
     "/Volumes/NVM/Paperclip/backends/opencode-glm-flash/data/opencode/opencode.db",
   "mac-pro/mtplx-flash-next-optimized-quality":
     "/Volumes/NVM/Paperclip/backends/opencode-qwen-quality/data/opencode/opencode.db",
 };
+const PROFILES: Readonly<Record<string, string>> = {
+  ...DEFAULT_PROFILES,
+  ...profilesFromEnv(process.env.PAPERCLIP_OPENCODE_REASONING_PROFILES),
+};
+
+export function profilesFromEnv(raw: string | undefined): Record<string, string> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string" && entry[1].startsWith("/"),
+    ));
+  } catch {
+    return {};
+  }
+}
 const SESSION_RE = /^ses_[a-zA-Z0-9]{10,72}$/;
 const MAX_ROWS = 120;
 const MAX_TEXT_CHARS = 40_000;

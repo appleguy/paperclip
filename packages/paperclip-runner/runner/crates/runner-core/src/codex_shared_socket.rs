@@ -786,7 +786,8 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = format!(
-            "/Volumes/NVM/AI_Agent_Runtime/tmp/ws-{}-{nonce:x}-{}",
+            "{}/ws-{}-{nonce:x}-{}",
+            crate::test_socket_tmp(),
             std::process::id(),
             NEXT_SOCKET.fetch_add(1, Ordering::Relaxed)
         )

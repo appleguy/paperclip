@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * SCO-337 read-only external OpenCode activity projection.
+ * Read-only external OpenCode activity projection.
  * No Paperclip writes, inference, provider password, native prompt or TUI control.
  * Never maps an external session onto a Paperclip heartbeat run.
  */
@@ -9,8 +9,8 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 
-const DEFAULT_ROOT = "/Volumes/NVM/Research/project-maya-metal/opencode-ztop-medium";
-const DEFAULT_WORKSPACE = "/Volumes/NVM/AI_Coding_Projects/zsys";
+const DEFAULT_ROOT = process.env.PAPERCLIP_EXTERNAL_OPENCODE_ROOT || "/Volumes/NVM/Research/project-maya-metal/opencode-ztop-medium";
+const DEFAULT_WORKSPACE = process.env.PAPERCLIP_EXTERNAL_OPENCODE_WORKSPACE || "/Volumes/NVM/AI_Coding_Projects/zsys";
 const ID = /^ses_[A-Za-z0-9_]{10,100}$/;
 const FRESHNESS_MS = 120_000;
 const HANDOFF_LIMIT = 3;

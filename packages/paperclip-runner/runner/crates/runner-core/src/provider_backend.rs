@@ -6403,7 +6403,8 @@ mod tests {
             }
         }
         let root = PathBuf::from(format!(
-            "/Volumes/NVM/AI_Agent_Runtime/tmp/p-{}",
+            "{}/p-{}",
+            crate::test_socket_tmp(),
             uuid::Uuid::new_v4().simple()
         ));
         fs::create_dir(&root).unwrap();
@@ -6538,7 +6539,8 @@ mod tests {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         use std::os::unix::net::UnixListener;
         let root = PathBuf::from(format!(
-            "/Volumes/NVM/AI_Agent_Runtime/tmp/p-{}",
+            "{}/p-{}",
+            crate::test_socket_tmp(),
             uuid::Uuid::new_v4().simple()
         ));
         fs::create_dir(&root).unwrap();
@@ -6717,7 +6719,8 @@ mod tests {
     #[test]
     fn shared_writer_epoch_survives_failed_attach_and_rejects_reconnect() {
         let root = PathBuf::from(format!(
-            "/Volumes/NVM/AI_Agent_Runtime/tmp/p-{}",
+            "{}/p-{}",
+            crate::test_socket_tmp(),
             uuid::Uuid::new_v4().simple()
         ));
         fs::create_dir(&root).unwrap();
@@ -6788,7 +6791,8 @@ mod tests {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         use std::os::unix::net::UnixListener;
         let root = PathBuf::from(format!(
-            "/Volumes/NVM/AI_Agent_Runtime/tmp/p-{}",
+            "{}/p-{}",
+            crate::test_socket_tmp(),
             uuid::Uuid::new_v4().simple()
         ));
         fs::create_dir(&root).unwrap();
@@ -7038,7 +7042,8 @@ mod tests {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         use std::os::unix::net::UnixListener;
         let root = PathBuf::from(format!(
-            "/Volumes/NVM/AI_Agent_Runtime/tmp/p-{}",
+            "{}/p-{}",
+            crate::test_socket_tmp(),
             uuid::Uuid::new_v4().simple()
         ));
         fs::create_dir(&root).unwrap();

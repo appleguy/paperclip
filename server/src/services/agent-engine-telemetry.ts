@@ -9,9 +9,9 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-const GLM_MODEL = "native-fleet/wrx80/glm-5.3-flash-colibri";
-const WRX_TARGET = "wrx80";
-const GLM_BASE = "http://127.0.0.1:19126";
+const GLM_MODEL = process.env.PAPERCLIP_GLM_TELEMETRY_MODEL || "native-fleet/wrx80/glm-5.3-flash-colibri";
+const WRX_TARGET = process.env.PAPERCLIP_GLM_TELEMETRY_TARGET || "wrx80";
+const GLM_BASE = process.env.PAPERCLIP_GLM_TELEMETRY_BASE_URL || "http://127.0.0.1:19126";
 
 export type EngineTelemetry = {
   supported: boolean;

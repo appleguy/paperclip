@@ -377,3 +377,9 @@ mod tests {
 
 #[cfg(unix)]
 pub mod runtime_notifications;
+
+#[cfg(test)]
+pub(crate) fn test_socket_tmp() -> String {
+    std::env::var("PAPERCLIP_TEST_SOCKET_TMP")
+        .unwrap_or_else(|_| "/Volumes/NVM/AI_Agent_Runtime/tmp".to_string())
+}

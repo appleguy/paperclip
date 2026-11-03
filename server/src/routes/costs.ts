@@ -380,7 +380,8 @@ export function costRoutes(
       let bankedResetDispute: { ownerExpected: number; source: string } | null = null;
       try {
         const local = JSON.parse(await readFile(
-          "/Volumes/NVM/Paperclip/knowledge/raw/model-routing/credit_offers.json", "utf8"
+          process.env.PAPERCLIP_CREDIT_OFFERS_PATH
+            ?? "/Volumes/NVM/Paperclip/knowledge/raw/model-routing/credit_offers.json", "utf8"
         )) as Record<string, any>;
         if (local.schema === 1 && Array.isArray(local.offers)) {
           creditOffers = local.offers.filter((offer: unknown) => offer && typeof offer === "object")

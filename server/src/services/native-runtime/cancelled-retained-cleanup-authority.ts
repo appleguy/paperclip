@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { retainedRunnerdCleanupProofIsCurrent, type RetainedRunnerdCleanupProof } from "../../vendor/paperclip-runner/index.js";
 import { validatePrpEvent, type NativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
 import { nativeSha256 } from "./canonical.js";
+import { resolvePaperclipInstanceRoot } from "../../home-paths.js";
 import { cancelledResumeLineageIsAuthentic, type CancelledResumeLineage } from "./cancelled-recovery-epoch.js";
 
 export const exactCancelledOwner = Object.freeze({
@@ -469,7 +470,7 @@ function prepareExactCancelledRecoveryIntentForOwner(exactCancelledOwner: Cancel
   const verdict = assessCancelledNativeOwnerForOwner(exactCancelledOwner, input);
   if (verdict.code !== "ready_for_authorized_staging")
     return {code:"operator_required",verdict};
-  const root = input.root ?? "/Volumes/NVM/Paperclip/instances/main/runtime/paperclip-runner/board-cancelled-recovery";
+  const root = input.root ?? join(resolvePaperclipInstanceRoot(), "runtime", "paperclip-runner", "board-cancelled-recovery");
   mkdirSync(root,{recursive:true,mode:0o700});
   const stat = lstatSync(root);
   if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o077))
