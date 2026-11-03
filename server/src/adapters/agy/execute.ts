@@ -335,8 +335,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const adopted = adoptableActive(await fs.readFile(activePath, "utf8").catch(() => ""), issueId, stateDir);
     const rcUrl = await ensureSession(socket, session, cwd, stateDir, Boolean(adopted));
     if (!rcUrl) throw new Error("agy RC URL unavailable: use /remote-control in its TUI, then retry");
-    const expected = asString(cfg.expectedRemoteControlUrl, rcUrl);
-    if (expected !== rcUrl) throw new Error("agy RC URL changed; refusing to dispatch to an unverified session");
+    // Owner 2026-11-03: auto re-pin, logged. The URL rotates on every agy restart; ensureSession only reads it from the
+    // adapter-owned private tmux socket/session, so a new URL there is the same owned instance. The pin lives in
+    // stateDir (cfg.expectedRemoteControlUrl is only the initial seed). An in-flight adopted dispatch stays strict below.
+    const pinPath = path.join(stateDir, "rc-url.json");
+    const pinned = await fs.readFile(pinPath, "utf8").then((t) => asString(JSON.parse(t)?.url, "")).catch(() => "")
+      || asString(cfg.expectedRemoteControlUrl, rcUrl);
+    if (pinned !== rcUrl) {
+      await ctx.onLog("stdout", `[agy] RC URL re-pinned ${pinned} -> ${rcUrl} (owned tmux ${socket}/${session})\n`);
+    }
+    if (pinned !== rcUrl || !(await fs.stat(pinPath).catch(() => null)))
+      await fs.writeFile(pinPath, JSON.stringify({ url: rcUrl, previous: pinned === rcUrl ? null : pinned, at: new Date().toISOString(), runId: ctx.runId }), { mode: 0o600 });
     let receiptRunId = ctx.runId;
     let receiptPath = path.join(stateDir, `receipt-${ctx.runId}.json`);
     let conversationId: string | null = null;
