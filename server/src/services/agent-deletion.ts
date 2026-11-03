@@ -71,6 +71,11 @@ export async function deleteAgentDependencies(tx: Db, companyId: string, id: str
   await tx.execute(sql`update activity_log set run_id = null where run_id in ${ownRuns}`);
   await tx.execute(sql`update finance_events set heartbeat_run_id = null where heartbeat_run_id in ${ownRuns}`);
   await tx.execute(sql`delete from native_run_finalizations where run_id in ${ownRuns}`);
+  await tx.execute(sql`update assets set created_by_agent_id = null where created_by_agent_id = ${id}`);
+  await tx.execute(sql`update approvals set requested_by_agent_id = null where requested_by_agent_id = ${id}`);
+  await tx.execute(sql`update issue_thread_interactions set created_by_agent_id = null where created_by_agent_id = ${id}`);
+  await tx.execute(sql`update issue_thread_interactions set resolved_by_agent_id = null where resolved_by_agent_id = ${id}`);
+  await tx.execute(sql`delete from status_decisions where run_id in ${ownRuns}`);
   await tx.execute(sql`delete from work_assessments where run_id in ${ownRuns}`);
   await tx.execute(sql`delete from native_run_results where run_id in ${ownRuns}`);
   // cost_events reference both the agent and its runs; agent-usage rows cannot be
