@@ -274,9 +274,9 @@ create table native_ops (
     ('reserved','push_started','emitted_local','hook_observed','terminal','rejected','unknown','interrupted')),
   host_epoch integer not null, lease_generation integer not null,
   evidence_json jsonb not null default '{}',   -- per-rung source + timestamp, bounded
-  reserved_at timestamptz not null default now(), updated_at timestamptz not null default now(),
-  unique (run_id, client_intent)
+  reserved_at timestamptz not null default now(), updated_at timestamptz not null default now()
 );
+create unique index native_ops_run_intent on native_ops (run_id, client_intent) where state <> 'rejected';
 create index on native_ops (run_id, state);
 
 -- Receipt store: one validated terminal per run.
@@ -308,7 +308,13 @@ Endpoint passwords, bearer or provider tokens, run-scoped Paperclip tokens (only
 
 ## 8. Conformance suite
 
-One suite, parameterized by driver. Tests run against fake providers/TUIs first, with mocked Herdr sockets and throwaway named sessions; no model calls and no paid inference. A provider is marked supported for a capability only when its tests in both groups pass. All tests are [I] proposed and not yet run.
+One suite, parameterized by driver. Tests run against fake providers/TUIs first, with mocked Herdr sockets and throwaway named sessions; no model calls and no paid inference. A provider is marked supported for a capability only when its tests in both groups pass. Status 2026-11-02: U1-U13 implemented in `packages/paperclip-runner/src/nar/nar-conformance.test.ts` against the reference ledger `src/nar/core.ts` and `FakeDriver` for all four providers (76 cases, green, killed by targeted mutants of core). This proves Core ledger semantics only; no live driver exists yet, so no capability cell changes. C/H/A groups are not yet written.
+
+Amendments found while implementing (v0.2.1):
+- `unique (run_id, client_intent)` must be a partial unique index `where state <> 'rejected'`, otherwise a reserved-then-rejected intent can never be rescheduled as a NEW op (2.3 crash table row 1).
+- `bindConversation(h, s, mode, f, existingId?)` returns `{conversationId, cwd, model?}`: resume needs the stored id, and Core must compare the provider-reported cwd/model against the scope (U9) instead of trusting the driver.
+- Creation is ledgered as a `new_conversation` op. A throw after `push_started` leaves the (agent, issue) conversation `unknown`; later binds are refused with `conversation_unknown` until Board reconciliation (A1).
+- A hook observed for an op already `unknown` is recorded as evidence only; `unknown` is left only by a Receipt or reconciliation.
 
 ### 8.1 Universal tests (every driver)
 - U1 Lease and fence: a write with an expired lease, lower epoch or foreign controller is refused; late tool result from a dead run is rejected (`authority_lost`).
