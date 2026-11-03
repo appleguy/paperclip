@@ -50,7 +50,7 @@ restore_old_payload() {
 rollback_restart() {
   echo 'pc-deploy: restoring previous build and checking restart health' >&2
   restore_old_payload || return 1
-  launchctl kickstart -k "gui/$(id -u)/ing.paperclip.paperclipai.main" || return 1
+  sudo -n launchctl kickstart -k system/ing.paperclip.paperclipai.main || return 1
   [ -n "$original_sha" ] || { echo 'pc-deploy: original exact SHA unavailable for rollback verification' >&2; return 1; }
   node "$helper" finish "$manifest" "$original_sha" || {
     echo 'pc-deploy: rollback health/process identity FAILED' >&2; return 1;
@@ -150,7 +150,7 @@ bounded 60 node "$helper" verify "$manifest" || {
   forced=1
   echo 'pc-deploy: WARNING safety barrier not proven; restarting anyway (deploys never hold)' >&2
 }
-if ! launchctl kickstart -k "gui/$(id -u)/ing.paperclip.paperclipai.main"; then
+if ! sudo -n launchctl kickstart -k system/ing.paperclip.paperclipai.main; then
   echo 'pc-deploy: kickstart failed; rolling back' >&2
   rollback_restart || echo 'pc-deploy: rollback FAILED, operator investigation required' >&2
   exit 1
