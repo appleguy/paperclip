@@ -114,6 +114,12 @@ Live update 2026-11-03 01:16 PST (cloud lead). Agent `4a180a05-e7a4-48f7-8610-19
 | Owner steer | OPEN | Manual chat input is possible, but same-session managed steering has no accepted NAR contract. |
 | Usage reporting | UNSUPPORTED | No native run-scoped token/cost receipt from the manual browser path. |
 
+## Mission cycle (item 8)
+
+| Capability | Status | Receipts |
+|---|---|---|
+| Mission -> issue -> experiment -> accepted report -> next issue | PROVEN-LIVE | goal `2d502228` "Deliver useful, verified project outcomes" -> SCO-494 (`132f37da`) experiment executed by agy run `89a6164d` (succeeded) -> `report` issue document (marker CYCLE-EXP-20261103: 13 run logs, 6 rejoined / 7 fresh-prompt, verdict CONFIRMED) -> accepted by cloud lead (comment `c9acfb55`; named limitation: "fresh prompt" is inferred from absence of rejoin telemetry) -> SCO-495 (`cf696d2f`, child of SCO-494, backlog) created from report recommendation "NAR: emit structured telemetry events for session rejoin vs prompt dispatch". |
+
 ## Acceptance risks and next evidence
 
 1. **Canonical cursor absent.** Reconcile the packaged IC with the integration lead's current source, and preserve complete run/session IDs plus the exact tested/deployed SHA in future headings. No cell was promoted from the separate cloud-lead cursor or the spec's unbound `[L]` notes.
