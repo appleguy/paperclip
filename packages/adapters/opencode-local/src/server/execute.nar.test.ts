@@ -30,6 +30,7 @@ describe("OpenCode adapter nativeRuntime nar", () => {
   let interruptPosts: number;
   let autoComplete: boolean;
   let promptStatus: number | undefined;
+  let messagePageSize: number | undefined;
   let clock: number;
 
   beforeEach(async () => {
@@ -42,6 +43,7 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     interruptPosts = 0;
     autoComplete = true;
     promptStatus = undefined;
+    messagePageSize = undefined;
     clock = 1000;
     vi.stubEnv("XDG_CONFIG_HOME", root);
     runProcess.mockReset();
@@ -103,7 +105,15 @@ describe("OpenCode adapter nativeRuntime nar", () => {
         m = p.match(/^\/api\/session\/([^/]+)\/inbox$/);
         if (m) return reply(200, { data: [] });
         m = p.match(/^\/api\/session\/([^/]+)\/message$/);
-        if (m) return reply(200, { data: sessions.get(m[1]!)?.msgs ?? [] });
+        if (m) {
+          const all = sessions.get(m[1]!)?.msgs ?? [];
+          if (!messagePageSize) return reply(200, { data: all });
+          // Like the real API once paging matters: newest first, `cursor.next` addresses the older page.
+          const q = new URL(req.url ?? "", url).searchParams;
+          const end = q.has("cursor") ? Number(q.get("cursor")) : all.length;
+          const start = Math.max(0, end - Math.min(messagePageSize, Number(q.get("limit") ?? messagePageSize)));
+          return reply(200, { data: all.slice(start, end).reverse(), cursor: { previous: null, next: start > 0 ? String(start) : null } });
+        }
         m = p.match(/^\/api\/session\/([^/]+)\/message\/([^/]+)$/);
         if (m) { const x = sessions.get(m[1]!)?.msgs.find((y) => y.id === m![2]); return x ? reply(200, { data: x }) : reply(404, {}); }
         m = p.match(/^\/api\/experimental\/session\/([^/]+)\/log$/);
@@ -210,6 +220,32 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect(promptPosts).toBe(0);
     expect(userMsgs().map((m) => m.id)).toEqual([orphan]);
     expect(retry).toMatchObject({ exitCode: 0, summary: "orphan finished", sessionId: sid, costUsd: 0.25 });
+  }, 15_000);
+
+  it("rejoins a long in-flight turn whose user prompt is older than one page of messages", async () => {
+    // A turn that has run for hours: hundreds of assistant messages sit after the single user prompt, so the
+    // newest page holds no user message. A retry run used to fail with "active session has no user message".
+    messagePageSize = 2;
+    const sid = sessionIdFor(scope);
+    const orphan = messageIdFor(narOpIdFor("run-1"));
+    sessions.set(sid, { info: { id: sid, location: { directory: root }, model: { providerID: "openai", id: "fixture", variant: "medium" }, time: { created: clock++ } },
+      msgs: [{ id: orphan, type: "user", text: "Full assignment", time: { created: clock++ } },
+        ...Array.from({ length: 5 }, (_, i) => ({ id: `msg_work${i}`, type: "assistant", time: { created: clock++ }, content: [{ type: "tool", name: "read" }] }))] });
+    active.add(sid);
+    const finish = setTimeout(() => {
+      const s = sessions.get(sid)!;
+      s.msgs.push({ id: "msg_done", type: "assistant", time: { created: clock++, completed: clock++ },
+        content: [{ type: "text", text: "long turn finished" }], cost: 0.25, tokens: { input: 50, output: 5, reasoning: 0, cache: { read: 0, write: 0 } } });
+      s.info.time.idle = clock++;
+      s.info.outcome = "succeeded";
+      active.delete(sid);
+    }, 60);
+    const retry = await execute(context("run-1-retry", { nativeRuntime: "nar" }) as never);
+    clearTimeout(finish);
+    expect(promptPosts).toBe(0);
+    expect(interruptPosts).toBe(0);
+    expect(userMsgs().map((m) => m.id)).toEqual([orphan]);
+    expect(retry).toMatchObject({ exitCode: 0, sessionId: sid });
   }, 15_000);
 
   it("registers the heartbeat cancellation barrier and interrupts the exact in-flight NAR turn on explicit pause", async () => {

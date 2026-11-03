@@ -54,6 +54,11 @@ export function sessionTitleFor(identifier: unknown, title: unknown): string | u
 }
 export const messageIdFor = (opId: string) => `msg_${hex(`nar|${opId}`).slice(0, 26)}`;
 
+// Rejoin pages the session's newest-first message list looking for the latest user prompt; bounded so a
+// pathological session cannot turn one rejoin check into an unbounded scan (50 x 200 = 10k messages).
+const INFLIGHT_MESSAGE_PAGE_SIZE = 200;
+const INFLIGHT_MESSAGE_MAX_PAGES = 50;
+
 export class OpenCodeHttpError extends Error {
   constructor(readonly code: "auth" | "http" | "mismatch" | "transport" | "unqualified", message: string, readonly status?: number) {
     super(message);
@@ -264,12 +269,21 @@ export class OpenCodeHttpDriver implements ProviderDriver {
     const active = await this.json("GET", "/api/session/active");
     if (active.status !== 200 || typeof active.data?.data !== "object") throw new OpenCodeHttpError("http", `session.active HTTP ${active.status}`, active.status);
     if (!active.data.data?.[conversationId]) return null;
-    const list = await this.json("GET", `/api/session/${sid}/message?limit=200`);
-    const msgs: any[] = list.status === 200 && Array.isArray(list.data?.data) ? list.data.data : [];
-    const user = msgs.filter((m) => m?.type === "user" && typeof m?.id === "string")
-      .sort((a, b) => (b?.time?.created ?? 0) - (a?.time?.created ?? 0))[0];
-    if (!user) throw new OpenCodeHttpError("mismatch", `active session ${conversationId} has no user message`);
-    return user.id;
+    // The list is newest first. A turn that has run for hours is hundreds of assistant/tool messages after its one
+    // user prompt, so the newest page holds no user message: walk older pages (`cursor.next`) until one does.
+    let cursor: string | null = null;
+    for (let page = 0; page < INFLIGHT_MESSAGE_MAX_PAGES; page++) {
+      const list = await this.json("GET", `/api/session/${sid}/message?limit=${INFLIGHT_MESSAGE_PAGE_SIZE}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
+      if (list.status !== 200 && page > 0) throw new OpenCodeHttpError("http", `session.message page ${page} HTTP ${list.status}`, list.status);
+      const msgs: any[] = list.status === 200 && Array.isArray(list.data?.data) ? list.data.data : [];
+      const user = msgs.filter((m) => m?.type === "user" && typeof m?.id === "string")
+        .sort((a, b) => (b?.time?.created ?? 0) - (a?.time?.created ?? 0))[0];
+      if (user) return user.id;
+      const next = list.data?.cursor?.next;
+      if (typeof next !== "string" || !next || next === cursor) break;
+      cursor = next;
+    }
+    throw new OpenCodeHttpError("mismatch", `active session ${conversationId} has no user message`);
   }
 
   async readOutcomeMsg(conversationId: string, msgId: string): Promise<OutcomeRead> {
