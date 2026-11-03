@@ -111,11 +111,17 @@ describe("managed install commands", () => {
     fs.mkdirSync(path.join(native, "native"), { recursive: true });
     fs.writeFileSync(path.join(native, "native", "pg-symlinks.json"), "[]");
     fs.writeFileSync(path.join(native, "scripts", "hydrate-symlinks.js"), "// test fixture\n");
+    const nested = path.join(payload, "node_modules", "@paperclipai", "server", "node_modules", "@embedded-postgres", `${process.platform}-${process.arch}`);
+    fs.mkdirSync(path.join(nested, "scripts"), { recursive: true });
+    fs.mkdirSync(path.join(nested, "native"), { recursive: true });
+    fs.writeFileSync(path.join(nested, "native", "pg-symlinks.json"), "[]");
+    fs.writeFileSync(path.join(nested, "scripts", "hydrate-symlinks.js"), "");
     const runCommand = vi.fn(async () => ({ stdout: "", stderr: "" }));
     expect(await hydrateEmbeddedPostgresSymlinks(payload, runCommand)).toBe(true);
     expect(runCommand).toHaveBeenCalledWith(process.execPath, [path.join(native, "scripts", "hydrate-symlinks.js")], expect.objectContaining({ cwd: native }));
+    expect(runCommand).toHaveBeenCalledWith(process.execPath, [path.join(nested, "scripts", "hydrate-symlinks.js")], expect.objectContaining({ cwd: nested }));
     expect(await hydrateEmbeddedPostgresSymlinks(path.join(root, "missing"), runCommand)).toBe(false);
-    expect(runCommand).toHaveBeenCalledOnce();
+    expect(runCommand).toHaveBeenCalledTimes(2);
   });
 
   it("reuses a SHA-keyed git payload without downloading or rebuilding", async () => {
@@ -126,10 +132,16 @@ describe("managed install commands", () => {
     fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true });
     fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ version: "0.3.1" }));
     fs.writeFileSync(path.join(packageRoot, "dist", "index.js"), "#!/usr/bin/env node\n");
+    const native = path.join(payloadPath, "node_modules", "@embedded-postgres", `${process.platform}-${process.arch}`);
+    fs.mkdirSync(path.join(native, "native"), { recursive: true });
+    fs.mkdirSync(path.join(native, "scripts"), { recursive: true });
+    fs.writeFileSync(path.join(native, "native", "pg-symlinks.json"), "[]");
+    fs.writeFileSync(path.join(native, "scripts", "hydrate-symlinks.js"), "");
     const runCommand = vi.fn(async (_file: string, _args: string[]) => ({ stdout: "0.3.1\n", stderr: "" }));
     await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, paths)).resolves.toEqual({ payloadPath, reused: true, version: "0.3.1" });
-    expect(runCommand).toHaveBeenCalledOnce();
-    expect(runCommand.mock.calls[0]?.[0]).toBe(process.execPath);
+    expect(runCommand).toHaveBeenCalledTimes(2);
+    expect(runCommand.mock.calls[0]?.[1]).toEqual([path.join(native, "scripts", "hydrate-symlinks.js")]);
+    expect(runCommand.mock.calls[1]?.[0]).toBe(process.execPath);
   });
 
   const createGitCheckoutRunCommand = (sha: string) =>
@@ -220,13 +232,18 @@ describe("managed install commands", () => {
     expect(uiPackCall).toBeDefined();
   });
 
-  it("resolves the complete server workspace dependency closure in dependency order", () => {
+  it("resolves server and CLI workspace dependencies without treating registry packages as local", () => {
     const checkout = path.join(root, "checkout");
     const packages = [
       { dir: "packages/shared", name: "@paperclipai/shared", dependencies: {} },
       { dir: "packages/db", name: "@paperclipai/db", dependencies: { "@paperclipai/shared": "workspace:*" } },
-      { dir: "server", name: "@paperclipai/server", dependencies: { "@paperclipai/db": "workspace:*" } },
+      { dir: "server", name: "@paperclipai/server", dependencies: { "@paperclipai/db": "workspace:*", "@paperclipai/registry-only": "^9.0.0" } },
+      { dir: "packages/cli-extra", name: "@paperclipai/cli-extra", dependencies: { "@paperclipai/shared": "workspace:^" } },
     ];
+    fs.mkdirSync(path.join(checkout, "cli"), { recursive: true });
+    fs.writeFileSync(path.join(checkout, "cli", "package.json"), JSON.stringify({
+      dependencies: { "@paperclipai/server": "workspace:*", "@paperclipai/cli-extra": "workspace:*" },
+    }));
     fs.mkdirSync(path.join(checkout, "scripts"), { recursive: true });
     fs.writeFileSync(path.join(checkout, "scripts", "release-package-manifest.json"), JSON.stringify(packages.map(({ dir, name }) => ({ dir, name }))));
     for (const workspacePackage of packages) {
@@ -238,6 +255,7 @@ describe("managed install commands", () => {
       "@paperclipai/shared",
       "@paperclipai/db",
       "@paperclipai/server",
+      "@paperclipai/cli-extra",
     ]);
   });
 

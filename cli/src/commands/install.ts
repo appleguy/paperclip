@@ -65,6 +65,15 @@ export function resolveGitInstallWorkspacePackages(checkoutPath: string): Releas
   const visited = new Set<string>();
   const ordered: ReleasePackageEntry[] = [];
 
+  const runtimeWorkspaceDependencies = (packageJson: Record<string, unknown>): string[] =>
+    (["dependencies", "optionalDependencies", "peerDependencies"] as const).flatMap((section) => {
+      const dependencies = packageJson[section];
+      if (!dependencies || typeof dependencies !== "object") return [];
+      return Object.entries(dependencies as Record<string, unknown>)
+        .filter(([name, range]) => name.startsWith("@paperclipai/") && typeof range === "string" && range.startsWith("workspace:"))
+        .map(([name]) => name);
+    });
+
   const visit = (packageName: string): void => {
     if (visited.has(packageName)) return;
     if (visiting.has(packageName)) throw new Error(`Circular workspace dependency while staging ${packageName}.`);
@@ -72,19 +81,15 @@ export function resolveGitInstallWorkspacePackages(checkoutPath: string): Releas
     if (!entry) throw new Error(`Git install cannot stage workspace dependency ${packageName}; it is missing from scripts/release-package-manifest.json.`);
     visiting.add(packageName);
     const packageJson = JSON.parse(fs.readFileSync(path.join(checkoutPath, entry.dir, "package.json"), "utf8")) as Record<string, unknown>;
-    for (const section of ["dependencies", "optionalDependencies", "peerDependencies"] as const) {
-      const dependencies = packageJson[section];
-      if (!dependencies || typeof dependencies !== "object") continue;
-      for (const dependencyName of Object.keys(dependencies)) {
-        if (dependencyName.startsWith("@paperclipai/")) visit(dependencyName);
-      }
-    }
+    for (const dependencyName of runtimeWorkspaceDependencies(packageJson)) visit(dependencyName);
     visiting.delete(packageName);
     visited.add(packageName);
     ordered.push(entry);
   };
 
   visit("@paperclipai/server");
+  const cliPackageJson = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as Record<string, unknown>;
+  for (const dependencyName of runtimeWorkspaceDependencies(cliPackageJson)) visit(dependencyName);
   return ordered;
 }
 
@@ -191,14 +196,15 @@ export async function hydrateEmbeddedPostgresSymlinks(payloadPath: string, runCo
     path.join(payloadPath, "node_modules", "@embedded-postgres", nativeName),
     path.join(payloadPath, "node_modules", "@paperclipai", "server", "node_modules", "@embedded-postgres", nativeName),
   ];
+  let hydrated = false;
   for (const root of roots) {
     const manifest = path.join(root, "native", "pg-symlinks.json");
     const helper = path.join(root, "scripts", "hydrate-symlinks.js");
     if (!fs.existsSync(manifest) || !fs.existsSync(helper)) continue;
     await runCommand(process.execPath, [helper], { cwd: root, maxBuffer: 1024 * 1024 });
-    return true;
+    hydrated = true;
   }
-  return false;
+  return hydrated;
 }
 
 export async function installNpmPayload(
@@ -308,14 +314,20 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
     const rootSkills = path.join(checkoutPath, "skills");
     if (fs.existsSync(rootSkills)) {
-      fs.cpSync(rootSkills, path.join(checkoutPath, "server", "skills"), { recursive: true });
+      for (const relativeDir of ["server", "packages/adapters/claude-local", "packages/adapters/codex-local"]) {
+        const packageDir = path.join(checkoutPath, relativeDir);
+        if (!fs.existsSync(packageDir)) continue;
+        const target = path.join(packageDir, "skills");
+        fs.rmSync(target, { recursive: true, force: true });
+        fs.cpSync(rootSkills, target, { recursive: true });
+      }
     }
     const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
     for (const workspacePackage of workspacePackages) {
       const packageDir = path.join(checkoutPath, workspacePackage.dir);
       const packageFiles = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")).files as string[] | undefined;
-      if (workspacePackage.name !== "@paperclipai/server" && packageFiles?.includes("skills") && !fs.existsSync(path.join(packageDir, "skills"))) {
+      if (packageFiles?.includes("skills") && !fs.existsSync(path.join(packageDir, "skills"))) {
         fs.mkdirSync(path.join(packageDir, "skills"), { recursive: true });
       }
     }
