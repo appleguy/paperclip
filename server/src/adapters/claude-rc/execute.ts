@@ -39,7 +39,7 @@ function asString(v: unknown, fallback: string): string {
 /** Screen text without dim (ghost prompt suggestion) spans or other escapes. */
 async function claudePane(socket: string, session: string): Promise<string> {
   const raw = await tmux(socket, ["capture-pane", "-t", session, "-p", "-J", "-e", "-S", "-150"]);
-  return raw.replace(/\x1b\[2m[^\x1b]*/g, "").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
+  return raw.replace(/\x1b\[2m[^\x1b\n]*/g, "").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
 }
 export function isClaudeIdle(screen: string): boolean {
   const tail = screen.replace(/\r/g, "").trimEnd().split("\n").slice(-18);
