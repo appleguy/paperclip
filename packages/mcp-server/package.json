@@ -13,7 +13,8 @@
   },
   "type": "module",
   "bin": {
-    "paperclip-mcp-server": "./dist/stdio.js"
+    "paperclip-mcp-server": "./dist/stdio.js",
+    "paperclip-run-bridge": "./dist/run-bridge-stdio.js"
   },
   "exports": {
     ".": "./src/index.ts"

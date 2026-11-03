@@ -56,6 +56,7 @@ import {
 import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl, createOpenCodeJsonlParser } from "./parse.js";
 import { createOpenCodeAttemptProgressGuard } from "./attempt-progress.js";
 import { runNarOpenCodeAttempt } from "./nar/nar-attempt.js";
+import { runHandleNote, writeRunHandle } from "./nar/run-handle.js";
 import { sessionTitleFor } from "./nar/opencode-http-driver.js";
 import { OpenCodeSharedSessionWait, prepareSharedOpenCodeSession } from "./shared-session-recovery.js";
 import {
@@ -687,11 +688,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     // Remote targets receive only the prepared environment, never host keys.
     const accountingEnv = executionTargetIsRemote ? preparedRuntimeConfig.env : runtimeEnv;
+    const narApiUrl = (env.PAPERCLIP_API_URL ?? process.env.PAPERCLIP_API_URL ?? "").trim();
+    const runHandle = narMode && authToken && narApiUrl
+      ? await writeRunHandle({
+          configPath: sharedConfigPath, apiUrl: narApiUrl, apiKey: authToken, runId, agentId: agent.id,
+          companyId: agent.companyId, ttlMs: (timeoutSec > 0 ? timeoutSec * 1000 : 6 * 3600_000) + 600_000,
+        })
+      : null;
     const runAttempt = async (resumeSessionId: string | null) => {
       await hydrateFreshSessionHandoff(ctx, { resumedSession: Boolean(resumeSessionId) });
       const { basePrompt, promptMetrics } = buildPrompt(Boolean(resumeSessionId));
       const prompt = joinPromptSections([
         selectInitialCommunicationGuidance(context, { resumedSession: Boolean(resumeSessionId) }),
+        runHandle ? runHandleNote(runHandle.handle) : "",
         basePrompt,
       ]);
       const args = buildArgs(resumeSessionId);
@@ -905,6 +914,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       } finally {
         await Promise.all([
           paperclipBridge?.stop(),
+          runHandle?.cleanup(),
           restoreRemoteWorkspace?.(),
           localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
         ]);
