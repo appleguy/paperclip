@@ -7,7 +7,7 @@ import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
 
 /** Cancellation changes admission. Process and lease evidence controls cleanup. */
-const STALE_UNACKNOWLEDGED_CANCEL_MS = 2 * 60 * 60 * 1000;
+const STALE_UNACKNOWLEDGED_CANCEL_MS = 15 * 60 * 1000;
 
 export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
   if (!agentIds.length) return true;
