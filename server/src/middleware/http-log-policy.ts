@@ -72,6 +72,23 @@ export function isPrivateMuseHttpRequest(url:string|undefined):boolean {
   return false;
 }
 
+export function isPrivateClaudeManagedHttpRequest(url: string | undefined): boolean {
+  if (!url) return false;
+  let pathname = normalizePath(url).replace(/^https?:\/\/[^/]*/i, "");
+  for (let depth = 0; depth < 4; depth++) {
+    if (/^\/api\/companies\/[^/]+\/native-sessions\/claude\/managed(?:\/|$)/i.test(pathname)) return true;
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(pathname);
+    } catch {
+      break;
+    }
+    if (decoded === pathname) break;
+    pathname = decoded;
+  }
+  return false;
+}
+
 /** Provider payloads are private even when a method/signature is rejected. */
 export function isPrivateWebhookHttpRequest(
   method: string | undefined,
@@ -106,7 +123,7 @@ export function isSecretSensitiveHttpRequest(
   method: string | undefined,
   url: string | undefined,
 ): boolean {
-  if (isPrivateWebhookHttpRequest(method, url) || isPrivateMuseHttpRequest(url)) return true;
+  if (isPrivateWebhookHttpRequest(method, url) || isPrivateMuseHttpRequest(url) || isPrivateClaudeManagedHttpRequest(url)) return true;
   if (url && normalizePath(url).startsWith("/mcp/files/")) return true;
   if (isPrivateAgentCommentaryHttpRequest(url)) return true;
   // Custom OTLP header values are arbitrary credentials, including on rejected
