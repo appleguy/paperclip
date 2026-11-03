@@ -44,20 +44,22 @@ Evidence snapshot: **2026-11-02 Pacific**. Running checkout SHA initially **`d31
 
 ## Claude Code (interactive Remote Control/channel target)
 
+Live update 2026-11-03 00:55 PST (cloud lead). Deployed payload **`569f89e25aea`**; agent `37c15613-2f74-454e-9794-5aa17782be7d`; IC heading '2026-11-03 … Claude Code (item 5) TUI-side co-presence PROVEN-LIVE on 569f89e25'.
+
 | Capability | Status | Evidence / boundary |
 |---|---|---|
-| Admission | SHIPPED-UNPROVEN | `C` channel bridge emits `notifications/claude/channel`; the current `claude-rc` adapter still types into tmux. S §4 probe is not an IC production receipt. |
-| Session identity | SHIPPED-UNPROVEN | RC URL/name and conversation ID are observed by `claude-rc`; new-issue bind and same-URL rotation remain open (S Q1). |
-| Durable op ids | SHIPPED-UNPROVEN | `C/lib/ledger.cjs` fsyncs an append-only op journal; no cross-run Core DB ledger binding. |
-| Receipt settlement | SHIPPED-UNPROVEN | Channel `paperclip_finish`/`paperclip_block` and legacy file receipt are coded; dynamic run/lease validation not yet end-to-end. |
-| One-writer | OPEN | Legacy adapter serializes pane dispatch, but persistent channel-to-lease writer authority is not implemented (S C5/C10). |
-| Duplicate/stale/foreign refusal | OPEN | Channel duplicate op ID is refused locally; stale run, epoch and foreign sender checks remain incomplete. |
-| Unknown-effect handling | SHIPPED-UNPROVEN | Bridge marks ambiguous restart pushes `held_unknown_effect`; no terminal can be inferred from Stop alone. |
-| Restart rejoin without replay | SHIPPED-UNPROVEN | Same-issue legacy checkpoint adoption and S §4 `--resume` probe exist; production persistent-channel rebind lacks IC receipt. |
-| TUI co-presence in Herdr | OPEN | tmux interactive adapter exists; exact Herdr-hosted native session with channel and same phone history not accepted. |
-| Remote Control/phone | SHIPPED-UNPROVEN | RC launch and URL checks shipped; S §4 [L] phone probe lacks run/session/SHA tuple in IC. |
-| Owner steer | SHIPPED-UNPROVEN | Channel hook parser labels owner input; no IC live managed turn/phone steering tuple. |
-| Usage reporting | UNSUPPORTED | `claude-rc` reports `subscription/unpriced` without token totals; S Q13 remains open for future channel accounting. |
+| Admission | PROVEN-LIVE | Channel push `notifications/claude/channel` with op_id = run ID: run **`21094c57-b98d-4d63-9a92-235c74e9c455`** (SCO-490), bridge ledger stage `hook_observed`; no tmux typing. |
+| Session identity | PROVEN-LIVE | Per-issue `/clear` gives a new conversation: SCO-490 → **`838310a7-14f1-4884-95ab-e3355ea80d19`**, SCO-487 → **`6dd7938a-c032-4e53-8f35-9e6800202413`**; same RC session. |
+| Durable op ids | PROVEN-LIVE | fsynced bridge ledger keyed by run ID; duplicate op_id refused (`already exists`, unit-tested and ledger-enforced). No cross-run Core DB ledger (NAR store gap remains). |
+| Receipt settlement | PROVEN-LIVE | `receipt-21094c57…json` status done → run succeeded, issue done (`issueClosed:true`). |
+| One-writer | SHIPPED-UNPROVEN | Adapter `acquire()` serializes one tmux host; no lease/epoch writer fence. Steering-race conformance is out of scope (Amendment 1). |
+| Duplicate/stale/foreign refusal | SHIPPED-UNPROVEN | Duplicate op refusal is live-enforced; stale/foreign checks are out of scope per Amendment 1. |
+| Unknown-effect handling | PROVEN-LIVE | Run `86fb71c6` was held (misclassified inbox_pending, fixed in `569f89e25`); recovery hold `259b2519` was released only with ledger + receipt evidence (outcome false_positive). |
+| Restart rejoin without replay | PROVEN-LIVE | Run **`707a6a09-4b08-49ac-bdee-1acd79b8b4a2`** adopted the `86fb71c6` checkpoint/receipt and sent no prompt (transcript `6dd7938a` untouched after 00:36). Deploy shutdown uses the `server_shutdown_rejoin` lane (`05e5f599c`, live). |
+| TUI co-presence in Herdr | PROVEN-LIVE (agent side) | Native TUI `tmux -L pc-claude-rc` session `claude` shown in Herdr `sco337-native` w1:p8 (tab claude-rc) during both runs. Owner phone view: pending owner confirmation. |
+| Remote Control/phone | SHIPPED-UNPROVEN | RC session `https://claude.ai/code/session_01QMN4wcQRS53LUMcwR9jkjv` pinned in `rc-url.json` (previous:null); owner confirms the phone view. |
+| Owner steer | SHIPPED-UNPROVEN | The hook labels owner-origin prompts; awaiting owner phone/TUI steer. |
+| Usage reporting | UNSUPPORTED | Vendor limit: the subscription TUI exposes no per-run token totals to the adapter; reported as `subscription/unpriced`. |
 
 ## agy (Antigravity CLI 1.4.x)
 
