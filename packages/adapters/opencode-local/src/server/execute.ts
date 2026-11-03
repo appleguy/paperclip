@@ -697,7 +697,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     // Remote targets receive only the prepared environment, never host keys.
     const accountingEnv = executionTargetIsRemote ? preparedRuntimeConfig.env : runtimeEnv;
-    const narApiUrl = (env.PAPERCLIP_API_URL ?? process.env.PAPERCLIP_API_URL ?? "").trim();
+    // The bridge runs on this host; the public HTTPS URL uses a private CA that node fetch rejects.
+    const narApiUrl = `http://127.0.0.1:${process.env.PORT || 3100}`;
     const runHandle = narMode && authToken && narApiUrl
       ? await writeRunHandle({
           configPath: sharedConfigPath, apiUrl: narApiUrl, apiKey: authToken, runId, agentId: agent.id,
