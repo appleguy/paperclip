@@ -77,7 +77,9 @@ function requestLogUrl(req: {
   originalUrl?: unknown;
   url?: unknown;
 }) {
-  if(isPrivateClaudeManagedHttpRequest(requestClassificationUrl(req)))return "/api/companies/:companyId/native-sessions/claude/managed";
+  if (isPrivateClaudeManagedHttpRequest(requestClassificationUrl(req))) {
+    return "/api/companies/:companyId/native-sessions/claude/managed";
+  }
   if(isPrivateMuseHttpRequest(requestClassificationUrl(req)))return "/api/muse/:protocol";
   if (isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req))) return "/api/companies/:companyId/observability";
   return isPrivateWebhook(req)
@@ -90,7 +92,9 @@ export function createHttpLogger(baseLogger: Logger) {
     logger: baseLogger,
     serializers: {
       req(req: Record<string, unknown> & { url?: unknown }) {
-        if (isPrivateClaudeManagedHttpRequest(typeof req.url === "string" ? req.url : undefined)) return {id:req.id,method:req.method,url:"/api/companies/:companyId/native-sessions/claude/managed"};
+        if (isPrivateClaudeManagedHttpRequest(typeof req.url === "string" ? req.url : undefined)) {
+          return { id: req.id, method: req.method, url: "/api/companies/:companyId/native-sessions/claude/managed" };
+        }
         if (isPrivateAgentObservabilityHttpRequest(typeof req.url === "string" ? req.url : undefined)) {
           return { id: req.id, method: req.method, url: "/api/companies/:companyId/observability" };
         }
@@ -165,7 +169,9 @@ export function createHttpLogger(baseLogger: Logger) {
       return `${req.method} ${stripSecretBearingUrlParts(req.url ?? "")} ${res.statusCode} — ${errMsg}`;
     },
     customErrorObject(req, _res, _err, value) {
-      if (isPrivateClaudeManagedHttpRequest(requestClassificationUrl(req))) return {...value,err:{type:"Error",message:"Claude managed request failed"}};
+      if (isPrivateClaudeManagedHttpRequest(requestClassificationUrl(req))) {
+        return { ...value, err: { type: "Error", message: "Claude managed request failed" } };
+      }
       if (isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req))) {
         return { ...value, err: { type: "Error", message: "Agent observability request failed" } };
       }

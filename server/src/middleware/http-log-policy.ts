@@ -73,12 +73,19 @@ export function isPrivateMuseHttpRequest(url:string|undefined):boolean {
 }
 
 /** Interactive terminal input and launch failures may contain private text. */
-export function isPrivateClaudeManagedHttpRequest(url:string|undefined):boolean {
+export function isPrivateClaudeManagedHttpRequest(url: string | undefined): boolean {
   if (!url) return false;
-  let pathname=normalizePath(url).replace(/^https?:\/\/[^/]*/i, "");
-  for(let depth=0;depth<4;depth++) {
+  let pathname = normalizePath(url).replace(/^https?:\/\/[^/]*/i, "");
+  for (let depth = 0; depth < 4; depth++) {
     if (/^\/api\/companies\/[^/]+\/native-sessions\/claude\/managed(?:\/|$)/i.test(pathname)) return true;
-    try {const decoded=decodeURIComponent(pathname);if(decoded===pathname)break;pathname=decoded;} catch {break;}
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(pathname);
+    } catch {
+      break;
+    }
+    if (decoded === pathname) break;
+    pathname = decoded;
   }
   return false;
 }
