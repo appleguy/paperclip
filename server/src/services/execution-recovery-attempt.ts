@@ -40,9 +40,15 @@ function historicalFailureCount(run: RetryRun): number {
   return count(run.scheduledRetryAttempt) ?? 0;
 }
 
+/** A graceful server shutdown (deploy) is not a run failure: its rejoin lane has its own bounded budget. */
+export const SERVER_SHUTDOWN_REJOIN_RETRY_REASON = "server_shutdown_rejoin";
+export const SERVER_SHUTDOWN_REJOIN_MAX_ATTEMPTS = 12;
+/** Lanes counted only against their own consecutive attempts, never the failure budget. */
+const PER_REASON_LANES = ["workspace_busy", "ai_connection_busy", "ai_connection_pool_wait", SERVER_SHUTDOWN_REJOIN_RETRY_REASON];
+
 export function executionRetryAccounting(run: RetryRun): ExecutionRetryAccounting {
   const saved = savedAccounting(run);
-  const nonFailureLane = ["max_turns_continuation", "issue_disposition_repair", "workspace_busy", "ai_connection_busy", "ai_connection_pool_wait"].includes(run.scheduledRetryReason ?? "");
+  const nonFailureLane = ["max_turns_continuation", "issue_disposition_repair", ...PER_REASON_LANES].includes(run.scheduledRetryReason ?? "");
   return {
     version: 1,
     failureRetries: Math.max(saved?.failureRetries ?? 0, saved && nonFailureLane ? 0 : historicalFailureCount(run)),
@@ -57,7 +63,7 @@ export function executionFailureRetryCount(run: RetryRun): number {
 }
 
 export function executionRetryAttemptCount(run: RetryRun, reason: string): number {
-  if (reason === "workspace_busy" || reason === "ai_connection_busy" || reason === "ai_connection_pool_wait") {
+  if (PER_REASON_LANES.includes(reason)) {
     return run.scheduledRetryReason === reason ? count(run.scheduledRetryAttempt) ?? 0 : 0;
   }
   const accounting = executionRetryAccounting(run);
@@ -67,6 +73,6 @@ export function executionRetryAttemptCount(run: RetryRun, reason: string): numbe
 export function accountingForScheduledRetry(run: RetryRun, reason: string, attempt: number): ExecutionRetryAccounting {
   const accounting = executionRetryAccounting(run);
   if (reason === "max_turns_continuation") accounting.maxTurnContinuations = attempt;
-  else if (reason !== "workspace_busy" && reason !== "ai_connection_busy" && reason !== "ai_connection_pool_wait") accounting.failureRetries = attempt;
+  else if (!PER_REASON_LANES.includes(reason)) accounting.failureRetries = attempt;
   return accounting;
 }

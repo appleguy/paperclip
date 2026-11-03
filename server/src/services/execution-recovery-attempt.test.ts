@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
+import { accountingForScheduledRetry, executionFailureRetryCount, executionRetryAttemptCount, SERVER_SHUTDOWN_REJOIN_RETRY_REASON } from "./execution-recovery-attempt.js";
 
 describe("failure attempts across resource waits", () => {
   it("preserves prior failures through subscription waits without trusting unrelated context", () => {
@@ -41,5 +41,22 @@ describe("persisted independent accounting", () => {
     ]) expect(executionFailureRetryCount({ scheduledRetryReason: "transient_failure", scheduledRetryAttempt: 2,
       contextSnapshot: { executionRetryAccounting },
     })).toBe(2);
+  });
+});
+
+describe("server shutdown rejoin lane", () => {
+  it("counts deploy interrupts per reason and never spends the failure budget", () => {
+    const run = { scheduledRetryReason: SERVER_SHUTDOWN_REJOIN_RETRY_REASON, scheduledRetryAttempt: 5,
+      contextSnapshot: { executionRetryAccounting: { version: 1, failureRetries: 1, maxTurnContinuations: 0 } } };
+    expect(executionRetryAttemptCount(run, SERVER_SHUTDOWN_REJOIN_RETRY_REASON)).toBe(5);
+    expect(executionRetryAttemptCount(run, "transient_failure")).toBe(1);
+    expect(executionFailureRetryCount(run)).toBe(1);
+    expect(accountingForScheduledRetry(run, SERVER_SHUTDOWN_REJOIN_RETRY_REASON, 6).failureRetries).toBe(1);
+  });
+  it("keeps the transient failure budget unchanged", () => {
+    const run = { scheduledRetryReason: "transient_failure", scheduledRetryAttempt: 2 };
+    expect(executionRetryAttemptCount(run, "transient_failure")).toBe(2);
+    expect(accountingForScheduledRetry(run, "transient_failure", 3).failureRetries).toBe(3);
+    expect(executionRetryAttemptCount(run, SERVER_SHUTDOWN_REJOIN_RETRY_REASON)).toBe(0);
   });
 });

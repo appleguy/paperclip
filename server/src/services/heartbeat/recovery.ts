@@ -1,3 +1,4 @@
+import { SERVER_SHUTDOWN_REJOIN_MAX_ATTEMPTS, SERVER_SHUTDOWN_REJOIN_RETRY_REASON } from "../execution-recovery-attempt.js";
 import { pendingFailedNativeRetryCancellationCondition } from "../native-runtime/native-cancellation-request.js";
 import { notifyLiveRunRecovery } from "../live-run-recovery-notifications.js";
 import { registerLiveRecoveryWork } from "./live-recovery-work.js";
@@ -418,7 +419,11 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     // transient retries; process loss must not open a second retry budget.
     if (run.runtimeMode === "native" || await legacyExecutionNeedsReconciliationWithEvidence(db, run))
       return null;
-    const scheduled = await scheduleBoundedRetryForRun(run, agent, { now });
+    // Deploys never wait (owner policy): a graceful-shutdown interrupt rejoins
+    // on its own bounded lane instead of spending the 2 transient-failure retries.
+    const scheduled = await scheduleBoundedRetryForRun(run, agent, run.errorCode === "server_shutdown_interrupted"
+      ? { now, retryReason: SERVER_SHUTDOWN_REJOIN_RETRY_REASON, maxAttempts: SERVER_SHUTDOWN_REJOIN_MAX_ATTEMPTS, delayMs: 15_000 }
+      : { now });
     return scheduled.outcome === "scheduled" ? scheduled.run : null;
   }
 
