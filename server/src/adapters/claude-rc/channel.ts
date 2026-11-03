@@ -41,6 +41,7 @@ export async function findBridgeRoot(explicit?: string): Promise<string> {
     path.resolve(process.cwd(), "../packages/claude-channel-bridge"),
     path.resolve(here, "../../../../packages/claude-channel-bridge"),
     path.resolve(here, "../../../../../packages/claude-channel-bridge"),
+    path.resolve(here, "../../vendor/claude-channel-bridge"),
   ];
   for (const p of candidates) {
     try {
