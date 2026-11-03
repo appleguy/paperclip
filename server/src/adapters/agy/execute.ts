@@ -36,7 +36,11 @@ export function parseRemoteUrl(screen: string): string | null {
 }
 export function parseRemoteConversationId(screen: string): string | null {
   // /remote-control prints the live ID before the first prompt, unlike the stale cache.
-  const ids = [...screen.matchAll(/p=c%2F([a-f0-9-]{36})/gi)];
+  // agy hard-wraps long URLs onto an indented next line (capture-pane -J cannot rejoin those),
+  // so match on a copy with line breaks and their indentation removed. The 36-char UUID bound
+  // keeps the join from absorbing following words.
+  const compact = screen.replace(/[ \t]*\r?\n[ \t│┃]*/g, "");
+  const ids = [...compact.matchAll(/p=c%2F([a-f0-9-]{36})/gi)];
   return ids.length ? ids[ids.length - 1]![1] : null;
 }
 export function isIdleScreen(screen: string): boolean {

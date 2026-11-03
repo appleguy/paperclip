@@ -18,6 +18,14 @@ describe("agy single-RC dispatch safety", () => {
     expect(parseRemoteConversationId("no active RC")).toBeNull();
   });
 
+  it("reads a conversation ID that agy hard-wrapped across indented lines", () => {
+    const screen = "> /remote-control\n  ⎿  Remote control on for this session.\n     Open\n" +
+      "     https://antigravity.google.com/r/3b230a76-97fe-42ae-a568-d9b6a0fb9b48-v2?p=\n" +
+      "     c%2F19cf69d7-66d2-457a-9aba-5c7c3c7eec66\n     on another device to continue this conversation.";
+    expect(parseRemoteConversationId(screen)).toBe("19cf69d7-66d2-457a-9aba-5c7c3c7eec66");
+    expect(parseRemoteUrl(screen)).toBe("https://antigravity.google.com/r/3b230a76-97fe-42ae-a568-d9b6a0fb9b48-v2");
+  });
+
   it("forbids newline submissions that send early TUI turns", () => {
     expect(normalizeOneLine("first line\nsecond line\tthird")).toBe("first line second line third");
   });
