@@ -154,7 +154,7 @@ async function ensureSession(
       await sleep(700);
     }
   }
-  if (!rejoinOnly && !(await waitIdle(socket, session, Date.now() + 25_000))) {
+  if (!rejoinOnly && !(await waitIdle(socket, session, Date.now() + 300_000))) {
     const s = await pane(socket, session);
     if (/trust the files|Do you trust/i.test(s))
       throw new Error("Claude workspace trust prompt: approve this dedicated workspace in the terminal, then retry");
@@ -194,7 +194,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (!MODELS.has(model)) throw new Error(`claude_rc_local permits only ${[...MODELS].join(", ")}; received ${model}`);
     if (!EFFORTS.has(effort)) throw new Error(`invalid effort ${effort}`);
     if (!ID.test(socket) || !ID.test(session) || !NAME.test(name)) throw new Error("invalid tmux socket/session/name");
-    if (!issueId) throw new Error("claude_rc_local requires one issueId/taskId");
+    if (!issueId) return {
+      exitCode: 0, signal: null, timedOut: false, provider: "anthropic", biller: "anthropic", model,
+      billingType: "subscription", costStatus: "unpriced", summary: "claude_rc_local: no issue on this wake; nothing to dispatch",
+    };
     if (!ctx.authToken) throw new Error("claude_rc_local requires a Paperclip run-scoped token before dispatch");
     if (ctx.executionTarget?.kind && ctx.executionTarget.kind !== "local")
       throw new Error("claude_rc_local runs on the Mac Pro local host only");
