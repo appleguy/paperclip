@@ -44,7 +44,7 @@ export function isIdleScreen(screen: string): boolean {
   return /(?:^|\n)>\s*\n[─\s]*\n\? for shortcuts/m.test(end) &&
     !/esc to cancel|Generating\.\.\.|Working\.\.\./i.test(end);
 }
-type Receipt = { runId: string; issueId: string; status: string; summary: string; report: string };
+export type Receipt = { runId: string; issueId: string; status: string; summary: string; report: string };
 export function parseReceipt(raw: string, runId: string, issueId: string): Receipt {
   const parsed: unknown = JSON.parse(raw);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("invalid agy receipt object");
@@ -74,17 +74,17 @@ export function adoptableActive(raw: string, issueId: string, stateDir: string):
   return a as ActiveDispatch;
 }
 
-async function tmux(socket: string, args: string[]): Promise<string> {
+export async function tmux(socket: string, args: string[]): Promise<string> {
   const { stdout } = await runFile("/opt/homebrew/bin/tmux", ["-L", socket, ...args], {
     timeout: 10_000, maxBuffer: 2_000_000,
   });
   return stdout;
 }
 const target = (session: string) => ["-t", session];
-async function pane(socket: string, session: string): Promise<string> {
+export async function pane(socket: string, session: string): Promise<string> {
   return tmux(socket, ["capture-pane", ...target(session), "-p", "-J", "-S", "-150"]);
 }
-async function send(socket: string, session: string, message: string, stateDir: string): Promise<void> {
+export async function send(socket: string, session: string, message: string, stateDir: string): Promise<void> {
   if (/[\r\n]/.test(message)) throw new Error("multiline TUI submissions forbidden");
   // Using a private UTF-8 buffer file keeps large prompts out of argv.
   const file = path.join(stateDir, "dispatch-input.txt");
@@ -143,7 +143,7 @@ async function ensureSession(socket: string, session: string, cwd: string, state
   return url ?? previous.trim();
 }
 
-async function acquire(stateDir: string, deadline: number): Promise<() => Promise<void>> {
+export async function acquire(stateDir: string, deadline: number): Promise<() => Promise<void>> {
   const dir = path.join(stateDir, "dispatch.lock");
   while (Date.now() < deadline) {
     try {
@@ -168,7 +168,7 @@ async function acquire(stateDir: string, deadline: number): Promise<() => Promis
   throw new Error("agy single Remote Control session busy: serialization timeout");
 }
 
-async function deliver(ctx: AdapterExecutionContext, receipt: Receipt): Promise<void> {
+export async function deliver(ctx: AdapterExecutionContext, receipt: Receipt, title = "Antigravity execution report", label = "agy Remote Control"): Promise<void> {
   // Paperclip-owned run-scoped auth stays entirely inside the server adapter.
   // The live agy TUI sees only an issue ID and receipt path, NEVER the token.
   if (!ctx.authToken) throw new Error("missing scoped agent token for report/closure");
@@ -197,8 +197,8 @@ async function deliver(ctx: AdapterExecutionContext, receipt: Receipt): Promise<
     if (!response.ok) throw new Error(`Paperclip ${method} ${suffix} returned HTTP ${response.status}`);
   };
   await invoke("PUT", "/documents/report", {
-    title: "Antigravity execution report", format: "markdown", body: receipt.report,
-    changeSummary: `agy Remote Control run ${ctx.runId}`,
+    title, format: "markdown", body: receipt.report,
+    changeSummary: `${label} run ${ctx.runId}`,
   });
   await invoke("PATCH", "", { status: "done" });
 }
