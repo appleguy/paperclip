@@ -56,6 +56,23 @@ export function parseReceipt(raw: string, runId: string, issueId: string): Recei
   }
   return r as Receipt;
 }
+export type ActiveDispatch = { runId: string; issueId: string; receiptPath: string; rcUrl: string; conversationId?: string | null };
+/**
+ * Crash reconciliation without replay: a checkpoint for the SAME issue is
+ * adopted by the next run (the TUI kept working while Paperclip restarted);
+ * a checkpoint for any other issue still refuses dispatch.
+ */
+export function adoptableActive(raw: string, issueId: string, stateDir: string): ActiveDispatch | null {
+  if (!raw) return null;
+  let a: Partial<ActiveDispatch>;
+  try { a = JSON.parse(raw) as Partial<ActiveDispatch>; } catch { a = {}; }
+  const expectedReceipt = typeof a.runId === "string" ? path.join(stateDir, `receipt-${a.runId}.json`) : "";
+  if (a.issueId !== issueId || typeof a.runId !== "string" || !/^[0-9a-f-]{36}$/i.test(a.runId)
+      || a.receiptPath !== expectedReceipt || typeof a.rcUrl !== "string") {
+    throw new Error("agy previous task unresolved; inspect active.json and its receipt before dispatch. Never replay actions");
+  }
+  return a as ActiveDispatch;
+}
 
 async function tmux(socket: string, args: string[]): Promise<string> {
   const { stdout } = await runFile("/opt/homebrew/bin/tmux", ["-L", socket, ...args], {
@@ -212,12 +229,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     await fs.mkdir(stateDir, { recursive: true, mode: 0o700 });
     unlock = await acquire(stateDir, Date.now() + timeoutMs);
     const activePath = path.join(stateDir, "active.json");
-    const active = await fs.readFile(activePath, "utf8").catch(() => "");
-    if (active) throw new Error("agy previous task unresolved; inspect active.json and its receipt before dispatch. Never replay actions");
+    const adopted = adoptableActive(await fs.readFile(activePath, "utf8").catch(() => ""), issueId, stateDir);
     const rcUrl = await ensureSession(socket, session, cwd, stateDir);
     if (!rcUrl) throw new Error("agy RC URL unavailable: use /remote-control in its TUI, then retry");
     const expected = asString(cfg.expectedRemoteControlUrl, rcUrl);
     if (expected !== rcUrl) throw new Error("agy RC URL changed; refusing to dispatch to an unverified session");
+    let receiptRunId = ctx.runId;
+    let receiptPath = path.join(stateDir, `receipt-${ctx.runId}.json`);
+    let conversationId: string | null = null;
+    if (adopted) {
+      if (adopted.rcUrl !== rcUrl) throw new Error("agy RC URL changed since the adopted dispatch; operator reconciliation required");
+      // The original prompt is already in the live conversation: never re-send it.
+      receiptRunId = adopted.runId;
+      receiptPath = adopted.receiptPath;
+      conversationId = adopted.conversationId ?? null;
+      ctx.onDispatch?.();
+      dispatched = true;
+      await ctx.onLog("stdout", `[agy] Adopting dispatched run ${adopted.runId} for issue ${issueId}; no re-dispatch; receipt ${receiptPath}\n`);
+    } else {
     const before = await inspectRemoteConversation(socket, session, stateDir);
     if (before.url !== rcUrl) throw new Error("agy RC instance URL changed during inspection");
     // Verify /new via /remote-control's live conversation ID, NOT the cache:
@@ -229,7 +258,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const fresh = await inspectRemoteConversation(socket, session, stateDir);
     if (fresh.url !== rcUrl || fresh.id === before.id)
       throw new Error("agy /new did not isolate a conversation under the same RC instance");
-    const receiptPath = path.join(stateDir, `receipt-${ctx.runId}.json`);
+    conversationId = fresh.id;
     const promptBase = asString(cfg.promptTemplate, DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE);
     const { taskContextNote, wakePrompt } = selectPaperclipPromptSections(ctx.context);
     const instructionsFilePath = asString(cfg.instructionsFilePath, "");
@@ -254,20 +283,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (prompt.length > 50_000) throw new Error("agy prompt exceeds TUI paste budget");
     await fs.writeFile(activePath, JSON.stringify({
       runId: ctx.runId, issueId, receiptPath, rcUrl, tmuxSocket: socket, tmuxSession: session,
-      startedAt: new Date().toISOString(),
+      conversationId, startedAt: new Date().toISOString(),
     }, null, 2), { flag: "wx", mode: 0o600 });
     ctx.onDispatch?.();
     dispatched = true;
     await ctx.onLog("stdout", `[agy] Dispatching issue ${issueId} in shared RC ${rcUrl}; receipt ${receiptPath}\n`);
     await send(socket, session, prompt, stateDir);
+    }
     const deadline = Date.now() + timeoutMs;
     let receipt: Receipt | null = null;
+    let idleWithoutReceipt = 0;
     while (Date.now() < deadline) {
       if (ctx.signal?.aborted) throw new Error("agy run cancelled; shared TUI left intact, active checkpoint preserved");
       const raw = await fs.readFile(receiptPath, "utf8").catch(() => "");
       if (raw) {
-        receipt = parseReceipt(raw, ctx.runId, issueId);
+        receipt = parseReceipt(raw, receiptRunId, issueId);
         if (await waitIdle(socket, session, Date.now() + 4000)) break;
+      } else if (adopted) {
+        // An adopted turn that has gone idle with no receipt will not finish by itself.
+        idleWithoutReceipt = isIdleScreen(await pane(socket, session)) ? idleWithoutReceipt + 1 : 0;
+        if (idleWithoutReceipt >= 5)
+          return failure("agy adopted dispatch is idle without a receipt; checkpoint retained for operator reconciliation");
       }
       // A terminated pane must never be mistaken for successful agent work.
       await tmux(socket, ["has-session", ...target(session)]);
@@ -275,7 +311,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
     if (!receipt || !(await waitIdle(socket, session, Date.now() + 1500)))
       return failure("agy did not produce a validated completion receipt at an idle TUI; checkpoint retained", true);
-    const conversationId = fresh.id;
     await deliver(ctx, receipt);
     await ctx.onLog("stdout", `[agy] Done ${issueId}: ${receipt.summary}; conversation=${conversationId ?? "unknown"}\n`);
     await fs.rm(activePath); // completed only after authenticated report + issue closure

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isIdleScreen, normalizeOneLine, parseReceipt, parseRemoteUrl, parseRemoteConversationId, pasteSettleMs } from "./execute.js";
+import { adoptableActive, isIdleScreen, normalizeOneLine, parseReceipt, parseRemoteUrl, parseRemoteConversationId, pasteSettleMs } from "./execute.js";
 
 describe("agy single-RC dispatch safety", () => {
   it("parses shared /r/ base URL and drops conversation query", () => {
@@ -49,5 +49,14 @@ describe("agy single-RC dispatch safety", () => {
     expect(() => parseReceipt(r, "r1", "i2")).toThrow(/exact run/);
     expect(() => parseReceipt(JSON.stringify({ ...JSON.parse(r), report: "short" }), "r1", "i1")).toThrow(/250/);
     expect(() => parseReceipt(JSON.stringify({ ...JSON.parse(r), status: "blocked" }), "r1", "i1")).toThrow(/done/);
+  });
+  it("adopts only the same issue's checkpoint after a crash, never another issue's", () => {
+    const run = "8e5cbb55-1e72-4dda-a4f5-f0b050c2ee6c";
+    const a = { runId: run, issueId: "i1", receiptPath: `/s/receipt-${run}.json`, rcUrl: "https://antigravity.google.com/r/x", conversationId: "c1" };
+    expect(adoptableActive("", "i1", "/s")).toBeNull();
+    expect(adoptableActive(JSON.stringify(a), "i1", "/s")?.runId).toBe(run);
+    expect(() => adoptableActive(JSON.stringify(a), "i2", "/s")).toThrow(/Never replay/);
+    expect(() => adoptableActive(JSON.stringify({ ...a, receiptPath: "/etc/x.json" }), "i1", "/s")).toThrow(/Never replay/);
+    expect(() => adoptableActive("{not json", "i1", "/s")).toThrow(/Never replay/);
   });
 });
