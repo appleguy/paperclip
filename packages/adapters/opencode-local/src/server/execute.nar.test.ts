@@ -11,7 +11,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async (original) => ({
 }));
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
 import { execute } from "./execute.js";
-import { messageIdFor, sessionIdFor } from "./nar/opencode-http-driver.js";
+import { OpenCodeHttpDriver, messageIdFor, sessionIdFor } from "./nar/opencode-http-driver.js";
 import { narOpIdFor } from "./nar/nar-attempt.js";
 
 const runProcess = vi.mocked(runAdapterExecutionTargetProcess);
@@ -27,6 +27,8 @@ describe("OpenCode adapter nativeRuntime nar", () => {
   let sessions: Map<string, { info: any; msgs: any[] }>;
   let active: Set<string>;
   let promptPosts: number;
+  let interruptPosts: number;
+  let autoComplete: boolean;
   let promptStatus: number | undefined;
   let clock: number;
 
@@ -37,6 +39,8 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     sessions = new Map();
     active = new Set();
     promptPosts = 0;
+    interruptPosts = 0;
+    autoComplete = true;
     promptStatus = undefined;
     clock = 1000;
     vi.stubEnv("XDG_CONFIG_HOME", root);
@@ -68,14 +72,27 @@ describe("OpenCode adapter nativeRuntime nar", () => {
           if (promptStatus) return reply(promptStatus, {});
           if (!s.msgs.some((x) => x.id === body.id)) {
             s.msgs.push({ id: body.id, type: "user", text: body.text, time: { created: clock++ } });
-            const n = s.msgs.length;
-            s.msgs.push({ id: `msg_a${n}`, type: "assistant", time: { created: clock++, completed: clock++ },
-              content: [{ type: "text", text: `answer ${n}` }, { type: "tool", name: "read" }],
-              cost: 0.5, tokens: { input: 100 * n, output: 10 * n, reasoning: 1, cache: { read: 7, write: 2 } } });
-            s.info.time.idle = clock++;
-            s.info.outcome = "succeeded";
+            if (autoComplete) {
+              const n = s.msgs.length;
+              s.msgs.push({ id: `msg_a${n}`, type: "assistant", time: { created: clock++, completed: clock++ },
+                content: [{ type: "text", text: `answer ${n}` }, { type: "tool", name: "read" }],
+                cost: 0.5, tokens: { input: 100 * n, output: 10 * n, reasoning: 1, cache: { read: 7, write: 2 } } });
+              s.info.time.idle = clock++;
+              s.info.outcome = "succeeded";
+            } else {
+              active.add(m[1]!);
+            }
           }
           return reply(200, { data: { id: body.id, type: "user" } });
+        }
+        m = p.match(/^\/api\/session\/([^/]+)\/interrupt$/);
+        if (m && method === "POST") {
+          interruptPosts++;
+          const s = sessions.get(m[1]!);
+          if (!s) return reply(404, {});
+          const interrupted = active.delete(m[1]!);
+          if (interrupted) { s.info.time.idle = clock++; s.info.outcome = "interrupted"; }
+          return reply(200, { interrupted });
         }
         m = p.match(/^\/api\/session\/([^/]+)\/inbox$/);
         if (m) return reply(200, { data: [] });
@@ -163,6 +180,66 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect(promptPosts).toBe(0);
     expect(userMsgs().map((m) => m.id)).toEqual([orphan]);
     expect(retry).toMatchObject({ exitCode: 0, summary: "orphan finished", sessionId: sid, costUsd: 0.25 });
+  }, 15_000);
+
+  it("registers the heartbeat cancellation barrier and interrupts the exact in-flight NAR turn on explicit pause", async () => {
+    autoComplete = false;
+    const controller = new AbortController();
+    const onCancellationReady = vi.fn(async () => {});
+    const run = execute({ ...context("run-pause", { nativeRuntime: "nar" }),
+      signal: controller.signal, onCancellationReady } as never);
+    const sid = sessionIdFor(scope);
+    await vi.waitFor(() => expect(active.has(sid)).toBe(true));
+    expect(onCancellationReady).toHaveBeenCalledOnce();
+    controller.abort(Object.assign(new Error("Cancelled due to agent pause"), { code: "paperclip_explicit_run_stop" }));
+    const stopped = await run;
+    expect(stopped).toMatchObject({ exitCode: 75, resultJson: { executionRecovery: { providerWorkStarted: true } } });
+    expect(stopped.errorMessage).toMatch(/interrupt requested/);
+    expect(promptPosts).toBe(1);
+    expect(interruptPosts).toBe(1);
+    expect(active.size).toBe(0);
+    expect(userMsgs()).toHaveLength(1);
+    expect(runProcess).not.toHaveBeenCalled();
+  });
+
+  it("preserves an in-flight provider turn on untagged shutdown for no-replay rejoin", async () => {
+    autoComplete = false;
+    const controller = new AbortController();
+    const run = execute({ ...context("run-shutdown", { nativeRuntime: "nar" }), signal: controller.signal } as never);
+    const sid = sessionIdFor(scope);
+    await vi.waitFor(() => expect(active.has(sid)).toBe(true));
+    controller.abort(new Error("Server shutting down"));
+    const stopped = await run;
+    expect(stopped.resultJson).toMatchObject({ executionRecovery: { providerWorkStarted: true } });
+    expect(stopped.errorMessage).toMatch(/preserved for restart rejoin/);
+    expect(interruptPosts).toBe(0);
+    expect(active.has(sid)).toBe(true);
+    expect(promptPosts).toBe(1);
+  });
+
+  it("does not send an interrupt to an already-idle session or a different message", async () => {
+    await execute(context("run-idle", { nativeRuntime: "nar" }) as never);
+    const driver = new OpenCodeHttpDriver({ url, passwordFile: path.join(root, "pw") });
+    const sid = sessionIdFor(scope);
+    const fence = { runId: "run-idle", leaseGeneration: 1, hostEpoch: 4242 };
+    const op = { opId: "stop-run-idle", kind: "interrupt" as const, payloadSha256: "" };
+    expect(await driver.interruptExpectedMessage(sid, messageIdFor(narOpIdFor("run-idle")), op, fence)).toBe("idle");
+    expect(interruptPosts).toBe(0);
+    autoComplete = false;
+    const live = execute(context("run-other", { nativeRuntime: "nar" }) as never);
+    await vi.waitFor(() => expect(active.has(sid)).toBe(true));
+    expect(await driver.interruptExpectedMessage(sid, messageIdFor(narOpIdFor("run-idle")), op, fence)).toBe("idle");
+    expect(interruptPosts).toBe(0);
+    // Complete the synthetic active turn so the fixture finishes without a long timer.
+    const s = sessions.get(sid)!;
+    const n = s.msgs.length;
+    s.msgs.push({ id: "msg_other_done", type: "assistant", time: { created: clock++, completed: clock++ },
+      content: [{ type: "text", text: "done" }], cost: 0, tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } });
+    s.info.time.idle = clock++;
+    s.info.outcome = "succeeded";
+    active.delete(sid);
+    await live;
+    expect(n).toBeGreaterThan(0);
   }, 15_000);
 
   it("holds on an unknown submit outcome and never resends", async () => {

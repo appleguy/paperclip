@@ -708,6 +708,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
 
       if (narMode) {
+        // Own cancellation before the first shared-server request. Without this,
+        // heartbeat Stop has no registered adapter controller to abort.
+        await ctx.onCancellationReady?.();
         return runNarOpenCodeAttempt({
           configPath: sharedConfigPath, agentId: agent.id, taskId: narTaskId, runId, cwd: effectiveExecutionCwd,
           model: model && variant ? `${model}#${variant}` : model, prompt, timeoutSec, signal: ctx.signal, onLog,

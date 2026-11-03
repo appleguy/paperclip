@@ -1390,7 +1390,9 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
                   eq(heartbeatRuns.status, "running"),
                 ),
               );
-            control.controller.abort(new Error(reason));
+            // Explicit Stop (including pause) must interrupt provider work. Shutdown uses an
+            // untagged abort so persistent NAR sessions can be rejoined without replay.
+            control.controller.abort(Object.assign(new Error(reason), { code: "paperclip_explicit_run_stop" }));
           }
           let terminationSettled = false;
           try {

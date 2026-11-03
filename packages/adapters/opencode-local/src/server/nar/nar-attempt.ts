@@ -1,6 +1,6 @@
 // Opt-in NAR attempt for the OpenCode adapter (config nativeRuntime: "nar" + sharedServerRecoveryConfigPath).
 // No child process: one deterministic session per agent+issue on the shared 2.2.5 server, one prompt with an op id
-// derived from the run id (a restart of the same run re-submits the same message id; the server dedupes), then
+// derived from the run id (a restart first rejoins any in-flight message without resending), then
 // poll provider evidence. Never retries submit. Spec: doc/spec/native-agent-runtime.md sections 2.3, 3, 10.
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -35,6 +35,12 @@ export interface NarAttemptInput {
 }
 
 export const narOpIdFor = (runId: string) => `nar-run-${runId}`;
+
+// run-control tags explicit Stop; shutdown/recovery uses an untagged abort so
+// a persistent provider turn can survive and be rejoined without replay.
+function explicitStopRequested(signal?: AbortSignal): boolean {
+  return signal?.aborted === true && (signal.reason as { code?: unknown } | undefined)?.code === "paperclip_explicit_run_stop";
+}
 
 const emptyParsed = (sessionId: string | null, errorMessage: string | null): ReturnType<typeof parseOpenCodeJsonl> => ({
   sessionId, summary: "", usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0 }, usageReported: false,
@@ -117,6 +123,7 @@ async function collectOutcome(
 
 export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<NarAttempt> {
   const { onLog, signal } = input;
+  if (signal?.aborted) return held("OpenCode NAR stopped before provider contact", false, null, "aborted_pre_submit");
   const f = input.fetchImpl ?? fetch;
   let server: { url: string; passwordFile: string };
   try {
@@ -140,6 +147,15 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
     // Rejoin: the conversation is per agent+issue, so a busy one is still working an earlier run's prompt
     // (e.g. Paperclip restarted mid-run). Settle on that message; never queue a second prompt behind it.
     const inflight = await driver.inflightMessage(conversationId);
+    if (signal?.aborted) {
+      // An old in-flight message may have been adopted during rejoin. Only a
+      // deliberate Stop may interrupt it; an ordinary shutdown must leave it.
+      if (inflight && explicitStopRequested(signal)) {
+        await driver.interruptExpectedMessage(conversationId, inflight,
+          { opId: `${opId}-interrupt`, kind: "interrupt", payloadSha256: "" }, fence);
+      }
+      return held("OpenCode NAR stopped before sending a new prompt", Boolean(inflight), conversationId, "aborted");
+    }
     if (inflight) {
       msgId = inflight;
       await onLog("stdout", `[paperclip] NAR rejoined in-flight message ${inflight}; prompt not resent\n`);
@@ -147,6 +163,12 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
     const payloadSha256 = createHash("sha256").update(input.prompt).digest("hex");
     const sub = await driver.submit(host, conversationId, { opId, kind: "prompt", payloadSha256, text: input.prompt }, fence);
     if (sub.grade === "outcome_unknown") {
+      if (explicitStopRequested(signal)) {
+        // A lost admission response does not authorize a resend. Best-effort
+        // scoped interrupt only if this exact message is observed in flight.
+        await driver.interruptExpectedMessage(conversationId, msgId,
+          { opId: `${opId}-interrupt`, kind: "interrupt", payloadSha256: "" }, fence);
+      }
       const m = `OpenCode NAR prompt outcome unknown (${sub.evidence.replace(/\s+/g, " ").slice(0, 200)}); held, not resent`;
       await onLog("stderr", `[paperclip] ${m}\n`);
       return held(m, true, conversationId, "submit_outcome_unknown");
@@ -163,19 +185,43 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
   const deadline = input.timeoutSec > 0 ? Date.now() + input.timeoutSec * 1000 : Infinity;
   const pollMs = input.pollMs ?? 5000;
   let settled = false;
-  while (true) {
-    if (signal?.aborted) {
-      // Do not interrupt: the retry run rejoins this in-flight message (inflightMessage) and settles it.
-      return held("OpenCode NAR run aborted while the provider may still be working; the retry rejoins the in-flight message", true, conversationId, "aborted");
+  let interruptPromise: Promise<"requested" | "uncertain" | "idle"> | undefined;
+  const interruptOnce = () => interruptPromise ??= driver.interruptExpectedMessage(
+    conversationId, msgId,
+    { opId: `${opId}-interrupt`, kind: "interrupt", payloadSha256: "" },
+    { runId: input.runId, leaseGeneration: 1, hostEpoch: 0 },
+  );
+  // Do not wait for a possibly slow outcome read to return before initiating
+  // explicit Stop. Both this callback and the poll loop join the same request.
+  const onAbort = () => { if (explicitStopRequested(signal)) void interruptOnce(); };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    while (true) {
+      if (signal?.aborted) {
+        const interrupted = explicitStopRequested(signal) ? await interruptOnce() : "rejoin";
+        const message = interrupted === "requested"
+          ? "OpenCode NAR interrupt requested; provider termination is not yet proven"
+          : interrupted === "idle"
+            ? "OpenCode NAR stop found no matching in-flight message; no interrupt sent"
+            : interrupted === "uncertain"
+              ? "OpenCode NAR interrupt uncertain; held without replay"
+              : "OpenCode NAR observer stopped; provider turn preserved for restart rejoin";
+        return held(message, true, conversationId, interrupted === "uncertain" ? "interrupt_unknown" : "aborted");
+      }
+      const r = await driver.readOutcomeMsg(conversationId, msgId);
+      // Stop may arrive while the outcome read is pending. Settle the Stop
+      // request first rather than misreporting a concurrent read as success.
+      if (signal?.aborted) continue;
+      if (r === "hook_observed" || r === "receipted") { settled = true; break; }
+      if (Date.now() >= deadline) break;
+      await sleep(Math.min(pollMs, Math.max(0, deadline - Date.now())), signal);
     }
-    const r = await driver.readOutcomeMsg(conversationId, msgId);
-    if (r === "hook_observed" || r === "receipted") { settled = true; break; }
-    if (Date.now() >= deadline) break;
-    await sleep(Math.min(pollMs, Math.max(0, deadline - Date.now())), signal);
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
   }
 
   if (!settled) {
-    await driver.interrupt(conversationId, { opId: `${opId}-interrupt`, kind: "interrupt", payloadSha256: "" }, { runId: input.runId, leaseGeneration: 1, hostEpoch: 0 }).catch(() => undefined);
+    await interruptOnce().catch(() => undefined);
     return {
       proc: { exitCode: null, signal: null, timedOut: true, stdout: "", stderr: "" }, rawStderr: "",
       parsed: emptyParsed(conversationId, null), possibleWork: true, capacityRefusal: false,

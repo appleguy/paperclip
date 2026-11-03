@@ -827,6 +827,9 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
         details: { code: "adapter_stop_pending", runId: run.id },
       });
       expect(control.controller.signal.aborted).toBe(true);
+      expect(control.controller.signal.reason).toMatchObject({
+        code: "paperclip_explicit_run_stop", message: "Cancelled by control plane",
+      });
       // Only a Stop that never settles is reported, from the same execution.
       expect(reportAdapterStopIfUnsettled).toHaveBeenCalledWith(control.settled, captureException,
         expect.objectContaining({ runId: run.id, adapterType: "codex_local", runtimeMode: "legacy", abortRequested: true }), control,
