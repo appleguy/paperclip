@@ -127,7 +127,7 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
   }
   const driver = new OpenCodeHttpDriver({ url: server.url, passwordFile: server.passwordFile, fetchImpl: f });
   const opId = narOpIdFor(input.runId);
-  const msgId = messageIdFor(opId);
+  let msgId = messageIdFor(opId);
   let conversationId: string | null = null;
   try {
     const host = await driver.attestHost(input.agentId);
@@ -137,12 +137,20 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
     );
     conversationId = bound.conversationId;
     await onLog("stdout", `[paperclip] NAR OpenCode session ${conversationId} (run ${input.runId})\n`);
+    // Rejoin: the conversation is per agent+issue, so a busy one is still working an earlier run's prompt
+    // (e.g. Paperclip restarted mid-run). Settle on that message; never queue a second prompt behind it.
+    const inflight = await driver.inflightMessage(conversationId);
+    if (inflight) {
+      msgId = inflight;
+      await onLog("stdout", `[paperclip] NAR rejoined in-flight message ${inflight}; prompt not resent\n`);
+    } else {
     const payloadSha256 = createHash("sha256").update(input.prompt).digest("hex");
     const sub = await driver.submit(host, conversationId, { opId, kind: "prompt", payloadSha256, text: input.prompt }, fence);
     if (sub.grade === "outcome_unknown") {
       const m = `OpenCode NAR prompt outcome unknown (${sub.evidence.replace(/\s+/g, " ").slice(0, 200)}); held, not resent`;
       await onLog("stderr", `[paperclip] ${m}\n`);
       return held(m, true, conversationId, "submit_outcome_unknown");
+    }
     }
   } catch (e) {
     const msg = e instanceof OpenCodeHttpError ? `${e.code}: ${e.message}` : (e as Error).message;
@@ -157,10 +165,10 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
   let settled = false;
   while (true) {
     if (signal?.aborted) {
-      // Do not interrupt: a controller restart resumes this run and settles the same message id.
-      return held("OpenCode NAR run aborted while the provider may still be working; same run resumes the same message", true, conversationId, "aborted");
+      // Do not interrupt: the retry run rejoins this in-flight message (inflightMessage) and settles it.
+      return held("OpenCode NAR run aborted while the provider may still be working; the retry rejoins the in-flight message", true, conversationId, "aborted");
     }
-    const r = await driver.readOutcome(conversationId, opId);
+    const r = await driver.readOutcomeMsg(conversationId, msgId);
     if (r === "hook_observed" || r === "receipted") { settled = true; break; }
     if (Date.now() >= deadline) break;
     await sleep(Math.min(pollMs, Math.max(0, deadline - Date.now())), signal);

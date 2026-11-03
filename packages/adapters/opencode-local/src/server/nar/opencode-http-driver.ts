@@ -211,8 +211,31 @@ export class OpenCodeHttpDriver implements ProviderDriver {
 
   // Provider-side evidence only; "receipted" is Core's call (R-N3), so this never returns it.
   async readOutcome(conversationId: string, opId: string): Promise<OutcomeRead> {
-    const msgId = messageIdFor(opId);
     this.rememberOp(opId);
+    return this.readOutcomeMsg(conversationId, messageIdFor(opId));
+  }
+
+  // Rejoin (spec: restart resumes, never replays): the user message the conversation is still working on, or
+  // null when it is idle. A retry run after a Paperclip restart settles on this message instead of submitting
+  // a second prompt into the same conversation.
+  async inflightMessage(conversationId: string): Promise<string | null> {
+    const sid = encodeURIComponent(conversationId);
+    const inbox = await this.json("GET", `/api/session/${sid}/inbox`);
+    const pending = inbox.status === 200 && Array.isArray(inbox.data?.data) ? inbox.data.data : [];
+    const last = pending[pending.length - 1];
+    if (typeof last?.id === "string") return last.id;
+    const active = await this.json("GET", "/api/session/active");
+    if (active.status !== 200 || typeof active.data?.data !== "object") throw new OpenCodeHttpError("http", `session.active HTTP ${active.status}`, active.status);
+    if (!active.data.data?.[conversationId]) return null;
+    const list = await this.json("GET", `/api/session/${sid}/message?limit=200`);
+    const msgs: any[] = list.status === 200 && Array.isArray(list.data?.data) ? list.data.data : [];
+    const user = msgs.filter((m) => m?.type === "user" && typeof m?.id === "string")
+      .sort((a, b) => (b?.time?.created ?? 0) - (a?.time?.created ?? 0))[0];
+    if (!user) throw new OpenCodeHttpError("mismatch", `active session ${conversationId} has no user message`);
+    return user.id;
+  }
+
+  async readOutcomeMsg(conversationId: string, msgId: string): Promise<OutcomeRead> {
     let log;
     try { log = await this.observe(conversationId); } catch { return "unknown"; }
     let admittedAt = -1;

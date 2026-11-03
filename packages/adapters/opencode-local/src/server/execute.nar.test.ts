@@ -25,6 +25,7 @@ describe("OpenCode adapter nativeRuntime nar", () => {
   let server: Server;
   let url = "";
   let sessions: Map<string, { info: any; msgs: any[] }>;
+  let active: Set<string>;
   let promptPosts: number;
   let promptStatus: number | undefined;
   let clock: number;
@@ -34,6 +35,7 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     cli = path.join(root, "fake-opencode");
     await fs.writeFile(cli, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
     sessions = new Map();
+    active = new Set();
     promptPosts = 0;
     promptStatus = undefined;
     clock = 1000;
@@ -50,7 +52,7 @@ describe("OpenCode adapter nativeRuntime nar", () => {
         const p = (req.url ?? "").split("?")[0]!;
         const method = req.method;
         if (p === "/api/info") return reply(200, { version: "2.2.5", pid: 4242, urls: [url + "/"] });
-        if (p === "/api/session/active") return reply(200, { data: {} });
+        if (p === "/api/session/active") return reply(200, { data: Object.fromEntries([...active].map((id) => [id, { type: "running" }])) });
         if (p === "/api/session" && method === "POST") {
           if (sessions.has(body.id)) return reply(409, {});
           sessions.set(body.id, { info: { id: body.id, location: body.location, model: body.model, time: { created: clock++ } }, msgs: [] });
@@ -140,6 +142,28 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect(next).toMatchObject({ exitCode: 0, summary: "answer 3", costUsd: 0.5, usage: { inputTokens: 302 } });
     expect(runProcess).not.toHaveBeenCalled();
   });
+
+  it("a retry run after a mid-run Paperclip restart rejoins the in-flight message instead of re-prompting", async () => {
+    // Interrupted run-1 left its prompt running in the per-issue session (provider not interrupted).
+    const sid = sessionIdFor(scope);
+    const orphan = messageIdFor(narOpIdFor("run-1"));
+    sessions.set(sid, { info: { id: sid, location: { directory: root }, model: { providerID: "openai", id: "fixture", variant: "medium" }, time: { created: clock++ } },
+      msgs: [{ id: orphan, type: "user", text: "Full assignment", time: { created: clock++ } }] });
+    active.add(sid);
+    const finish = setTimeout(() => {
+      const s = sessions.get(sid)!;
+      s.msgs.push({ id: "msg_done", type: "assistant", time: { created: clock++, completed: clock++ },
+        content: [{ type: "text", text: "orphan finished" }], cost: 0.25, tokens: { input: 50, output: 5, reasoning: 0, cache: { read: 0, write: 0 } } });
+      s.info.time.idle = clock++;
+      s.info.outcome = "succeeded";
+      active.delete(sid);
+    }, 60);
+    const retry = await execute(context("run-1-retry", { nativeRuntime: "nar" }) as never); // one 5s poll
+    clearTimeout(finish);
+    expect(promptPosts).toBe(0);
+    expect(userMsgs().map((m) => m.id)).toEqual([orphan]);
+    expect(retry).toMatchObject({ exitCode: 0, summary: "orphan finished", sessionId: sid, costUsd: 0.25 });
+  }, 15_000);
 
   it("holds on an unknown submit outcome and never resends", async () => {
     promptStatus = 503;
