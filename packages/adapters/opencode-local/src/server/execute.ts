@@ -55,6 +55,7 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl, createOpenCodeJsonlParser } from "./parse.js";
 import { createOpenCodeAttemptProgressGuard } from "./attempt-progress.js";
+import { runNarOpenCodeAttempt } from "./nar/nar-attempt.js";
 import { OpenCodeSharedSessionWait, prepareSharedOpenCodeSession } from "./shared-session-recovery.js";
 import {
   ensureOpenCodeModelConfiguredAndAvailable,
@@ -520,7 +521,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const sessionId = canResumeSession ? runtimeSessionId : null;
     let sharedSession: Awaited<ReturnType<typeof prepareSharedOpenCodeSession>> | null = null;
     const sharedConfigPath = asString(config.sharedServerRecoveryConfigPath, "").trim();
-    if (sharedConfigPath) {
+    // Opt-in native runtime: no child process, HTTP driver against the shared server (nar/nar-attempt.ts).
+    const narTaskId = wakeTaskId ?? asString(runtime.taskKey, "").trim();
+    const narMode = config.nativeRuntime === "nar" && sharedConfigPath.length > 0;
+    if (narMode && (executionTargetIsRemote || !narTaskId || !path.isAbsolute(sharedConfigPath))) {
+      await onLog("stderr", "[paperclip] NAR OpenCode requires a local target, a task and an absolute shared config; no inference sent.\n");
+      return {
+        exitCode: 75, signal: null, timedOut: false,
+        errorMessage: "OpenCode NAR runtime unavailable for this run; no inference sent",
+        resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      };
+    }
+    if (sharedConfigPath && !narMode) {
       // Opt-in only for the local persistent OpenCode server. Any unpaired
       // active provider turn fails before inference; never manufacture a fork.
       try {
@@ -695,6 +707,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         });
       }
 
+      if (narMode) {
+        return runNarOpenCodeAttempt({
+          configPath: sharedConfigPath, agentId: agent.id, taskId: narTaskId, runId, cwd: effectiveExecutionCwd,
+          model: model && variant ? `${model}#${variant}` : model, prompt, timeoutSec, signal: ctx.signal, onLog,
+        });
+      }
       const consumeAccounting = createOpenCodeJsonlParser();
       const progressGuard = createOpenCodeAttemptProgressGuard();
       let hasAccounting = false;
@@ -849,6 +867,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     try {
       const initial = await runAttempt(sharedSession?.resumed ? sharedSession.sessionId : sessionId);
+      if (narMode) {
+        // One attempt, never a stale-session retry: a second prompt could replay work.
+        const result = toResult(initial);
+        const recovery = (initial as { executionRecovery?: unknown }).executionRecovery;
+        return recovery ? { ...result, resultJson: { ...(result.resultJson ?? {}), executionRecovery: recovery } } : result;
+      }
       await sharedSession?.finish(initial.proc);
       const initialFailed =
         !initial.proc.timedOut && ((initial.proc.exitCode ?? 0) !== 0 || Boolean(initial.parsed.errorMessage));

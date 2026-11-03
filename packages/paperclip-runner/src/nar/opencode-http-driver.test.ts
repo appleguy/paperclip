@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { OpenCodeHttpDriver, OpenCodeHttpError, messageIdFor, parseModelRef, parseSse, sessionIdFor } from "./opencode-http-driver.js";
+import { OpenCodeHttpDriver, OpenCodeHttpError, messageIdFor, parseModelRef, parseSse, sessionIdFor } from "../../../adapters/opencode-local/src/server/nar/opencode-http-driver.js";
 
 const URL0 = "http://127.0.0.1:19403";
 const PW = `pw-${randomBytes(9).toString("hex")}`;

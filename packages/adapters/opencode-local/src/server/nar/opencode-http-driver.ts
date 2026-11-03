@@ -5,10 +5,25 @@
 //   message  msg_<sha256(opId)>          (POST /api/session/:id/prompt {id})
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { CAPABILITIES } from "./capabilities.js";
 import type {
   Capabilities, ConvScope, Fence, HostHandle, ObserveEvent, Op, OutcomeRead, ProviderDriver, SubmitResult,
-} from "./driver.js";
+} from "./types.js";
+
+// Provider boundary: this driver lives with the OpenCode adapter (the adapter package is source-exported and
+// depends only on adapter-utils). paperclip-runner/src/nar keeps the interface + conformance suite and imports
+// this file by relative path in its test. The matrix cell mirrors paperclip-runner/src/nar/capabilities.ts.
+export const OPENCODE_CAPABILITIES: Capabilities = {
+  provider: "opencode",
+  inputKind: "http_api",
+  ackGrade: "accepted_provider",
+  receiptKinds: ["mcp_tool", "provider_event"],
+  ownerPhone: { path: "Herdr/Moshi pane (generic)", proof: "OPEN" },
+  permission: { route: "provider_policy", proof: "OPEN" },
+  resume: { byId: true, proof: "SHIPPED-UNPROVEN" },
+  interrupt: { scoped: true, proof: "SHIPPED-UNPROVEN" },
+  needsPane: false,
+  observeCoverage: "complete",
+};
 
 export const QUALIFIED_OPENCODE_V2 = "2.2.5";
 type Fetch = typeof fetch;
@@ -46,7 +61,7 @@ export class OpenCodeHttpDriver implements ProviderDriver {
   }
 
   capabilities(): Capabilities {
-    return CAPABILITIES.opencode;
+    return OPENCODE_CAPABILITIES;
   }
 
   private auth(): string {
