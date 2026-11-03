@@ -17,7 +17,19 @@ import {
 
 const runFile = promisify(execFile);
 const AGY = "/opt/homebrew/bin/agy";
-const MODEL = "gemini-3.8-flash-low";
+const DEFAULT_MODEL = "gemini-3.8-flash-low";
+export const AGY_MODELS = ["gemini-3.8-flash-low", "gemini-3.8-flash-medium", "gemini-3.8-flash-high"] as const;
+/** Only Gemini 3.8 Flash tiers run here; Claude, GPT and any other model are refused. */
+export function resolveAgyModel(value: unknown): string {
+  const model = typeof value === "string" && value.trim() ? value.trim() : DEFAULT_MODEL;
+  if (!(AGY_MODELS as readonly string[]).includes(model))
+    throw new Error(`agy adapter permits only ${AGY_MODELS.join(", ")}; received ${model}`);
+  return model;
+}
+function modelLabel(model: string): string {
+  const tier = model.split("-").pop() ?? "";
+  return `Gemini 3.8 Flash ${tier.charAt(0).toUpperCase()}${tier.slice(1)}`;
+}
 const ID = /^[a-zA-Z0-9_-]{1,55}$/;
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
@@ -230,7 +242,7 @@ async function inspectRemoteConversation(
 }
 
 async function ensureSession(
-  socket: string, session: string, cwd: string, stateDir: string, rejoinOnly: boolean,
+  socket: string, session: string, cwd: string, stateDir: string, rejoinOnly: boolean, model: string,
 ): Promise<string> {
   let exists = true;
   try { await tmux(socket, ["has-session", ...target(session)]); } catch { exists = false; }
@@ -240,7 +252,7 @@ async function ensureSession(
     await fs.mkdir(cwd, { recursive: true });
     // tmux exec mode: no interpolated shell source or arbitrary model selection.
     await tmux(socket, ["new-session", "-d", "-s", session, "-c", cwd,
-      AGY, "--remote-control", "--dangerously-skip-permissions", "--model", MODEL]);
+      AGY, "--remote-control", "--dangerously-skip-permissions", "--model", model]);
   }
   const processName = (await tmux(socket, ["display-message", "-p", ...target(session), "#{pane_current_command}"])).trim();
   if (processName !== "agy") throw new Error(`tmux pane is ${processName}, not agy; refusing to commandeer it`);
@@ -324,18 +336,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const socket = asString(cfg.tmuxSocket, "paperclip-agy-rc");
   const stateDir = path.resolve(asString(cfg.stateDir, path.join(os.homedir(), ".paperclip/agy-rc-state")));
   const cwd = path.resolve(asString(cfg.cwd, path.join(os.homedir(), ".paperclip/agy-rc-workspace")));
-  const model = asString(cfg.model, MODEL);
+  const requestedModel = asString(cfg.model, DEFAULT_MODEL);
+  const model = AGY_MODELS.includes(requestedModel as typeof AGY_MODELS[number]) ? requestedModel : DEFAULT_MODEL;
   const issueId = asString(ctx.context.issueId, asString(ctx.context.taskId, ""));
   const timeoutMs = Math.min(3600, Math.max(30, Number(cfg.timeoutSec) || 600)) * 1000;
   let unlock: (() => Promise<void>) | undefined;
   let dispatched = false;
   const failure = (reason: string, timedOut = false): AdapterExecutionResult => ({
-    exitCode: 1, signal: null, timedOut, model: MODEL, provider: "google", biller: "google",
+    exitCode: 1, signal: null, timedOut, model, provider: "google", biller: "google",
     billingType: "subscription", costStatus: "unpriced", errorMessage: reason,
     ...(dispatched ? {} : { executionRecovery: { kind: "bootstrap" as const, providerWorkStarted: false as const } }),
   });
   try {
-    if (model !== MODEL) throw new Error(`agy adapter permits only ${MODEL}; received ${model}`);
+    resolveAgyModel(requestedModel);
     if (!ID.test(socket) || !ID.test(session)) throw new Error("invalid tmux socket/session");
     if (!issueId) throw new Error("agy adapter requires one issueId/taskId");
     if (!ctx.authToken) throw new Error("agy adapter requires a Paperclip run-scoped token before dispatch");
@@ -345,7 +358,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     unlock = await acquire(stateDir, Date.now() + timeoutMs);
     const activePath = path.join(stateDir, "active.json");
     const adopted = adoptableActive(await fs.readFile(activePath, "utf8").catch(() => ""), issueId, stateDir);
-    const rcUrl = await ensureSession(socket, session, cwd, stateDir, Boolean(adopted));
+    const rcUrl = await ensureSession(socket, session, cwd, stateDir, Boolean(adopted), model);
     if (!rcUrl) throw new Error("agy RC URL unavailable: use /remote-control in its TUI, then retry");
     // Owner 2026-11-03: auto re-pin, logged. The URL rotates on every agy restart; ensureSession only reads it from the
     // adapter-owned private tmux socket/session, so a new URL there is the same owned instance. The pin lives in
@@ -395,7 +408,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const instructions = [
       `Paperclip run ${ctx.runId}, issue ${issueId}. Work on ONLY the assigned issue.`,
       "Your actions are visible and steerable through the single Antigravity Remote Control session.",
-      "Use Gemini 3.8 Flash Low. Do not switch models. Never use secrets or guess Paperclip API credentials.",
+      `Use ${modelLabel(model)}. Do not switch models.`,
+      " Never use secrets or guess Paperclip API credentials.",
       "Finish the requested issue work, then write a JSON receipt via your write_to_file tool",
       `to ${receiptPath} with exactly these keys: runId = ${ctx.runId}, issueId = ${issueId},`,
       'status = "done", summary = a short factual summary, report = a detailed Markdown result (at least 250 characters).',
@@ -444,7 +458,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     await ctx.onLog("stdout", `[agy] Done ${issueId}: ${receipt.summary}; conversation=${conversationId ?? "unknown"}\n`);
     await fs.rm(activePath); // completed only after authenticated report + issue closure
     return {
-      exitCode: 0, signal: null, timedOut: false, provider: "google", biller: "google", model: MODEL,
+      exitCode: 0, signal: null, timedOut: false, provider: "google", biller: "google", model,
       billingType: "subscription", costStatus: "unpriced", summary: receipt.summary,
       sessionId: conversationId, sessionDisplayId: conversationId,
       sessionParams: { sessionId: conversationId, cwd, remoteControlUrl: rcUrl, tmuxSocket: socket, tmuxSession: session },

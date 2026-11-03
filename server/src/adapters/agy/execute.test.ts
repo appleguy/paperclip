@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { adoptableActive, inputGuard, isEmptyInputBox, isIdleScreen, normalizeOneLine, parseReceipt, parseRemoteUrl, parseRemoteConversationId, pasteSettleMs, STALE_IDLE } from "./execute.js";
+import { adoptableActive, inputGuard, isEmptyInputBox, isIdleScreen, normalizeOneLine, parseReceipt, parseRemoteUrl, parseRemoteConversationId, pasteSettleMs, STALE_IDLE, resolveAgyModel } from "./execute.js";
 
 describe("agy single-RC dispatch safety", () => {
   it("parses shared /r/ base URL and drops conversation query", () => {
@@ -154,5 +154,15 @@ describe("agy single-RC dispatch safety", () => {
     expect(() => adoptableActive(JSON.stringify(a), "i2", "/s")).toThrow(/Never replay/);
     expect(() => adoptableActive(JSON.stringify({ ...a, receiptPath: "/etc/x.json" }), "i1", "/s")).toThrow(/Never replay/);
     expect(() => adoptableActive("{not json", "i1", "/s")).toThrow(/Never replay/);
+  });
+});
+
+describe("resolveAgyModel", () => {
+  it("defaults to flash-low and accepts the three Gemini 3.8 Flash tiers", () => {
+    expect(resolveAgyModel(undefined)).toBe("gemini-3.8-flash-low");
+    for (const m of ["gemini-3.8-flash-low", "gemini-3.8-flash-medium", "gemini-3.8-flash-high"]) expect(resolveAgyModel(m)).toBe(m);
+  });
+  it("refuses Claude, GPT and other models", () => {
+    for (const m of ["claude-sonnet-5-5", "gpt-6", "gemini-3.8-pro", "gemini-3.8-flash-ultra"]) expect(() => resolveAgyModel(m)).toThrow(/permits only/);
   });
 });

@@ -24,20 +24,25 @@ export const agyAdapter: ServerAdapterModule = {
     return { adapterType: "agy_local", status: checks.some(c => c.level === "error") ? "fail" : "pass",
       testedAt: new Date().toISOString(), checks };
   },
-  models: [{ id: "gemini-3.8-flash-low", label: "Gemini 3.8 Flash (Low) via shared Antigravity RC" }],
+  models: [
+    { id: "gemini-3.8-flash-low", label: "Gemini 3.8 Flash (Low) via shared Antigravity RC" },
+    { id: "gemini-3.8-flash-medium", label: "Gemini 3.8 Flash (Medium) via shared Antigravity RC" },
+    { id: "gemini-3.8-flash-high", label: "Gemini 3.8 Flash (High) via shared Antigravity RC" },
+  ],
   supportsLocalAgentJwt: true,
   supportsInstructionsBundle: true,
   instructionsPathKey: "instructionsFilePath",
   agentConfigurationDoc: `# agy_local: one shared Antigravity Remote Control session
 
-Requires macOS, agy 1.4.12 and tmux. Runs ONLY gemini-3.8-flash-low.
+Requires macOS, agy 1.4.12 and tmux. Runs ONLY gemini-3.8-flash-low, -medium or -high.
 One persistent interactive TUI with a stable https://antigravity.google.com/r/... instance.
 Paperclip turns are serialized. Each issue is isolated with /new, while the
 owner sees/steers that same live process from the single RC instance.
 
 Config:
 - cwd: fixed, trusted work directory; all turns share it
-- model: gemini-3.8-flash-low (other models refused)
+- model: gemini-3.8-flash-{low,medium,high}, default low (all other models refused); one
+  TUI per tmuxSocket/tmuxSession, so give each model tier its own socket
 - tmuxSocket (default paperclip-agy-rc); tmuxSession (default agy)
 - stateDir (default ~/.paperclip/agy-rc-state): private lock, active checkpoint,
   per-agent status-line.json and one completion receipt per run; prune
