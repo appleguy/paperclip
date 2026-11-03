@@ -10,7 +10,7 @@ import { notifyInstructionCommit } from "./instruction-commit-notifications.js";
 import { notifyScheduledRetryCancellation } from "./scheduled-retry-cancellation-notifications.js";
 import { and, eq, or, sql } from "drizzle-orm";
 import { agents, agentApiKeys, agentRuntimeState, agentTaskSessions, agentWakeupRequests, activityLog,
-  budgetReservations, heartbeatRunEvents, heartbeatRuns, issueExecutionDecisions, issues, issueComments,
+  budgetReservations, costEvents, heartbeatRunEvents, heartbeatRuns, issueExecutionDecisions, issues, issueComments,
   caseHandoffs, principalPermissionGrants, type Db } from "@paperclipai/db";
 import { conflict } from "../errors.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
@@ -63,6 +63,12 @@ export async function deleteAgentDependencies(tx: Db, companyId: string, id: str
   await notifyInstructionCollection(tx, { companyId: companyId });
   await notifyCancelledWorkspacePreservation(tx, { companyId: companyId });
   await notifyUnsafeWorkspaceExportRecovery(tx, { companyId });
+  // cost_events reference both the agent and its runs; agent-usage rows cannot be
+  // detached (cost_events_usage_kind_check requires agent_id), so they go with the agent.
+  await tx.delete(costEvents).where(or(
+    eq(costEvents.agentId, id),
+    sql`${costEvents.heartbeatRunId} in (select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.agentId} = ${id})`,
+  ));
   await tx.delete(heartbeatRuns).where(eq(heartbeatRuns.agentId, id));
   await tx.delete(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, id));
   await tx.delete(agentApiKeys).where(eq(agentApiKeys.agentId, id));
