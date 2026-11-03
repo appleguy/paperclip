@@ -25,15 +25,16 @@ describe("deploy drain exact ownership and fail-closed rules", () => {
   it("retains the same durable binding when OpenCode is already idle", () => {
     assert.equal(plan([run], [binding], { [sid]: { type: "idle" } })[0].active, false);
   });
-  it("refuses an orphan active server session even when another run has a journal", () => {
-    assert.throws(() => plan([run], [binding], {
+  it("ignores an unowned active server session: a Paperclip restart does not touch it", () => {
+    assert.deepEqual(plan([run], [binding], {
       [sid]: { type: "busy" }, ses_unowned_live_45678: { type: "busy" },
-    }), /unowned or pre-journal/);
+    }).map(item => item.sessionId), [sid]);
   });
-  it("refuses pre-journal and stale run mappings", () => {
-    assert.throws(() => plan([run], []), /missing or conflicting/);
-    assert.throws(() => plan([run], [{ ...binding, runId: "44444444-4444-4444-8444-444444444444" }]),
-      /missing or conflicting/);
+  const lost = { runId: id, issueId: issue, agentId, taskId: null, sessionId: null, url: null,
+    active: false, state: "restart-lost" };
+  it("marks pre-journal and stale run mappings restart-lost instead of waiting", () => {
+    assert.deepEqual(plan([run], []), [lost]);
+    assert.deepEqual(plan([run], [{ ...binding, runId: "44444444-4444-4444-8444-444444444444" }]), [lost]);
   });
   it("refuses a binding belonging to another issue or server", () => {
     assert.throws(() => plan([run], [{ ...binding, taskId: id }]), /journal task\/session identity/);
@@ -45,9 +46,9 @@ describe("deploy drain exact ownership and fail-closed rules", () => {
     const binding2 = { ...binding, runId: run2.id };
     assert.throws(() => plan([run, run2], [binding, binding2]), /two runs claim one session/);
   });
-  it("refuses non-OpenCode runs instead of killing them", () => {
-    const agents = new Map([[agentId, { ...agent, adapterType: "claude_local" }]]);
-    assert.throws(() => verifyOwned([run], agents, [binding], new Map([[url, {}]])), /non-OpenCode/);
+  it("never interrupts non-OpenCode runs; they are restart-lost and recovered server-side", () => {
+    const agents = new Map([[agentId, { adapterType: "claude_local", url: null, cwd: null }]]);
+    assert.deepEqual(verifyOwned([run], agents, [binding], new Map()), [lost]);
   });
   it("never selects a session with an invalid ID or mismatched workspace", () => {
     assert.throws(() => plan([run], [{ ...binding, sessionId: "invalid" }]), /journal task\/session identity/);
@@ -78,6 +79,14 @@ describe("pre-L2 stale orphan reconciliation", () => {
     assert.equal(candidate([], new Map(), [], new Set(), new Map([
       [url + "/" + orphan, { time: { updated: "stale" } }],
     ])).length, 0);
+  });
+  it("selects a fresh zombie whose only journal owner run is no longer running", () => {
+    const fresh = new Map([[url + "/" + orphan, { time: { updated: at - 1_000 } }]]);
+    const zombieBinding = { ...binding, sessionId: orphan, runId: "44444444-4444-4444-8444-444444444444" };
+    assert.deepEqual(candidate([], new Map(), [zombieBinding], new Set([url + "/" + orphan]), fresh),
+      [{ url, sessionId: orphan, updatedAt: at - 1_000, state: "planned", zombie: true }]);
+    assert.equal(candidate([run], new Map([[agentId, agent]]), [{ ...zombieBinding, runId: id }],
+      new Set([url + "/" + orphan]), fresh).length, 0);
   });
   it("rejects malformed active status and does not treat retry as interruptible", () => {
     assert.throws(() => selectStaleUnowned(new Map([[url, null]]), details, [], new Map(), [], new Set(), at),
@@ -217,8 +226,8 @@ describe("installed deploy shell contract", () => {
   it("orders admission, bounded wait, owned interrupt, restart, health and completion", async () => {
     const source = await fs.readFile(new URL("./pc-deploy.sh", import.meta.url), "utf8");
     const markers = [
-      'node "$helper" verified "$sha"', 'node "$helper" pace',
-      'node "$helper" begin "$manifest"', 'node "$helper" wait "$manifest" 600',
+      'node "$helper" verified "$sha"',
+      'node "$helper" begin "$manifest"', 'node "$helper" wait "$manifest" 0',
       'node "$helper" pause "$manifest"', 'node "$helper" verify "$manifest"',
       'launchctl kickstart -k', 'node "$helper" finish "$manifest" "$sha"',
     ];
@@ -231,7 +240,7 @@ describe("installed deploy shell contract", () => {
     assert.match(source, /node "\$helper" release "\$manifest"/);
     assert.match(source, /if \[ "\$rc" -eq 10 \]|\[ "\$rc" -eq 10 \]/);
     assert.match(source, /flock -x|-x -w 2700/);
-    assert.doesNotMatch(source, /poll_health|curl -fsS/);
+    assert.doesNotMatch(source, /poll_health|curl -fsS|helper" pace|wait "\$manifest" [1-9]/);
     assert.match(source, /helper" finish "\$manifest" "\$sha"/);
     assert.match(source, /install --ref "\$sha"/);
     assert.match(source, /source_branch=fix\/git-installer-bundled-workspaces-20261030/);

@@ -94,22 +94,8 @@ else
   rc=$?
   [ "$rc" -eq 10 ] || exit "$rc"
 fi
-# Wait safely for the lead's 30-minute deploy spacing, even for a concurrent
-# caller that only acquires the lock after the first caller restarts.
-node "$helper" pace || exit 1
-# Recheck the source after the pacing wait; another agent may have committed.
-[ "$(git -C "$repo/master" symbolic-ref --quiet --short HEAD)" = "$source_branch" ] || {
-  echo 'pc-deploy: source branch changed during pacing' >&2; exit 1;
-}
-sha=$(git -C "$repo/master" rev-parse --verify HEAD) || exit 1
-short=$(printf '%s' "$sha" | cut -c1-12)
-if node "$helper" verified "$sha"; then
-  echo "pc-deploy: $short serving process verified after pacing; no restart needed"
-  exit 0
-else
-  rc=$?
-  [ "$rc" -eq 10 ] || exit "$rc"
-fi
+# Owner policy 2026-11-02: deploys never wait (no pacing gate, no drain wait).
+# Running work is paused at an exact safe point or left for server recovery.
 original=$(current)
 original_sha=$(git -C "$repo/master" rev-parse --verify "$original^{commit}" 2>/dev/null || :)
 # The exact 40-digit immutable sha is pushed and installed. Never resolve
@@ -134,7 +120,7 @@ done
 [ "$(current)" = "$short" ] || {
   echo 'pc-deploy: installed payload differs from pushed SHA' >&2; exit 1;
 }
-if node "$helper" wait "$manifest" 600; then
+if node "$helper" wait "$manifest" 0; then
   :
 else
   rc=$?

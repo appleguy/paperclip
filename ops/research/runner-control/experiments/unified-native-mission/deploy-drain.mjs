@@ -180,7 +180,8 @@ async function listRunning(client) {
     const rows = await client.api("GET", "/api/companies/" + company.id + "/live-runs?limit=1000");
     ensure(Array.isArray(rows) && rows.length < 1000, "live-run inventory truncated or invalid");
     for (const run of rows) if (run.status === "running") {
-      ensure(UUID.test(run.id) && UUID.test(run.agentId) && UUID.test(run.issueId), "invalid run identity");
+      ensure(UUID.test(run.id) && UUID.test(run.agentId) && (run.issueId == null || UUID.test(run.issueId)),
+        "invalid run identity");
       runs.push(run);
     }
   }
@@ -190,11 +191,20 @@ async function listRunning(client) {
 export function verifyOwned(runs, agents, bindings, active) {
   const planned = [];
   const selected = new Set();
+  // Owner policy 2026-11-02: deploys never wait. A run with no journaled
+  // OpenCode session (Claude/Codex/agy, NAR, pre-journal) is not paused; the
+  // restart loses its process and server recovery re-runs or rejoins it.
   for (const run of runs) {
     const agent = agents.get(run.agentId);
-    ensure(agent && agent.adapterType === "opencode_local", "cannot forcibly interrupt non-OpenCode running run");
-    const match = bindings.filter(b => b.runId === run.id && b.agentId === run.agentId);
-    ensure(match.length === 1, "missing or conflicting durable OpenCode run/session binding");
+    ensure(agent, "running run agent unavailable");
+    const match = agent.adapterType === "opencode_local" && agent.url
+      ? bindings.filter(b => b.runId === run.id && b.agentId === run.agentId) : [];
+    ensure(match.length <= 1, "conflicting durable OpenCode run/session bindings");
+    if (match.length === 0) {
+      planned.push({ runId: run.id, issueId: run.issueId ?? null, agentId: run.agentId, taskId: null,
+        sessionId: null, url: null, active: false, state: "restart-lost" });
+      continue;
+    }
     const b = match[0];
     ensure(SESSION.test(b.sessionId) && UUID.test(b.taskId) && b.taskId === run.issueId,
       "journal task/session identity does not match the running issue");
@@ -208,8 +218,10 @@ export function verifyOwned(runs, agents, bindings, active) {
     ensure(object(states), "unverifiable provider active sessions");
     for (const [sid, state] of Object.entries(states)) {
       if (state?.type === "idle") continue;
-      ensure(SESSION.test(sid) && selected.has(url + "/" + sid),
-        "unowned or pre-journal OpenCode session is still active");
+      ensure(SESSION.test(sid), "invalid active OpenCode session identity");
+      // A Paperclip restart does not touch the OpenCode server: an unowned
+      // session keeps running and never blocks a deploy.
+      if (!selected.has(url + "/" + sid)) continue;
       const record = planned.find(p => p.url === url && p.sessionId === sid);
       record.active = true;
     }
@@ -243,13 +255,17 @@ export function selectStaleUnowned(active, details, runs, agents, bindings, jour
     for (const [sessionId, status] of Object.entries(states)) {
       if (status?.type === "idle") continue;
       ensure(SESSION.test(sessionId), "invalid active OpenCode session identity");
-      if (!["busy", "running"].includes(status?.type) || unpairedRun ||
-        journals.has(url + "/" + sessionId) ||
-        bindings.some(b => b.url === url && b.sessionId === sessionId)) continue;
+      if (!["busy", "running"].includes(status?.type) || unpairedRun) continue;
+      const owners = bindings.filter(b => b.url === url && b.sessionId === sessionId);
+      // Zombie: every journal owner's run is terminal (e.g. cancelled by an
+      // agent pause) yet the provider turn is still generating. Its owner is
+      // gone, so it is interrupted at once, with no staleness wait.
+      const zombie = owners.length > 0 && !owners.some(b => runs.some(run => run.id === b.runId));
+      if (!zombie && (owners.length > 0 || journals.has(url + "/" + sessionId))) continue;
       const updated = details.get(url + "/" + sessionId)?.time?.updated;
       if (!Number.isSafeInteger(updated) || updated <= 0 || updated > at ||
-        at - updated < 180_000) continue;
-      candidates.push({ url, sessionId, updatedAt: updated, state: "planned" });
+        (!zombie && at - updated < 180_000)) continue;
+      candidates.push({ url, sessionId, updatedAt: updated, state: "planned", ...(zombie ? { zombie: true } : {}) });
     }
   }
   ensure(candidates.length <= 100, "too many unowned sessions to verify safely");
@@ -303,8 +319,11 @@ async function snapshot(client, record = null) {
     if (agents.has(run.agentId)) continue;
     const agent = await client.api("GET", "/api/agents/" + run.agentId);
     const cfgPath = agent?.adapterConfig?.sharedServerRecoveryConfigPath;
-    ensure(agent?.adapterType === "opencode_local" && typeof cfgPath === "string" &&
-      path.isAbsolute(cfgPath), "active run lacks a local, owned OpenCode recovery configuration");
+    if (agent?.adapterType !== "opencode_local" || typeof cfgPath !== "string" || !path.isAbsolute(cfgPath)) {
+      // Owner policy 2026-11-02: deploys never wait; verifyOwned marks this run restart-lost.
+      agents.set(run.agentId, { adapterType: agent?.adapterType ?? "unknown", url: null, cwd: null });
+      continue;
+    }
     const cfg = await readJson(cfgPath);
     const p = await provider(cfg);
     const cwd = agent.adapterConfig.cwd;
@@ -351,8 +370,11 @@ async function snapshot(client, record = null) {
     for (const [url, states] of active) {
       ensure(object(states), "unverifiable provider active sessions");
       for (const [sid, state] of Object.entries(states)) {
-        if (!["busy", "running"].includes(state?.type) || journals.has(url + "/" + sid) ||
-          bindings.some(b => b.url === url && b.sessionId === sid)) continue;
+        const live = bindings.some(b => b.url === url && b.sessionId === sid &&
+          runs.some(run => run.id === b.runId));
+        const bound = bindings.some(b => b.url === url && b.sessionId === sid);
+        if (!["busy", "running"].includes(state?.type) || live ||
+          (!bound && journals.has(url + "/" + sid))) continue;
         ensure(SESSION.test(sid), "invalid OpenCode session identity");
         details.set(url + "/" + sid, await providers.get(url).request("GET", "/session/" + sid));
       }
@@ -378,7 +400,7 @@ async function snapshot(client, record = null) {
           listRunning(client),
         ]);
         ensure(["busy", "running"].includes(states?.[item.sessionId]?.type) &&
-          detail?.time?.updated === item.updatedAt && Date.now() - item.updatedAt >= 180_000,
+          (item.zombie || (detail?.time?.updated === item.updatedAt && Date.now() - item.updatedAt >= 180_000)),
           "orphan activity changed during safety recheck");
         ensure(latestRuns.map(run => run.id).sort().join(",") === initialRunIds,
           "Paperclip run set changed during orphan safety recheck");
@@ -387,7 +409,10 @@ async function snapshot(client, record = null) {
           for (const filename of files) {
             if (!/^[a-zA-Z0-9_-]{1,130}\.json$/.test(filename)) continue;
             const row = await readJson(path.join(dir, filename));
-            ensure(row?.sessionId !== item.sessionId, "new journal ownership appeared for orphan session");
+            // A zombie keeps its terminal-run journal; only a live run's claim wins.
+            ensure(row?.sessionId !== item.sessionId ||
+              (item.zombie && !latestRuns.some(run => run.id === row?.runId)),
+              "new journal ownership appeared for orphan session");
           }
         }
       });
