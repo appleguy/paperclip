@@ -165,6 +165,12 @@ export async function send(
   if (/[\r\n]/.test(message)) throw new Error("multiline TUI submissions forbidden");
   const readiness = await inputReadiness(socket, session, stateDir, cwd, expectedConversationId);
   if (!readiness.allowed) throw new Error(`agy input guard refused: ${readiness.reason}`);
+  await pasteSubmit(socket, session, message, stateDir);
+}
+
+/** One-line bracketed paste + Enter. Callers own their input guard (agy: send(); claude-rc: its own idle check). */
+export async function pasteSubmit(socket: string, session: string, message: string, stateDir: string): Promise<void> {
+  if (/[\r\n]/.test(message)) throw new Error("multiline TUI submissions forbidden");
   // Private UTF-8 file and named tmux buffer: no prompt in argv, no shared
   // unnamed paste buffer. Bracketed paste keeps '/' and text inside one edit.
   const file = path.join(stateDir, "dispatch-input.txt");

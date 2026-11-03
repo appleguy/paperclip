@@ -1,9 +1,9 @@
 /**
- * Paperclip -> one long-lived interactive Claude Code session with Remote
- * Control. `claude --print --remote-control` is ignored by the CLI (never
- * listed on the owner's phone), so this drives the SAME interactive process
- * the owner sees and steers under a stable session name. Modeled on agy:
- * serialized, receipt-closed, same-issue adoption after restart, no replay.
+ * One interactive Claude Code session, shared by Paperclip and the owner via
+ * Remote Control. Primary transport: a private MCP channel in that SAME TUI.
+ * The tmux input path is guarded compatibility fallback, never a retry of
+ * an uncertain channel write. Only the existing JSON receipt + deliver()
+ * may publish a report or close the issue.
  */
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -14,9 +14,12 @@ import {
   joinPromptSections, renderTemplate, selectPaperclipPromptSections,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
-  acquire, adoptableActive, deliver, normalizeOneLine, pane, parseReceipt, send, tmux,
+  acquire, adoptableActive, deliver, normalizeOneLine, pane, parseReceipt, tmux,
   type Receipt,
 } from "../agy/execute.js";
+import {
+  CHANNEL_NAME, findBridgeRoot, prepareChannelHost, routeChannelInput, type ChannelHost,
+} from "./channel.js";
 
 const CLAUDE = "/opt/homebrew/bin/claude";
 const MODELS = new Set(["claude-sonnet-5-5", "claude-haiku-5-5"]);
@@ -28,11 +31,23 @@ const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, m
 function asString(v: unknown, fallback: string): string {
   return typeof v === "string" && v.trim() ? v.trim() : fallback;
 }
-/** Idle = input box + permission footer visible and no turn or dialog in progress. */
+/**
+ * Fallback requires an *empty* owner editor and an idle TUI. A historical
+ * prompt, active permission menu or half-written owner message never qualifies.
+ * Claude's static "Try ..." placeholder is not typed owner input.
+ */
 export function isClaudeIdle(screen: string): boolean {
-  const end = screen.trimEnd().slice(-900);
-  return /(?:^|\n)❯/.test(end) && /bypass permissions on/.test(end) &&
-    !/esc to interrupt|Do you want to|❯ 1\. /i.test(end);
+  const tail = screen.replace(/\r/g, "").trimEnd().split("\n").slice(-18);
+  const i = tail.findLastIndex(l => /^\s*❯/.test(l));
+  if (i < 0 || tail.length - i > 12) return false;
+  const input = tail[i]!.replace(/^\s*❯/, "").trim();
+  if (input !== "" && input !== 'Try "how does <filepath> work?"') return false;
+  const after = tail.slice(i + 1);
+  if (!after.some(l => /bypass permissions on/i.test(l))) return false;
+  // Only terminal rules/blank lines may occur between the editor and footer.
+  if (after.some(l => l.trim() && !/^[\s─━═│┃]+$/.test(l) &&
+    !/bypass permissions on|shift\+tab to cycle/i.test(l))) return false;
+  return !/esc to interrupt|Do you want to|❯ 1\.|Generating|Thinking…|Working…/i.test(tail.join("\n"));
 }
 export function parseClaudeRcUrl(screen: string): string | null {
   return screen.match(/https:\/\/claude\.ai\/code\/session_[A-Za-z0-9]+/)?.[0] ?? null;
@@ -58,21 +73,62 @@ async function waitIdle(socket: string, session: string, deadline: number): Prom
   }
   return false;
 }
-async function ensureSession(socket: string, session: string, cwd: string, stateDir: string,
-  name: string, model: string, effort: string): Promise<string> {
+
+/** Named, private tmux buffer; no prompt in argv and no shared paste buffer. */
+async function sendClaudePane(socket: string, session: string, message: string, stateDir: string): Promise<void> {
+  if (/[\r\n]/.test(message)) throw new Error("multiline TUI submission refused");
+  if (!isClaudeIdle(await pane(socket, session)))
+    throw new Error("Claude input guard refused: owner input nonempty or TUI not idle");
+  const inputFile = path.join(stateDir, `claude-input-${process.pid}.txt»);
+  const buffer = `paperclip-claude-${process.pid}»;
+  await fs.writeFile(inputFile, message, { mode: 0o600 });
+  try {
+    await tmux(socket, ["load-buffer", "-b", buffer, inputFile]);
+    await tmux(socket, ["paste-buffer", "-p", "-r", "-d", "-b", buffer, "-t", session]);
+    await sleep(Math.min(3000, Math.max(350, 500 + Math.ceil(message.length / 1500) * 300)));
+    await tmux(socket, ["send-keys", "-t", session, "Enter"]);
+  } finally {
+    await tmux(socket, ["delete-buffer", "-b", buffer]).catch(() => {});
+    await fs.rm(inputFile, { force: true });
+  }
+}
+
+/** Mark fallback BEFORE touching tmux. A crash after this point is not retried. */
+async function recordFallback(activePath: string, active: Record<string, unknown>): Promise<void> {
+  const temp = activePath + "." + process.pid + ".tmp";
+  try {
+    await fs.writeFile(temp, JSON.stringify({ ...active, dispatchMode: "tmux-fallback" }, null, 2), { mode: 0o600 });
+    await fs.rename(temp, activePath);
+  } finally {
+    await fs.rm(temp, { force: true }).catch(() => {});
+  }
+}
+
+async function ensureSession(
+  socket: string, session: string, cwd: string, stateDir: string,
+  name: string, model: string, effort: string, channel: ChannelHost, rejoinOnly: boolean,
+): Promise<string> {
   let exists = true;
   try { await tmux(socket, ["has-session", "-t", session]); } catch { exists = false; }
   if (!exists) {
+    if (rejoinOnly) {
+      throw new Error("Claude active op lost its original TUI; hold for operator reconciliation, never replay");
+    }
     await fs.mkdir(cwd, { recursive: true });
-    // exec mode, no shell. Background tasks would die with no owner; keep tools foreground.
+    // [ASSUMPTION] The experimental channel flag remains accepted by Claude
+    // Code 2.1.x; it is hidden in some versions of --help. Live verify before use.
+    // No --strict-mcp-config: that would hide the owner's other required MCPs.
     await tmux(socket, ["new-session", "-d", "-s", session, "-x", "200", "-y", "50", "-c", cwd,
       "-e", "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1",
       CLAUDE, "--remote-control", name, "--name", name, "--model", model, "--effort", effort,
-      "--dangerously-skip-permissions"]);
+      "--dangerously-skip-permissions",
+      "--mcp-config", channel.mcpConfigPath,
+      "--settings", channel.hookSettingsPath,
+      "--dangerously-load-development-channels", `server:${CHANNEL_NAME}»]);
   }
   const processName = (await tmux(socket, ["display-message", "-p", "-t", session, "#{pane_current_command}"])).trim();
-  if (processName !== "claude") throw new Error(`tmux pane is ${processName}, not claude; refusing to commandeer it`);
-  if (!(await waitIdle(socket, session, Date.now() + 25_000))) {
+  if (processName !== "claude") throw new Error(`tmux pane is ${processName}, not claude; refusing to commandeer it»);
+  if (!rejoinOnly && !(await waitIdle(socket, session, Date.now() + 25_000))) {
     const s = await pane(socket, session);
     if (/trust the files|Do you trust/i.test(s))
       throw new Error("Claude workspace trust prompt: approve this dedicated workspace in the terminal, then retry");
@@ -81,7 +137,7 @@ async function ensureSession(socket: string, session: string, cwd: string, state
   const urlFile = path.join(stateDir, "remote-control-url.txt");
   const url = parseClaudeRcUrl(await pane(socket, session));
   if (url) await fs.writeFile(urlFile, url + "\n", { mode: 0o600 });
-  return url ?? (await fs.readFile(urlFile, "utf8").catch(() => "")).trim();
+  return url ?? (exists ? (await fs.readFile(urlFile, "utf8").catch(() => "")).trim() : "");
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
@@ -103,8 +159,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ...(dispatched ? {} : { executionRecovery: { kind: "bootstrap" as const, providerWorkStarted: false as const } }),
   });
   try {
-    if (!MODELS.has(model)) throw new Error(`claude_rc_local permits only ${[...MODELS].join(", ")}; received ${model}`);
-    if (!EFFORTS.has(effort)) throw new Error(`invalid effort ${effort}`);
+    if (!MODELS.has(model)) throw new Error(`claude_rc_local permits only ${[...MODELS].join(", ")}; received ${model}»);
+    if (!EFFORTS.has(effort)) throw new Error(`invalid effort ${effort}»);
     if (!ID.test(socket) || !ID.test(session) || !NAME.test(name)) throw new Error("invalid tmux socket/session/name");
     if (!issueId) throw new Error("claude_rc_local requires one issueId/taskId");
     if (!ctx.authToken) throw new Error("claude_rc_local requires a Paperclip run-scoped token before dispatch");
@@ -114,24 +170,33 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     unlock = await acquire(stateDir, Date.now() + timeoutMs);
     const activePath = path.join(stateDir, "active.json");
     const adopted = adoptableActive(await fs.readFile(activePath, "utf8").catch(() => ""), issueId, stateDir);
-    const rcUrl = await ensureSession(socket, session, cwd, stateDir, name, model, effort);
+    const bridgeRoot = await findBridgeRoot(asString(cfg.channelBridgeRoot, "") || undefined);
+    const channel = await prepareChannelHost(stateDir, bridgeRoot);
+    const rcUrl = await ensureSession(socket, session, cwd, stateDir, name, model, effort, channel, Boolean(adopted));
     if (!rcUrl) throw new Error("Claude RC URL unavailable; refusing to dispatch to an unverified session");
     const expected = asString(cfg.expectedRemoteControlUrl, rcUrl);
     if (expected !== rcUrl) throw new Error("Claude RC URL changed; refusing to dispatch to an unverified session");
     let receiptRunId = ctx.runId;
-    let receiptPath = path.join(stateDir, `receipt-${ctx.runId}.json`);
+    let receiptPath = path.join(stateDir, `receipt-${ctx.runId}.json»);
     let conversationId: string | null = null;
+
     if (adopted) {
-      if (adopted.rcUrl !== rcUrl) throw new Error("Claude RC URL changed since the adopted dispatch; operator reconciliation required");
+      if (adopted.rcUrl !== rcUrl) throw new Error("Claude RC URL changed since adopted dispatch; operator reconciliation required");
       receiptRunId = adopted.runId;
       receiptPath = adopted.receiptPath;
       conversationId = adopted.conversationId ?? null;
+      // Does not consult/modify the inbox. Even an emitted-local or pending
+      // op is UNKNOWN until a receipt. Never try to re-enqueue on restart.
+      await routeChannelInput((adopted as { op_id?: string }).op_id || adopted.runId, "", true, {
+        ready: channel.ready, status: channel.status, submit: channel.submit,
+        fallback: async () => { throw new Error("adoption may never paste"); },
+      });
       ctx.onDispatch?.();
       dispatched = true;
-      await ctx.onLog("stdout", `[claude-rc] Adopting dispatched run ${adopted.runId} for issue ${issueId}; no re-dispatch; receipt ${receiptPath}\n`);
+      await ctx.onLog("stdout", `[claude-rc] Adopting run ${adopted.runId} for issue ${issueId}; no re-dispatch; receipt ${receiptPath}\n»);
     } else {
       const before = await newestConversation(cwd);
-      await send(socket, session, "/clear", stateDir);
+      await sendClaudePane(socket, session, "/clear", stateDir);
       await sleep(800);
       if (!(await waitIdle(socket, session, Date.now() + 12_000)))
         throw new Error("Claude /clear did not settle to an idle prompt");
@@ -146,26 +211,41 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         agent: ctx.agent, run: { id: ctx.runId }, context: ctx.context, companyId: ctx.agent.companyId,
       });
       const instructions = [
-        `Paperclip run ${ctx.runId}, issue ${issueId}. Work on ONLY the assigned issue.`,
-        "This is the owner's live Claude Code Remote Control session: messages they send mid-task are steering for this issue.",
+        `Paperclip run ${ctx.runId}, issue ${issueId}. Work on ONLY the assigned issue.»,
+        "This is the owner's live Claude Code Remote Control session: messages they send mid-task steer this issue.",
         "Run every command in the foreground; never background a tool call. Never use secrets or guess Paperclip API credentials.",
         "Finish the requested issue work, then use your Write tool to create the JSON receipt",
-        `${receiptPath} with exactly these keys: runId = ${ctx.runId}, issueId = ${issueId},`,
+        `${receiptPath} with exactly these keys: runId = ${ctx.runId}, issueId = ${issueId},»,
         'status = "done", summary = a short factual summary, report = a detailed Markdown result (at least 250 characters).',
         "Write it only once actual work is complete. The Paperclip adapter publishes the report and closes the issue",
         "under the run's scoped identity. Do NOT update the issue yourself. Do not write a done receipt on failure;",
         "if blocked, explain the blocker visibly and stop.",
       ].join(" ");
-      const prompt = normalizeOneLine(joinPromptSections([instructionsPrefix, intro, taskContextNote, wakePrompt, instructions]));
-      if (prompt.length > 50_000) throw new Error("Claude prompt exceeds TUI paste budget");
-      await fs.writeFile(activePath, JSON.stringify({
-        runId: ctx.runId, issueId, receiptPath, rcUrl, tmuxSocket: socket, tmuxSession: session,
-        conversationId, startedAt: new Date().toISOString(),
-      }, null, 2), { flag: "wx", mode: 0o600 });
+      // The channel preserves Markdown/newlines; only the tmux fallback flattens.
+      const prompt = joinPromptSections([instructionsPrefix, intro, taskContextNote, wakePrompt, instructions]);
+      if (prompt.length > 50_000) throw new Error("Claude prompt exceeds dispatch budget");
+      const active: Record<string, unknown> = {
+        runId: ctx.runId, issueId, op_id: ctx.runId, receiptPath, rcUrl,
+        tmuxSocket: socket, tmuxSession: session, conversationId,
+        dispatchMode: "channel-pending", startedAt: new Date().toISOString(),
+      };
+      // Exact checkpoint, durable before any potentially side-effecting emit.
+      await fs.writeFile(activePath, JSON.stringify(active, null, 2), { flag: "wx", mode: 0o600 });
       ctx.onDispatch?.();
       dispatched = true;
-      await ctx.onLog("stdout", `[claude-rc] Dispatching issue ${issueId} into "${name}" ${rcUrl}; conversation ${conversationId}; receipt ${receiptPath}\n`);
-      await send(socket, session, prompt, stateDir);
+      await ctx.onLog("stdout", `[claude-rc] Dispatching issue ${issueId} via MCP channel ${CHANNEL_NAME}; conversation ${conversationId}; receipt ${receiptPath}\n»);
+      const mode = await routeChannelInput(ctx.runId, prompt, false, {
+        ready: channel.ready, status: channel.status, submit: channel.submit,
+        fallback: async () => {
+          if (!isClaudeIdle(await pane(socket, session))) {
+            throw new Error("channel unavailable and Claude editor is not empty+idle; no fallback");
+          }
+          await recordFallback(activePath, active);
+          await ctx.onLog("stderr", "[claude-rc] Channel unavailable; using guarded tmux fallback (no bridge op submitted)\n");
+          await sendClaudePane(socket, session, normalizeOneLine(prompt), stateDir);
+        },
+      });
+      await ctx.onLog("stdout", `[claude-rc] Input route ${mode}; op_id ${ctx.runId}\n»);
     }
     const deadline = Date.now() + timeoutMs;
     let receipt: Receipt | null = null;
@@ -179,7 +259,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       } else if (adopted) {
         idleWithoutReceipt = isClaudeIdle(await pane(socket, session)) ? idleWithoutReceipt + 1 : 0;
         if (idleWithoutReceipt >= 5)
-          return failure("Claude adopted dispatch is idle without a receipt; checkpoint retained for operator reconciliation");
+          return failure("Claude adopted dispatch idle without a receipt; checkpoint retained for reconciliation");
       }
       await tmux(socket, ["has-session", "-t", session]);
       await sleep(1100);
@@ -187,18 +267,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (!receipt || !(await waitIdle(socket, session, Date.now() + 1500)))
       return failure("Claude did not produce a validated completion receipt at an idle TUI; checkpoint retained", true);
     await deliver(ctx, receipt, "Claude Code execution report", "Claude Remote Control");
-    await ctx.onLog("stdout", `[claude-rc] Done ${issueId}: ${receipt.summary}; conversation=${conversationId ?? "unknown"}\n`);
+    await ctx.onLog("stdout", `[claude-rc] Done ${issueId}: ${receipt.summary}; conversation=${conversationId ?? "unknown"}\n»);
     await fs.rm(activePath);
     return {
       exitCode: 0, signal: null, timedOut: false, provider: "anthropic", biller: "anthropic", model,
       billingType: "subscription", costStatus: "unpriced", summary: receipt.summary,
       sessionId: conversationId, sessionDisplayId: conversationId,
-      sessionParams: { sessionId: conversationId, cwd, remoteControlUrl: rcUrl, remoteControlName: name, tmuxSocket: socket, tmuxSession: session },
+      sessionParams: {
+        sessionId: conversationId, cwd, remoteControlUrl: rcUrl,
+        remoteControlName: name, tmuxSocket: socket, tmuxSession: session,
+      },
       resultJson: { issueId, receiptPath, remoteControlUrl: rcUrl, conversationId, reportPublished: true, issueClosed: true },
     };
   } catch (e) {
     const error = e instanceof Error ? e.message : String(e);
-    await ctx.onLog("stderr", `[claude-rc] ${error}\n`);
+    await ctx.onLog("stderr", `[claude-rc] ${error}\n»);
     return failure(error);
   } finally {
     if (unlock) await unlock();
