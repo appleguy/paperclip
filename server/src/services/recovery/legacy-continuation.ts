@@ -23,6 +23,11 @@ export interface LegacyDispositionEpisode {
   maxAttempts: number;
 }
 export const LEGACY_DISPOSITION_REPAIR_MAX_ATTEMPTS = 2;
+/** Dispatch cancels a repair with this code when another lifecycle already owns the issue; it is a verdict, not a failure. */
+export const LEGACY_DISPOSITION_REPAIR_SUPPRESSED_ERROR_CODE = "legacy_disposition_repair_suppressed";
+export function isSuppressedLegacyDispositionRepair(run: { errorCode?: string | null } | null | undefined) {
+  return run?.errorCode === LEGACY_DISPOSITION_REPAIR_SUPPRESSED_ERROR_CODE;
+}
 export const LEGACY_DISPOSITION_REPAIR_INSTRUCTION =
   "The previous task run ended without a recorded disposition or an owned next execution path. " +
   "Re-read the current task state. Use Paperclip tools/API to record completion, a real blocker, " +

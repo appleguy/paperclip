@@ -17,7 +17,8 @@ describe("legacy continuation persisted authority", () => {
     await db.insert(agents).values({ id: agentId, companyId, name: "Worker", role: "engineer", status: "idle", adapterType: "codex_local", runtimeConfig: { heartbeat: { wakeOnDemand: true } } });
     await db.insert(issues).values({ id: issueId, companyId, title: "Implement export", status: "in_progress", assigneeAgentId: agentId, responsibleUserId: "fixture-owner" });
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, invocationSource: "on_demand", status: "succeeded", runtimeMode: "legacy", continuationAttempt, contextSnapshot: { issueId, ...context }, livenessState: "blocked", resultJson: { summary: "All done. Need approval. I will continue." } });
-    const createRecovery = (afterEnqueue?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void>) => recoveryService(db, {
+    const createRecovery = (afterEnqueue?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void>, extraDeps: Partial<Parameters<typeof recoveryService>[1]> = {}) => recoveryService(db, {
+      ...extraDeps,
       enqueueWakeup: async (targetAgentId, opts) => db.transaction(async tx => {
         const [wake] = await tx.insert(agentWakeupRequests).values({ companyId, agentId: targetAgentId, source: "automation", reason: opts?.reason, payload: opts?.payload, idempotencyKey: opts?.idempotencyKey, status: "queued" }).returning();
         const [run] = await tx.insert(heartbeatRuns).values({ companyId, agentId: targetAgentId, invocationSource: "automation", status: "queued", runtimeMode: "legacy", wakeupRequestId: wake.id, contextSnapshot: opts?.contextSnapshot }).returning();
@@ -221,6 +222,47 @@ describe("legacy continuation persisted authority", () => {
     if (gate === "stopped") await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "operator_cancelled" }).where(eq(heartbeatRuns.id, repair.id));
     expect(await f.createRecovery().legacyRepairDispatchBlock(repair.id)).not.toBeNull();
     expect((await f.actions())[0].attemptCount).toBe(1);
+  });
+  describe("a repair that dispatch suppressed", () => {
+    async function suppressed() {
+      const f = await fixture();
+      await f.createRecovery().reconcileLegacyContinuation(f.runId);
+      const interrupted = (await f.runs()).find(r => r.id !== f.runId)!;
+      await db.update(heartbeatRuns).set({ status: "interrupted", errorCode: "server_shutdown_interrupted", finishedAt: new Date() }).where(eq(heartbeatRuns.id, interrupted.id));
+      await db.update(agentWakeupRequests).set({ status: "completed" }).where(eq(agentWakeupRequests.id, interrupted.wakeupRequestId!));
+      // Production's suppressed runs were deploy-rejoin retries of the interrupted repair.
+      const [repair] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "cancelled",
+        errorCode: "legacy_disposition_repair_suppressed", finishedAt: new Date(), runtimeMode: "legacy", retryOfRunId: interrupted.id,
+        scheduledRetryReason: "server_shutdown_rejoin", scheduledRetryAttempt: 1,
+        contextSnapshot: { ...interrupted.contextSnapshot, retryOfRunId: interrupted.id, retryReason: "server_shutdown_rejoin", wakeReason: "transient_failure_retry" },
+      }).returning();
+      return { f, repair };
+    }
+    it("stays settled while its owner holds: no retry of the repair, no escalation", async () => {
+      const { f, repair } = await suppressed();
+      await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, kind: "request_confirmation", status: "pending", requestedResolverPolicy: "anyone", effectiveResolverPolicy: "anyone", payload: { version: 1, prompt: "Approve?" } });
+      const retried: string[] = [];
+      const recovery = f.createRecovery(undefined, { scheduleRecoveryRetry: async runId => { retried.push(runId); return null; } });
+      expect(await recovery.legacyRepairDispatchBlock(repair.id)).toBe("repair_not_active");
+      expect(await recovery.legacyRepairDispatchBlock(repair.id, { settled: true })).toBe("durable_wait");
+      const before = (await f.runs()).length;
+      await recovery.reconcileStrandedAssignedIssues();
+      expect(retried).toEqual([]);
+      expect(await f.runs()).toHaveLength(before);
+      expect((await db.select().from(issues).where(eq(issues.id, f.issueId)))[0].status).toBe("in_progress");
+    });
+    it("continues the issue with a fresh wake, not a repair retry, once the owner is gone", async () => {
+      const { f, repair } = await suppressed();
+      const retried: string[] = [];
+      const recovery = f.createRecovery(undefined, { scheduleRecoveryRetry: async runId => { retried.push(runId); return null; } });
+      expect(await recovery.legacyRepairDispatchBlock(repair.id, { settled: true })).toBeNull();
+      await recovery.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+      expect(retried).toEqual([]);
+      const queued = (await f.runs()).filter(r => r.status === "queued");
+      expect(queued).toHaveLength(1);
+      expect(queued[0].contextSnapshot).toMatchObject({ wakeReason: "issue_continuation_needed", source: "issue.suppressed_repair_released_continuation" });
+      expect(queued[0].contextSnapshot).not.toHaveProperty("retryOfRunId");
+    });
   });
   it.each([{ goalControlRequestId: "control" }, { resumeSessionGoalHeartbeat: true }])("leaves goal-control run ownership intact: %j", async context => {
     const f = await fixture(context);

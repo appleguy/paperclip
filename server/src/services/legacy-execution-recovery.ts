@@ -8,6 +8,7 @@ import { isPreDispatchReviewWaitVerified } from "./pre-dispatch-review-wait.js";
 import { isPreDispatchExecutionWaitVerified } from "./pre-dispatch-execution-wait.js";
 import { isLocalOpenCodeAdmissionDecline, isLocalOpenCodePreInferenceRateLimit } from "./local-opencode-admission-retry.js";
 import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
+import { isSuppressedLegacyDispositionRepair } from "./recovery/legacy-continuation.js";
 import { normalizeMaxTurnStopReason } from "./heartbeat-stop-metadata.js";
 import { claimedAdapterType, hasConversationContinuationPolicy } from "./conversation-continuation.js";
 import { canonicalExecutionUuid } from "./execution-identity.js";
@@ -51,6 +52,9 @@ export function legacyExecutionNeedsReconciliation(
     !["failed", "timed_out", "interrupted", "cancelled"].includes(run.status)
   )
     return false;
+  // Dispatch cancelled a suppressed repair at its final gate, before adapter bootstrap or any
+  // provider request, so there is no unknown work to reconcile.
+  if (run.status === "cancelled" && isSuppressedLegacyDispositionRepair(run)) return false;
   // A fresh model turn cannot repair or verify unrestored files.
   if (run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive" || hasRequiredWorkspaceRecovery(run.resultJson)) return true;
   // A fresh conversation turn lets the agent decide what remains. The retry

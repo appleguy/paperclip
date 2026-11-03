@@ -1,4 +1,6 @@
-import { SERVER_SHUTDOWN_REJOIN_MAX_ATTEMPTS, SERVER_SHUTDOWN_REJOIN_RETRY_REASON } from "../execution-recovery-attempt.js";
+import {
+  executionRetryAttemptCount, SERVER_SHUTDOWN_REJOIN_MAX_ATTEMPTS, SERVER_SHUTDOWN_REJOIN_RETRY_REASON,
+} from "../execution-recovery-attempt.js";
 import { pendingFailedNativeRetryCancellationCondition } from "../native-runtime/native-cancellation-request.js";
 import { notifyLiveRunRecovery } from "../live-run-recovery-notifications.js";
 import { registerLiveRecoveryWork } from "./live-recovery-work.js";
@@ -405,6 +407,20 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
   } = dependencies;
   const scheduledRetryCancellation = createScheduledRetryCancellationRecovery(db, cancelRunInternal);
 
+  // A disposition repair is a one-shot recheck: after one rejoin the reconciler re-decides whether
+  // another repair is still wanted, instead of the repair riding every later deploy. Other runs keep
+  // the full lane, with the delay doubling from 15 s to 5 min so a restart loop cannot hammer.
+  function shutdownRejoinRetryOptions(run: typeof heartbeatRuns.$inferSelect, now: Date) {
+    const isDispositionRepair = Boolean(parseObject(parseObject(run.contextSnapshot).legacyDispositionEpisode).id);
+    const consumed = executionRetryAttemptCount(run, SERVER_SHUTDOWN_REJOIN_RETRY_REASON);
+    return {
+      now,
+      retryReason: SERVER_SHUTDOWN_REJOIN_RETRY_REASON,
+      maxAttempts: isDispositionRepair ? 1 : SERVER_SHUTDOWN_REJOIN_MAX_ATTEMPTS,
+      delayMs: Math.min(15_000 * 2 ** consumed, 300_000),
+    };
+  }
+
   async function enqueueProcessLossRetry(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -422,7 +438,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     // Deploys never wait (owner policy): a graceful-shutdown interrupt rejoins
     // on its own bounded lane instead of spending the 2 transient-failure retries.
     const scheduled = await scheduleBoundedRetryForRun(run, agent, run.errorCode === "server_shutdown_interrupted"
-      ? { now, retryReason: SERVER_SHUTDOWN_REJOIN_RETRY_REASON, maxAttempts: SERVER_SHUTDOWN_REJOIN_MAX_ATTEMPTS, delayMs: 15_000 }
+      ? shutdownRejoinRetryOptions(run, now)
       : { now });
     return scheduled.outcome === "scheduled" ? scheduled.run : null;
   }

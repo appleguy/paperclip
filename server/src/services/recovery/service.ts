@@ -25,7 +25,7 @@ import { executionRetryAccounting } from "../execution-recovery-attempt.js";
 import { isExplicitContinuationRetryClaim } from "../explicit-continuation-retry-claim.js";
 import {
   decideLegacyContinuation, legacyDispositionEpisode, legacyDispositionFingerprint,
-  LEGACY_DISPOSITION_REPAIR_INSTRUCTION, type LegacyDispositionEpisode,
+  isSuppressedLegacyDispositionRepair, LEGACY_DISPOSITION_REPAIR_INSTRUCTION, type LegacyDispositionEpisode,
 } from "./legacy-continuation.js";
 import { CONTROLLER_LEASE_LOST_FAILURE_CODE, hasLiveLegacyController, liveLegacyControllerExpiresAt } from "../legacy-controller-lease.js";
 import { isCompletedOnboardingHandoffWake } from "../chat-completion-delivery.js";
@@ -3855,11 +3855,12 @@ export function recoveryService(
     });
   }
 
-  async function legacyRepairDispatchBlock(runId: string): Promise<string | null> {
+  /** `settled` re-evaluates a repair that dispatch already cancelled, to learn whether its block still holds. */
+  async function legacyRepairDispatchBlock(runId: string, opts?: { settled?: boolean }): Promise<string | null> {
     const [run] = await db.select(recoveryRunFields).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).limit(1);
     const context = parseObject(run?.contextSnapshot);
     if (!run || !parseObject(context.legacyDispositionEpisode).id) return null;
-    if (!["queued", "running", "scheduled_retry"].includes(run.status)) return "repair_not_active";
+    if (!opts?.settled && !["queued", "running", "scheduled_retry"].includes(run.status)) return "repair_not_active";
     const episode = legacyDispositionEpisode(run);
     // Infrastructure retries retain the successful disposition source even
     // though their immediate retryOfRunId points at a failed repair attempt.
@@ -5624,6 +5625,34 @@ export function recoveryService(
           retryOfRunId: successfulRun.id,
         });
         if (queued) {
+          result.continuationRequeued += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
+        continue;
+      }
+      if (isSuppressedLegacyDispositionRepair(latestRun)) {
+        // Dispatch cancelled this repair because another lifecycle owns the issue (a healthy
+        // child, routine, goal or recovery action). It never ran, so there is nothing to retry
+        // and no missing execution path to escalate while that owner still holds.
+        if (latestRun && await legacyRepairDispatchBlock(latestRun.id, { settled: true })) {
+          result.skipped += 1;
+          continue;
+        }
+        // The owner released the issue: continue it with a fresh wake, not a retry of the repair.
+        if (await isInvocationBudgetBlocked(issue, agentId)) {
+          result.skipped += 1;
+          continue;
+        }
+        const resumed = await enqueueStrandedIssueRecovery({
+          issueId: issue.id,
+          agentId,
+          reason: "issue_continuation_needed",
+          retryReason: "issue_continuation_needed",
+          source: "issue.suppressed_repair_released_continuation",
+        });
+        if (resumed) {
           result.continuationRequeued += 1;
           result.issueIds.push(issue.id);
         } else {

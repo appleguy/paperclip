@@ -303,6 +303,7 @@ import {
   createAdapterExecutionControl,
 } from "./adapter-execution-control.js";
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
+import { LEGACY_DISPOSITION_REPAIR_SUPPRESSED_ERROR_CODE } from "./recovery/legacy-continuation.js";
 import { localOpenCodeAdmissionRetryOptions } from "./local-opencode-admission-retry.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
@@ -2819,7 +2820,7 @@ export function heartbeatService(
         const repairBlock = await recovery.legacyRepairDispatchBlock(run.id);
         if (repairBlock) {
           const cancelled = await setRunStatusIfRunning(run.id, "cancelled", {
-            finishedAt: new Date(), errorCode: "legacy_disposition_repair_suppressed",
+            finishedAt: new Date(), errorCode: LEGACY_DISPOSITION_REPAIR_SUPPRESSED_ERROR_CODE,
             error: `Disposition repair suppressed: ${repairBlock}`,
           });
           if (cancelled.updated) {
