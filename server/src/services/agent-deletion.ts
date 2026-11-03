@@ -63,6 +63,16 @@ export async function deleteAgentDependencies(tx: Db, companyId: string, id: str
   await notifyInstructionCollection(tx, { companyId: companyId });
   await notifyCancelledWorkspacePreservation(tx, { companyId: companyId });
   await notifyUnsafeWorkspaceExportRecovery(tx, { companyId });
+  // Rows that only point at this agent or its runs: detach where history can survive, delete where the row is run-scoped.
+  const ownRuns = sql`(select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.agentId} = ${id})`;
+  await tx.execute(sql`update goals set owner_agent_id = null where owner_agent_id = ${id}`);
+  await tx.execute(sql`update projects set lead_agent_id = null where lead_agent_id = ${id}`);
+  await tx.execute(sql`update issue_comments set deleted_by_run_id = null where deleted_by_run_id in ${ownRuns}`);
+  await tx.execute(sql`update activity_log set run_id = null where run_id in ${ownRuns}`);
+  await tx.execute(sql`update finance_events set heartbeat_run_id = null where heartbeat_run_id in ${ownRuns}`);
+  await tx.execute(sql`delete from native_run_finalizations where run_id in ${ownRuns}`);
+  await tx.execute(sql`delete from native_run_results where run_id in ${ownRuns}`);
+  await tx.execute(sql`delete from work_assessments where run_id in ${ownRuns}`);
   // cost_events reference both the agent and its runs; agent-usage rows cannot be
   // detached (cost_events_usage_kind_check requires agent_id), so they go with the agent.
   await tx.delete(costEvents).where(or(
