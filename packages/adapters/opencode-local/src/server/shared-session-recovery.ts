@@ -19,6 +19,8 @@ type Binding = {
   cwd: string;
   url: string;
   sessionId: string;
+  /** Set only after the bound CLI exited cleanly; absent means the run may have died mid-turn. */
+  exited?: "clean";
 };
 
 type Input = {
@@ -139,13 +141,19 @@ export async function prepareSharedOpenCodeSession(input: Input) {
 
   const binding: Binding = { version: 1, agentId: input.agentId, taskId: input.taskId,
     runId: input.runId, cwd: input.cwd, url, sessionId: sessionId! };
-  const temporary = savedPath + "." + randomUUID() + ".tmp";
-  try {
-    await fs.writeFile(temporary, JSON.stringify(binding), { mode: 0o600, flag: "wx" });
-    await fs.rename(temporary, savedPath);
-  } finally {
-    await fs.rm(temporary, { force: true }).catch(() => undefined);
-  }
+  const persist = async (value: Binding) => {
+    const temporary = savedPath + "." + randomUUID() + ".tmp";
+    try {
+      await fs.writeFile(temporary, JSON.stringify(value), { mode: 0o600, flag: "wx" });
+      await fs.rename(temporary, savedPath);
+    } finally {
+      await fs.rm(temporary, { force: true }).catch(() => undefined);
+    }
+  };
+  await persist(binding);
+  // Only a predecessor that did not record a clean exit is a crash/restart
+  // recovery. Ordinary follow-up wakes resume the same session normally.
+  const recovered = old !== null && old.exited !== "clean";
   let stopPromise: Promise<void> | null = null;
   const pause = () => {
     stopPromise ??= interruptOwned();
@@ -158,6 +166,7 @@ export async function prepareSharedOpenCodeSession(input: Input) {
   return {
     sessionId: sessionId!,
     resumed,
+    recovered,
     /** Preserve the binding until issue archival, including after exit 0. */
     async finish(outcome: { exitCode: number | null; signal: string | null; timedOut: boolean }) {
       input.signal?.removeEventListener("abort", onAbort);
@@ -165,6 +174,7 @@ export async function prepareSharedOpenCodeSession(input: Input) {
         await pause();
         return;
       }
+      if (outcome.exitCode === 0) await persist({ ...binding, exited: "clean" });
       // A clean client exit is not proof the Paperclip run result was committed.
       // Preserve the exact provider session binding for a successor after a
       // crash between CLI completion and durable run settlement. Retire it only

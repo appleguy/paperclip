@@ -90,13 +90,30 @@ describe("persistent OpenCode server restart re-pair", () => {
     const successor = await prepareSharedOpenCodeSession(input("run-after-crash"));
     expect(successor.sessionId).toBe(previousId);
     expect(successor.resumed).toBe(true);
+    expect(successor.recovered).toBe(true);
     expect(state.created).toBe(1);
     expect(state.interrupted).toEqual([previousId]);
     expect(state.active.has(previousId)).toBe(false);
     await successor.finish({ exitCode: 0, signal: null, timedOut: false });
     expect(JSON.parse(await fs.readFile(journal, "utf8"))).toMatchObject({
-      sessionId: previousId, runId: "run-after-crash",
+      sessionId: previousId, runId: "run-after-crash", exited: "clean",
     });
+  });
+
+  it("treats a follow-up after a clean exit as a normal resume, not a restart recovery", async () => {
+    const first = await prepareSharedOpenCodeSession(input("run-clean"));
+    await first.finish({ exitCode: 0, signal: null, timedOut: false });
+    state.sessions.add(first.sessionId);
+    const followUp = await prepareSharedOpenCodeSession(input("run-follow-up"));
+    expect(followUp.sessionId).toBe(first.sessionId);
+    expect(followUp.resumed).toBe(true);
+    expect(followUp.recovered).toBe(false);
+    // The new run's binding clears the clean marker until it, too, exits cleanly.
+    const journal = path.join(root, "paperclip-opencode-session-recovery", "agent-test-issue-test.json");
+    expect(JSON.parse(await fs.readFile(journal, "utf8")).exited).toBeUndefined();
+    await followUp.finish({ exitCode: 1, signal: null, timedOut: false });
+    const afterFailure = await prepareSharedOpenCodeSession(input("run-after-failure"));
+    expect(afterFailure.recovered).toBe(true);
   });
 
   it("pauses the exact bound session when shutdown aborts, and retains the binding", async () => {

@@ -621,7 +621,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const basePrompt = joinPromptSections([
         // On a recovered server session, keep the model's prior tool outcomes
         // in context instead of treating the assignment as a fresh execution.
-        sharedSession?.resumed && resumedSession
+        resumedSession && sharedSession?.resumed &&
+          (sharedSession.recovered || isPaperclipRecoveryWakePayload(context.paperclipWake))
           ? "Controller restart recovery: inspect the existing session history. Do not repeat any completed tool actions; continue only unfinished work."
           : "",
         instructionsPrefix,
