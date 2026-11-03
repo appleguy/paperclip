@@ -14,7 +14,7 @@
   "type": "module",
   "bin": {
     "paperclip-mcp-server": "./dist/stdio.js",
-    "paperclip-run-bridge": "./dist/run-bridge-stdio.js"
+    "paperclip-run-bridge": "./dist/run-bridge.bundle.mjs"
   },
   "exports": {
     ".": "./src/index.ts"
@@ -38,7 +38,7 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && ../../node_modules/.bin/esbuild src/run-bridge-stdio.ts --bundle --platform=node --format=esm '--external:@modelcontextprotocol/*' --external:zod --outfile=dist/run-bridge.bundle.mjs --log-level=warning",
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
