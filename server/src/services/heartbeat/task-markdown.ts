@@ -332,10 +332,9 @@ export function buildPaperclipTaskMarkdown(input: {
       "Follow-up directive:",
       "Apply the latest wake comment to the current task. Later direction replaces conflicting scope; preserve other requirements and approval gates. Clarification is not approval. Reuse completed work rather than repeating it.",
       "",
-      "Latest wake comment:",
       ...(renderWakeCommentBodies
-        ? [fenceTaskText(effectiveWakeComments[0]!.body)]
-        : []),
+        ? ["Latest wake comment:", fenceTaskText(effectiveWakeComments[0]!.body)]
+        : [`Latest wake comment: ${quoteTaskScalar(effectiveWakeComments[0]!.id)}. Its text is in the wake payload above. Act on it now.`]),
     );
     appendWakeAttachments(effectiveWakeComments[0]!);
   } else if (effectiveWakeComments.length > 1) {
