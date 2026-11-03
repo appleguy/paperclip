@@ -239,7 +239,12 @@ describe("installed deploy shell contract", () => {
     }
     assert.match(source, /node "\$helper" release "\$manifest"/);
     assert.match(source, /if \[ "\$rc" -eq 10 \]|\[ "\$rc" -eq 10 \]/);
-    assert.match(source, /flock -x|-x -w 2700/);
+    assert.match(source, /-x -w 600 -E 76/);
+    // Owner 2026-11-03: a deploy never holds on a stuck process or refuses on unprovable work.
+    assert.match(source, /killing stuck holder/);
+    assert.match(source, /bounded 120 node "\$helper" pause/);
+    assert.match(source, /bounded 60 node "\$helper" verify/);
+    assert.doesNotMatch(source, /refusing restart|-w 2700|verify "\$manifest" \|\| exit/);
     assert.doesNotMatch(source, /poll_health|curl -fsS|helper" pace|wait "\$manifest" [1-9]/);
     assert.match(source, /helper" finish "\$manifest" "\$sha"/);
     assert.match(source, /install --ref "\$sha"/);

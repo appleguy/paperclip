@@ -13,9 +13,19 @@ source_branch=fix/git-installer-bundled-workspaces-20261030
 if [ "${PC_DEPLOY_IN_LOCK:-}" != 1 ]; then
   [ -x "$flock" ] || { echo 'pc-deploy: atomic flock unavailable' >&2; exit 1; }
   mkdir -p "$tmp"
-  # Each caller waits for its own exclusive turn. An earlier failure cannot
-  # acknowledge and lose a queued request. Kernel releases on SIGKILL/PID reuse.
-  exec "$flock" -x -w 2700 -E 76 "$tmp/pc-deploy.flock" \
+  # Each caller waits for its own exclusive turn. A full deploy finishes in
+  # well under 10 minutes; a holder older than that is stuck and is killed
+  # (owner 2026-11-03: deploys never hold on a stuck process). The kernel
+  # releases the lock on SIGKILL. Queued waiters may also be killed; every
+  # deploy installs master HEAD, so the surviving caller covers their request.
+  rc=0
+  "$flock" -x -w 600 -E 76 "$tmp/pc-deploy.flock" \
+    /usr/bin/env PC_DEPLOY_IN_LOCK=1 /bin/sh "$0" "$@" || rc=$?
+  [ "$rc" -eq 76 ] || exit "$rc"
+  holders=$(lsof -t "$tmp/pc-deploy.flock" 2>/dev/null | grep -vx "$$" || :)
+  echo "pc-deploy: WARNING deploy lock held >10 min; killing stuck holder(s): $holders" >&2
+  [ -z "$holders" ] || { kill -TERM $holders 2>/dev/null || :; sleep 10; kill -KILL $holders 2>/dev/null || :; }
+  exec "$flock" -x -w 60 -E 76 "$tmp/pc-deploy.flock" \
     /usr/bin/env PC_DEPLOY_IN_LOCK=1 /bin/sh "$0" "$@"
 fi
 
@@ -120,18 +130,26 @@ done
 [ "$(current)" = "$short" ] || {
   echo 'pc-deploy: installed payload differs from pushed SHA' >&2; exit 1;
 }
-if node "$helper" wait "$manifest" 0; then
+# Owner policy 2026-11-03: a deploy NEVER holds on running, stuck or
+# unprovable work. Killing it is acceptable; redo is acceptable. Each safety
+# step gets one bounded attempt to reach a clean safe point, then the restart
+# proceeds and server recovery re-runs or rejoins the work. A step that fails
+# is reported loudly, never turned into a hold or a refusal.
+bounded() { secs=$1; shift; perl -e 'alarm shift; exec @ARGV' "$secs" "$@"; }
+forced=0
+if bounded 60 node "$helper" wait "$manifest" 0; then
   :
 else
-  rc=$?
-  [ "$rc" -eq 10 ] || exit "$rc"
-  node "$helper" pause "$manifest" || {
-    echo 'pc-deploy: cannot prove safe OpenCode ownership; refusing restart' >&2
-    exit 1
+  bounded 120 node "$helper" pause "$manifest" || {
+    forced=1
+    echo 'pc-deploy: WARNING owned sessions not paused within bound; restarting anyway (deploys never hold)' >&2
   }
 fi
-# Last-second fence: task admission, all company runs, provider sessions.
-node "$helper" verify "$manifest" || exit 1
+# Last-second barrier: report, never hold.
+bounded 60 node "$helper" verify "$manifest" || {
+  forced=1
+  echo 'pc-deploy: WARNING safety barrier not proven; restarting anyway (deploys never hold)' >&2
+}
 if ! launchctl kickstart -k "gui/$(id -u)/ing.paperclip.paperclipai.main"; then
   echo 'pc-deploy: kickstart failed; rolling back' >&2
   rollback_restart || echo 'pc-deploy: rollback FAILED, operator investigation required' >&2
@@ -148,3 +166,4 @@ fi
 held=0
 installed=0
 echo "pc-deploy: $short verified live, health stable, admission restored"
+[ "$forced" -eq 0 ] || echo "pc-deploy: NOTE forced restart; interrupted work is recovered or re-run by the server"
