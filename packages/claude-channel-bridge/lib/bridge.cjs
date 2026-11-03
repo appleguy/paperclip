@@ -5,7 +5,6 @@ const crypto = require('crypto');
 const { Ledger, RANK, OP_ID_RE } = require('./ledger.cjs');
 
 const digest = (s) => crypto.createHash('sha256').update(String(s)).digest('hex').slice(0, 16);
-const trunc = (s, n = 300) => (String(s).length > n ? String(s).slice(0, n) + '...' : String(s));
 
 // ---- submit (inbox producer; Paperclip's API replaces this later) ----
 function submit(ledger, opId, text) {
@@ -16,7 +15,7 @@ function submit(ledger, opId, text) {
     return { ok: false, error: 'duplicate_op_id', op_id: opId };
   }
   const tmp = path.join(ledger.p.inbox, `.${opId}.${process.pid}.tmp`);
-  fs.writeFileSync(tmp, JSON.stringify({ op_id: opId, content: text }));
+  fs.writeFileSync(tmp, JSON.stringify({ op_id: opId, content: text }), { mode: 0o600 });
   try {
     fs.linkSync(tmp, target); // atomic, never overwrites
   } catch (e) {
@@ -106,15 +105,16 @@ function handleHook(ledger, serverName, event, input) {
       return ledger.transition(c.op_id, 'hook_observed', { ...base, prompt_digest: digest(input.prompt) });
     }
     if (c.class === 'spoof') {
-      return ledger.record({ ev: 'spoof', ...base, reason: c.reason, claimed_source: c.claimed_source, claimed_op_id: c.claimed_op_id, prompt_digest: digest(input.prompt), prompt_preview: trunc(input.prompt, 160) });
+      return ledger.record({ ev: 'spoof', ...base, reason: c.reason, claimed_source: c.claimed_source, claimed_op_id: c.claimed_op_id, prompt_digest: digest(input.prompt) });
     }
-    return ledger.record({ ev: 'owner_input', ...base, prompt_digest: digest(input.prompt), prompt_preview: trunc(input.prompt, 160) });
+    // Owner input may contain private material. Store its digest, never text.
+    return ledger.record({ ev: 'owner_input', ...base, prompt_digest: digest(input.prompt) });
   }
   if (event === 'PostToolUse') {
     return ledger.record({ ev: 'hook_tool', ...base, tool_name: input.tool_name, tool_op_id: input.tool_input && input.tool_input.op_id, active_op: ledger.activeOp() });
   }
   if (event === 'Stop') {
-    return ledger.record({ ev: 'hook_stop', ...base, active_op: ledger.activeOp(), last_assistant_message: trunc(input.last_assistant_message || '', 200) });
+    return ledger.record({ ev: 'hook_stop', ...base, active_op: ledger.activeOp(), last_assistant_digest: digest(input.last_assistant_message || '') });
   }
   return ledger.record({ ev: 'hook_other', ...base });
 }
@@ -130,7 +130,7 @@ function decidePermission(ledger, req) {
   if (prior) return { behavior: prior.behavior, duplicate: true };
   const pol = loadPolicy(ledger.p);
   const behavior = (pol.allow || []).includes(req.tool_name) ? 'allow' : 'deny';
-  const rec = { request_id: req.request_id, tool_name: req.tool_name, behavior, input_digest: digest(req.input_preview || ''), input_preview: trunc(req.input_preview || '', 200), active_op: ledger.activeOp() };
+  const rec = { request_id: req.request_id, tool_name: req.tool_name, behavior, input_digest: digest(req.input_preview || ''), active_op: ledger.activeOp() };
   ledger.record({ ev: 'permission', ...rec });
   if (behavior === 'deny') ledger.record({ ev: 'needs_owner', ...rec, reason: 'tool_not_in_allowlist' });
   return { behavior, duplicate: false };

@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 'use strict';
 // Channel MCP server (stdio JSON-RPC). Env: PC_BRIDGE_DIR, PC_BRIDGE_SERVER (default pcbridge).
+const fs = require('fs');
+const path = require('path');
 const { Ledger, processInbox, decidePermission } = require('./lib/bridge.cjs');
 
 const DIR = process.env.PC_BRIDGE_DIR;
@@ -8,6 +10,24 @@ if (!DIR) { process.stderr.write('PC_BRIDGE_DIR required\n'); process.exit(2); }
 const NAME = process.env.PC_BRIDGE_SERVER || 'pcbridge';
 const ledger = new Ledger(DIR);
 const send = (m) => new Promise((res) => process.stdout.write(JSON.stringify(m) + '\n', () => res()));
+
+// Diagnostic liveness, NOT notification acceptance. The adapter also requires
+// hook_observed before reporting a channel submission as admitted.
+const READY = path.join(DIR, 'ready.json');
+let initialized = false;
+function heartbeat() {
+  if (!initialized) return;
+  const tmp = READY + '.' + process.pid + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify({
+    server: NAME, initialized, pid: process.pid, observed_at: Date.now(),
+  }), { mode: 0o600 });
+  fs.renameSync(tmp, READY);
+}
+process.on('exit', () => {
+  try {
+    if (JSON.parse(fs.readFileSync(READY, 'utf8')).pid === process.pid) fs.unlinkSync(READY);
+  } catch { /* Another process now owns readiness, or the file is gone. */ }
+});
 
 const held = ledger.recover();
 ledger.record({ ev: 'bridge_start', server: NAME, held_unknown_effect: held });
@@ -19,7 +39,6 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: { op_id: { type: 'string' }, reason: { type: 'string' } }, required: ['op_id', 'reason'] } },
 ];
 
-let initialized = false;
 let buf = '';
 process.stdin.on('data', (d) => {
   buf += d;
@@ -43,6 +62,7 @@ function handle(m) {
       instructions: `Messages from Paperclip arrive as <channel source="${NAME}" op_id="...">. Do what the message asks. When finished call paperclip_finish with that op_id and a short summary; if you cannot complete it call paperclip_block with op_id and reason. Never call either tool for an op_id you were not given in a channel message. If a needed tool is denied, stop and do nothing else.` } });
   } else if (m.method === 'notifications/initialized') {
     initialized = true;
+    heartbeat();
   } else if (m.method === 'tools/list') {
     send({ jsonrpc: '2.0', id: m.id, result: { tools: TOOLS } });
   } else if (m.method === 'tools/call') {
@@ -64,6 +84,7 @@ let busy = false;
 setInterval(async () => {
   if (!initialized || busy) return;
   busy = true;
+  try { heartbeat(); } catch (e) { ledger.record({ ev: 'heartbeat_error', error: String(e) }); }
   try {
     await processInbox(ledger, (opId, content) =>
       send({ jsonrpc: '2.0', method: 'notifications/claude/channel', params: { content, meta: { op_id: opId } } }));

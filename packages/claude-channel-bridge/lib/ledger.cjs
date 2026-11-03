@@ -22,8 +22,12 @@ function resolvePaths(dir) {
 }
 
 function ensureDirs(p) {
-  for (const d of [p.dir, p.inbox, p.processed, p.refused]) fs.mkdirSync(d, { recursive: true });
-  if (!fs.existsSync(p.ledger)) fs.closeSync(fs.openSync(p.ledger, 'a'));
+  for (const d of [p.dir, p.inbox, p.processed, p.refused]) {
+    fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+    fs.chmodSync(d, 0o700);
+  }
+  if (!fs.existsSync(p.ledger)) fs.closeSync(fs.openSync(p.ledger, 'a', 0o600));
+  fs.chmodSync(p.ledger, 0o600);
 }
 
 // One write() of one line on an O_APPEND fd is atomic for these sizes; fsync before returning.
@@ -55,11 +59,12 @@ function fold(events) {
   for (const e of events) {
     if (!e.op_id) continue;
     if (!ops[e.op_id] && !(e.ev in RANK)) continue; // refusals/spoof notes never create an op
-    const o = (ops[e.op_id] ||= { op_id: e.op_id, stage: null, held: false, receipt: null, history: [] });
+    const o = (ops[e.op_id] ||= { op_id: e.op_id, stage: null, held: false, observed: false, receipt: null, history: [] });
     o.history.push(e.ev);
     if (e.ev in RANK) {
       if (o.stage === null || RANK[e.ev] > RANK[o.stage]) o.stage = e.ev;
-      if (e.ev === 'hook_observed' || e.ev === 'terminal') o.held = false;
+      if (e.ev === 'hook_observed') { o.held = false; o.observed = true; }
+      if (e.ev === 'terminal') o.held = false;
       if (e.ev === 'terminal' && !o.receipt) {
         o.receipt = { kind: e.kind, summary: e.summary, reason: e.reason, t: e.t };
       }
@@ -97,7 +102,13 @@ class Ledger {
       this.record({ ev: 'terminal_duplicate', op_id: opId, kind, existing_kind: st.receipt.kind });
       return { ok: true, duplicate: true, receipt: st.receipt };
     }
-    const extra = { kind, hook_unobserved: RANK[st.stage] < RANK.hook_observed, ...payload };
+    // A model/owner cannot settle an op before its correlated channel hook.
+    // Marker text alone is not authority; the JSON receipt remains separate.
+    if (!st.observed) {
+      this.record({ ev: 'terminal_refused', claimed_op_id: opId, kind, reason: 'hook_unobserved' });
+      return { ok: false, error: 'hook_unobserved' };
+    }
+    const extra = { kind, hook_unobserved: false, ...payload };
     this.record({ ev: 'terminal', op_id: opId, ...extra });
     return { ok: true, duplicate: false, receipt: this.state(opId).receipt };
   }
