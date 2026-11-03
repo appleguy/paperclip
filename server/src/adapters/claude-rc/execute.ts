@@ -41,7 +41,7 @@ export function isClaudeIdle(screen: string): boolean {
   const i = tail.findLastIndex(l => /^\s*❯/.test(l));
   if (i < 0 || tail.length - i > 12) return false;
   const input = tail[i]!.replace(/^\s*❯/, "").trim();
-  if (input !== "" && input !== 'Try "how does <filepath> work?"') return false;
+  if (input !== "" && !/^Try "[^"]*"$/.test(input)) return false;
   const after = tail.slice(i + 1);
   if (!after.some(l => /bypass permissions on/i.test(l))) return false;
   // Only terminal rules/blank lines may occur between the editor and footer.
