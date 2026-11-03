@@ -714,7 +714,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // heartbeat Stop has no registered adapter controller to abort.
         await ctx.onCancellationReady?.();
         return runNarOpenCodeAttempt({
-          configPath: sharedConfigPath, agentId: agent.id, taskId: narTaskId, runId, cwd: effectiveExecutionCwd,
+          configPath: sharedConfigPath, agentId: agent.id, taskId: narTaskId, runId, cwd: effectiveExecutionCwd, resumeSessionId: sessionId,
           model: model && variant ? `${model}#${variant}` : model, prompt, timeoutSec, signal: ctx.signal, onLog,
           title: sessionTitleFor(wakeIssue.identifier, wakeIssue.title),
         });

@@ -39,7 +39,10 @@ export interface OpenCodeHttpOptions {
 }
 
 const hex = (s: string) => createHash("sha256").update(s).digest("hex");
-export const sessionIdFor = (s: Pick<ConvScope, "agentId" | "issueId">) => `ses_${hex(`nar|${s.agentId}|${s.issueId}`).slice(0, 26)}`;
+/** Generation 0 keeps the original id; each Paperclip session rotation moves the pair to the next generation. */
+export const sessionIdFor = (s: Pick<ConvScope, "agentId" | "issueId">, generation = 0) =>
+  `ses_${hex(`nar|${s.agentId}|${s.issueId}${generation > 0 ? `|g${generation}` : ""}`).slice(0, 26)}`;
+export const MAX_SESSION_GENERATION = 500;
 export const defaultSessionTitle = (issueId: string) => `Paperclip ${issueId}`;
 /** `SCO-12 Issue title`, whitespace collapsed and capped for the session list; null without an identifier. */
 export function sessionTitleFor(identifier: unknown, title: unknown): string | undefined {
@@ -128,6 +131,18 @@ export class OpenCodeHttpDriver implements ProviderDriver {
     return { provider: "opencode", hostEpoch: this.o.hostEpoch ?? d.pid, attested: true, detail: { url: this.url, version: d.version, pid: d.pid } };
   }
 
+  /** Highest generation of this agent+issue pair that exists on the server, or -1 when none does. */
+  async latestGeneration(s: Pick<ConvScope, "agentId" | "issueId">): Promise<number> {
+    let latest = -1;
+    for (let g = 0; g <= MAX_SESSION_GENERATION; g++) {
+      const r = await this.json("GET", `/api/session/${encodeURIComponent(sessionIdFor(s, g))}`);
+      if (r.status === 404) break;
+      if (r.status !== 200) throw new OpenCodeHttpError("http", `session.get generation ${g} HTTP ${r.status}`, r.status);
+      latest = g;
+    }
+    return latest;
+  }
+
   async bindConversation(_h: HostHandle, s: ConvScope, mode: "new" | "resume", _f: Fence, existingId?: string) {
     const id = existingId ?? sessionIdFor(s);
     if (mode === "new") {
@@ -184,7 +199,7 @@ export class OpenCodeHttpDriver implements ProviderDriver {
     return { grade: "outcome_unknown", evidence: `prompt ${msgId}: HTTP ${r.status}`, at };
   }
 
-  private async messageExists(conversationId: string, msgId: string): Promise<boolean> {
+  async messageExists(conversationId: string, msgId: string): Promise<boolean> {
     const inbox = await this.json("GET", `/api/session/${encodeURIComponent(conversationId)}/inbox`);
     if (inbox.status === 200 && Array.isArray(inbox.data?.data) && inbox.data.data.some((i: any) => i?.id === msgId)) return true;
     const m = await this.json("GET", `/api/session/${encodeURIComponent(conversationId)}/message/${encodeURIComponent(msgId)}`);

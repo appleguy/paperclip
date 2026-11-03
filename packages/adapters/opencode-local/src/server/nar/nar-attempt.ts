@@ -5,7 +5,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
-import { OpenCodeHttpDriver, OpenCodeHttpError, messageIdFor } from "./opencode-http-driver.js";
+import { OpenCodeHttpDriver, OpenCodeHttpError, messageIdFor, sessionIdFor } from "./opencode-http-driver.js";
 import { parseOpenCodeJsonl } from "../parse.js";
 
 export type NarAttempt = {
@@ -28,6 +28,8 @@ export interface NarAttemptInput {
   model: string;
   /** Session title, e.g. `SCO-12 Issue title`; absent => `Paperclip <issueId>`. */
   title?: string;
+  /** Session Paperclip chose to resume; null/absent means it rotated (or this is the first wake). */
+  resumeSessionId?: string | null;
   prompt: string;
   timeoutSec: number;
   signal?: AbortSignal;
@@ -123,6 +125,26 @@ async function collectOutcome(
   return { texts, usage, usageReported, costUsd: ops.length ? cost : null, sessionOutcome };
 }
 
+/**
+ * One OpenCode session per agent+issue+generation. Paperclip resumes by passing back the id it saved; when it passes
+ * none (first wake, or its session rotation cleared it) the pair moves to a fresh generation, so rotation really
+ * drops OpenCode's accumulated context. A busy latest generation is still being worked by an earlier run of the
+ * same pair (restart mid-run) and is rejoined, never abandoned.
+ */
+async function chooseSessionId(
+  driver: OpenCodeHttpDriver, scope: { agentId: string; issueId: string }, resume: string | null | undefined, msgId: string,
+): Promise<string> {
+  const latest = await driver.latestGeneration(scope);
+  if (resume) {
+    for (let g = 0; g <= latest; g++) if (sessionIdFor(scope, g) === resume) return resume;
+  }
+  if (latest < 0) return sessionIdFor(scope, 0);
+  const latestId = sessionIdFor(scope, latest);
+  // A restart of the same run already has its prompt in the latest generation: stay there, never re-prompt elsewhere.
+  if (await driver.messageExists(latestId, msgId) || await driver.inflightMessage(latestId)) return latestId;
+  return sessionIdFor(scope, latest + 1);
+}
+
 export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<NarAttempt> {
   const { onLog, signal } = input;
   if (signal?.aborted) return held("OpenCode NAR stopped before provider contact", false, null, "aborted_pre_submit");
@@ -141,8 +163,10 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
   try {
     const host = await driver.attestHost(input.agentId);
     const fence = { runId: input.runId, leaseGeneration: 1, hostEpoch: host.hostEpoch };
+    const scope = { agentId: input.agentId, issueId: input.taskId };
     const bound = await driver.bindConversation(
-      host, { agentId: input.agentId, issueId: input.taskId, cwd: input.cwd, model: input.model || undefined, title: input.title }, "new", fence,
+      host, { ...scope, cwd: input.cwd, model: input.model || undefined, title: input.title }, "new", fence,
+      await chooseSessionId(driver, scope, input.resumeSessionId, msgId),
     );
     conversationId = bound.conversationId;
     await onLog("stdout", `[paperclip] NAR OpenCode session ${conversationId} (run ${input.runId})\n`);

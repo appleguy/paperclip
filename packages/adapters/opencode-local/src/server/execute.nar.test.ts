@@ -128,10 +128,10 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     await fs.rm(root, { force: true, recursive: true });
   });
 
-  const context = (runId: string, extra: Record<string, unknown> = {}, taskId = "issue-one") => ({
+  const context = (runId: string, extra: Record<string, unknown> = {}, taskId = "issue-one", sessionId: string | null = null) => ({
     runId,
     agent: { id: "agent-one", companyId: "company-one", name: "OpenCode Fixture", adapterType: "opencode_local", adapterConfig: {} },
-    runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: taskId },
+    runtime: { sessionId, sessionParams: sessionId ? { sessionId, cwd: root } : null, sessionDisplayId: null, taskKey: taskId },
     config: { command: cli, cwd: root, model: "openai/fixture", variant: "medium", sharedServerRecoveryConfigPath: cfg,
       promptTemplate: "Full assignment", env: { OPENCODE_ALLOW_ALL_MODELS: "1" }, ...extra },
     context: { taskId, paperclipTaskMarkdown: "Finish SCO-337" },
@@ -159,7 +159,9 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     };
     await execute(context("run-1", { nativeRuntime: "nar" }) as never); // no wake issue: placeholder
     expect([...sessions.values()][0]!.info.title).toBe("Paperclip issue-one");
-    await execute(withIssue("run-2") as never);
+    const first = [...sessions.keys()][0]!;
+    const w2 = withIssue("run-2");
+    await execute({ ...w2, runtime: { ...w2.runtime, sessionId: first, sessionParams: { sessionId: first, cwd: root } } } as never);
     expect(sessions.size).toBe(1);
     expect([...sessions.values()][0]!.info.title).toBe("SCO-12 Fix the thing");
   });
@@ -170,12 +172,22 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect(again).toMatchObject({ exitCode: 0, summary: "answer 1" });
     expect(userMsgs()).toHaveLength(1);
     expect(promptPosts).toBe(2); // re-submitted with the same id, deduped by the server
-    const next = await execute(context("run-2", { nativeRuntime: "nar" }) as never);
+    const next = await execute(context("run-2", { nativeRuntime: "nar" }, "issue-one", sessionIdFor(scope)) as never);
     expect(sessions.size).toBe(1);
     expect(userMsgs()).toHaveLength(2);
     // Only this op's assistant message is counted, not the earlier run's.
     expect(next).toMatchObject({ exitCode: 0, summary: "answer 3", costUsd: 0.5, usage: { inputTokens: 302 } });
     expect(runProcess).not.toHaveBeenCalled();
+  });
+
+  it("a wake that arrives without a resumable session after one existed rotates to a fresh generation", async () => {
+    await execute(context("run-1", { nativeRuntime: "nar" }) as never);
+    const rotated = await execute(context("run-2", { nativeRuntime: "nar" }) as never); // Paperclip cleared the session id
+    expect(sessions.size).toBe(2);
+    expect(rotated).toMatchObject({ exitCode: 0, sessionId: sessionIdFor(scope, 1) });
+    const resumed = await execute(context("run-3", { nativeRuntime: "nar" }, "issue-one", sessionIdFor(scope, 1)) as never);
+    expect(sessions.size).toBe(2);
+    expect(resumed).toMatchObject({ sessionId: sessionIdFor(scope, 1) });
   });
 
   it("a retry run after a mid-run Paperclip restart rejoins the in-flight message instead of re-prompting", async () => {
@@ -244,7 +256,7 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect(await driver.interruptExpectedMessage(sid, messageIdFor(narOpIdFor("run-idle")), op, fence)).toBe("idle");
     expect(interruptPosts).toBe(0);
     autoComplete = false;
-    const live = execute(context("run-other", { nativeRuntime: "nar" }) as never);
+    const live = execute(context("run-other", { nativeRuntime: "nar" }, "issue-one", sid) as never);
     await vi.waitFor(() => expect(active.has(sid)).toBe(true));
     expect(await driver.interruptExpectedMessage(sid, messageIdFor(narOpIdFor("run-idle")), op, fence)).toBe("idle");
     expect(interruptPosts).toBe(0);
