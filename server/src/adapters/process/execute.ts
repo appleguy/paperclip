@@ -57,6 +57,8 @@ async function executeProcess(ctx: AdapterExecutionContext): Promise<AdapterExec
     env[k] = v;
   }
   env.PAPERCLIP_RUN_ID = runId;
+  const taskId = asString(ctx.context.taskId, "").trim() || asString(ctx.context.issueId, "").trim();
+  if (taskId) env.PAPERCLIP_TASK_ID = taskId;
   if (authToken) env.PAPERCLIP_API_KEY = authToken;
   // runtimeEnv is only used to resolve the command path and log HOME below;
   // the child env is built inside runChildProcess from

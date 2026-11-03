@@ -5,11 +5,14 @@ import { join } from "node:path";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
+  authUsers,
   agents,
+  companyMemberships,
   companies,
   createDb,
   environmentLeases,
   environments,
+  issues,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -170,6 +173,7 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
   it("injects run-scoped Paperclip env into process agents", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
+    const taskId = randomUUID();
     const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     const tempDir = await mkdtemp(join(tmpdir(), "paperclip-process-env-"));
     const envPath = join(tempDir, "env.json");
@@ -180,6 +184,21 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
       issuePrefix,
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
+    });
+
+    await db.insert(authUsers).values({
+      id: "responsible-user",
+      name: "Responsible user",
+      email: "responsible-user@example.test",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "responsible-user",
+      membershipRole: "member",
+      status: "active",
     });
 
     await db.insert(agents).values({
@@ -198,6 +217,7 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
             `fs.writeFileSync(${JSON.stringify(envPath)}, JSON.stringify({`,
             "agentId: process.env.PAPERCLIP_AGENT_ID ?? null,",
             "companyId: process.env.PAPERCLIP_COMPANY_ID ?? null,",
+            "taskId: process.env.PAPERCLIP_TASK_ID ?? null,",
             "apiUrl: process.env.PAPERCLIP_API_URL ?? null,",
             "runId: process.env.PAPERCLIP_RUN_ID ?? null,",
             "apiKeyPresent: Boolean(process.env.PAPERCLIP_API_KEY),",
@@ -209,7 +229,25 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
       permissions: {},
     });
 
-    const queued = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+    await db.insert(issues).values({
+      id: taskId,
+      companyId,
+      title: "Process environment fixture",
+      description: "Local environment injection test",
+      status: "todo",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+      createdByUserId: "responsible-user",
+      issueNumber: 1,
+    });
+
+    const queued = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+      reason: "issue_assigned",
+      payload: { issueId: taskId },
+      contextSnapshot: { issueId: taskId, taskId },
+    });
     expect(queued).not.toBeNull();
 
     const finished = await waitForRunToFinish(heartbeat, queued!.id);
@@ -219,6 +257,7 @@ describeEmbeddedPostgres("heartbeat local environment lifecycle", () => {
     expect(captured).toMatchObject({
       agentId,
       companyId,
+      taskId,
       runId: queued!.id,
       apiKeyPresent: true,
     });

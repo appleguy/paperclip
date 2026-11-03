@@ -7,8 +7,10 @@ vi.mock("../services/activity-log.js", () => ({
   publishActivity: vi.fn(),
 }));
 
+const mockEnqueueFastResponse = vi.hoisted(() => vi.fn(async () => undefined));
+
 vi.mock("../services/fast-responses.js", () => ({
-  enqueueFastResponse: vi.fn(async () => undefined),
+  enqueueFastResponse: mockEnqueueFastResponse,
 }));
 
 const ASSIGNEE_AGENT_ID = "11111111-1111-4111-8111-111111111111";
@@ -706,6 +708,66 @@ describe("issue update comment wakeups", () => {
           source: "issue.comment",
         }),
       }),
+    );
+  });
+
+  it.each(["post", "patch"] as const)("stores a %s operator comment on an assigned backlog issue without waking or promoting it", async (method) => {
+    const existing = makeIssue({
+      status: "backlog",
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-backlog",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "context for later",
+    });
+
+    const app = await createApp();
+    const res = method === "post"
+      ? await request(app).post(`/api/issues/${existing.id}/comments`).send({ body: "context for later" })
+      : await request(app).patch(`/api/issues/${existing.id}`).send({ comment: "context for later" });
+
+    expect(res.status).toBe(method === "post" ? 201 : 200);
+    if (method === "post") {
+      expect(res.body).toMatchObject({ id: "comment-backlog", body: "context for later" });
+    } else {
+      expect(res.body).toMatchObject({ id: existing.id, status: "backlog" });
+    }
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(mockIssueService.addComment).toHaveBeenCalledOnce();
+    expect(mockIssueService.update.mock.calls.every(([, patch]) => patch.status !== "todo")).toBe(true);
+    expect(mockEnqueueFastResponse).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  it("wakes an assigned issue when it is explicitly promoted from backlog to todo", async () => {
+    const existing = makeIssue({
+      status: "backlog",
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+    });
+    const promoted = makeIssue({
+      status: "todo",
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.update.mockResolvedValue(promoted);
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${existing.id}`)
+      .send({ status: "todo" });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ status: "todo" });
+    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1));
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({ reason: "issue_status_changed" }),
     );
   });
 

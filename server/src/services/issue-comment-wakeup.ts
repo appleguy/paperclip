@@ -21,6 +21,9 @@ export function shouldWakeAssigneeForIssueComment(input: {
   ) {
     return false;
   }
+  // A comment is context, not an instruction to activate work still in backlog.
+  // Promotion to todo has its own explicit status-change wake path.
+  if (!input.reopened && input.currentStatus === "backlog") return false;
   return (
     input.reopened ||
     (input.currentStatus !== "done" && input.currentStatus !== "cancelled")

@@ -47,6 +47,30 @@ describe("shouldWakeAssigneeForIssueComment", () => {
     ).toBe(false);
   });
 
+  it("does not wake an assigned issue while it remains in backlog", () => {
+    expect(
+      shouldWakeAssigneeForIssueComment({
+        selfComment: false,
+        resumeRequested: false,
+        issueAtCommentStart: {},
+        reopened: false,
+        currentStatus: "backlog",
+      }),
+    ).toBe(false);
+  });
+
+  it("preserves comment wakes after explicit promotion to todo", () => {
+    expect(
+      shouldWakeAssigneeForIssueComment({
+        selfComment: false,
+        resumeRequested: false,
+        issueAtCommentStart: {},
+        reopened: false,
+        currentStatus: "todo",
+      }),
+    ).toBe(true);
+  });
+
   it("does not wake a closed issue unless the comment reopened it", () => {
     const base = {
       selfComment: false,
