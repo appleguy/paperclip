@@ -247,18 +247,24 @@ function typeText(value: string) {
 
 function pressKey(
   key: string,
-  modifiers: { metaKey?: boolean; ctrlKey?: boolean; shiftKey?: boolean } = {},
+  modifiers: { metaKey?: boolean; ctrlKey?: boolean; shiftKey?: boolean; code?: string; isComposing?: boolean } = {},
 ) {
-  flushSync(() => {
-    editable().dispatchEvent(
-      new KeyboardEvent("keydown", {
-        key,
-        ...modifiers,
-        bubbles: true,
-        cancelable: true,
-      }),
-    );
+  const event = new KeyboardEvent("keydown", {
+    key,
+    ...modifiers,
+    bubbles: true,
+    cancelable: true,
   });
+  flushSync(() => {
+    editable().dispatchEvent(event);
+  });
+  return event;
+}
+
+function toggleEnterToSend() {
+  openComposerAddMenu();
+  const item = document.querySelector<HTMLElement>('[data-testid="composer-add-enter-to-send"]')!;
+  flushSync(() => item.dispatchEvent(new MouseEvent("click", { bubbles: true })));
 }
 
 function openComposerAddMenu() {
@@ -1120,6 +1126,56 @@ describe("TaskChatComposer", () => {
     expect(onAdd).toHaveBeenCalledWith("hello", undefined, undefined, undefined, expect.any(String));
   });
 
+  it("sends on plain Enter once Enter to send is on, and Shift+Enter stays a newline", async () => {
+    const onAdd = vi.fn().mockResolvedValue(undefined);
+    renderComposer({ onAdd, workMode: "standard", onWorkModeChange: vi.fn().mockResolvedValue(undefined) });
+
+    toggleEnterToSend();
+    expect(localStorage.getItem("paperclip:composer:enter-to-send")).toBe("1");
+    expect(sendButton().title).toBe("Send (Enter)");
+
+    typeText("first line");
+    expect(container.querySelector('[data-testid="task-chat-composer-send-hint"]')?.textContent).toContain("Shift+Enter");
+    expect(pressKey("Enter", { shiftKey: true }).defaultPrevented).toBe(false);
+    expect(pressKey("Enter", { isComposing: true }).defaultPrevented).toBe(false);
+    await flushAsync();
+    expect(onAdd).not.toHaveBeenCalled();
+
+    expect(pressKey("Enter").defaultPrevented).toBe(true);
+    await flushAsync();
+    await flushAsync();
+    expect(onAdd).toHaveBeenCalledWith("first line", undefined, undefined, undefined, expect.any(String));
+    expect(editable().textContent).toBe("");
+  });
+
+  it("keeps Cmd+Enter sending and restores newline-on-Enter when Enter to send is turned off", async () => {
+    const onAdd = vi.fn().mockResolvedValue(undefined);
+    localStorage.setItem("paperclip:composer:enter-to-send", "1");
+    renderComposer({ onAdd, workMode: "standard", onWorkModeChange: vi.fn().mockResolvedValue(undefined) });
+
+    toggleEnterToSend();
+    expect(localStorage.getItem("paperclip:composer:enter-to-send")).toBeNull();
+    expect(sendButton().title).toBe("Send (⌘+Enter)");
+
+    typeText("hello");
+    expect(container.querySelector('[data-testid="task-chat-composer-send-hint"]')?.textContent).toContain("Enter to send");
+    expect(pressKey("Enter").defaultPrevented).toBe(false);
+    pressKey("Enter", { metaKey: true });
+    await flushAsync();
+    expect(onAdd).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores the Enter to send preference on mobile layouts", () => {
+    localStorage.setItem("paperclip:composer:enter-to-send", "1");
+    renderComposer({ onAdd: vi.fn(), workMode: "standard", mobile: true, onWorkModeChange: vi.fn().mockResolvedValue(undefined) });
+
+    typeText("hello");
+    expect(pressKey("Enter").defaultPrevented).toBe(false);
+    expect(container.querySelector('[data-testid="task-chat-composer-send-hint"]')).toBeNull();
+    openComposerAddMenu();
+    expect(document.querySelector('[data-testid="composer-add-enter-to-send"]')).toBeNull();
+  });
+
   it("does not submit on plain Enter or Shift+Enter (newline stays with the editor)", async () => {
     const onAdd = vi.fn().mockResolvedValue(undefined);
     render(<TaskChatComposer onAdd={onAdd} workMode="standard" />);
@@ -1158,6 +1214,30 @@ describe("TaskChatComposer", () => {
 
     expect(onWorkModeChange).toHaveBeenCalledWith("planning");
     expect(onAdd).toHaveBeenCalledWith("do the plan", undefined, undefined, undefined, expect.any(String));
+  });
+
+  it("leaves Cmd/Ctrl+V alone on Dvorak, where V reports code Period", () => {
+    const onWorkModeChange = vi.fn().mockResolvedValue(undefined);
+    renderComposer({ onAdd: vi.fn(), workMode: "standard", onWorkModeChange });
+    editable().focus();
+
+    for (const modifiers of [{ metaKey: true }, { ctrlKey: true }]) {
+      const event = pressKey("v", { ...modifiers, code: "Period" });
+      expect(event.defaultPrevented).toBe(false);
+    }
+    expect(container.querySelector('[data-testid="task-chat-composer-mode"]')).toBeNull();
+    expect(onWorkModeChange).not.toHaveBeenCalled();
+  });
+
+  it("still cycles modes when a keyboard reports Cmd+Period without a character key", () => {
+    renderComposer({ onAdd: vi.fn(), workMode: "standard", onWorkModeChange: vi.fn().mockResolvedValue(undefined) });
+    editable().focus();
+
+    expect(pressKey("Unidentified", { metaKey: true, code: "Period" }).defaultPrevented).toBe(true);
+    expect(container.querySelector('[data-testid="task-chat-composer-mode"]')?.getAttribute("data-pending-work-mode")).toBe("planning");
+    // Dvorak Cmd+. (physical "E" position): key is the period, code is not.
+    expect(pressKey(".", { metaKey: true, code: "KeyE" }).defaultPrevented).toBe(true);
+    expect(container.querySelector('[data-testid="task-chat-composer-mode"]')?.getAttribute("data-pending-work-mode")).toBe("ask");
   });
 
   it("cycles Auto, Plan, and Ask modes with Cmd+Period while focused", () => {

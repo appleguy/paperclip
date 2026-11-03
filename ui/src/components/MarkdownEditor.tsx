@@ -57,6 +57,7 @@ import {
 } from "../lib/angle-bracket-markdown";
 import { unescapeBlockquoteMarkers } from "../lib/blockquote-markdown";
 import { pasteNormalizationPlugin } from "../lib/paste-normalization";
+import { isPlainEnterSend } from "../lib/composer-keys";
 import { cn } from "../lib/utils";
 import { useEditorAutocomplete, type SlashCommandOption } from "../context/EditorAutocompleteContext";
 
@@ -97,8 +98,14 @@ interface MarkdownEditorProps {
   mentions?: MentionOption[];
   /** Capability-aware action commands supplied by the owning composer. */
   actionCommands?: SlashCommandOption[];
-  /** Called on Cmd/Ctrl+Enter */
+  /** Called on Cmd/Ctrl+Enter (and on plain Enter when `submitOnEnter` is set) */
   onSubmit?: () => void;
+  /**
+   * Make plain Enter call `onSubmit`; Shift+Enter keeps inserting a newline.
+   * An open mention/slash menu still consumes Enter first, and IME
+   * composition Enter is never treated as a send.
+   */
+  submitOnEnter?: boolean;
   /** Render the rich editor without allowing edits. */
   readOnly?: boolean;
 }
@@ -742,6 +749,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
   mentions,
   actionCommands = [],
   onSubmit,
+  submitOnEnter = false,
   readOnly = false,
 }: MarkdownEditorProps, forwardedRef) {
   const editorValue = useMemo(() => prepareMarkdownForEditor(value), [value]);
@@ -1376,6 +1384,11 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
             if (onSubmit && event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
               event.preventDefault();
               onSubmit();
+              return;
+            }
+            if (onSubmit && submitOnEnter && isPlainEnterSend(event)) {
+              event.preventDefault();
+              onSubmit();
             }
           }}
           className={cn(
@@ -1471,6 +1484,20 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
               return;
             }
           }
+        }
+
+        // Plain Enter sends when the composer opted in. Runs after the mention
+        // menu so Enter still picks the highlighted suggestion.
+        if (
+          onSubmit
+          && submitOnEnter
+          && isPlainEnterSend(e)
+          && e.target instanceof HTMLElement
+          && e.target.closest('[contenteditable="true"]')
+        ) {
+          e.preventDefault();
+          e.stopPropagation();
+          onSubmit();
         }
       }}
       onDragEnter={(evt) => {

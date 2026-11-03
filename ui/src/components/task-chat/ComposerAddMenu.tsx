@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { IssueWorkMode } from "@paperclipai/shared";
-import { Check, ClipboardList, MessageCircleQuestion, Lock, Paperclip, Plus, Target, X, type LucideIcon } from "lucide-react";
+import { Check, ClipboardList, CornerDownLeft, MessageCircleQuestion, Lock, Paperclip, Plus, Target, X, type LucideIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useMobileEntityPickerViewportStyle } from "@/hooks/useMobileEntityPickerViewportStyle";
 import { workModeMetaFor } from "@/lib/work-mode-meta";
@@ -22,6 +22,8 @@ interface ComposerAddMenuProps {
   onAttachFile?: () => void;
   attachDisabled?: boolean;
   onGoal?: () => void;
+  /** Desktop-only toggle: plain Enter sends, Shift+Enter inserts a newline. */
+  enterToSend?: { enabled: boolean; onChange: (enabled: boolean) => void };
   privacy?: { private: boolean; inherited?: string; onChange: (value: boolean) => void };
   disabled?: boolean;
   mobile?: boolean;
@@ -30,7 +32,7 @@ interface ComposerAddMenuProps {
 }
 
 export function ComposerAddMenu({
-  mode, onModeChange, onAttachFile, attachDisabled, onGoal, privacy, disabled, mobile: mobileProp, triggerTestId, menuTestId,
+  mode, onModeChange, onAttachFile, attachDisabled, onGoal, enterToSend, privacy, disabled, mobile: mobileProp, triggerTestId, menuTestId,
 }: ComposerAddMenuProps) {
   const [open, setOpen] = useState(false);
   const mobileViewportStyle = useMobileEntityPickerViewportStyle();
@@ -53,6 +55,7 @@ export function ComposerAddMenu({
       { id: "composer-add-plan", label: "Plan mode", detail: "Plan before acting", Icon: ClipboardList, select: () => onModeChange(mode === "planning" ? "standard" : "planning"), selected: mode === "planning" },
       { id: "composer-add-ask", label: "Ask mode", detail: "Answer without changes", Icon: MessageCircleQuestion, select: () => onModeChange(mode === "ask" ? "standard" : "ask"), selected: mode === "ask" },
     ] : []),
+    ...(enterToSend ? [{ id: "composer-add-enter-to-send", label: "Enter to send", detail: enterToSend.enabled ? "Shift+Enter for a new line" : "Off · ⌘+Enter sends", Icon: CornerDownLeft, select: () => enterToSend.onChange(!enterToSend.enabled), selected: enterToSend.enabled }] : []),
   ];
   const trigger = <button type="button" aria-label="Add to composer" aria-keyshortcuts={onModeChange ? "Meta+Period Control+Period Shift+Tab" : undefined}
     disabled={disabled} data-testid={triggerTestId}

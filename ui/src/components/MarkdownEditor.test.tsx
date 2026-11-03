@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import type { ComponentProps } from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
@@ -1404,6 +1405,7 @@ describe("MarkdownEditor", () => {
       },
     ],
     matchText = "Paperclip App",
+    extraProps: Partial<ComponentProps<typeof MarkdownEditor>> = {},
   ): Promise<{ option: HTMLButtonElement; root: ReturnType<typeof createRoot>; menu: HTMLElement }> {
     const root = createRoot(container);
 
@@ -1413,6 +1415,7 @@ describe("MarkdownEditor", () => {
           value="@Pap"
           onChange={handleChange}
           mentions={mentions}
+          {...extraProps}
         />,
       );
     });
@@ -1443,6 +1446,72 @@ describe("MarkdownEditor", () => {
     expect(menu).toBeTruthy();
     return { option: option!, root, menu: menu! };
   }
+
+  describe("submitOnEnter", () => {
+    function pressEnter(modifiers: { shiftKey?: boolean; metaKey?: boolean; isComposing?: boolean } = {}) {
+      const target = container.querySelector('[contenteditable="true"]')!;
+      const event = new KeyboardEvent("keydown", { key: "Enter", ...modifiers, bubbles: true, cancelable: true });
+      act(() => {
+        target.dispatchEvent(event);
+      });
+      return event;
+    }
+
+    it("sends on plain Enter but keeps Shift+Enter and IME confirmation as editor input", async () => {
+      const onSubmit = vi.fn();
+      const root = createRoot(container);
+      await act(async () => {
+        root.render(<MarkdownEditor value="hello" onChange={vi.fn()} onSubmit={onSubmit} submitOnEnter />);
+      });
+      await flush();
+
+      expect(pressEnter({ shiftKey: true }).defaultPrevented).toBe(false);
+      expect(pressEnter({ isComposing: true }).defaultPrevented).toBe(false);
+      expect(onSubmit).not.toHaveBeenCalled();
+
+      expect(pressEnter().defaultPrevented).toBe(true);
+      expect(onSubmit).toHaveBeenCalledTimes(1);
+      expect(pressEnter({ metaKey: true }).defaultPrevented).toBe(true);
+      expect(onSubmit).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    it("leaves Enter as a newline when submitOnEnter is off", async () => {
+      const onSubmit = vi.fn();
+      const root = createRoot(container);
+      await act(async () => {
+        root.render(<MarkdownEditor value="hello" onChange={vi.fn()} onSubmit={onSubmit} />);
+      });
+      await flush();
+
+      expect(pressEnter().defaultPrevented).toBe(false);
+      expect(onSubmit).not.toHaveBeenCalled();
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+
+    it("lets Enter pick the highlighted mention instead of sending", async () => {
+      const onSubmit = vi.fn();
+      const handleChange = vi.fn();
+      const { root } = await openMentionMenuFor(handleChange, undefined, undefined, { onSubmit, submitOnEnter: true });
+
+      pressEnter();
+
+      expect(onSubmit).not.toHaveBeenCalled();
+      expect(handleChange).toHaveBeenCalledWith(
+        `[@Paperclip App](${buildProjectMentionHref("project-123", "#336699")}) `,
+      );
+
+      await act(async () => {
+        root.unmount();
+      });
+    });
+  });
 
   it("accepts mention selection from a touch tap", async () => {
     const handleChange = vi.fn();

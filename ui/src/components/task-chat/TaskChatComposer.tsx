@@ -11,6 +11,8 @@ import {
 } from "react";
 import { cn } from "@/lib/utils";
 import { useComposerStop } from "@/hooks/useComposerStop";
+import { useComposerEnterToSend } from "@/hooks/useComposerEnterToSend";
+import { isPeriodShortcutKey } from "@/lib/composer-keys";
 import { useStreamlinedTaskChatPresentation } from "./presentation-mode";
 import {
   DRAFT_DEBOUNCE_MS,
@@ -384,9 +386,10 @@ function escapeMarkdownLabel(name: string): string {
  * Composer for the redesigned thread (v7 spec): the shared MarkdownEditor
  * (rich lists, @-mentions, /-commands, inline pasted images) over a 32px
  * comp-bar of [add] [optional mode chip] … [assignee] [send]. The add menu
- * offers files, supported goals, Plan, and Ask. Cmd/Ctrl+. and Shift+Tab cycle modes (captured before
+ * offers files, supported goals, Plan, Ask, and an "Enter to send" toggle. Cmd/Ctrl+. and Shift+Tab cycle modes (captured before
  * Lexical); Cmd/Ctrl+Enter posts via the editor's native onSubmit; plain Enter
- * stays a newline / next list item. Pasted or dropped images upload through
+ * stays a newline / next list item unless the user turned on Enter to send
+ * (then Shift+Enter is the newline). Pasted or dropped images upload through
  * `onAttachImage` (or the `onImageUpload` fallback) and land inline at the
  * caret via the editor's image plugin; non-image files render as shadcn
  * base/attachment chips (kind icon · name · size, remove ×, uploading/error
@@ -431,6 +434,9 @@ export function TaskChatComposer({
   onRunnerGoalReassign,
 }: TaskChatComposerProps) {
   const streamlined = useStreamlinedTaskChatPresentation();
+  const [enterToSendPref, setEnterToSendPref] = useComposerEnterToSend();
+  // Soft keyboards need Enter for newlines, so the preference only applies to desktop layouts.
+  const enterToSend = enterToSendPref && !mobile;
   const stopControl = useComposerStop(onStop, stopPending);
   const [localBody, setBody] = useState(() => (draftKey ? loadDraft(draftKey) : ""));
   const body = creation ? creation.value : localBody;
@@ -1356,10 +1362,11 @@ export function TaskChatComposer({
         onKeyDownCapture={(e) => {
         // Capture mode shortcuts on the wrapper so they work while the rich
         // editor is focused and win over Lexical/browser bindings. Match the
-        // period by key and code because hardware keyboards on iOS can omit
-        // `code` for Cmd+Period.
+        // period by `key` first: `code` is the physical position, which on
+        // Dvorak is the V key, so Cmd+V must not cycle modes. Hardware
+        // keyboards on iOS can omit the key for Cmd+Period, hence the fallback.
         if (disabled || queuedEdit) return;
-        const isPeriod = e.key === "." || e.code === "Period";
+        const isPeriod = isPeriodShortcutKey(e);
         const isModeShortcut =
           (isPeriod && (e.metaKey || e.ctrlKey)) ||
           (e.key === "Tab" && e.shiftKey);
@@ -1423,6 +1430,7 @@ export function TaskChatComposer({
                 disabled,
               }] : [goalCommandOption]}
               onSubmit={() => void submit()}
+              submitOnEnter={enterToSend}
               imageUploadHandler={
                 canAcceptFiles && (!creation || onImageUpload) ? uploadInlineImage : undefined
               }
@@ -1535,6 +1543,7 @@ export function TaskChatComposer({
               onGoal={!queuedEdit && !conversationMode && attachments.length === 0 &&
                 runnerGoalCapability?.availability === "available" && onRunnerGoalCommand
                 ? prepareGoal : undefined}
+              enterToSend={mobile ? undefined : { enabled: enterToSendPref, onChange: setEnterToSendPref }}
               disabled={disabled || !!uncertainSubmission}
               mobile={mobile}
               triggerTestId="task-chat-composer-add"
@@ -1637,6 +1646,14 @@ export function TaskChatComposer({
                 Cancel
               </button>
             ) : null}
+            {!mobile && !queuedEdit && !showStop && body.trim().length > 0 ? (
+              <span
+                className="min-w-0 truncate text-xs text-muted-foreground max-sm:hidden"
+                data-testid="task-chat-composer-send-hint"
+              >
+                {enterToSend ? "Enter to send · Shift+Enter for a new line" : "⌘/Ctrl+Enter to send"}
+              </span>
+            ) : null}
             <button
               type="button"
               onClick={() => void (showStop ? stopControl.stop() : submit())}
@@ -1665,7 +1682,7 @@ export function TaskChatComposer({
                       ? "Waiting for upload to finish"
                       : uploadFailed
                         ? "Remove the failed attachment to send"
-                        : creation ? `${creation.submitLabel} (⌘+Enter)` : "Send (⌘+Enter)"
+                        : `${creation?.submitLabel ?? "Send"} (${enterToSend ? "Enter" : "⌘+Enter"})`
               }
               aria-label={
                 showStop
