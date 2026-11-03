@@ -59,10 +59,16 @@ describe("OpenCode adapter nativeRuntime nar", () => {
         if (p === "/api/session/active") return reply(200, { data: Object.fromEntries([...active].map((id) => [id, { type: "running" }])) });
         if (p === "/api/session" && method === "POST") {
           if (sessions.has(body.id)) return reply(409, {});
-          sessions.set(body.id, { info: { id: body.id, location: body.location, model: body.model, time: { created: clock++ } }, msgs: [] });
+          sessions.set(body.id, { info: { id: body.id, title: body.title, location: body.location, model: body.model, time: { created: clock++ } }, msgs: [] });
           return reply(200, { data: sessions.get(body.id)!.info });
         }
         let m = p.match(/^\/api\/session\/([^/]+)$/);
+        if (m && method === "PATCH") {
+          const s = sessions.get(m[1]!);
+          if (!s) return reply(404, {});
+          if (typeof body.title === "string") s.info.title = body.title;
+          res.writeHead(204); return res.end();
+        }
         if (m) { const s = sessions.get(m[1]!); return s ? reply(200, { data: s.info }) : reply(404, {}); }
         m = p.match(/^\/api\/session\/([^/]+)\/prompt$/);
         if (m) {
@@ -144,6 +150,18 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect(sessions.size).toBe(1);
     expect(userMsgs().map((m) => m.id)).toEqual([messageIdFor(narOpIdFor("run-1"))]);
     expect([...sessions.values()][0]!.info.model).toEqual({ providerID: "openai", id: "fixture", variant: "medium" });
+  });
+
+  it("names the session after the wake issue and retitles an older placeholder on the next run", async () => {
+    const withIssue = (runId: string) => {
+      const c = context(runId, { nativeRuntime: "nar" });
+      return { ...c, context: { ...c.context, paperclipWake: { issue: { id: "issue-one", identifier: "SCO-12", title: "Fix  the thing" } } } };
+    };
+    await execute(context("run-1", { nativeRuntime: "nar" }) as never); // no wake issue: placeholder
+    expect([...sessions.values()][0]!.info.title).toBe("Paperclip issue-one");
+    await execute(withIssue("run-2") as never);
+    expect(sessions.size).toBe(1);
+    expect([...sessions.values()][0]!.info.title).toBe("SCO-12 Fix the thing");
   });
 
   it("a restart of the same run does not create a second message; a new run resumes the same session", async () => {

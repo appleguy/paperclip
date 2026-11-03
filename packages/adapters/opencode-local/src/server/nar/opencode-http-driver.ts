@@ -40,6 +40,15 @@ export interface OpenCodeHttpOptions {
 
 const hex = (s: string) => createHash("sha256").update(s).digest("hex");
 export const sessionIdFor = (s: Pick<ConvScope, "agentId" | "issueId">) => `ses_${hex(`nar|${s.agentId}|${s.issueId}`).slice(0, 26)}`;
+export const defaultSessionTitle = (issueId: string) => `Paperclip ${issueId}`;
+/** `SCO-12 Issue title`, whitespace collapsed and capped for the session list; null without an identifier. */
+export function sessionTitleFor(identifier: unknown, title: unknown): string | undefined {
+  const id = typeof identifier === "string" ? identifier.trim() : "";
+  if (!id) return undefined;
+  const t = typeof title === "string" ? title.replace(/\s+/g, " ").trim() : "";
+  const full = t ? `${id} ${t}` : id;
+  return full.length > 120 ? `${full.slice(0, 119)}\u2026` : full;
+}
 export const messageIdFor = (opId: string) => `msg_${hex(`nar|${opId}`).slice(0, 26)}`;
 
 export class OpenCodeHttpError extends Error {
@@ -122,7 +131,7 @@ export class OpenCodeHttpDriver implements ProviderDriver {
   async bindConversation(_h: HostHandle, s: ConvScope, mode: "new" | "resume", _f: Fence, existingId?: string) {
     const id = existingId ?? sessionIdFor(s);
     if (mode === "new") {
-      const body: Record<string, unknown> = { id, title: `Paperclip ${s.issueId}`, location: { directory: s.cwd }, metadata: { paperclip: { agentId: s.agentId, issueId: s.issueId } } };
+      const body: Record<string, unknown> = { id, title: s.title ?? defaultSessionTitle(s.issueId), location: { directory: s.cwd }, metadata: { paperclip: { agentId: s.agentId, issueId: s.issueId } } };
       if (s.model) body.model = parseModelRef(s.model);
       const r = await this.json("POST", "/api/session", body);
       // A duplicate id (earlier create whose reply was lost) falls through to read-back verification.
@@ -134,9 +143,22 @@ export class OpenCodeHttpDriver implements ProviderDriver {
     if (info?.id !== id) throw new OpenCodeHttpError("mismatch", `session id ${String(info?.id)} != ${id}`);
     const cwd = info?.location?.directory;
     if (cwd !== s.cwd) throw new OpenCodeHttpError("mismatch", `session cwd ${String(cwd)} != ${s.cwd}`);
+    await this.retitle(id, info?.title, s);
     const model = info?.model ? `${info.model.providerID}/${info.model.id}${info.model.variant ? `#${info.model.variant}` : ""}` : undefined;
     if (s.model && model && model !== s.model) throw new OpenCodeHttpError("mismatch", `session model ${model} != ${s.model}`);
     return { conversationId: id, cwd, model };
+  }
+
+  // Resume path: sessions created before the title carried the issue (or by a run without wake context) keep the
+  // placeholder `Paperclip <issueId>`. Replace only our own placeholder or an earlier `<identifier> <title>`;
+  // a title the owner set by hand is left alone. Advisory: a failed PATCH never fails the attempt.
+  private async retitle(id: string, current: unknown, s: ConvScope): Promise<void> {
+    if (!s.title || typeof current !== "string" || current === s.title) return;
+    const identifier = s.title.split(/\s+/, 1)[0];
+    if (!current.startsWith("Paperclip ") && !current.startsWith(`${identifier} `)) return;
+    try {
+      await this.json("PATCH", `/api/session/${encodeURIComponent(id)}`, { title: s.title });
+    } catch { /* advisory */ }
   }
 
   // One POST, never retried. A reply echoing our msg id is durable admission (accepted_provider);

@@ -56,6 +56,7 @@ import {
 import { isOpenCodeUnknownSessionError, parseOpenCodeJsonl, createOpenCodeJsonlParser } from "./parse.js";
 import { createOpenCodeAttemptProgressGuard } from "./attempt-progress.js";
 import { runNarOpenCodeAttempt } from "./nar/nar-attempt.js";
+import { sessionTitleFor } from "./nar/opencode-http-driver.js";
 import { OpenCodeSharedSessionWait, prepareSharedOpenCodeSession } from "./shared-session-recovery.js";
 import {
   ensureOpenCodeModelConfiguredAndAvailable,
@@ -524,6 +525,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // Opt-in native runtime: no child process, HTTP driver against the shared server (nar/nar-attempt.ts).
     const narTaskId = wakeTaskId ?? asString(runtime.taskKey, "").trim();
     const narMode = config.nativeRuntime === "nar" && sharedConfigPath.length > 0;
+    const wakeIssue = parseObject(parseObject(context.paperclipWake).issue);
     if (narMode && (executionTargetIsRemote || !narTaskId || !path.isAbsolute(sharedConfigPath))) {
       await onLog("stderr", "[paperclip] NAR OpenCode requires a local target, a task and an absolute shared config; no inference sent.\n");
       return {
@@ -714,6 +716,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         return runNarOpenCodeAttempt({
           configPath: sharedConfigPath, agentId: agent.id, taskId: narTaskId, runId, cwd: effectiveExecutionCwd,
           model: model && variant ? `${model}#${variant}` : model, prompt, timeoutSec, signal: ctx.signal, onLog,
+          title: sessionTitleFor(wakeIssue.identifier, wakeIssue.title),
         });
       }
       const consumeAccounting = createOpenCodeJsonlParser();

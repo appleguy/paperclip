@@ -26,6 +26,8 @@ export interface NarAttemptInput {
   cwd: string;
   /** provider/model[#variant] */
   model: string;
+  /** Session title, e.g. `SCO-12 Issue title`; absent => `Paperclip <issueId>`. */
+  title?: string;
   prompt: string;
   timeoutSec: number;
   signal?: AbortSignal;
@@ -140,7 +142,7 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
     const host = await driver.attestHost(input.agentId);
     const fence = { runId: input.runId, leaseGeneration: 1, hostEpoch: host.hostEpoch };
     const bound = await driver.bindConversation(
-      host, { agentId: input.agentId, issueId: input.taskId, cwd: input.cwd, model: input.model || undefined }, "new", fence,
+      host, { agentId: input.agentId, issueId: input.taskId, cwd: input.cwd, model: input.model || undefined, title: input.title }, "new", fence,
     );
     conversationId = bound.conversationId;
     await onLog("stdout", `[paperclip] NAR OpenCode session ${conversationId} (run ${input.runId})\n`);

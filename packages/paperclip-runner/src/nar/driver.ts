@@ -32,6 +32,8 @@ export interface ConvScope {
   issueId: string;
   cwd: string;
   model?: string;
+  /** Human-readable conversation title; drivers may apply it on create and when resuming. */
+  title?: string;
 }
 export interface Fence {
   runId: string;

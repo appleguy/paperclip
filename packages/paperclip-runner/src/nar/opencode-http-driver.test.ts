@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { OpenCodeHttpDriver, OpenCodeHttpError, messageIdFor, parseModelRef, parseSse, sessionIdFor } from "../../../adapters/opencode-local/src/server/nar/opencode-http-driver.js";
+import { OpenCodeHttpDriver, OpenCodeHttpError, messageIdFor, parseModelRef, parseSse, sessionIdFor, sessionTitleFor } from "../../../adapters/opencode-local/src/server/nar/opencode-http-driver.js";
 
 const URL0 = "http://127.0.0.1:19403";
 const PW = `pw-${randomBytes(9).toString("hex")}`;
@@ -44,13 +44,19 @@ class FakeServer {
     if (p === "/api/session" && method === "POST") {
       if (!String(body.id).startsWith("ses")) return j(400, {});
       if (this.sessions.has(body.id)) return j(409, {});
-      this.sessions.set(body.id, { info: { id: body.id, location: body.location, model: body.model, time: { created: this.clock++ } }, log: [], inbox: new Set(), msgs: new Map(), active: false });
+      this.sessions.set(body.id, { info: { id: body.id, title: body.title, location: body.location, model: body.model, time: { created: this.clock++ } }, log: [], inbox: new Set(), msgs: new Map(), active: false });
       return j(200, { data: this.sessions.get(body.id)!.info });
     }
     if (p === "/api/session/active") {
       return j(200, { data: Object.fromEntries([...this.sessions].filter(([, s]) => s.active).map(([id]) => [id, { type: "running" }])) });
     }
     let m = p.match(/^\/api\/session\/([^/]+)$/);
+    if (m && method === "PATCH") {
+      const s = this.sessions.get(decodeURIComponent(m[1]));
+      if (!s) return j(404, {});
+      if (typeof body.title === "string") s.info.title = body.title;
+      return new Response(null, { status: 204 });
+    }
     if (m) { const s = this.sessions.get(decodeURIComponent(m[1])); return s ? j(200, { data: s.info }) : j(404, {}); }
     m = p.match(/^\/api\/session\/([^/]+)\/prompt$/);
     if (m) {
@@ -127,6 +133,39 @@ describe("OpenCode v2.2.5 driver: conversation binding", () => {
     expect(b.conversationId).toBe(a.conversationId);
     expect(s.sessions.size).toBe(1);
     expect(sessionIdFor({ agentId: "agent-a", issueId: "SCO-2" })).not.toBe(a.conversationId);
+  });
+  it("titles a new session with the issue and retitles an older placeholder on resume", async () => {
+    const s = new FakeServer();
+    const d = mk(s);
+    const id = sessionIdFor(scope);
+    await d.bindConversation(H, scope, "new", FENCE); // no wake context: placeholder
+    expect(s.sessions.get(id)!.info.title).toBe(`Paperclip ${scope.issueId}`);
+    const titled = { ...scope, title: "SCO-12 Fix the thing" };
+    await d.bindConversation(H, titled, "new", FENCE); // 409 -> read-back -> PATCH
+    expect(s.sessions.get(id)!.info.title).toBe("SCO-12 Fix the thing");
+    const patches = () => s.calls.filter((c) => c.method === "PATCH").length;
+    expect(patches()).toBe(1);
+    await d.bindConversation(H, titled, "new", FENCE); // already right: no PATCH
+    expect(patches()).toBe(1);
+    await d.bindConversation(H, { ...scope, title: "SCO-12 Renamed issue" }, "new", FENCE); // own earlier title tracks the issue
+    expect(s.sessions.get(id)!.info.title).toBe("SCO-12 Renamed issue");
+    await d.bindConversation(H, scope, "new", FENCE); // no title given: untouched
+    expect(s.sessions.get(id)!.info.title).toBe("SCO-12 Renamed issue");
+    s.sessions.get(id)!.info.title = "my own name";
+    await d.bindConversation(H, titled, "new", FENCE); // owner-set title is never overwritten
+    expect(s.sessions.get(id)!.info.title).toBe("my own name");
+  });
+  it("creates a session straight with the issue title and survives a failed retitle", async () => {
+    const s = new FakeServer();
+    const d = mk(s);
+    const t = { ...scope, issueId: "SCO-9", title: sessionTitleFor("SCO-9", "  Long\n title ") };
+    await d.bindConversation(H, t, "new", FENCE);
+    expect(s.sessions.get(sessionIdFor(t))!.info.title).toBe("SCO-9 Long title");
+    s.sessions.get(sessionIdFor(t))!.info.title = "Paperclip SCO-9";
+    s.fail = (method) => (method === "PATCH" ? 500 : undefined);
+    expect((await d.bindConversation(H, t, "new", FENCE)).conversationId).toBe(sessionIdFor(t)); // PATCH 500 is advisory
+    expect(sessionTitleFor("", "x")).toBeUndefined();
+    expect(sessionTitleFor("SCO-1", "y".repeat(300))!.length).toBe(120);
   });
   it("rejects a session whose cwd or model differs", async () => {
     const s = new FakeServer();
