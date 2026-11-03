@@ -19,7 +19,7 @@ Evidence snapshot: **2026-11-02 Pacific**. Running checkout SHA initially **`d31
 | One-writer | OPEN | `OC` ignores transport fence arguments; legacy shared-host leases do not establish this NAR path's authority. |
 | Duplicate/stale/foreign refusal | OPEN | HTTP 409/message and cwd/model checks exist; no end-to-end stale lease/foreign writer refusal. |
 | Unknown-effect handling | SHIPPED-UNPROVEN | Ambiguous submit is held; some exceptions during bind are labeled pre-submit, requiring crash-window audit. |
-| Restart rejoin without replay | SHIPPED-UNPROVEN | `inflightMessage()` reuses a busy message without re-prompt (`e2771a59d`); no live restart NAR tuple in IC. |
+| Restart rejoin without replay | PROVEN-LIVE | Tensor64 Runtime (GLM, agent `a4222e05`, `nativeRuntime: nar`), SCO-489, native session **`ses_65bbaab03e751251c917c690ec`** survived three deploys (00:33, 00:44, 01:09 PST; final payload `33739668c7a8`). Successor runs `1249b358`, `0d55944e` and **`529558ec-2280-4c76-8db3-1e768cf6c16a`** each logged `NAR rejoined in-flight message msg_98b7baf2…; prompt not resent`. Completion of owned work is still pending (SCO-489 in progress). |
 | TUI co-presence in Herdr | SHIPPED-UNPROVEN | IC 'v7 OpenCode wiring' reports SCO-427 visible/steered in a legacy pane; not proof for NAR's same session. |
 | Remote Control/phone | OPEN | Generic Herdr/Moshi visibility is not a verified OpenCode phone attachment (S §3.3, Q10). |
 | Owner steer | SHIPPED-UNPROVEN | IC 'v7 OpenCode wiring' reports SCO-427 `MAYA-STEERED`, but lacks run+session+SHA receipt. |
@@ -36,7 +36,7 @@ Evidence snapshot: **2026-11-02 Pacific**. Running checkout SHA initially **`d31
 | One-writer | OPEN | HTTP `submit` and `bindConversation` do not consume the passed fence; no NAR writer CAS. |
 | Duplicate/stale/foreign refusal | OPEN | Duplicate prompt and mismatched session checks are partial; stale/foreign lease checks unintegrated. |
 | Unknown-effect handling | SHIPPED-UNPROVEN | Ambiguous POST held; bind/create errors and incomplete public log are residual gaps. |
-| Restart rejoin without replay | SHIPPED-UNPROVEN | In-flight session lookup and no-resend path shipped in `e2771a59d`; restart live proof absent from IC. |
+| Restart rejoin without replay | PROVEN-LIVE | Tensor64 Lead (DeepSeek, agent `bddd515a`, `nativeRuntime: nar`), SCO-488, native session **`ses_06179247e7e07fb9529543845f`** survived the same three deploys. Successor runs `6d2a9842`, `05ca1eff` and **`0da45b99-a908-4d45-a870-d92005d40fd3`** logged `NAR rejoined in-flight message msg_ec05215f…; prompt not resent`. SCO-488 is in progress. Separate SCO-396 run `d4f240a7` failed (`OpenCode session outcome: failed`); this is Tensor64's own lane. |
 | TUI co-presence in Herdr | SHIPPED-UNPROVEN | IC 'v4: OpenCode live visibility/steering PROVEN (DeepSeek); Herdr clean' reports legacy TUI view; no run/session tuple. |
 | Remote Control/phone | OPEN | Herdr TUI and phone attachment are separate claims; native same-session phone path not receipted (S Q10). |
 | Owner steer | SHIPPED-UNPROVEN | IC SCO-421 second-client `STEERED` evidence has no full qualifying run/session/SHA tuple. |
@@ -63,19 +63,21 @@ Live update 2026-11-03 00:55 PST (cloud lead). Deployed payload **`569f89e25aea`
 
 ## agy (Antigravity CLI 1.4.x)
 
+Live update 2026-11-03 01:16 PST (cloud lead). Agent `4a180a05-e7a4-48f7-8610-190d38f9fdd5`, one persistent TUI `tmux -L pc-agy-exp` session `agy` (Herdr p5), RC URL `https://antigravity.google.com/r/3649148d-fcbc-4129-a4ea-e64933637e78-v2` unchanged across both issues. SCO-491 on payload `569f89e25aea`; SCO-492 on payload **`33739668c7a8`** (stale-idle guard fix). IC heading '2026-11-03 … agy (item 6) re-proven on the new runtime'.
+
 | Capability | Status | Evidence / boundary |
 |---|---|---|
-| Admission | SHIPPED-UNPROVEN | `A` tmux paste/Enter transport exists; no supported structured admission into the same live TUI (S §3.3). |
-| Session identity | SHIPPED-UNPROVEN | `/remote-control` reads live conversation ID and `/new` verifies changed ID; `7880ba307` fixes hard-wrapped URL parsing after failed runs, with no new live bind receipt. |
-| Durable op ids | UNSUPPORTED | A local active run checkpoint is not a provider-ingested, idempotent op ID for pane input. |
-| Receipt settlement | SHIPPED-UNPROVEN | `A` checks file receipt run/issue IDs and report then publishes; no structured `block` or NAR Core receipt. |
-| One-writer | SHIPPED-UNPROVEN | `acquire()` serializes one tmux host; this is not a provider-level fenced writer. |
-| Duplicate/stale/foreign refusal | OPEN | Active checkpoint and RC-URL mismatch checks exist; complete op/epoch/foreign refusal does not. |
-| Unknown-effect handling | SHIPPED-UNPROVEN | Same-issue active checkpoint is adopted, uncertain idle-without-receipt held; no blind re-paste on retry. |
-| Restart rejoin without replay | SHIPPED-UNPROVEN | `adoptableActive` avoids same-issue redispatch while pane survives; resume after pane death is OPEN. |
-| TUI co-presence in Herdr | OPEN | tmux interactive session shipped; Herdr per-agent host identity/owner co-presence not receipted in IC. |
-| Remote Control/phone | SHIPPED-UNPROVEN | `agy --remote-control` and live URL read exist; phone side not proven by an IC tuple. |
-| Owner steer | OPEN | Shared input/phone steering can collide; no verified owner-origin attribution or idle-five-minute guard. |
+| Admission | PROVEN-LIVE | Typed only into an empty editor (Amendment 1): SCO-491 run **`3993475f-e22d-45fd-951c-4f3925325a69`**; SCO-492 run **`1bf933e6-1c21-4810-a25b-d7d772059b34`** was admitted on a stale idle statusLine plus an empty editor that stayed the same across two captures (`STALE_IDLE`, `33739668c`). Before the fix, runs `258cf1d6`/`fd902e96`/`7a4d3a1f` were refused, which was safe but unlive. |
+| Session identity | PROVEN-LIVE | `/new` per issue with read-back: SCO-491 → **`32331df0-9a7c-496d-a335-f2dd15aacd06`**, SCO-492 → **`5a9ecbce-eb84-471c-8280-26744e9d446b`**; same RC URL. |
+| Durable op ids | UNSUPPORTED | Pane input has no provider-ingested idempotent op ID; the run-ID-keyed `active.json` checkpoint and `receipt-<runId>.json` stand in at the adapter boundary. |
+| Receipt settlement | PROVEN-LIVE | `receipt-3993475f…json` and `receipt-1bf933e6…json` matched the exact run and issue; report published; both issues done. |
+| One-writer | SHIPPED-UNPROVEN | `acquire()` serializes one tmux host; steering-race conformance is out of scope (Amendment 1). |
+| Duplicate/stale/foreign refusal | SHIPPED-UNPROVEN | A different-issue checkpoint throws; a stale checkpoint (`ebcf8e1d`, SCO-486 done) blocked dispatch until it was archived. The full triad is out of scope (Amendment 1). |
+| Unknown-effect handling | PROVEN-LIVE | Cancel of `1bf933e6` mid-turn → watchdog `0c1ecb63` recorded `replay: blocked`, `actionOutcome: unknown`; it was released only with checkpoint plus receipt evidence. |
+| Restart rejoin without replay | PROVEN-LIVE | Successor run **`4d770cf4-e5f7-4cec-afad-8dba4b5661d2`** logged `Adopting dispatched run 1bf933e6…; no re-dispatch`. The pane's SCO-492 mention count was 6 before and after (no re-paste); it settled the original receipt and SCO-492 is done. Resume after pane death: OPEN. |
+| TUI co-presence in Herdr | PROVEN-LIVE (agent side) | The same TUI is shown in Herdr p5 throughout both runs; the controller and the typed steer share one conversation. The owner phone view awaits owner confirmation. |
+| Remote Control/phone | SHIPPED-UNPROVEN | `agy --remote-control` URL pinned in `rc-url.json` and unchanged; the owner confirms the phone view. |
+| Owner steer | PROVEN-LIVE (TUI) | A mid-run steer typed into the same TUI during SCO-491 ("put … OWNER-STEER-491 in the receipt summary") was obeyed: the receipt summary contains `OWNER-STEER-491`. It was typed by the lead as a stand-in for the owner; an owner-phone steer is pending. |
 | Usage reporting | UNSUPPORTED | `A` reports `subscription/unpriced` and no per-run token totals (S Q13). |
 
 ## Codex (shared app-server)
@@ -104,8 +106,8 @@ Live update 2026-11-03 00:55 PST (cloud lead). Deployed payload **`569f89e25aea`
 | Durable op ids | UNSUPPORTED | No NAR provider op ID or automatic durable admission protocol in S. |
 | Receipt settlement | UNSUPPORTED | Manual human reply/copy is outside `finish`/`block` Core receipt semantics. |
 | One-writer | UNSUPPORTED | No native Paperclip one-writer lease for a browser session. |
-| Duplicate/stale/foreign refusal | OPEN | Manual handoff markers, if any, require separate importer evidence; none qualifies in IC for this NAR matrix. |
-| Unknown-effect handling | OPEN | Ambiguous manual send/import requires an explicit human reconciliation boundary, not an inferred loss. |
+| Duplicate/stale/foreign refusal | PROVEN-LIVE | `chatgpt-handoff.mjs` (`33739668c`), SCO-493: handoff `7e790b93-c43b-4504-9dea-680af2874df1` was pasted in Chat mode (`https://chatgpt.com/c/6ae9a276-6efc-83e8-8bca-2e5203f9d13e`) and the reply was imported and **accepted** (sha256 `7adcc60c…`). Rejected with exit 3 and logged in `ledger.rejections`: the same reply again (**duplicate**), the superseded h1 `7bc77eed` marker (**stale**), an `evil.example` URL and a marker naming SCO-337 (**wrong-origin**). |
+| Unknown-effect handling | SHIPPED-UNPROVEN | `chatgpt-beta-run send` refuses a resend via an O_EXCL marker, and the import accepts each handoff once. A human reconciles any ambiguous manual send. |
 | Restart rejoin without replay | UNSUPPORTED | No native driver to attach/reconcile a pending browser prompt after controller restart. |
 | TUI co-presence in Herdr | UNSUPPORTED | A browser chat is not a Herdr-native agent TUI. |
 | Remote Control/phone | UNSUPPORTED | Normal ChatGPT phone/web access is not vendor Remote Control into a shared native-runner process. |
