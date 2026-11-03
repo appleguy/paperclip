@@ -6,10 +6,13 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
-const stateFile = process.argv[2];
-const expectedCwd = process.argv[3];
-if (!stateFile || !path.isAbsolute(stateFile) || !expectedCwd || !path.isAbsolute(expectedCwd)) {
-  process.stderr.write("usage: node statusline.cjs ABSOLUTE_STATE_FILE ABSOLUTE_AGY_CWD\n");
+// One or more ABSOLUTE_STATE_FILE ABSOLUTE_AGY_CWD pairs: statusLine is a global agy setting,
+// so every agy_local agent's pair is listed and the snapshot goes to the pair matching the TUI's cwd.
+const args = process.argv.slice(2);
+const pairs = [];
+for (let i = 0; i + 1 < args.length; i += 2) pairs.push([args[i], args[i + 1]]);
+if (!pairs.length || args.length % 2 !== 0 || pairs.some(([f, c]) => !path.isAbsolute(f) || !path.isAbsolute(c))) {
+  process.stderr.write("usage: node statusline.cjs (ABSOLUTE_STATE_FILE ABSOLUTE_AGY_CWD)...\n");
   process.exit(2);
 }
 
@@ -39,6 +42,8 @@ function writeSnapshot(raw) {
     if (raw) payload = JSON.parse(raw);
   } catch { /* Treat malformed updates as unknown, never idle. */ }
   const sourceCwd = typeof payload?.cwd === "string" ? path.resolve(payload.cwd) : null;
+  const pair = (sourceCwd && pairs.find(([, c]) => path.resolve(c) === sourceCwd)) || pairs[0];
+  const [stateFile, expectedCwd] = pair;
   if (sourceCwd && sourceCwd !== path.resolve(expectedCwd)) {
     // statusLine is a global agy setting. Never let another TUI overwrite
     // this agent's snapshot when its working directory is different.

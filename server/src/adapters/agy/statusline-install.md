@@ -40,3 +40,9 @@ idle state older than five minutes can be admitted **only** with an empty input
 box and no visible busy marker. If the callback fails without updating the
 state file, that remains a legacy-TUI uncertainty: monitor stale callbacks and
 keep the provider graded `emitted_local`, not acknowledged.
+
+## Several agy_local agents
+
+statusLine is one global agy setting. List every agent's `ABSOLUTE_STATE_FILE ABSOLUTE_AGY_CWD` pair
+after the script path (state file is `<stateDir>/status-line.json`); the snapshot is written to the pair
+whose cwd matches the TUI. Agents sharing a cwd share the first matching pair, so give each its own cwd.
