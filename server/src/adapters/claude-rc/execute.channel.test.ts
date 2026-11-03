@@ -48,6 +48,27 @@ describe("claude_rc_local channel dispatch", () => {
     expect(pushes).toBe(1);
   });
 
+  it("keeps waiting while a just-submitted op is inbox_pending (held only to block resubmit)", async () => {
+    let stage: ChannelStatus | null = null;
+    let pushes = 0;
+    const io: ChannelIO = {
+      ready: async () => true,
+      status: async () => stage,
+      submit: async () => {
+        pushes++;
+        stage = { op_id: opId, stage: "inbox_pending", hook_observed: false, held_unknown_effect: true, receipt: null };
+        return { ok: true };
+      },
+      fallback: async () => { throw new Error("must not type"); },
+    };
+    const finish = routeChannelInput(opId, "queued then reserved", false, io, { pollMs: 5, hookWaitMs: 1000 });
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(pushes).toBe(1);
+    stage = state("hook_observed");
+    await expect(finish).resolves.toBe("channel");
+    expect(pushes).toBe(1);
+  });
+
   it("adopts a restart checkpoint with emitted_local without any replay", async () => {
     const dir = await tmp();
     const active = {

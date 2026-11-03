@@ -139,6 +139,21 @@ async function ensureSession(
   }
   const processName = (await tmux(socket, ["display-message", "-p", "-t", session, "#{pane_current_command}"])).trim();
   if (processName !== "claude") throw new Error(`tmux pane is ${processName}, not claude; refusing to commandeer it`);
+  if (!exists) {
+    // Only for a TUI this call just launched with our own local bridge: accept
+    // the one-time development-channels notice (option 1). Never on an existing
+    // session, where the screen may hold the owner's own prompt.
+    const until = Date.now() + 20_000;
+    while (Date.now() < until) {
+      const s = await pane(socket, session).catch(() => "");
+      if (/Loading development channels/i.test(s) && /I am using this for local development/i.test(s)) {
+        await tmux(socket, ["send-keys", "-t", session, "Enter"]);
+        break;
+      }
+      if (isClaudeIdle(s)) break;
+      await sleep(700);
+    }
+  }
   if (!rejoinOnly && !(await waitIdle(socket, session, Date.now() + 25_000))) {
     const s = await pane(socket, session);
     if (/trust the files|Do you trust/i.test(s))
@@ -146,7 +161,13 @@ async function ensureSession(
     throw new Error("Claude TUI not idle; leave the owner's live work intact");
   }
   const urlFile = path.join(stateDir, "remote-control-url.txt");
-  const url = parseClaudeRcUrl(await pane(socket, session));
+  // The RC URL line can render after the editor turns idle; give it a moment.
+  let url: string | null = null;
+  for (const until = Date.now() + 15_000; ;) {
+    url = parseClaudeRcUrl(await pane(socket, session).catch(() => ""));
+    if (url || Date.now() >= until) break;
+    await sleep(750);
+  }
   if (url) await fs.writeFile(urlFile, url + "\n", { mode: 0o600 });
   return url ?? (exists ? (await fs.readFile(urlFile, "utf8").catch(() => "")).trim() : "");
 }

@@ -191,7 +191,10 @@ export async function routeChannelInput(
   while (true) {
     const status = await io.status(opId);
     if (status?.hook_observed === true) return "channel"; // terminal without a hook is never acknowledgement
-    if (status?.held_unknown_effect) throw new Error("bridge op held in unknown-effect state; operator reconciliation required");
+    // A just-submitted op sits in the inbox until the bridge reserves it; that
+    // view is flagged held only to block a duplicate submit, so keep waiting.
+    if (status?.held_unknown_effect && status.stage !== "inbox_pending")
+      throw new Error("bridge op held in unknown-effect state; operator reconciliation required");
     if (Date.now() >= deadline) {
       throw new Error(`bridge op ${opId} was not hook-observed; held for reconciliation, no TUI replay`);
     }
