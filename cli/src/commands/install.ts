@@ -48,8 +48,12 @@ export async function runCommandWithDiagnostics(
     const stderr = error && typeof error === "object" && "stderr" in error && typeof error.stderr === "string"
       ? error.stderr.trim()
       : "";
-    if (!stderr || (error instanceof Error && error.message.includes(stderr))) throw error;
-    throw new Error(`${error instanceof Error ? error.message : String(error)}\n${stderr}`, { cause: error });
+    const stdout = error && typeof error === "object" && "stdout" in error && typeof error.stdout === "string"
+      ? error.stdout.trim() : "";
+    const message = error instanceof Error ? error.message : String(error);
+    const diagnostics = [stderr && !message.includes(stderr) ? stderr : "", stdout ? `Build stdout tail:\n${stdout.slice(-6000)}` : ""].filter(Boolean);
+    if (diagnostics.length === 0) throw error;
+    throw new Error(`${message}\n${diagnostics.join("\n")}`, { cause: error });
   }
 }
 
@@ -181,6 +185,22 @@ export async function smokePayload(payloadPath: string, expectedVersion: string,
   }
 }
 
+export async function hydrateEmbeddedPostgresSymlinks(payloadPath: string, runCommand: CommandRunner): Promise<boolean> {
+  const nativeName = `${process.platform}-${process.arch}`;
+  const roots = [
+    path.join(payloadPath, "node_modules", "@embedded-postgres", nativeName),
+    path.join(payloadPath, "node_modules", "@paperclipai", "server", "node_modules", "@embedded-postgres", nativeName),
+  ];
+  for (const root of roots) {
+    const manifest = path.join(root, "native", "pg-symlinks.json");
+    const helper = path.join(root, "scripts", "hydrate-symlinks.js");
+    if (!fs.existsSync(manifest) || !fs.existsSync(helper)) continue;
+    await runCommand(process.execPath, [helper], { cwd: root, maxBuffer: 1024 * 1024 });
+    return true;
+  }
+  return false;
+}
+
 export async function installNpmPayload(
   version: string,
   runCommand: CommandRunner,
@@ -241,6 +261,7 @@ function gitBuildEnv(extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   // Source builds need devDependencies (esbuild, typescript); ambient NODE_ENV=production
   // makes pnpm/npm omit them, so the checkout build must not inherit it.
   delete env.NODE_ENV;
+  delete env.CARGO_TARGET_DIR;
   return env;
 }
 
@@ -249,6 +270,7 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
   const payloadPath = payloadPathFor(paths, "git", identifier);
   if (fs.existsSync(payloadPath)) {
     const metadata = JSON.parse(fs.readFileSync(path.join(payloadPath, "node_modules", "paperclipai", "package.json"), "utf8")) as { version: string };
+    await hydrateEmbeddedPostgresSymlinks(payloadPath, runCommand);
     await smokePayload(payloadPath, metadata.version, runCommand);
     return { payloadPath, reused: true, version: metadata.version };
   }
@@ -280,8 +302,23 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     await runCommand("corepack", ["pnpm", "install", "--frozen-lockfile"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+    await runCommand("corepack", ["pnpm", "--filter", "@paperclipai/paperclip-runner", "run", "build:issue-thread"],
+      { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+    await runCommand("corepack", ["pnpm", "--filter", "@paperclipai/server", "run", "prepare:ui-dist"],
+      { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
+    const rootSkills = path.join(checkoutPath, "skills");
+    if (fs.existsSync(rootSkills)) {
+      fs.cpSync(rootSkills, path.join(checkoutPath, "server", "skills"), { recursive: true });
+    }
     const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
+    for (const workspacePackage of workspacePackages) {
+      const packageDir = path.join(checkoutPath, workspacePackage.dir);
+      const packageFiles = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")).files as string[] | undefined;
+      if (workspacePackage.name !== "@paperclipai/server" && packageFiles?.includes("skills") && !fs.existsSync(path.join(packageDir, "skills"))) {
+        fs.mkdirSync(path.join(packageDir, "skills"), { recursive: true });
+      }
+    }
     for (const [index, workspacePackage] of workspacePackages.entries()) {
       const packageDir = path.join(checkoutPath, workspacePackage.dir);
       const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { bundleDependencies?: string[]; bundledDependencies?: string[] };
@@ -289,12 +326,12 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       if (bundledDependencies.length > 0) {
         const stagedPackage = path.join(stagingRoot, `workspace-package-${index}`);
         await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "prepare-bundled-package.mjs"), packageDir, stagedPackage], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
-        await runCommand("npm", ["pack", stagedPackage, "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
+        await runCommand("npm", ["pack", stagedPackage, "--ignore-scripts", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
       } else {
         await runCommand("corepack", ["pnpm", "--dir", workspacePackage.dir, "pack", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
       }
     }
-    await runCommand("npm", ["pack", "--pack-destination", stagingRoot], { cwd: path.join(checkoutPath, "cli"), env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
+    await runCommand("corepack", ["pnpm", "--dir", "cli", "pack", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
     const tarballs = fs.readdirSync(stagingRoot).filter((entry) => entry.endsWith(".tgz"));
     const cliTarball = tarballs.find((entry) => entry === `paperclipai-${metadata.version}.tgz`);
     const workspaceTarballs = tarballs.filter((entry) => entry !== cliTarball);
@@ -302,6 +339,7 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       throw new Error(`Git install packaging produced ${workspaceTarballs.length} workspace tarballs; expected ${workspacePackages.length}.`);
     }
     await runCommand("npm", ["install", "--prefix", stagedPayload, path.join(stagingRoot, cliTarball), ...workspaceTarballs.map((entry) => path.join(stagingRoot, entry)), "--no-audit", "--no-fund"], { cwd: stagingRoot, maxBuffer: 32 * 1024 * 1024 });
+    await hydrateEmbeddedPostgresSymlinks(stagedPayload, runCommand);
     await smokePayload(stagedPayload, metadata.version, runCommand);
     fs.renameSync(stagedPayload, payloadPath);
     return { payloadPath, reused: false, version: metadata.version };
