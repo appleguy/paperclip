@@ -3,6 +3,8 @@ export interface SessionCompactionPolicy {
   maxSessionRuns: number;
   maxRawInputTokens: number;
   maxSessionAgeHours: number;
+  modelContextWindowTokens?: number;
+  contextRotationRatio?: number;
 }
 
 export type NativeContextManagement = "confirmed" | "likely" | "unknown" | "none";
@@ -22,9 +24,11 @@ export interface ResolvedSessionCompactionPolicy {
 
 const DEFAULT_SESSION_COMPACTION_POLICY: SessionCompactionPolicy = {
   enabled: true,
-  maxSessionRuns: 200,
-  maxRawInputTokens: 2_000_000,
-  maxSessionAgeHours: 72,
+  maxSessionRuns: 25,
+  maxRawInputTokens: 89_600,
+  maxSessionAgeHours: 24,
+  modelContextWindowTokens: 128_000,
+  contextRotationRatio: 0.7,
 };
 
 // Adapters with native context management still participate in session resume,
@@ -152,11 +156,21 @@ export function readSessionCompactionOverride(runtimeConfig: unknown): Partial<S
   const maxSessionRuns = readNumber(compaction.maxSessionRuns);
   const maxRawInputTokens = readNumber(compaction.maxRawInputTokens);
   const maxSessionAgeHours = readNumber(compaction.maxSessionAgeHours);
+  const modelContextWindowTokens = readNumber(compaction.modelContextWindowTokens);
+  const contextRotationRatio =
+    typeof compaction.contextRotationRatio === "number" &&
+    Number.isFinite(compaction.contextRotationRatio) &&
+    compaction.contextRotationRatio > 0 &&
+    compaction.contextRotationRatio <= 1
+      ? compaction.contextRotationRatio
+      : undefined;
 
   if (enabled !== undefined) explicit.enabled = enabled;
   if (maxSessionRuns !== undefined) explicit.maxSessionRuns = maxSessionRuns;
   if (maxRawInputTokens !== undefined) explicit.maxRawInputTokens = maxRawInputTokens;
   if (maxSessionAgeHours !== undefined) explicit.maxSessionAgeHours = maxSessionAgeHours;
+  if (modelContextWindowTokens !== undefined) explicit.modelContextWindowTokens = modelContextWindowTokens;
+  if (contextRotationRatio !== undefined) explicit.contextRotationRatio = contextRotationRatio;
 
   return explicit;
 }
@@ -173,13 +187,23 @@ export function resolveSessionCompactionPolicy(
     ...DEFAULT_SESSION_COMPACTION_POLICY,
     enabled: fallbackEnabled,
   };
+  const modelContextWindowTokens =
+    explicitOverride.modelContextWindowTokens ?? basePolicy.modelContextWindowTokens;
+  const contextRotationRatio =
+    explicitOverride.contextRotationRatio ?? basePolicy.contextRotationRatio ?? 0.7;
+  const calculatedMaxTokens =
+    modelContextWindowTokens && !explicitOverride.maxRawInputTokens
+      ? Math.floor(modelContextWindowTokens * contextRotationRatio)
+      : (explicitOverride.maxRawInputTokens ?? basePolicy.maxRawInputTokens);
 
   return {
     policy: {
       enabled: explicitOverride.enabled ?? basePolicy.enabled,
       maxSessionRuns: explicitOverride.maxSessionRuns ?? basePolicy.maxSessionRuns,
-      maxRawInputTokens: explicitOverride.maxRawInputTokens ?? basePolicy.maxRawInputTokens,
+      maxRawInputTokens: calculatedMaxTokens,
       maxSessionAgeHours: explicitOverride.maxSessionAgeHours ?? basePolicy.maxSessionAgeHours,
+      modelContextWindowTokens,
+      contextRotationRatio,
     },
     adapterSessionManagement,
     explicitOverride,

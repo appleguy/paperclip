@@ -1487,7 +1487,7 @@ export function createHeartbeatRunState(db: Db) {
       `- Previous session: ${sessionId}`,
       issueId ? `- Issue: ${issueId}` : "",
       `- Rotation reason: ${reason}`,
-      latestTextSummary ? `- Last run summary: ${latestTextSummary}` : "",
+      latestTextSummary ? `- Last run summary: ${latestTextSummary.slice(0, 1_200)}` : "",
       input.continuationSummaryBody
         ? `- Issue continuation summary: ${input.continuationSummaryBody.slice(0, 1_500)}`
         : "",
