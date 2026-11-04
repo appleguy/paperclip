@@ -120,6 +120,15 @@ async function recordFallback(activePath: string, active: Record<string, unknown
   }
 }
 
+const AGENT_TMP_ROOT = "/Volumes/NVM/AI_Agent_Runtime/tmp";
+function agentTmpDir(session: string): string { return path.join(AGENT_TMP_ROOT, `claude-rc-${session}`); }
+
+/** SCO-534: agent work never runs from / or a hidden/system temp directory. */
+export function assertWorkableCwd(cwd: string): void {
+  if (cwd === "/" || cwd.startsWith("/private/var/folders") || cwd.startsWith("/var/folders") || /(^|\/)\.[^/.]/.test(cwd))
+    throw new Error(`claude_rc_local cwd ${cwd} is root, system temp or hidden; use a canonical NVM path (SCO-534)`);
+}
+
 /** SCO-560 (opt-in keepConversation): reuse the live conversation instead of /clear. */
 export interface KeepState { conversationId: string; projectId: string }
 export function shouldReuseConversation(o: {
@@ -141,11 +150,14 @@ async function ensureSession(
       throw new Error("Claude active op lost its original TUI; hold for operator reconciliation, never replay");
     }
     await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(agentTmpDir(session), { recursive: true });
     // [ASSUMPTION] The experimental channel flag remains accepted by Claude
     // Code 2.1.x; it is hidden in some versions of --help. Live verify before use.
     // No --strict-mcp-config: that would hide the owner's other required MCPs.
     await tmux(socket, ["new-session", "-d", "-s", session, "-x", "200", "-y", "50", "-c", cwd,
       "-e", "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1",
+      // SCO-534: scratch on NVM per agent, never the per-user /var/folders temp.
+      "-e", `TMPDIR=${agentTmpDir(session)}`,
       CLAUDE, "--remote-control", name, "--name", name, "--model", model, "--effort", effort,
       "--dangerously-skip-permissions",
       "--mcp-config", channel.mcpConfigPath,
@@ -221,13 +233,22 @@ async function deliverBlock(ctx: AdapterExecutionContext, issueId: string, reaso
   }
 }
 
+async function postComment(ctx: AdapterExecutionContext, issueId: string, body: string): Promise<void> {
+  if (!ctx.authToken) return;
+  const port = Number(process.env.PAPERCLIP_LISTEN_PORT ?? process.env.PORT ?? "3100");
+  await fetch(new URL(`/api/issues/${encodeURIComponent(issueId)}/comments`, `http://127.0.0.1:${port}`), {
+    method: "POST", redirect: "manual", body: JSON.stringify({ body }), signal: AbortSignal.timeout(15_000),
+    headers: { Authorization: `Bearer ${ctx.authToken}`, "X-Paperclip-Run-Id": ctx.runId, "Content-Type": "application/json" },
+  });
+}
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const cfg = ctx.config;
   const session = asString(cfg.tmuxSession, "claude");
   const socket = asString(cfg.tmuxSocket, "pc-claude-rc");
   const name = asString(cfg.remoteControlName, "Paperclip Claude");
   const stateDir = path.resolve(asString(cfg.stateDir, path.join(os.homedir(), ".paperclip/claude-rc-state")));
-  const cwd = path.resolve(asString(cfg.cwd, path.join(os.homedir(), ".paperclip/claude-rc-workspace")));
+  const cwd = path.resolve(asString(cfg.cwd, "/Volumes/NVM/Paperclip/workspaces/claude-rc"));
   const model = asString(cfg.model, "claude-sonnet-5-5");
   const effort = asString(cfg.effort, "medium");
   const issueId = asString(ctx.context.issueId, asString(ctx.context.taskId, ""));
@@ -242,6 +263,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   try {
     if (!MODELS.has(model)) throw new Error(`claude_rc_local permits only ${[...MODELS].join(", ")}; received ${model}`);
     if (!EFFORTS.has(effort)) throw new Error(`invalid effort ${effort}`);
+    assertWorkableCwd(cwd);
     if (!ID.test(socket) || !ID.test(session) || !NAME.test(name)) throw new Error("invalid tmux socket/session/name");
     if (!issueId) return {
       exitCode: 0, signal: null, timedOut: false, provider: "anthropic", biller: "anthropic", model,
@@ -301,6 +323,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       dispatched = true;
       await ctx.onLog("stdout", `[claude-rc] Adopting run ${adopted.runId} for issue ${issueId}; no re-dispatch; receipt ${receiptPath}\n`);
     } else {
+      const keepPath = path.join(stateDir, "keep-conversation.json");
+      const keepEnabled = cfg.keepConversation === true;
+      const projectId = asString(ctx.context.projectId, "");
+      const keepMax = typeof cfg.keepConversationMaxBytes === "number" ? cfg.keepConversationMaxBytes : 400_000;
+      const keepState: KeepState | null = keepEnabled
+        ? await fs.readFile(keepPath, "utf8").then(t => JSON.parse(t) as KeepState).catch(() => null) : null;
       const before = await newestConversation(cwd);
       const keepSize = before ? (await fs.stat(path.join(projectDir(cwd), `${before}.jsonl`)).catch(() => null))?.size ?? 0 : 0;
       const reuse = shouldReuseConversation({
@@ -324,12 +352,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const instructionsPrefix = reuse
         ? "(Same conversation as your previous dispatch: your standing instructions above still apply; no resend.)" : instructionsFull;
       const intro = renderTemplate(promptBase, {
-      const keepPath = path.join(stateDir, "keep-conversation.json");
-      const keepEnabled = cfg.keepConversation === true;
-      const projectId = asString(ctx.context.projectId, "");
-      const keepMax = typeof cfg.keepConversationMaxBytes === "number" ? cfg.keepConversationMaxBytes : 400_000;
-      const keepState: KeepState | null = keepEnabled
-        ? await fs.readFile(keepPath, "utf8").then(t => JSON.parse(t) as KeepState).catch(() => null) : null;
         agent: ctx.agent, run: { id: ctx.runId }, context: ctx.context, companyId: ctx.agent.companyId,
       });
       const instructions = [
@@ -346,6 +368,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // The channel preserves Markdown/newlines; only the tmux fallback flattens.
       const prompt = joinPromptSections([instructionsPrefix, intro, taskContextNote, wakePrompt, instructions]);
       if (prompt.length > 50_000) throw new Error("Claude prompt exceeds dispatch budget");
+      if (keepEnabled) {
+        await ctx.onLog("stdout", `[claude-rc] keepConversation ${reuse ? "reuse" : "fresh"}: prompt ${prompt.length} bytes (instructions ${reuse ? 0 : instructionsFull.length} of ${instructionsFull.length}); conversation ${Math.round(keepSize)} bytes\n`);
+        await fs.writeFile(keepPath, JSON.stringify({ conversationId, projectId }), { mode: 0o600 });
+      }
       const active: Record<string, unknown> = {
         runId: ctx.runId, issueId, op_id: ctx.runId, receiptPath, rcUrl,
         tmuxSocket: socket, tmuxSession: session, conversationId,
@@ -359,10 +385,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const mode = await routeChannelInput(ctx.runId, prompt, false, {
         ready: channel.ready, status: channel.status, submit: channel.submit,
         fallback: async () => {
-      if (keepEnabled) {
-        await ctx.onLog("stdout", `[claude-rc] keepConversation ${reuse ? "reuse" : "fresh"}: prompt ${prompt.length} bytes (instructions ${reuse ? 0 : instructionsFull.length} of ${instructionsFull.length}); conversation ${Math.round(keepSize)} bytes\n`);
-        await fs.writeFile(keepPath, JSON.stringify({ conversationId, projectId }), { mode: 0o600 });
-      }
           if (!isClaudeIdle(await claudePane(socket, session))) {
             throw new Error("channel unavailable and Claude editor is not empty+idle; no fallback");
           }
@@ -373,11 +395,26 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
       await ctx.onLog("stdout", `[claude-rc] Input route ${mode}; op_id ${ctx.runId}\n`);
     }
-    const deadline = Date.now() + timeoutMs;
+    let deadline = Date.now() + timeoutMs;
+    // A conversation still writing its transcript is working, not hung: slide the deadline
+    // while the jsonl is fresh, up to a hard cap, instead of orphaning it (SCO-564).
+    const hardDeadline = Date.now() + Math.max(timeoutMs, (Number(cfg.maxExtendSec) || 4 * 3600) * 1000);
+    const liveWindowMs = (Number(cfg.liveWindowSec) || 600) * 1000;
+    const conversationLive = async () => {
+      if (!conversationId) return false;
+      const st = await fs.stat(path.join(projectDir(cwd), `${conversationId}.jsonl`)).catch(() => null);
+      return Boolean(st) && Date.now() - st!.mtimeMs < liveWindowMs;
+    };
     let receipt: Receipt | null = null;
     let idleWithoutReceipt = 0;
     let blockedReason = null as string | null;
-    while (Date.now() < deadline) {
+    while (true) {
+      if (Date.now() >= deadline) {
+        if (Date.now() < hardDeadline && await conversationLive()) {
+          deadline = Math.min(Date.now() + timeoutMs, hardDeadline);
+          await ctx.onLog("stdout", `[claude-rc] timeout reached but conversation ${conversationId} is still writing; extending deadline\n`);
+        } else break;
+      }
       if (ctx.signal?.aborted) throw new Error("Claude run cancelled; shared TUI left intact, active checkpoint preserved");
       const raw = await fs.readFile(receiptPath, "utf8").catch(() => "");
       if (raw) {
@@ -407,6 +444,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       sessionParams: { sessionId: conversationId, cwd, remoteControlUrl: rcUrl, remoteControlName: name, tmuxSocket: socket, tmuxSession: session },
       resultJson: { issueId, receiptPath, remoteControlUrl: rcUrl, conversationId, blocked: true },
     };
+    if (!receipt && await conversationLive()) {
+      await postComment(ctx, issueId, `claude_rc run ${ctx.runId} timed out, but RC conversation ${conversationId} is still writing its transcript (${rcUrl}). It is likely still working; its later receipt at ${receiptPath} can be recovered. Do not re-dispatch.`).catch(() => {});
+    }
     if (!receipt || !(await waitIdle(socket, session, Date.now() + 1500)))
       return failure("Claude did not produce a validated completion receipt at an idle TUI; checkpoint retained", true);
     await deliver(ctx, receipt, "Claude Code execution report", "Claude Remote Control");
