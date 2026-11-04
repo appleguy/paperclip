@@ -161,14 +161,16 @@ export function assertWorkableCwd(cwd: string): void {
     throw new Error(`claude_rc_local cwd ${cwd} is root, system temp or hidden; use a canonical NVM path (SCO-534)`);
 }
 
-/** SCO-560 (opt-in keepConversation): reuse the live conversation instead of /clear. */
+/** SCO-560 (opt-in keepConversation): reuse the live conversation instead of /clear.
+ * keepConversationAcrossProjects: a cross-project seat (Board) keeps one conversation
+ * whatever project the next issue is in; compaction, not /clear, bounds its size. */
 export interface KeepState { conversationId: string; projectId: string }
 export function shouldReuseConversation(o: {
   enabled: boolean; state: KeepState | null; newestId: string | null; projectId: string;
-  sizeBytes: number; maxBytes: number;
+  sizeBytes: number; maxBytes: number; acrossProjects?: boolean;
 }): boolean {
   return o.enabled && !!o.state && !!o.newestId && o.state.conversationId === o.newestId
-    && o.state.projectId === o.projectId && o.sizeBytes < o.maxBytes;
+    && (o.acrossProjects === true || o.state.projectId === o.projectId) && o.sizeBytes < o.maxBytes;
 }
 
 async function ensureSession(
@@ -388,6 +390,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const keepSize = before ? (await fs.stat(path.join(projectDir(cwd), `${before}.jsonl`)).catch(() => null))?.size ?? 0 : 0;
       const reuse = shouldReuseConversation({
         enabled: keepEnabled, state: keepState, newestId: before, projectId, sizeBytes: keepSize, maxBytes: keepMax,
+        acrossProjects: cfg.keepConversationAcrossProjects === true,
       }) && isClaudeIdle(await claudePane(socket, session));
       if (reuse) {
         conversationId = before;

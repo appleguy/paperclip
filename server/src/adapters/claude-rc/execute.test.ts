@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isClaudeIdle, parseClaudeRcUrl, projectDir } from "./execute.js";
+import { isClaudeIdle, parseClaudeRcUrl, projectDir, shouldReuseConversation } from "./execute.js";
 
 const rule = "─".repeat(40) + " Paperclip Claude ─";
 const footer = "  ⏵⏵ bypass permissions on (shift+tab to cycle)";
@@ -78,5 +78,20 @@ describe("target-busy refusals", () => {
       "Claude input guard refused: owner input nonempty or TUI not idle",
     ]) expect(isTargetBusyRefusal(m)).toBe(true);
     expect(isTargetBusyRefusal("Claude workspace trust prompt: approve this dedicated workspace")).toBe(false);
+  });
+});
+
+describe("claude_rc_local keepConversation", () => {
+  const base = {
+    enabled: true, state: { conversationId: "c1", projectId: "p1" }, newestId: "c1",
+    projectId: "p2", sizeBytes: 10, maxBytes: 100,
+  };
+  it("clears on a project change unless the seat keeps across projects", () => {
+    expect(shouldReuseConversation(base)).toBe(false);
+    expect(shouldReuseConversation({ ...base, acrossProjects: true })).toBe(true);
+  });
+  it("still clears on a different conversation or the size cap", () => {
+    expect(shouldReuseConversation({ ...base, acrossProjects: true, newestId: "c2" })).toBe(false);
+    expect(shouldReuseConversation({ ...base, acrossProjects: true, sizeBytes: 100 })).toBe(false);
   });
 });
