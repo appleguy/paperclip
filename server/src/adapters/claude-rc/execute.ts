@@ -203,7 +203,10 @@ async function deliverBlock(ctx: AdapterExecutionContext, issueId: string, reaso
       method, redirect: "manual", body: JSON.stringify(body), signal: AbortSignal.timeout(15_000),
       headers: { Authorization: `Bearer ${ctx.authToken}`, "X-Paperclip-Run-Id": ctx.runId, "Content-Type": "application/json" },
     });
-    if (!res.ok) throw new Error(`Paperclip ${method} ${suffix || "issue"} returned HTTP ${res.status}`);
+    if (!res.ok) {
+      const detail = (await res.text().catch(() => "")).slice(0, 300);
+      throw new Error(`Paperclip ${method} ${suffix || "issue"} returned HTTP ${res.status}: ${detail}`);
+    }
   }
 }
 
