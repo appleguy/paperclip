@@ -96,6 +96,7 @@ export type AdapterExecutionErrorFamily =
   | "configuration"
   | "transient_upstream"
   | "provider_quota"
+  | "target_busy"
   | "model_refusal"
   | "refresh_token_reused"
   | "refresh_token_expired"

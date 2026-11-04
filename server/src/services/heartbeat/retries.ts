@@ -57,6 +57,7 @@ import {
   MAX_TURN_CONTINUATION_RETRY_REASON,
   WORKSPACE_BUSY_RETRY_REASON,
   AI_CONNECTION_BUSY_RETRY_REASON,
+  TARGET_BUSY_RETRY_REASON,
   AI_CONNECTION_POOL_WAIT_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
@@ -286,7 +287,8 @@ export function readTransientRecoveryContractFromRun(
 ) {
   const errorFamily = readHeartbeatRunErrorFamily(run);
   return errorFamily === "transient_upstream" ||
-    errorFamily === "provider_quota"
+    errorFamily === "provider_quota" ||
+    errorFamily === "target_busy"
     ? {
         errorFamily,
         retryNotBefore: readTransientRetryNotBeforeFromRun(run),
@@ -472,7 +474,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
       ? { ...computedBaseSchedule, maxAttempts }
       : null;
     const transientRecovery =
-      retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON
+      retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON || retryReason === TARGET_BUSY_RETRY_REASON
         ? readTransientRecoveryContractFromRun(run)
         : null;
     const codexTransientFallbackMode =
@@ -648,6 +650,9 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
               failureRetriesBeforeWorkspaceWait:
                 executionFailureRetryCount(run),
             }
+          : {}),
+        ...(retryReason === TARGET_BUSY_RETRY_REASON
+          ? { failureRetriesBeforeTargetWait: executionFailureRetryCount(run) }
           : {}),
         ...((retryReason === AI_CONNECTION_BUSY_RETRY_REASON || retryReason === AI_CONNECTION_POOL_WAIT_RETRY_REASON)
           ? { failureRetriesBeforeAiConnectionWait: executionFailureRetryCount(run) }

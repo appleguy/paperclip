@@ -7,8 +7,10 @@ import { PROJECT_ACCESS_DENIED, ProjectAccessDeniedError } from "../project-acce
 import { pendingCaseHandoffForRun } from "./case-handoff-lifecycle.js";
 import { NON_RETRYABLE_PREFLIGHT_FAILURE_CODES, isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
 import { ChatControlRecoveryUnresolvedError } from "./queue.js";
-import { readTransientRecoveryContractFromRun, readHeartbeatRunErrorFamily, isTransientWorkspacePreparationCode } from "./retries.js";
 import { RemoteWorkspacePreparationTimeoutError } from "../remote-workspace-transport.js";
+import { readTransientRecoveryContractFromRun, readHeartbeatRunErrorFamily, isTransientWorkspacePreparationCode, computeWorkspaceBusyRetryDelayMs } from "./retries.js";
+import { TARGET_BUSY_RETRY_REASON } from "../../modules/run-dispatch/index.js";
+import { isLocalOpenCodeAdmissionDecline } from "../local-opencode-admission-retry.js";
 import { type RunSessionOutcome, resolveNextSessionState, normalizeUsageTotals, resolveCacheAdjustedCostUsd, resolveLedgerBiller, resolveLedgerCostStatus, normalizeLedgerBillingType } from "./run-state.js";
 import { readGitConnectionFailure } from "../git-connection-failure.js";
 import { CONFIGURATION_INCOMPLETE_FAILURE_CODE, ConfigurationIncompleteFailure } from "./run-preparation.js";
@@ -412,6 +414,16 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       failedProcessRunCancellations.get(run.id);
     await processCancellation?.settled;
     let outcome: RunSessionOutcome;
+    // A busy seat/engine or a quota-limited provider refused before any work began:
+    // that is a wait (cancelled + scheduled_retry), not a failed run.
+    const quotaResetAt = adapterResult.errorFamily === "provider_quota" && adapterResult.retryNotBefore
+      ? new Date(adapterResult.retryNotBefore).getTime() : NaN;
+    const targetBusy = adapterResult.errorFamily === "target_busy" ||
+      quotaResetAt > Date.now() ||
+      isLocalOpenCodeAdmissionDecline({
+        errorCode: "adapter_failed", exitCode: adapterResult.exitCode,
+        error: adapterResult.errorMessage, runnerProfileJson: run.runnerProfileJson,
+      });
     const latestRun = await getRun(run.id);
     if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
       outcome = latestRun.status;
@@ -426,6 +438,8 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           : nativeTerminal === "cancelled"
             ? "cancelled"
             : "failed";
+    } else if (targetBusy) {
+      outcome = "cancelled";
     } else if (adapterResult.timedOut) {
       outcome = "timed_out";
     } else if (adapterResult.resultJson?.status === "cancelled") {
@@ -476,7 +490,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       outcome === "timed_out"
         ? "timeout"
         : outcome === "cancelled"
-          ? (latestRun?.errorCode ?? "cancelled")
+          ? (targetBusy ? TARGET_BUSY_RETRY_REASON : (latestRun?.errorCode ?? "cancelled"))
           : outcome === "failed"
             ? (adapterResult.errorCode ??
               recordedResponsibleUserDenialCode ??
@@ -637,6 +651,15 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
               ? { executionRecovery: adapterResult.executionRecovery }
               : {}),
             ...(outcome === "cancelled" ? controllerLeaseLossResultJson(signal) : {}),
+            ...(targetBusy && outcome === "cancelled"
+              ? {
+                  executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+                  cancellation: {
+                    source: "control_plane", expected: true, initiator: { type: "system" },
+                    reason: "Waiting for the target seat or engine", recordedAt: new Date().toISOString(),
+                  },
+                }
+              : {}),
             configFreshness: configFreshnessResultMetadata,
           },
           errorFamily: adapterResult.errorFamily ?? null,
@@ -934,7 +957,15 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           `[paperclip] Failed to resolve run presentation: ${err instanceof Error ? err.message : String(err)}\n`,
         );
       }
-      if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
+      if (targetBusy && outcome === "cancelled") {
+        // No attempt ceiling: the wait ends when the seat frees up or the quota resets.
+        await scheduleBoundedRetryForRun(livenessRun, agent, {
+          retryReason: TARGET_BUSY_RETRY_REASON,
+          wakeReason: "target_busy_retry",
+          maxAttempts: (livenessRun.scheduledRetryAttempt ?? 0) + 1,
+          delayMs: computeWorkspaceBusyRetryDelayMs(),
+        });
+      } else if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
         const policy = parseMaxTurnContinuationPolicy(agent);
         if (policy.enabled && policy.maxAttempts > 0) {
           await scheduleBoundedRetryForRun(livenessRun, agent, {
