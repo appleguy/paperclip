@@ -129,13 +129,21 @@ export async function reconcileOrphanActive(o: {
   stateDir: string; activePath: string; issueId: string; runId: string;
   live: (conversationId: string | null) => Promise<boolean>; paneIdle: () => Promise<boolean>;
   log: (m: string) => Promise<void> | void;
+  /** Same-issue checkpoints are only reconciled once this old (default 3 min), so a just-sent dispatch is never re-sent. */
+  sameIssueMinAgeMs?: number;
 }): Promise<"none" | "kept" | "archived"> {
   const raw = await fs.readFile(o.activePath, "utf8").catch(() => "");
   if (!raw) return "none";
-  let prev: { op_id?: string; runId?: string; issueId?: string; receiptPath?: string; conversationId?: string | null };
+  let prev: { op_id?: string; runId?: string; issueId?: string; receiptPath?: string; conversationId?: string | null; startedAt?: string };
   try { prev = JSON.parse(raw); } catch { prev = {}; }
   const op = asString(prev.op_id, asString(prev.runId, ""));
-  if (!op || op === o.runId || prev.issueId === o.issueId) return "none";
+  if (!op || op === o.runId) return "none";
+  if (prev.issueId === o.issueId) {
+    // Deploy-interrupted run of this same issue: no receipt, conversation idle and quiet means
+    // the work is over; adopting it would idle-fail every later wake. Archive and redispatch.
+    const started = Date.parse(asString(prev.startedAt, ""));
+    if (!Number.isFinite(started) || Date.now() - started < (o.sameIssueMinAgeMs ?? 180_000)) return "none";
+  }
   if (prev.receiptPath && await fs.stat(prev.receiptPath).then(() => true, () => false)) return "none";
   if (await o.live(prev.conversationId ?? null) || !(await o.paneIdle())) return "kept";
   const dest = path.join(o.stateDir, `active.unverified-${op}.json`);

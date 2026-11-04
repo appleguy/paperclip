@@ -55,6 +55,14 @@ describe("SCO-626 orphan active.json after deploy cancel", () => {
     const d = await mk();
     expect(await reconcileOrphanActive({ ...base(d, false, true), issueId: "A" })).toBe("none");
   });
+  it("archives an old same-issue checkpoint (deploy-interrupted, idle, no receipt)", async () => {
+    const d = await mk();
+    const old = JSON.parse(await fsp.readFile(d.activePath, "utf8"));
+    await fsp.writeFile(d.activePath, JSON.stringify({ ...old, startedAt: new Date(Date.now() - 600_000).toISOString() }));
+    expect(await reconcileOrphanActive({ ...base(d, true, true), issueId: "A" })).toBe("kept");
+    expect(await reconcileOrphanActive({ ...base(d, false, true), issueId: "A" })).toBe("archived");
+    await fsp.stat(nodePath.join(d.dir, "active.unverified-r1.json"));
+  });
   it("error text names the adapter", () => {
     expect(() => adoptableActive("{}", "B", "/x", "claude_rc_local")).toThrow(/^claude_rc_local previous task unresolved/);
   });
