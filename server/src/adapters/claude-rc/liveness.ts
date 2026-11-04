@@ -32,23 +32,32 @@ const defaultDeps: ClaudeRcLivenessDeps = {
 
 const str = (v: unknown, d: string) => (typeof v === "string" && v.trim() ? v.trim() : d);
 
-/** `issueId` set: only a checkpoint for that issue counts; otherwise any checkpoint on the seat. */
-export async function claudeRcConversationLive(
+/** The seat's live checkpoint (its active.json issue), or null when the conversation is not live. */
+export async function claudeRcLiveCheckpoint(
   config: Record<string, unknown>,
-  issueId: string | null,
   deps: ClaudeRcLivenessDeps = defaultDeps,
-): Promise<boolean> {
+): Promise<{ issueId: string | null } | null> {
   const stateDir = path.resolve(str(config.stateDir, path.join(os.homedir(), ".paperclip/claude-rc-state")));
   const cwd = path.resolve(str(config.cwd, "/Volumes/NVM/Paperclip/workspaces/claude-rc"));
   const socket = str(config.tmuxSocket, "pc-claude-rc");
   const session = str(config.tmuxSession, "claude");
   const liveWindowMs = (Number(config.liveWindowSec) || 600) * 1000;
   let active: { issueId?: string; conversationId?: string | null; tmuxSocket?: string; tmuxSession?: string };
-  try { active = JSON.parse(await deps.readFile(path.join(stateDir, "active.json"))); } catch { return false; }
-  if (issueId && active.issueId !== issueId) return false;
+  try { active = JSON.parse(await deps.readFile(path.join(stateDir, "active.json"))); } catch { return null; }
+  const checkpoint = { issueId: active.issueId ?? null };
   if (active.conversationId) {
     const m = await deps.mtimeMs(path.join(projectDir(cwd), `${active.conversationId}.jsonl`));
-    if (m !== null && deps.now() - m < liveWindowMs) return true;
+    if (m !== null && deps.now() - m < liveWindowMs) return checkpoint;
   }
-  return (await deps.paneIdle(active.tmuxSocket ?? socket, active.tmuxSession ?? session)) === false;
+  return (await deps.paneIdle(active.tmuxSocket ?? socket, active.tmuxSession ?? session)) === false ? checkpoint : null;
+}
+
+/** `issueId` set: only a checkpoint for that issue counts; otherwise any checkpoint on the seat. */
+export async function claudeRcConversationLive(
+  config: Record<string, unknown>,
+  issueId: string | null,
+  deps: ClaudeRcLivenessDeps = defaultDeps,
+): Promise<boolean> {
+  const live = await claudeRcLiveCheckpoint(config, deps);
+  return live !== null && (!issueId || live.issueId === issueId);
 }
