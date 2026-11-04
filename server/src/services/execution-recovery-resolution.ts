@@ -13,6 +13,7 @@ import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
 import { and, eq, exists, inArray, isNull, not, or, sql } from "drizzle-orm";
 import {
+  agents,
   chatActions,
   environmentLeases,
   heartbeatRuns,
@@ -33,6 +34,7 @@ import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
 import { alias } from "drizzle-orm/pg-core";
+import { claudeRcConversationLive, claudeRcLiveCheckpoint } from "../adapters/claude-rc/liveness.js";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
 export async function validateExecutionReconciliation(input: {
@@ -440,7 +442,54 @@ export function isDeployInterruptedClaudeRcRun(run: Pick<typeof heartbeatRuns.$i
   return run.errorCode === "server_shutdown_interrupted" && claimedAdapterType(run) === "claude_rc";
 }
 
+/**
+ * SCO-648: status follows the live claude_rc conversation, in both directions. An issue left todo or
+ * blocked by a deploy-interrupted run whose conversation is still writing/busy is in_progress.
+ */
+export async function promoteLiveClaudeRcIssues(
+  db: Db,
+  checkpoint: typeof claudeRcLiveCheckpoint = claudeRcLiveCheckpoint,
+  now = new Date(),
+) {
+  const seats = await db.select({ id: agents.id, companyId: agents.companyId, adapterConfig: agents.adapterConfig })
+    .from(agents).where(eq(agents.adapterType, "claude_rc_local"));
+  let promoted = 0;
+  for (const seat of seats) {
+    const live = await checkpoint((seat.adapterConfig ?? {}) as Record<string, unknown>);
+    if (!live?.issueId) continue;
+    const [issue] = await db.select().from(issues).where(and(
+      eq(issues.companyId, seat.companyId), eq(issues.id, live.issueId),
+      eq(issues.assigneeAgentId, seat.id), inArray(issues.status, ["todo", "blocked"]),
+    ));
+    if (!issue) continue;
+    const runs = await db.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, seat.companyId), eq(heartbeatRuns.issueId, issue.id)))
+      .orderBy(sql`${heartbeatRuns.createdAt} desc`).limit(1);
+    // Only repair what a deploy interruption left behind; a deliberate block or todo stays.
+    if (runs[0]?.errorCode !== "server_shutdown_interrupted") continue;
+    const [updated] = await db.update(issues).set({ status: "in_progress", updatedAt: now })
+      .where(and(eq(issues.id, issue.id), eq(issues.status, issue.status))).returning({ id: issues.id });
+    if (!updated) continue;
+    promoted++;
+    await persistActivity(db, { companyId: seat.companyId, actorType: "system", actorId: "execution-recovery",
+      action: "issue.execution_recovery_settled", entityType: "issue", entityId: issue.id,
+      details: { outcome: "in_progress", previousStatus: issue.status, reason: "claude_rc_conversation_live" } });
+  }
+  return promoted;
+}
+
 /** Idempotent sweep: releases resolved no-replay holds left by a deploy-interrupted claude_rc run. */
+/**
+ * SCO-679: an adapter that proved from its provider that the turn ended and the session resumes (acknowledged
+ * cancellation + settled interrupted recovery, e.g. OpenCode server restart) carries no replay hazard either.
+ */
+export function isProviderVerifiedInterruptedRun(run: Pick<typeof heartbeatRuns.$inferSelect, "resultJson">) {
+  const recovery = run.resultJson?.executionRecovery as Record<string, unknown> | undefined;
+  const cancellation = run.resultJson?.executionCancellation as Record<string, unknown> | undefined;
+  return recovery?.kind === "interrupted" && recovery.providerStopped === true && recovery.sessionPreserved === true
+    && recovery.actionOutcomes === "settled" && cancellation?.state === "acknowledged";
+}
+
 export async function releaseDeployInterruptedReplayHolds(db: Db, now = new Date()) {
   const released = await db.execute<{ id: string }>(sql`
     update ${issueRecoveryActions} set
@@ -455,8 +504,13 @@ export async function releaseDeployInterruptedReplayHolds(db: Db, now = new Date
       and not (${issueRecoveryActions.evidence} ? 'workspaceRestoreFailure')
       and not (${issueRecoveryActions.evidence} ? 'workspaceRestoreRecovery')
       and not (${issueRecoveryActions.evidence} ? 'systemRecovery')
-      and ${heartbeatRuns.errorCode} = 'server_shutdown_interrupted'
-      and ${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType' = 'claude_rc'
+      and ((${heartbeatRuns.errorCode} = 'server_shutdown_interrupted'
+        and ${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType' = 'claude_rc')
+        or (${heartbeatRuns.resultJson}->'executionRecovery'->>'kind' = 'interrupted'
+          and ${heartbeatRuns.resultJson}->'executionRecovery'->>'providerStopped' = 'true'
+          and ${heartbeatRuns.resultJson}->'executionRecovery'->>'sessionPreserved' = 'true'
+          and ${heartbeatRuns.resultJson}->'executionRecovery'->>'actionOutcomes' = 'settled'
+          and ${heartbeatRuns.resultJson}->'executionCancellation'->>'state' = 'acknowledged'))
     returning ${issueRecoveryActions.id} as id`);
   return released.length;
 }
@@ -481,8 +535,14 @@ export function obsoleteExecutionConversationHold() {
 export async function settleUnrecoverableExecutions(
   db: Db,
   now = new Date(),
-  options: { failpoint?: (phase: "persisted") => void } = {},
+  options: {
+    failpoint?: (phase: "persisted") => void;
+    /** SCO-648: injectable liveness probes (default: the real claude_rc conversation signal). */
+    rcLive?: typeof claudeRcConversationLive;
+    rcCheckpoint?: typeof claudeRcLiveCheckpoint;
+  } = {},
 ) {
+  const rcLive = options.rcLive ?? claudeRcConversationLive;
   // Fold obsolete conversation holds without waking historical work on upgrade.
   // Keep their evidence and record the policy change in the task's activity log.
   const obsoleteConversationHold = obsoleteExecutionConversationHold();
@@ -518,6 +578,7 @@ export async function settleUnrecoverableExecutions(
     }
   });
   await releaseDeployInterruptedReplayHolds(db, now);
+  await promoteLiveClaudeRcIssues(db, options.rcCheckpoint ?? claudeRcLiveCheckpoint, now);
   // Filter eligibility before applying the batch limit. A queue of sessions
   // awaiting replacement must not starve settled incidents behind it.
   const candidates = await unresolvedExecutionDispositions(db, 25);
@@ -631,6 +692,13 @@ export async function settleUnrecoverableExecutions(
         await notifyUnsafeWorkspaceExportRecovery(tx, { companyId: task.companyId, issueId: task.id });
         let nativeFailureBlock = action.evidence.nativeFailureBlock;
         let nativeBootstrapFailureBlock = action.evidence.nativeBootstrapFailureBlock;
+        // SCO-648: a deploy-interrupted claude_rc conversation that is still live is working, not failed.
+        let keepRunning = false;
+        if (current && isDeployInterruptedClaudeRcRun(run)) {
+          const [seat] = await tx.select({ adapterConfig: agents.adapterConfig }).from(agents)
+            .where(eq(agents.id, task.assigneeAgentId!));
+          keepRunning = await rcLive((seat?.adapterConfig ?? {}) as Record<string, unknown>, task.id);
+        }
         if (current) {
           await notifyNativeStatusReassessment(tx, { companyId: task.companyId, issueId: task.id });
           if (task.status !== "blocked") await notifyChatResponseAvailability(tx, { companyId: task.companyId, issueId: task.id });
@@ -640,7 +708,7 @@ export async function settleUnrecoverableExecutions(
           const [projected] = await tx
             .update(issues)
             .set({
-              status: "blocked",
+              status: keepRunning ? "in_progress" : "blocked",
               executionRunId: null,
               checkoutRunId: null,
               updatedAt: now,
@@ -674,7 +742,7 @@ export async function settleUnrecoverableExecutions(
               automaticRecovery: {
                 policy: "preserve_without_replay_v1",
                 runId: run.id,
-                replay: isDeployInterruptedClaudeRcRun(run) ? "allowed" : "blocked",
+                replay: isDeployInterruptedClaudeRcRun(run) || isProviderVerifiedInterruptedRun(run) ? "allowed" : "blocked",
                 actionOutcome: "unknown",
                 recordedAt: now.toISOString(),
               },

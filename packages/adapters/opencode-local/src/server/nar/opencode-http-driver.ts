@@ -136,6 +136,16 @@ export class OpenCodeHttpDriver implements ProviderDriver {
     return { provider: "opencode", hostEpoch: this.o.hostEpoch ?? d.pid, attested: true, detail: { url: this.url, version: d.version, pid: d.pid } };
   }
 
+  /** Server OS pid from /api/info, or null when the server is unreachable. A pid change is a server restart. */
+  async probePid(): Promise<number | null> {
+    try {
+      const info = await this.json("GET", "/api/info");
+      return info.status === 200 && Number.isInteger(info.data?.pid) && info.data.pid > 0 ? info.data.pid : null;
+    } catch {
+      return null;
+    }
+  }
+
   /** Highest generation of this agent+issue pair that exists on the server, or -1 when none does. */
   async latestGeneration(s: Pick<ConvScope, "agentId" | "issueId">): Promise<number> {
     let latest = -1;

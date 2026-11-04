@@ -16,6 +16,8 @@ export type NarAttempt = {
   capacityRefusal: boolean;
   /** Merged into resultJson by execute.ts; absent on success. */
   executionRecovery?: { kind: "bootstrap"; providerWorkStarted: boolean; reason: string };
+  /** Set when OpenCode itself proved the provider turn is gone (SCO-679); execute.ts acknowledges the cancellation. */
+  providerTermination?: { proof: "server_restarted" | "session_idle"; reason: string };
 };
 
 export interface NarAttemptInput {
@@ -35,6 +37,10 @@ export interface NarAttemptInput {
   signal?: AbortSignal;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   pollMs?: number;
+  /** Liveness probe cadence, idle-session grace, and unreachable-server give-up (SCO-679). */
+  probeMs?: number;
+  idleGraceMs?: number;
+  unreachableGiveUpMs?: number;
   fetchImpl?: typeof fetch;
 }
 
@@ -61,6 +67,35 @@ const held = (
   capacityRefusal: false,
   executionRecovery: { kind: "bootstrap", providerWorkStarted, reason },
 });
+
+/** Provider turn is gone and verified from OpenCode: the session resumes, so replay is safe (SCO-679). */
+const interrupted = (
+  reason: string, proof: "server_restarted" | "session_idle", sessionId: string | null,
+): NarAttempt => {
+  const message = `OpenCode NAR ${reason}; provider termination verified (${proof})`;
+  return {
+    proc: { exitCode: 75, signal: null, timedOut: false, stdout: "", stderr: message },
+    rawStderr: message,
+    parsed: emptyParsed(sessionId, message),
+    possibleWork: true,
+    capacityRefusal: false,
+    providerTermination: { proof, reason },
+  };
+};
+
+/** "restarted" when the server pid changed, "idle" when our message is no longer in flight, else null (unverified). */
+async function verifyTermination(
+  driver: OpenCodeHttpDriver, hostPid: number | null, conversationId: string, msgId: string,
+): Promise<"server_restarted" | "session_idle" | null> {
+  const pid = await driver.probePid();
+  if (pid === null) return null;
+  if (hostPid !== null && pid !== hostPid) return "server_restarted";
+  try {
+    return (await driver.inflightMessage(conversationId)) === msgId ? null : "session_idle";
+  } catch {
+    return null;
+  }
+}
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -177,8 +212,11 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
   const opId = narOpIdFor(input.runId);
   let msgId = messageIdFor(opId);
   let conversationId: string | null = null;
+  let hostPid: number | null = null;
   try {
     const host = await driver.attestHost(input.agentId);
+    const hostDetail = host.detail as { pid?: unknown } | undefined;
+    hostPid = Number.isInteger(hostDetail?.pid) ? Number(hostDetail?.pid) : null;
     const fence = { runId: input.runId, leaseGeneration: 1, hostEpoch: host.hostEpoch };
     const scope = { agentId: input.agentId, issueId: input.taskId };
     const bound = await driver.bindConversation(
@@ -228,6 +266,12 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
   const deadline = input.timeoutSec > 0 ? Date.now() + input.timeoutSec * 1000 : Infinity;
   const pollMs = input.pollMs ?? 5000;
   let settled = false;
+  const probeMs = input.probeMs ?? 10000;
+  const idleGraceMs = input.idleGraceMs ?? 30000;
+  const unreachableGiveUpMs = input.unreachableGiveUpMs ?? 300000;
+  let lastProbe = Date.now();
+  let unreachableSince: number | null = null;
+  let idleSince: number | null = null;
   let interruptPromise: Promise<"requested" | "uncertain" | "idle"> | undefined;
   const interruptOnce = () => interruptPromise ??= driver.interruptExpectedMessage(
     conversationId, msgId,
@@ -241,15 +285,24 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
   try {
     while (true) {
       if (signal?.aborted) {
-        const interrupted = explicitStopRequested(signal) ? await interruptOnce() : "rejoin";
-        const message = interrupted === "requested"
+        const interruptResult = explicitStopRequested(signal) ? await interruptOnce() : "rejoin";
+        if (interruptResult !== "rejoin") {
+          // Verify from OpenCode that the turn ended (session idle/absent, or the server restarted).
+          for (let i = 0; i < 10; i++) {
+            const proof = await verifyTermination(driver, hostPid, conversationId, msgId);
+            if (proof) return interrupted("stopped by explicit Stop", proof, conversationId);
+            await sleep(1500);
+          }
+        }
+        const interrupted_ = interruptResult;
+        const message = interrupted_ === "requested"
           ? "OpenCode NAR interrupt requested; provider termination is not yet proven"
-          : interrupted === "idle"
+          : interrupted_ === "idle"
             ? "OpenCode NAR stop found no matching in-flight message; no interrupt sent"
-            : interrupted === "uncertain"
+            : interrupted_ === "uncertain"
               ? "OpenCode NAR interrupt uncertain; held without replay"
               : "OpenCode NAR observer stopped; provider turn preserved for restart rejoin";
-        return held(message, true, conversationId, interrupted === "uncertain" ? "interrupt_unknown" : "aborted");
+        return held(message, true, conversationId, interrupted_ === "uncertain" ? "interrupt_unknown" : "aborted");
       }
       const r = await driver.readOutcomeMsg(conversationId, msgId);
       // Stop may arrive while the outcome read is pending. Settle the Stop
@@ -257,6 +310,35 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
       if (signal?.aborted) continue;
       if (r === "hook_observed" || r === "receipted") { settled = true; break; }
       if (Date.now() >= deadline) break;
+      // SCO-679: a dead server or a session left idle (e.g. compaction.interrupted) never settles on its own.
+      if (Date.now() - lastProbe >= probeMs) {
+        lastProbe = Date.now();
+        const pid = await driver.probePid();
+        if (pid === null) {
+          unreachableSince ??= Date.now();
+          if (Date.now() - unreachableSince >= unreachableGiveUpMs) {
+            const m = "OpenCode NAR server unreachable; provider termination not verified";
+            await onLog("stderr", `[paperclip] ${m}\n`);
+            return held(m, true, conversationId, "server_unreachable");
+          }
+        } else {
+          unreachableSince = null;
+          if (hostPid !== null && pid !== hostPid) {
+            await onLog("stderr", `[paperclip] OpenCode server restarted (pid ${hostPid} -> ${pid}); ending run as interrupted\n`);
+            return interrupted("server restarted during run", "server_restarted", conversationId);
+          }
+          let inflight: string | null | undefined;
+          try { inflight = await driver.inflightMessage(conversationId); } catch { inflight = undefined; }
+          if (inflight === undefined || inflight === msgId) idleSince = null;
+          else {
+            idleSince ??= Date.now();
+            if (Date.now() - idleSince >= idleGraceMs) {
+              await onLog("stderr", "[paperclip] OpenCode session idle with no in-flight message; ending run as interrupted\n");
+              return interrupted("session idle without settling", "session_idle", conversationId);
+            }
+          }
+        }
+      }
       await sleep(Math.min(pollMs, Math.max(0, deadline - Date.now())), signal);
     }
   } finally {

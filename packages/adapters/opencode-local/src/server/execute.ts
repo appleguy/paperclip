@@ -895,6 +895,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (narMode) {
         // One attempt, never a stale-session retry: a second prompt could replay work.
         const result = toResult(initial);
+        const termination = (initial as { providerTermination?: { proof: string; reason: string } }).providerTermination;
+        if (termination) {
+          // SCO-679: OpenCode proved the turn ended and the session resumes. Acknowledge so no reconciliation is needed.
+          return { ...result, errorCode: "cancelled", resultJson: { ...(result.resultJson ?? {}),
+            executionCancellation: { state: "acknowledged", acknowledgedAt: new Date().toISOString(), proof: termination.proof },
+            executionRecovery: { kind: "interrupted", providerStopped: true, sessionPreserved: true, actionOutcomes: "settled", reason: termination.reason } } };
+        }
         const recovery = (initial as { executionRecovery?: unknown }).executionRecovery;
         return recovery ? { ...result, resultJson: { ...(result.resultJson ?? {}), executionRecovery: recovery } } : result;
       }

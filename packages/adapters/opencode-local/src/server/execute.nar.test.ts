@@ -18,6 +18,8 @@ const runProcess = vi.mocked(runAdapterExecutionTargetProcess);
 
 // In-memory fake of the OpenCode 2.2.5 session API served on loopback. Executes a prompt synchronously:
 // admits the user message, appends one assistant message for it and goes idle with an outcome.
+let serverPid = 4242;
+
 describe("OpenCode adapter nativeRuntime nar", () => {
   let root: string;
   let cfg: string;
@@ -61,7 +63,7 @@ describe("OpenCode adapter nativeRuntime nar", () => {
         const body = raw ? JSON.parse(raw) : undefined;
         const p = (req.url ?? "").split("?")[0]!;
         const method = req.method;
-        if (p === "/api/info") return reply(200, { version: "2.2.5", pid: 4242, urls: [url + "/"] });
+        if (p === "/api/info") return reply(200, { version: "2.2.5", pid: serverPid, urls: [url + "/"] });
         if (p === "/api/session/active") return reply(200, { data: Object.fromEntries([...active].map((id) => [id, { type: "running" }])) });
         if (p === "/api/session" && method === "POST") {
           if (sessions.has(body.id)) return reply(409, {});
@@ -290,14 +292,39 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect(onCancellationReady).toHaveBeenCalledOnce();
     controller.abort(Object.assign(new Error("Cancelled due to agent pause"), { code: "paperclip_explicit_run_stop" }));
     const stopped = await run;
-    expect(stopped).toMatchObject({ exitCode: 75, resultJson: { executionRecovery: { providerWorkStarted: true } } });
-    expect(stopped.errorMessage).toMatch(/interrupt requested/);
+    // SCO-679: the stop is verified from OpenCode (turn no longer in flight), so cancellation is acknowledged.
+    expect(stopped).toMatchObject({ exitCode: 75, errorCode: "cancelled", resultJson: {
+      executionCancellation: { state: "acknowledged", proof: "session_idle" },
+      executionRecovery: { kind: "interrupted", providerStopped: true, sessionPreserved: true } } });
     expect(promptPosts).toBe(1);
     expect(interruptPosts).toBe(1);
     expect(active.size).toBe(0);
     expect(userMsgs()).toHaveLength(1);
     expect(runProcess).not.toHaveBeenCalled();
   });
+
+  it("ends the run as verified-interrupted when the OpenCode server restarts mid-run (SCO-679)", async () => {
+    autoComplete = false;
+    const run = execute({ ...context("run-restart", { nativeRuntime: "nar" }, "issue-one"), signal: new AbortController().signal } as never);
+    await vi.waitFor(() => expect(active.size).toBe(1));
+    serverPid = 9999; // launchd restarted the server
+    try {
+      const out = await run;
+      expect(out.errorCode).toBe("cancelled");
+      expect(out.resultJson).toMatchObject({
+        executionCancellation: { state: "acknowledged", proof: "server_restarted" },
+        executionRecovery: { kind: "interrupted", sessionPreserved: true } });
+    } finally { serverPid = 4242; }
+  }, 30_000);
+
+  it("ends the run as verified-interrupted when the session goes idle without settling (SCO-679)", async () => {
+    autoComplete = false;
+    const run = execute({ ...context("run-idle-dead", { nativeRuntime: "nar" }, "issue-one"), signal: new AbortController().signal } as never);
+    await vi.waitFor(() => expect(active.size).toBe(1));
+    active.clear(); // e.g. compaction.interrupted: idle, no outcome recorded
+    const out = await run;
+    expect(out.resultJson).toMatchObject({ executionCancellation: { state: "acknowledged", proof: "session_idle" } });
+  }, 120_000);
 
   it("preserves an in-flight provider turn on untagged shutdown for no-replay rejoin", async () => {
     autoComplete = false;
