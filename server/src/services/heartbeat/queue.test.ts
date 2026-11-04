@@ -745,7 +745,7 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
       poolAgents.push(agent); runIds.push(run.id);
     }
     const deps = callbacks(db);
-    deps.getAgent.mockImplementation(async (id: string) => poolAgents.find(a => a.id === id) ?? null);
+    deps.getAgent.mockImplementation((async (id: string) => poolAgents.find(a => a.id === id) ?? null) as never);
     const queue = createHeartbeatQueue(db, deps);
     await queue.startNextQueuedRunForAgent(poolAgents[0].id);
     const status = async () => Object.fromEntries((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, company.id))).map(r => [r.id, r.status]));
