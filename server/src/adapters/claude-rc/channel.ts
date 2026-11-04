@@ -53,7 +53,13 @@ export async function findBridgeRoot(explicit?: string): Promise<string> {
 }
 
 /** Per-host files contain absolute paths and a server name only, never auth. */
-export async function prepareChannelHost(stateDir: string, root: string): Promise<ChannelHost> {
+export async function prepareChannelHost(stateDir: string, installRoot: string): Promise<ChannelHost> {
+  // A long-lived TUI keeps the hook/MCP paths it started with; deploys replace the versioned
+  // cli/installs/git/<sha> directory, so prefer the stable cli/current symlink when it is the same install.
+  const stable = installRoot.replace(/\/cli\/installs\/git\/[0-9a-f]+\//, "/cli/current/");
+  const root = stable !== installRoot
+    && await Promise.all([fs.realpath(stable), fs.realpath(installRoot)]).then(([a, b]) => a === b, () => false)
+    ? stable : installRoot;
   const dir = path.join(stateDir, "channel-bridge");
   const mcpConfigPath = path.join(stateDir, "channel-mcp-config.json");
   const hookSettingsPath = path.join(stateDir, "channel-hook-settings.json");
