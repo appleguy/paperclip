@@ -376,6 +376,33 @@ export async function deliver(ctx: AdapterExecutionContext, receipt: Receipt, ti
   await invoke("PATCH", "", { status: "done" });
 }
 
+/**
+ * active.json naming a DIFFERENT issue: a finished receipt is settled onto its issue and the checkpoint archived;
+ * a TUI still working defers the wake (busy refusal); only an idle TUI with no receipt is an unknown state and fails.
+ * The caller holds the state mutex, so no live adapter run owns this checkpoint.
+ */
+async function settleForeignCheckpoint(
+  ctx: AdapterExecutionContext, raw: string, issueId: string, stateDir: string, activePath: string,
+  socket: string, session: string, cwd: string,
+): Promise<void> {
+  let a: Partial<ActiveDispatch>;
+  try { a = JSON.parse(raw) as Partial<ActiveDispatch>; } catch { return; }
+  if (!a || typeof a.runId !== "string" || !/^[0-9a-f-]{36}$/i.test(a.runId) || typeof a.issueId !== "string"
+      || a.issueId === issueId || a.receiptPath !== path.join(stateDir, `receipt-${a.runId}.json`)) return;
+  const idle = (await inputReadiness(socket, session, stateDir, cwd, a.conversationId)).allowed;
+  let receipt: Receipt | null = null;
+  try { receipt = parseReceipt(await fs.readFile(a.receiptPath, "utf8"), a.runId, a.issueId); } catch { /* none yet */ }
+  if (!idle) throw new Error(`agy TUI not idle: previous run ${a.runId} (issue ${a.issueId}) is still working`);
+  if (!receipt) return; // idle, no valid receipt: adoptableActive refuses as unknown state
+  try {
+    await deliver(ctx, receipt);
+    await ctx.onLog("stdout", `[agy] Settled finished receipt of run ${a.runId} onto issue ${a.issueId}\n`);
+  } catch (e) {
+    await ctx.onLog("stderr", `[agy] Could not settle receipt of run ${a.runId} onto issue ${a.issueId} (${e instanceof Error ? e.message : e}); receipt kept at ${a.receiptPath}\n`);
+  }
+  await fs.rename(activePath, path.join(stateDir, `active.stale-${a.runId}-${Date.now()}.json`));
+}
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const cfg = ctx.config;
   const session = asString(cfg.tmuxSession, "agy");
@@ -405,7 +432,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     await fs.mkdir(stateDir, { recursive: true, mode: 0o700 });
     unlock = await acquire(stateDir, Date.now() + timeoutMs);
     const activePath = path.join(stateDir, "active.json");
-    const adopted = adoptableActive(await fs.readFile(activePath, "utf8").catch(() => ""), issueId, stateDir);
+    let activeRaw = await fs.readFile(activePath, "utf8").catch(() => "");
+    if (activeRaw) {
+      await settleForeignCheckpoint(ctx, activeRaw, issueId, stateDir, activePath, socket, session, cwd);
+      activeRaw = await fs.readFile(activePath, "utf8").catch(() => "");
+    }
+    const adopted = adoptableActive(activeRaw, issueId, stateDir);
     const rcUrl = await ensureSession(socket, session, cwd, stateDir, Boolean(adopted), model);
     if (!rcUrl) throw new Error("agy RC URL unavailable: use /remote-control in its TUI, then retry");
     // Owner 2026-11-03: auto re-pin, logged. The URL rotates on every agy restart; ensureSession only reads it from the
