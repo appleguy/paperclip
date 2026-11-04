@@ -246,7 +246,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const prevRaw = await fs.readFile(activePath, "utf8");
       const prev = JSON.parse(prevRaw) as { op_id?: string; runId?: string; receiptPath?: string };
       const prevOp = asString(prev.op_id, asString(prev.runId, ""));
-      if (prevOp && prevOp !== ctx.runId && !adoptableActive(prevRaw, issueId, stateDir)
+      if (prevOp && prevOp !== ctx.runId && !(() => { try { return adoptableActive(prevRaw, issueId, stateDir); } catch { return null; } })()
         && (await readBlockTerminal(stateDir, prevOp) !== null
           || (prev.receiptPath && await fs.stat(prev.receiptPath).then(() => true, () => false)))) {
         await fs.rename(activePath, path.join(stateDir, `active.stale-${prevOp}.json`));
