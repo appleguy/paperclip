@@ -5765,12 +5765,24 @@ export function agentRoutes(
       },
     };
     const command = requestedStatus === "paused" ? "pause" : requestedStatus === "idle" ? "resume" : requestedStatus === "terminated" ? "terminate" : null;
-    const agent = command
+    let agent = command
       ? await svcLifecycle.updateAndTransition(id, command, patchData, updateOptions)
       : await svc.update(id, patchData, updateOptions);
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
       return;
+    }
+    // Resume leaves an errored agent in error; status=idle must clear it
+    // instead of returning 200 with the status unchanged (SCO-649).
+    if (requestedStatus === "idle" && agent.status === "error") {
+      if (existing.orgChainHealth?.status === "invalid_org_chain") {
+        throw conflict(existing.orgChainHealth?.repairGuidance ?? "Repair this agent's reporting chain before clearing its error");
+      }
+      agent = (await svc.clearError(id)) ?? agent;
+    }
+    const expectedStatus = requestedStatus === "idle" ? ["idle", "active", "running"] : requestedStatus ? [requestedStatus] : null;
+    if (expectedStatus && !expectedStatus.includes(agent.status)) {
+      throw conflict(`Requested status ${requestedStatus} was not applied; agent status is ${agent.status}`);
     }
 
     await logActivity(db, {
