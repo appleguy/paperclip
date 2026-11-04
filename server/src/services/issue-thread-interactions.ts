@@ -4495,6 +4495,24 @@ export function issueThreadInteractionService(
         const interaction = hydrateInteraction(
           current,
         ) as RequestItemVerdictsInteraction;
+        // The board keeps one verdict draft per issue, so a submission can carry
+        // ids from a sibling review on the same issue. Drop those; any id that
+        // belongs to no review on this issue is still rejected below.
+        const ownIds = new Set(interaction.payload.items.map((item) => item.id));
+        if (data.verdicts.some((verdict) => !ownIds.has(verdict.id))) {
+          const siblings = await tx
+            .select({ payload: issueThreadInteractions.payload })
+            .from(issueThreadInteractions)
+            .where(and(
+              eq(issueThreadInteractions.issueId, issue.id),
+              eq(issueThreadInteractions.kind, "request_item_verdicts"),
+              ne(issueThreadInteractions.id, current.id),
+            ));
+          const siblingIds = new Set(siblings.flatMap((row) =>
+            ((row.payload as { items?: { id: string }[] }).items ?? []).map((item) => item.id)));
+          data.verdicts = data.verdicts.filter((verdict) =>
+            ownIds.has(verdict.id) || !siblingIds.has(verdict.id));
+        }
         if (current.status !== "pending") {
           if (current.status === "answered") {
             const resolvedIds = new Set(

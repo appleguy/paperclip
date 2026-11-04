@@ -2931,6 +2931,25 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     })).rejects.toThrow("A reason is required when verdict is reject");
   });
 
+  it("ignores verdict ids that belong to a sibling review on the same issue", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Item verdict sibling draft");
+    const review = (ids: string[]) => interactionsSvc.create({ id: issueId, companyId }, {
+      kind: "request_item_verdicts",
+      payload: { version: 1, prompt: "Review.", items: ids.map((id) => ({ id, label: id })) },
+    }, { userId: "local-board" });
+    const first = await review(["hygiene-1"]);
+    const second = await review(["continuity-1"]);
+    await interactionsSvc.submitItemVerdicts({ id: issueId, companyId }, first.id, {
+      verdicts: [{ id: "hygiene-1", verdict: "approve" }],
+    }, { userId: "local-board" });
+
+    const result = await interactionsSvc.submitItemVerdicts({ id: issueId, companyId }, second.id, {
+      verdicts: [{ id: "hygiene-1", verdict: "approve" }, { id: "continuity-1", verdict: "approve" }],
+    }, { userId: "local-board" });
+    expect(result.newlyResolvedItemIds).toEqual(["continuity-1"]);
+    expect(result.interaction.status).toBe("answered");
+  });
+
   it("preserves resolved request_item_verdicts items when a later user comment supersedes the pending remainder", async () => {
     const { companyId, issueId } = await seedConfirmationIssue("Item verdict supersede");
     const commentId = randomUUID();
