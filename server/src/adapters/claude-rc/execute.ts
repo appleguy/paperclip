@@ -22,7 +22,7 @@ import {
 } from "./channel.js";
 
 const CLAUDE = "/opt/homebrew/bin/claude";
-const MODELS = new Set(["claude-sonnet-5-5", "claude-haiku-5-5"]);
+const MODELS = new Set(["claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5-5"]);
 const EFFORTS = new Set(["low", "medium", "high"]);
 const ID = /^[a-zA-Z0-9_-]{1,55}$/;
 const NAME = /^[A-Za-z0-9 ._-]{1,60}$/;
