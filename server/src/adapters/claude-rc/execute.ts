@@ -177,6 +177,36 @@ async function ensureSession(
   return url ?? (exists ? (await fs.readFile(urlFile, "utf8").catch(() => "")).trim() : "");
 }
 
+/** Terminal `block` the worker recorded via pcbridge paperclip_block for this op, if any. */
+async function readBlockTerminal(stateDir: string, opId: string): Promise<string | null> {
+  const raw = await fs.readFile(path.join(stateDir, "channel-bridge", "ledger.jsonl"), "utf8").catch(() => "");
+  for (const line of raw.split("\n").reverse()) {
+    if (!line.includes(opId) || !line.includes('"terminal"')) continue;
+    try {
+      const ev = JSON.parse(line) as { ev?: string; op_id?: string; kind?: string; reason?: string };
+      if (ev.ev === "terminal" && ev.op_id === opId && ev.kind === "block") return asString(ev.reason, "blocked");
+    } catch { /* partial line */ }
+  }
+  return null;
+}
+
+/** Post the worker's blocker as a comment and mark the issue blocked, under the run-scoped token. */
+async function deliverBlock(ctx: AdapterExecutionContext, issueId: string, reason: string): Promise<void> {
+  if (!ctx.authToken) throw new Error("missing scoped agent token for blocker delivery");
+  const port = Number(process.env.PAPERCLIP_LISTEN_PORT ?? process.env.PORT ?? "3100");
+  const issue = encodeURIComponent(issueId);
+  for (const [method, suffix, body] of [
+    ["POST", "/comments", { body: `Claude RC worker reported a blocker:\n\n${reason}` }],
+    ["PATCH", "", { status: "blocked" }],
+  ] as const) {
+    const res = await fetch(new URL(`/api/issues/${issue}${suffix}`, `http://127.0.0.1:${port}`), {
+      method, redirect: "manual", body: JSON.stringify(body), signal: AbortSignal.timeout(15_000),
+      headers: { Authorization: `Bearer ${ctx.authToken}`, "X-Paperclip-Run-Id": ctx.runId, "Content-Type": "application/json" },
+    });
+    if (!res.ok) throw new Error(`Paperclip ${method} ${suffix || "issue"} returned HTTP ${res.status}`);
+  }
+}
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const cfg = ctx.config;
   const session = asString(cfg.tmuxSession, "claude");
@@ -299,12 +329,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const deadline = Date.now() + timeoutMs;
     let receipt: Receipt | null = null;
     let idleWithoutReceipt = 0;
+    let blockedReason = null as string | null;
     while (Date.now() < deadline) {
       if (ctx.signal?.aborted) throw new Error("Claude run cancelled; shared TUI left intact, active checkpoint preserved");
       const raw = await fs.readFile(receiptPath, "utf8").catch(() => "");
       if (raw) {
         receipt = parseReceipt(raw, receiptRunId, issueId);
         if (await waitIdle(socket, session, Date.now() + 4000)) break;
+      } else if (await readBlockTerminal(stateDir, receiptRunId).then(async reason => {
+        if (reason === null || !(await waitIdle(socket, session, Date.now() + 4000))) return false;
+        await deliverBlock(ctx, issueId, reason);
+        await ctx.onLog("stdout", `[claude-rc] Worker blocked ${issueId}: ${reason.slice(0, 200)}\n`);
+        await fs.rm(activePath, { force: true });
+        blockedReason = reason;
+        return true;
+      })) {
+        break;
       } else if (adopted) {
         idleWithoutReceipt = isClaudeIdle(await claudePane(socket, session)) ? idleWithoutReceipt + 1 : 0;
         if (idleWithoutReceipt >= 5)
@@ -313,6 +353,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       await tmux(socket, ["has-session", "-t", session]);
       await sleep(1100);
     }
+    if (blockedReason !== null) return {
+      exitCode: 0, signal: null, timedOut: false, provider: "anthropic", biller: "anthropic", model,
+      billingType: "subscription", costStatus: "unpriced", summary: `Blocked: ${blockedReason.split("\n")[0].slice(0, 200)}`,
+      sessionId: conversationId, sessionDisplayId: conversationId,
+      sessionParams: { sessionId: conversationId, cwd, remoteControlUrl: rcUrl, remoteControlName: name, tmuxSocket: socket, tmuxSession: session },
+      resultJson: { issueId, receiptPath, remoteControlUrl: rcUrl, conversationId, blocked: true },
+    };
     if (!receipt || !(await waitIdle(socket, session, Date.now() + 1500)))
       return failure("Claude did not produce a validated completion receipt at an idle TUI; checkpoint retained", true);
     await deliver(ctx, receipt, "Claude Code execution report", "Claude Remote Control");
