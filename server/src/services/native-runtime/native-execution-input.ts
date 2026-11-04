@@ -99,7 +99,7 @@ export interface BuildNativeExecutionInput {
     branchName: string | null;
   };
   normalizedSessionId: string | null;
-  provider?: "codex" | "opencode" | "opencode_shared_v2" | "claude_interactive" | "claude_managed" | "aws_agentcore" | "acpx" | "openai_dot" | "grok_bot" | "muse" | "antigravity_headless";
+  provider?: "cursor_cloud" | "codex" | "opencode" | "opencode_shared_v2" | "claude_interactive" | "claude_managed" | "aws_agentcore" | "acpx" | "openai_dot" | "grok_bot" | "muse" | "antigravity_headless";
   opencodeEffort?: string;
   claudeAutoCompactTokens?: number;
   museBinding?: MuseBindingSnapshot;
@@ -117,6 +117,7 @@ export interface BuildNativeExecutionInput {
   grokEffort?: "minimal" | "low" | "medium" | "high" | "xhigh";
   grokDisableWebSearch?: boolean;
   model?: string | null;
+  cursorCloud?: import("../../vendor/paperclip-runner/index.js").NativeCursorCloudConfig;
   managedProfile?: Extract<
     NativeExecutionInputV5["provider"],
     { kind: "claude_managed" }
@@ -317,7 +318,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
     },
     session: {
       normalizedSessionId: input.normalizedSessionId,
-      driverKind: input.provider === "opencode"
+      driverKind: input.provider === "cursor_cloud" ? "cursor_cloud_api" : input.provider === "opencode"
         ? "opencode_server"
         : input.provider === "claude_managed"
           ? "claude_managed_agents_api"
@@ -329,7 +330,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
       protocolVersion: 1,
       lifecyclePolicy: input.lifecyclePolicy ?? { mode: "per_turn", idleTimeoutMs: null },
     },
-    provider: input.provider === "claude_managed"
+    provider: input.provider === "cursor_cloud" ? { kind: "cursor_cloud", model: input.model, cursorCloud: input.cursorCloud } : input.provider === "claude_managed"
       ? {
           kind: "claude_managed",
           model: input.model,

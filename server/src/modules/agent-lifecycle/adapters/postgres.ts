@@ -64,7 +64,7 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
   if (command === "complete" && next === "ready" && holds.length) next = "pausing";
   if (command === "complete" && next === "paused" && !holds.length) next = "resuming";
   if (["complete", "reconcile"].includes(command) && next === "paused" && holds.length === 1 && holds[0] === "setup"
-    && await effects.setupRequiresPreparation(tx, agent.companyId, agent.defaultEnvironmentId)) next = "preparing";
+    && await effects.setupRequiresPreparation(tx, agent.companyId, agent.defaultEnvironmentId, agent)) next = "preparing";
   if (next === agent.lifecycleState) {
     // Older pause paths could leave status=paused while lifecycleState=ready.
     // A successful resume must restore the dispatchable compatibility status,
