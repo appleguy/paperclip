@@ -32,6 +32,7 @@ describe("OpenCode adapter nativeRuntime nar", () => {
   let promptStatus: number | undefined;
   let messagePageSize: number | undefined;
   let clock: number;
+  let assistantError: unknown;
 
   beforeEach(async () => {
     root = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-nar-adapter-"));
@@ -45,6 +46,7 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     promptStatus = undefined;
     messagePageSize = undefined;
     clock = 1000;
+    assistantError = undefined;
     vi.stubEnv("XDG_CONFIG_HOME", root);
     runProcess.mockReset();
     const expected = "Basic " + Buffer.from("opencode:local-secret").toString("base64");
@@ -84,9 +86,10 @@ describe("OpenCode adapter nativeRuntime nar", () => {
               const n = s.msgs.length;
               s.msgs.push({ id: `msg_a${n}`, type: "assistant", time: { created: clock++, completed: clock++ },
                 content: [{ type: "text", text: `answer ${n}` }, { type: "tool", name: "read" }],
-                cost: 0.5, tokens: { input: 100 * n, output: 10 * n, reasoning: 1, cache: { read: 7, write: 2 } } });
+                cost: 0.5, tokens: { input: 100 * n, output: 10 * n, reasoning: 1, cache: { read: 7, write: 2 } },
+                ...(assistantError ? { error: assistantError } : {}) });
               s.info.time.idle = clock++;
-              s.info.outcome = "succeeded";
+              s.info.outcome = assistantError ? "failed" : "succeeded";
             } else {
               active.add(m[1]!);
             }
@@ -160,6 +163,20 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect(sessions.size).toBe(1);
     expect(userMsgs().map((m) => m.id)).toEqual([messageIdFor(narOpIdFor("run-1"))]);
     expect([...sessions.values()][0]!.info.model).toEqual({ providerID: "openai", id: "fixture", variant: "medium" });
+  });
+
+  it("records a llama-swap 429 concurrency_limit as a capacity refusal, not an adapter failure", async () => {
+    assistantError = { name: "provider.rate-limit", data: { statusCode: 429, code: "concurrency_limit", retryAfterMs: 1000 } };
+    const result = await execute(context("run-429", { nativeRuntime: "nar" }) as never);
+    expect(result.exitCode).toBe(1);
+    expect(result.resultJson).toMatchObject({ adapterPreInferenceAdmission: { kind: "opencode_capacity_refusal_v1", providerWorkStarted: false } });
+  });
+
+  it("a non-capacity failed session is not a capacity refusal", async () => {
+    assistantError = { name: "provider.auth", data: { statusCode: 401 } };
+    const result = await execute(context("run-401", { nativeRuntime: "nar" }) as never);
+    expect(result.exitCode).toBe(1);
+    expect(result.resultJson).not.toHaveProperty("adapterPreInferenceAdmission");
   });
 
   it("names the session after the wake issue and retitles an older placeholder on the next run", async () => {

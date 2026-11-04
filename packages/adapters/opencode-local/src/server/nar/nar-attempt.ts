@@ -81,10 +81,18 @@ async function readServer(configPath: string): Promise<{ url: string; passwordFi
   return { url, passwordFile };
 }
 
+/** A provider capacity refusal (llama-swap concurrency_limit): rate-limit error name, code or HTTP 429. */
+export function isCapacityError(err: unknown): boolean {
+  if (err == null) return false;
+  let text: string;
+  try { text = typeof err === "string" ? err : JSON.stringify(err); } catch { return false; }
+  return /provider\.rate-limit|concurrency_limit|"(?:status|statusCode)"\s*:\s*"?429\b/i.test(text);
+}
+
 /** Read this op's usage from the session message log: messages created at/after our user message. */
 async function collectOutcome(
   driverFetch: typeof fetch, url: string, passwordFile: string, sessionId: string, msgId: string,
-): Promise<{ texts: string[]; usage: ReturnType<typeof parseOpenCodeJsonl>["usage"]; usageReported: boolean; costUsd: number | null; sessionOutcome: string | null }> {
+): Promise<{ texts: string[]; usage: ReturnType<typeof parseOpenCodeJsonl>["usage"]; usageReported: boolean; costUsd: number | null; sessionOutcome: string | null; capacityRefusal: boolean }> {
   const pw = (await fs.readFile(passwordFile, "utf8")).trim();
   const headers = { authorization: "Basic " + Buffer.from(`opencode:${pw}`).toString("base64"), accept: "application/json" };
   const get = async (p: string) => {
@@ -119,11 +127,17 @@ async function collectOutcome(
     else cost = null;
   }
   let sessionOutcome: string | null = null;
+  // llama-swap concurrency_limit surfaces as a provider.rate-limit / HTTP 429 error on the last op message or the session.
+  let capacityRefusal = ops.length > 0 && isCapacityError(ops[ops.length - 1]?.error);
   try {
-    const o = (await get(`/api/session/${sid}`))?.data?.outcome;
+    const sess = (await get(`/api/session/${sid}`))?.data;
+    if (!capacityRefusal && !ops.some((m) => m?.content?.some?.((c: any) => c?.type === "text" && c.text?.trim()))) {
+      capacityRefusal = isCapacityError(sess?.error) || isCapacityError(sess?.outcome?.error);
+    }
+    const o = sess?.outcome;
     sessionOutcome = typeof o === "string" ? o : typeof o?.type === "string" ? o.type : typeof o?.status === "string" ? o.status : null;
   } catch { /* outcome detail is advisory */ }
-  return { texts, usage, usageReported, costUsd: ops.length ? cost : null, sessionOutcome };
+  return { texts, usage, usageReported, costUsd: ops.length ? cost : null, sessionOutcome, capacityRefusal };
 }
 
 /**
@@ -259,11 +273,12 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
   try {
     out = await collectOutcome(f, server.url, server.passwordFile, conversationId, msgId);
   } catch {
-    out = { texts: [], usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, peakContextTokens: 0 }, usageReported: false, costUsd: null, sessionOutcome: null };
+    out = { texts: [], usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, peakContextTokens: 0 }, usageReported: false, costUsd: null, sessionOutcome: null, capacityRefusal: false };
   }
   const summary = out.texts.join("\n\n");
   if (summary) await onLog("stdout", summary + "\n");
   const failed = out.sessionOutcome !== null && /fail|error|interrupt|abort|cancel/i.test(out.sessionOutcome);
+  const refused = failed && out.capacityRefusal;
   const errorMessage = failed ? `OpenCode session outcome: ${out.sessionOutcome}` : null;
   const parsed = emptyParsed(conversationId, errorMessage);
   parsed.summary = summary;
@@ -277,6 +292,6 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
     rawStderr: errorMessage ?? "",
     parsed,
     possibleWork: true,
-    capacityRefusal: false,
+    capacityRefusal: refused,
   };
 }
