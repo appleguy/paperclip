@@ -10110,6 +10110,7 @@ export function issueRoutes(
               activeRecoveryAction.evidence.runId ??
               activeRecoveryAction.evidence.sourceRunId,
             decision: executionReconciliation,
+            recoveryReturnOwnerAgentId: activeRecoveryAction.returnOwnerAgentId,
           });
         } else if (executionReconciliation) {
           throw conflict(

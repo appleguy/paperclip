@@ -44,6 +44,8 @@ export async function validateExecutionReconciliation(input: {
   decision: ExecutionReconciliation | undefined;
   /** Board-only source repair: never authorize a continuation of this run. */
   workspaceRepairOnly?: boolean;
+  /** The recovery action's recorded owner; lets a board reconcile after the task was reassigned. */
+  recoveryReturnOwnerAgentId?: string | null;
 }) {
   const { db, companyId, issueId, agentId, decision } = input;
   if (!decision || decision.runId !== input.sourceRunId || (!agentId && !input.workspaceRepairOnly)) {
@@ -74,13 +76,19 @@ export async function validateExecutionReconciliation(input: {
     review.currentParticipant.agentId === run?.agentId;
   const retainedWorkspace = hasRequiredWorkspaceRecovery(run?.resultJson);
   const repairOnly = input.workspaceRepairOnly === true && retainedWorkspace;
+  // A board-reconciled hold on a task that was reassigned after the run settled
+  // must still be clearable; it records the outcome without continuing the run
+  // for the new assignee (delivery also invalidates on an owner mismatch).
+  const reassigned = !repairOnly && !!task && task.assigneeAgentId === agentId &&
+    !!input.recoveryReturnOwnerAgentId && input.recoveryReturnOwnerAgentId !== agentId &&
+    run?.agentId === input.recoveryReturnOwnerAgentId;
   const terminalRepairSource = ["failed", "interrupted", "timed_out", "cancelled"].includes(run?.status ?? "") ||
     (repairOnly && run?.runtimeMode === "legacy" && run.status === "succeeded");
   if (
     (input.workspaceRepairOnly && !retainedWorkspace) ||
     !run ||
     !task ||
-    (!repairOnly && (task.assigneeAgentId !== agentId || (run.agentId !== agentId && !isCurrentReviewer))) ||
+    (!repairOnly && !reassigned && (task.assigneeAgentId !== agentId || (run.agentId !== agentId && !isCurrentReviewer))) ||
     (run.nativeIssueId ?? run.contextSnapshot?.issueId) !== issueId ||
     !terminalRepairSource
   ) {
@@ -159,7 +167,7 @@ export async function validateExecutionReconciliation(input: {
     throw conflict(
       "The previous execution environment has not finished releasing its authority.",
     );
-  if (!repairOnly) await buildExecutionContinuation({
+  if (!repairOnly && !reassigned) await buildExecutionContinuation({
     db,
     companyId,
     issueId,

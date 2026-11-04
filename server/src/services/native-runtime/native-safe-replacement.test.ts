@@ -500,6 +500,19 @@ const support = externalDatabaseUrl
       await db.update(issues).set({ executionState: null }).where(eq(issues.id, source.issueId));
       await expect(validateExecutionReconciliation(input)).rejects.toThrow("source or task owner changed");
     });
+    it("lets a board reconcile a hold after the task was reassigned, without a continuation", async () => {
+      const source = await seed();
+      const newAssignee = randomUUID();
+      await db.insert(agents).values({ id: newAssignee, companyId: source.companyId, name: "Reassigned", role: "engineer", adapterType: "process" });
+      const [run] = await db.update(heartbeatRuns).set({ runtimeMode: "legacy", status: "running" }).where(eq(heartbeatRuns.id, source.runId)).returning();
+      await terminalizeLegacyExecution({ db, run, status: "failed", patch: { finishedAt: new Date() } });
+      await db.update(issues).set({ assigneeAgentId: newAssignee }).where(eq(issues.id, source.issueId));
+      const input = { db, companyId: source.companyId, issueId: source.issueId, agentId: newAssignee, sourceRunId: source.runId,
+        decision: { runId: source.runId, providerStopped: true as const, actionOutcome: "not_performed" as const, outcomeEvidence: "Inspected the stopped run and verified no actions occurred." } };
+      await expect(validateExecutionReconciliation(input)).rejects.toThrow("source or task owner changed");
+      await expect(validateExecutionReconciliation({ ...input, recoveryReturnOwnerAgentId: source.agentId }))
+        .resolves.toMatchObject({ id: source.runId });
+    });
     it("does not turn an already reconciled continuation into a recovery assignment", async () => {
       const source = await seed();
       const [action] = await db.insert(issueRecoveryActions).values({ companyId: source.companyId, sourceIssueId: source.issueId, kind: "active_run_watchdog", status: "resolved", ownerType: "board", returnOwnerAgentId: source.agentId, cause: "native_event_replay_conflict", fingerprint: source.runId, nextAction: "Old recovery instruction", evidence: { executionReconciliation: { runId: source.runId } } }).returning();
