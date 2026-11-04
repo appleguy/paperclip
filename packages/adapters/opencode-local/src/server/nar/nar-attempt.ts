@@ -124,10 +124,28 @@ export function isCapacityError(err: unknown): boolean {
   return /provider\.rate-limit|concurrency_limit|"(?:status|statusCode)"\s*:\s*"?429\b/i.test(text);
 }
 
+/** Typed cause of a failed OpenCode turn, from the structured error OpenCode records on the failed message/outcome. */
+export function classifyOpenCodeError(err: unknown): { code: string; detail: string } | null {
+  if (err == null) return null;
+  const e: any = typeof err === "object" ? err : { message: String(err) };
+  const type = typeof e.type === "string" ? e.type : "";
+  const message = typeof e.message === "string" ? e.message : "";
+  let text = "";
+  try { text = JSON.stringify(err); } catch { text = message; }
+  const detail = `${type || "error"}: ${message || text}`.replace(/\s+/g, " ").slice(0, 200);
+  if (isCapacityError(err)) return { code: "opencode_provider_rate_limit", detail };
+  if (/vision encoder/i.test(text)) return { code: "opencode_backend_vision_encoder_missing", detail };
+  if (/variant unavailable/i.test(text) || type === "provider.no-route") return { code: "opencode_variant_unavailable", detail };
+  if (/context[_ -]?(length|window|overflow)|too many tokens|maximum context/i.test(text) || /context-overflow/i.test(type)) return { code: "opencode_context_overflow", detail };
+  if (/compaction/i.test(text)) return { code: "opencode_compaction_failed", detail };
+  if (/^tool\./i.test(type)) return { code: "opencode_tool_error", detail };
+  return { code: "opencode_session_failed", detail };
+}
+
 /** Read this op's usage from the session message log: messages created at/after our user message. */
 async function collectOutcome(
   driverFetch: typeof fetch, url: string, passwordFile: string, sessionId: string, msgId: string,
-): Promise<{ texts: string[]; usage: ReturnType<typeof parseOpenCodeJsonl>["usage"]; usageReported: boolean; costUsd: number | null; sessionOutcome: string | null; capacityRefusal: boolean }> {
+): Promise<{ texts: string[]; usage: ReturnType<typeof parseOpenCodeJsonl>["usage"]; usageReported: boolean; costUsd: number | null; sessionOutcome: string | null; capacityRefusal: boolean; cause: { code: string; detail: string } | null }> {
   const pw = (await fs.readFile(passwordFile, "utf8")).trim();
   const headers = { authorization: "Basic " + Buffer.from(`opencode:${pw}`).toString("base64"), accept: "application/json" };
   const get = async (p: string) => {
@@ -166,15 +184,19 @@ async function collectOutcome(
   // A later platform receipt or other trailing message must not hide the failed assistant message: use the last one carrying an error.
   const errored = [...ops].reverse().find((m) => m?.error != null || m?.finish === "error" || m?.finish?.type === "error");
   let capacityRefusal = errored != null && isCapacityError(errored.error ?? errored.finish ?? errored);
+  // The failed outcome record (and the errored assistant message) carry the structured provider error.
+  const outcomeRec = [...list].reverse().find((m) => m?.outcome === "failed" && m?.error != null && (m?.time?.created ?? 0) >= (created ?? 0));
+  let cause = classifyOpenCodeError(outcomeRec?.error ?? errored?.error ?? null);
   try {
     const sess = (await get(`/api/session/${sid}`))?.data;
+    cause ??= classifyOpenCodeError(sess?.error ?? sess?.outcome?.error ?? null);
     if (!capacityRefusal && !ops.some((m) => m?.content?.some?.((c: any) => c?.type === "text" && c.text?.trim()))) {
       capacityRefusal = isCapacityError(sess?.error) || isCapacityError(sess?.outcome?.error);
     }
     const o = sess?.outcome;
     sessionOutcome = typeof o === "string" ? o : typeof o?.type === "string" ? o.type : typeof o?.status === "string" ? o.status : null;
   } catch { /* outcome detail is advisory */ }
-  return { texts, usage, usageReported, costUsd: ops.length ? cost : null, sessionOutcome, capacityRefusal };
+  return { texts, usage, usageReported, costUsd: ops.length ? cost : null, sessionOutcome, capacityRefusal: capacityRefusal || cause?.code === "opencode_provider_rate_limit", cause };
 }
 
 /**
@@ -357,13 +379,14 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
   try {
     out = await collectOutcome(f, server.url, server.passwordFile, conversationId, msgId);
   } catch {
-    out = { texts: [], usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, peakContextTokens: 0 }, usageReported: false, costUsd: null, sessionOutcome: null, capacityRefusal: false };
+    out = { texts: [], usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, peakContextTokens: 0 }, usageReported: false, costUsd: null, sessionOutcome: null, capacityRefusal: false, cause: null };
   }
   const summary = out.texts.join("\n\n");
   if (summary) await onLog("stdout", summary + "\n");
   const failed = out.sessionOutcome !== null && /fail|error|interrupt|abort|cancel/i.test(out.sessionOutcome);
   const refused = failed && out.capacityRefusal;
-  const errorMessage = failed ? `OpenCode session outcome: ${out.sessionOutcome}` : null;
+  const cause = failed ? (out.cause ?? { code: "opencode_session_failed", detail: "no error recorded on the session" }) : null;
+  const errorMessage = failed ? `OpenCode session outcome: ${out.sessionOutcome} [${cause!.code}] ${cause!.detail}` : null;
   const parsed = emptyParsed(conversationId, errorMessage);
   parsed.summary = summary;
   parsed.usage = out.usage;
@@ -372,7 +395,7 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
   parsed.costUsd = out.costUsd;
   parsed.hasNonErrorOutput = true;
   return {
-    proc: { exitCode: failed ? 1 : 0, signal: null, timedOut: false, stdout: summary, stderr: errorMessage ?? "" },
+    proc: { exitCode: failed ? 1 : 0, signal: null, timedOut: false, stdout: summary, stderr: errorMessage ?? "", errorCode: cause?.code ?? null },
     rawStderr: errorMessage ?? "",
     parsed,
     possibleWork: true,
