@@ -164,7 +164,7 @@ export function assertWorkableCwd(cwd: string): void {
 /** SCO-560 (opt-in keepConversation): reuse the live conversation instead of /clear.
  * keepConversationAcrossProjects: a cross-project seat (Board) keeps one conversation
  * whatever project the next issue is in; compaction, not /clear, bounds its size. */
-export interface KeepState { conversationId: string; projectId: string }
+export interface KeepState { conversationId: string; projectId: string; issueIds?: string[] }
 export function shouldReuseConversation(o: {
   enabled: boolean; state: KeepState | null; newestId: string | null; projectId: string;
   sizeBytes: number; maxBytes: number; acrossProjects?: boolean;
@@ -404,15 +404,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           throw new Error("Claude /clear did not start an isolated conversation");
       }
       const promptBase = asString(cfg.promptTemplate, DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE);
-      const { taskContextNote, wakePrompt } = selectPaperclipPromptSections(ctx.context);
+      // A kept conversation already holds the standing text (template, run rules, receipt format)
+      // and the brief and history of every issue it handled, so a wake resends only the delta,
+      // as claude_local does on --resume. An issue new to the conversation still gets its brief.
+      const seenIssueIds = reuse ? keepState?.issueIds ?? [] : [];
+      const seenIssue = seenIssueIds.includes(issueId);
+      const wake = ctx.context.paperclipWake;
+      const promptContext = seenIssue && wake && typeof wake === "object"
+        ? { ...ctx.context, paperclipWake: { ...(wake as Record<string, unknown>), continuationSummary: null } } : ctx.context;
+      const { taskContextNote, wakePrompt } = selectPaperclipPromptSections(promptContext, { resumedSession: seenIssue });
       const instructionsFilePath = asString(cfg.instructionsFilePath, "");
       const instructionsFull = instructionsFilePath ? await fs.readFile(instructionsFilePath, "utf8") : "";
-      const instructionsPrefix = reuse
-        ? "(Same conversation as your previous dispatch: your standing instructions above still apply; no resend.)" : instructionsFull;
-      const intro = renderTemplate(promptBase, {
+      const instructionsPrefix = reuse ? "" : instructionsFull;
+      const intro = reuse ? "" : renderTemplate(promptBase, {
         agent: ctx.agent, run: { id: ctx.runId }, context: ctx.context, companyId: ctx.agent.companyId,
       });
-      const instructions = [
+      const instructions = reuse ? [
+        `Paperclip run ${ctx.runId}, issue ${issueId}: work on ONLY this issue; standing run rules unchanged.`,
+        `Done receipt (Write tool, only on success; do not update the issue yourself): ${receiptPath} with keys runId, issueId,`,
+        'status "done", summary, report (Markdown, 250+ chars).',
+        `pcrc: PAPERCLIP_RC_RUN_ENV=${runEnvPath}.`,
+      ].join(" ") : [
         `Paperclip run ${ctx.runId}, issue ${issueId}. Work on ONLY the assigned issue.`,
         "This is the owner's live Claude Code Remote Control session: messages they send mid-task steer this issue.",
         "Run every command in the foreground; never background a tool call. Never print secrets or guess Paperclip API credentials.",
@@ -429,7 +441,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (prompt.length > 50_000) throw new Error("Claude prompt exceeds dispatch budget");
       if (keepEnabled) {
         await ctx.onLog("stdout", `[claude-rc] keepConversation ${reuse ? "reuse" : "fresh"}: prompt ${prompt.length} bytes (instructions ${reuse ? 0 : instructionsFull.length} of ${instructionsFull.length}); conversation ${Math.round(keepSize)} bytes\n`);
-        await fs.writeFile(keepPath, JSON.stringify({ conversationId, projectId }), { mode: 0o600 });
+        const issueIds = [...seenIssueIds.filter(id => id !== issueId), issueId].slice(-200);
+        await fs.writeFile(keepPath, JSON.stringify({ conversationId, projectId, issueIds }), { mode: 0o600 });
       }
       const active: Record<string, unknown> = {
         runId: ctx.runId, issueId, op_id: ctx.runId, receiptPath, rcUrl,
