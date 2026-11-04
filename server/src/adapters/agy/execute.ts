@@ -154,14 +154,14 @@ export type ActiveDispatch = { runId: string; issueId: string; receiptPath: stri
  * adopted by the next run (the TUI kept working while Paperclip restarted);
  * a checkpoint for any other issue still refuses dispatch.
  */
-export function adoptableActive(raw: string, issueId: string, stateDir: string): ActiveDispatch | null {
+export function adoptableActive(raw: string, issueId: string, stateDir: string, adapter = "agy"): ActiveDispatch | null {
   if (!raw) return null;
   let a: Partial<ActiveDispatch>;
   try { a = JSON.parse(raw) as Partial<ActiveDispatch>; } catch { a = {}; }
   const expectedReceipt = typeof a.runId === "string" ? path.join(stateDir, `receipt-${a.runId}.json`) : "";
   if (a.issueId !== issueId || typeof a.runId !== "string" || !/^[0-9a-f-]{36}$/i.test(a.runId)
       || a.receiptPath !== expectedReceipt || typeof a.rcUrl !== "string") {
-    throw new Error("agy previous task unresolved; inspect active.json and its receipt before dispatch. Never replay actions");
+    throw new Error(`${adapter} previous task unresolved; inspect active.json and its receipt before dispatch. Never replay actions`);
   }
   return a as ActiveDispatch;
 }
@@ -253,6 +253,15 @@ async function inspectRemoteConversation(
   return { url, id };
 }
 
+const AGENT_TMP_ROOT = "/Volumes/NVM/AI_Agent_Runtime/tmp";
+function agentTmpDir(session: string): string { return path.join(AGENT_TMP_ROOT, `agy-${session}`); }
+
+/** SCO-534: never run from / or system temp. The default hidden ~/.paperclip cwd stays until the live session is re-pinned. */
+function assertWorkableCwd(cwd: string): void {
+  if (cwd === "/" || cwd.startsWith("/private/var/folders") || cwd.startsWith("/var/folders"))
+    throw new Error(`agy cwd ${cwd} is root or system temp; use a canonical NVM path (SCO-534)`);
+}
+
 async function ensureSession(
   socket: string, session: string, cwd: string, stateDir: string, rejoinOnly: boolean, model: string,
 ): Promise<string> {
@@ -262,8 +271,10 @@ async function ensureSession(
     // An already-emitted op cannot be rejoined through a newly launched TUI.
     if (rejoinOnly) throw new Error("agy active op lost its original TUI; operator reconciliation required, never replay");
     await fs.mkdir(cwd, { recursive: true });
+    await fs.mkdir(agentTmpDir(session), { recursive: true });
     // tmux exec mode: no interpolated shell source or arbitrary model selection.
     await tmux(socket, ["new-session", "-d", "-s", session, "-c", cwd,
+      "-e", `TMPDIR=${agentTmpDir(session)}`,
       AGY, "--remote-control", "--dangerously-skip-permissions", "--model", model]);
   }
   const processName = (await tmux(socket, ["display-message", "-p", ...target(session), "#{pane_current_command}"])).trim();
@@ -354,6 +365,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const socket = asString(cfg.tmuxSocket, "paperclip-agy-rc");
   const stateDir = path.resolve(asString(cfg.stateDir, path.join(os.homedir(), ".paperclip/agy-rc-state")));
   const cwd = path.resolve(asString(cfg.cwd, path.join(os.homedir(), ".paperclip/agy-rc-workspace")));
+  assertWorkableCwd(cwd);
   const requestedModel = asString(cfg.model, DEFAULT_MODEL);
   const model = AGY_MODELS.includes(requestedModel as typeof AGY_MODELS[number]) ? requestedModel : DEFAULT_MODEL;
   const issueId = asString(ctx.context.issueId, asString(ctx.context.taskId, ""));

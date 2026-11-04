@@ -120,6 +120,30 @@ async function recordFallback(activePath: string, active: Record<string, unknown
   }
 }
 
+/**
+ * A checkpoint for a DIFFERENT issue, no receipt, conversation neither writing nor busy:
+ * the run was cancelled (deploy) and the work is over. Archive it as unverified and free
+ * the seat instead of refusing forever. A live conversation keeps the refusal.
+ */
+export async function reconcileOrphanActive(o: {
+  stateDir: string; activePath: string; issueId: string; runId: string;
+  live: (conversationId: string | null) => Promise<boolean>; paneIdle: () => Promise<boolean>;
+  log: (m: string) => Promise<void> | void;
+}): Promise<"none" | "kept" | "archived"> {
+  const raw = await fs.readFile(o.activePath, "utf8").catch(() => "");
+  if (!raw) return "none";
+  let prev: { op_id?: string; runId?: string; issueId?: string; receiptPath?: string; conversationId?: string | null };
+  try { prev = JSON.parse(raw); } catch { prev = {}; }
+  const op = asString(prev.op_id, asString(prev.runId, ""));
+  if (!op || op === o.runId || prev.issueId === o.issueId) return "none";
+  if (prev.receiptPath && await fs.stat(prev.receiptPath).then(() => true, () => false)) return "none";
+  if (await o.live(prev.conversationId ?? null) || !(await o.paneIdle())) return "kept";
+  const dest = path.join(o.stateDir, `active.unverified-${op}.json`);
+  await fs.rename(o.activePath, dest);
+  await o.log(`[claude-rc] Orphan checkpoint for op ${op} (issue ${prev.issueId ?? "?"}): conversation idle, no receipt; archived as UNVERIFIED at ${dest}; seat freed\n`);
+  return "archived";
+}
+
 const AGENT_TMP_ROOT = "/Volumes/NVM/AI_Agent_Runtime/tmp";
 function agentTmpDir(session: string): string { return path.join(AGENT_TMP_ROOT, `claude-rc-${session}`); }
 
@@ -282,14 +306,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const prevRaw = await fs.readFile(activePath, "utf8");
       const prev = JSON.parse(prevRaw) as { op_id?: string; runId?: string; receiptPath?: string };
       const prevOp = asString(prev.op_id, asString(prev.runId, ""));
-      if (prevOp && prevOp !== ctx.runId && !(() => { try { return adoptableActive(prevRaw, issueId, stateDir); } catch { return null; } })()
+      if (prevOp && prevOp !== ctx.runId && !(() => { try { return adoptableActive(prevRaw, issueId, stateDir, "claude_rc_local"); } catch { return null; } })()
         && (await readBlockTerminal(stateDir, prevOp) !== null
           || (prev.receiptPath && await fs.stat(prev.receiptPath).then(() => true, () => false)))) {
         await fs.rename(activePath, path.join(stateDir, `active.stale-${prevOp}.json`));
         await ctx.onLog("stdout", `[claude-rc] Archived terminal checkpoint for finished op ${prevOp}\n`);
       }
     } catch { /* no checkpoint or unreadable: existing handling applies */ }
-    const adopted = adoptableActive(await fs.readFile(activePath, "utf8").catch(() => ""), issueId, stateDir);
+    // SCO-626: orphan checkpoint (deploy SIGTERM) whose conversation is idle with no receipt.
+    await reconcileOrphanActive({
+      stateDir, activePath, issueId, runId: ctx.runId,
+      live: async (conv) => {
+        if (!conv) return false;
+        const st = await fs.stat(path.join(projectDir(cwd), `${conv}.jsonl`)).catch(() => null);
+        return Boolean(st) && Date.now() - st!.mtimeMs < (Number(cfg.liveWindowSec) || 600) * 1000;
+      },
+      paneIdle: async () => isClaudeIdle(await claudePane(socket, session)),
+      log: (m) => ctx.onLog("stdout", m),
+    });
+    const adopted = adoptableActive(await fs.readFile(activePath, "utf8").catch(() => ""), issueId, stateDir, "claude_rc_local");
     const bridgeRoot = await findBridgeRoot(asString(cfg.channelBridgeRoot, "") || undefined);
     const channel = await prepareChannelHost(stateDir, bridgeRoot);
     const rcUrl = await ensureSession(socket, session, cwd, stateDir, name, model, effort, channel, Boolean(adopted));

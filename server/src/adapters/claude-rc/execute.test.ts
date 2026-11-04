@@ -21,3 +21,41 @@ describe("claude_rc_local screen parsing", () => {
       .toMatch(/\.claude\/projects\/-Volumes-NVM-Paperclip-tmp-claude-rc-scratch$/);
   });
 });
+
+import fsp from "node:fs/promises";
+import os from "node:os";
+import nodePath from "node:path";
+import { reconcileOrphanActive } from "./execute.js";
+import { adoptableActive } from "../agy/execute.js";
+
+describe("SCO-626 orphan active.json after deploy cancel", () => {
+  const mk = async () => {
+    const dir = await fsp.mkdtemp(nodePath.join(os.tmpdir(), "rc-orphan-"));
+    const activePath = nodePath.join(dir, "active.json");
+    await fsp.writeFile(activePath, JSON.stringify({ runId: "r1", op_id: "r1", issueId: "A", receiptPath: nodePath.join(dir, "receipt-r1.json"), conversationId: "c1" }));
+    return { dir, activePath };
+  };
+  const base = (d: { dir: string; activePath: string }, live: boolean, idle: boolean) => ({
+    stateDir: d.dir, activePath: d.activePath, issueId: "B", runId: "r2",
+    live: async () => live, paneIdle: async () => idle, log: () => {},
+  });
+  it("archives as unverified when idle, no receipt", async () => {
+    const d = await mk();
+    expect(await reconcileOrphanActive(base(d, false, true))).toBe("archived");
+    await expect(fsp.stat(d.activePath)).rejects.toThrow();
+    await fsp.stat(nodePath.join(d.dir, "active.unverified-r1.json"));
+  });
+  it("keeps the checkpoint while the conversation is live or busy", async () => {
+    const d = await mk();
+    expect(await reconcileOrphanActive(base(d, true, true))).toBe("kept");
+    expect(await reconcileOrphanActive(base(d, false, false))).toBe("kept");
+    await fsp.stat(d.activePath);
+  });
+  it("leaves same-issue (adoptable) checkpoints alone", async () => {
+    const d = await mk();
+    expect(await reconcileOrphanActive({ ...base(d, false, true), issueId: "A" })).toBe("none");
+  });
+  it("error text names the adapter", () => {
+    expect(() => adoptableActive("{}", "B", "/x", "claude_rc_local")).toThrow(/^claude_rc_local previous task unresolved/);
+  });
+});
