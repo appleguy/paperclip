@@ -120,6 +120,16 @@ async function recordFallback(activePath: string, active: Record<string, unknown
   }
 }
 
+/** SCO-560 (opt-in keepConversation): reuse the live conversation instead of /clear. */
+export interface KeepState { conversationId: string; projectId: string }
+export function shouldReuseConversation(o: {
+  enabled: boolean; state: KeepState | null; newestId: string | null; projectId: string;
+  sizeBytes: number; maxBytes: number;
+}): boolean {
+  return o.enabled && !!o.state && !!o.newestId && o.state.conversationId === o.newestId
+    && o.state.projectId === o.projectId && o.sizeBytes < o.maxBytes;
+}
+
 async function ensureSession(
   socket: string, session: string, cwd: string, stateDir: string,
   name: string, model: string, effort: string, channel: ChannelHost, rejoinOnly: boolean,
@@ -292,18 +302,34 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       await ctx.onLog("stdout", `[claude-rc] Adopting run ${adopted.runId} for issue ${issueId}; no re-dispatch; receipt ${receiptPath}\n`);
     } else {
       const before = await newestConversation(cwd);
-      await sendClaudePane(socket, session, "/clear", stateDir);
-      await sleep(800);
-      if (!(await waitIdle(socket, session, Date.now() + 12_000)))
-        throw new Error("Claude /clear did not settle to an idle prompt");
-      conversationId = await newestConversation(cwd);
-      if (!conversationId || conversationId === before)
-        throw new Error("Claude /clear did not start an isolated conversation");
+      const keepSize = before ? (await fs.stat(path.join(projectDir(cwd), `${before}.jsonl`)).catch(() => null))?.size ?? 0 : 0;
+      const reuse = shouldReuseConversation({
+        enabled: keepEnabled, state: keepState, newestId: before, projectId, sizeBytes: keepSize, maxBytes: keepMax,
+      }) && isClaudeIdle(await claudePane(socket, session));
+      if (reuse) {
+        conversationId = before;
+      } else {
+        await sendClaudePane(socket, session, "/clear", stateDir);
+        await sleep(800);
+        if (!(await waitIdle(socket, session, Date.now() + 12_000)))
+          throw new Error("Claude /clear did not settle to an idle prompt");
+        conversationId = await newestConversation(cwd);
+        if (!conversationId || conversationId === before)
+          throw new Error("Claude /clear did not start an isolated conversation");
+      }
       const promptBase = asString(cfg.promptTemplate, DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE);
       const { taskContextNote, wakePrompt } = selectPaperclipPromptSections(ctx.context);
       const instructionsFilePath = asString(cfg.instructionsFilePath, "");
-      const instructionsPrefix = instructionsFilePath ? await fs.readFile(instructionsFilePath, "utf8") : "";
+      const instructionsFull = instructionsFilePath ? await fs.readFile(instructionsFilePath, "utf8") : "";
+      const instructionsPrefix = reuse
+        ? "(Same conversation as your previous dispatch: your standing instructions above still apply; no resend.)" : instructionsFull;
       const intro = renderTemplate(promptBase, {
+      const keepPath = path.join(stateDir, "keep-conversation.json");
+      const keepEnabled = cfg.keepConversation === true;
+      const projectId = asString(ctx.context.projectId, "");
+      const keepMax = typeof cfg.keepConversationMaxBytes === "number" ? cfg.keepConversationMaxBytes : 400_000;
+      const keepState: KeepState | null = keepEnabled
+        ? await fs.readFile(keepPath, "utf8").then(t => JSON.parse(t) as KeepState).catch(() => null) : null;
         agent: ctx.agent, run: { id: ctx.runId }, context: ctx.context, companyId: ctx.agent.companyId,
       });
       const instructions = [
@@ -333,6 +359,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const mode = await routeChannelInput(ctx.runId, prompt, false, {
         ready: channel.ready, status: channel.status, submit: channel.submit,
         fallback: async () => {
+      if (keepEnabled) {
+        await ctx.onLog("stdout", `[claude-rc] keepConversation ${reuse ? "reuse" : "fresh"}: prompt ${prompt.length} bytes (instructions ${reuse ? 0 : instructionsFull.length} of ${instructionsFull.length}); conversation ${Math.round(keepSize)} bytes\n`);
+        await fs.writeFile(keepPath, JSON.stringify({ conversationId, projectId }), { mode: 0o600 });
+      }
           if (!isClaudeIdle(await claudePane(socket, session))) {
             throw new Error("channel unavailable and Claude editor is not empty+idle; no fallback");
           }
