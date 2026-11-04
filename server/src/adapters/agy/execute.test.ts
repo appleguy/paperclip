@@ -158,11 +158,11 @@ describe("agy single-RC dispatch safety", () => {
 });
 
 describe("resolveAgyModel", () => {
-  it("defaults to flash-low and accepts the three Gemini 3.8 Flash tiers", () => {
+  it("defaults to flash-low and accepts Flash, Argon and Claude-via-agy tiers", () => {
     expect(resolveAgyModel(undefined)).toBe("gemini-3.8-flash-low");
-    for (const m of ["gemini-3.8-flash-low", "gemini-3.8-flash-medium", "gemini-3.8-flash-high"]) expect(resolveAgyModel(m)).toBe(m);
+    for (const m of ["gemini-3.8-flash-low", "gemini-3.8-flash-medium", "gemini-3.8-flash-high", "gemini-4-argon-high", "claude-opus-5-5-high", "claude-sonnet-5-5-medium"]) expect(resolveAgyModel(m)).toBe(m);
   });
-  it("refuses Claude, GPT and other models", () => {
-    for (const m of ["claude-sonnet-5-5", "gpt-6", "gemini-3.8-pro", "gemini-3.8-flash-ultra"]) expect(() => resolveAgyModel(m)).toThrow(/permits only/);
+  it("refuses GPT, low-tier Claude and other models", () => {
+    for (const m of ["claude-sonnet-5-5", "claude-opus-5-5-low", "gpt-oss-120b-medium", "gpt-6", "gemini-3.8-pro", "gemini-3.8-flash-ultra"]) expect(() => resolveAgyModel(m)).toThrow(/permits only/);
   });
 });

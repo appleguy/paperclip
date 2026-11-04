@@ -18,8 +18,19 @@ import {
 const runFile = promisify(execFile);
 const AGY = "/opt/homebrew/bin/agy";
 const DEFAULT_MODEL = "gemini-3.8-flash-low";
-export const AGY_MODELS = ["gemini-3.8-flash-low", "gemini-3.8-flash-medium", "gemini-3.8-flash-high"] as const;
-/** Only Gemini 3.8 Flash tiers run here; Claude, GPT and any other model are refused. */
+const MODEL_FAMILIES: Record<string, string> = {
+  "gemini-3.8-flash": "Gemini 3.8 Flash",
+  "gemini-4-argon": "Gemini 4 Argon",
+  "claude-opus-5-5": "Claude Opus 5.5",
+  "claude-sonnet-5-5": "Claude Sonnet 5.5",
+};
+export const AGY_MODELS = [
+  "gemini-3.8-flash-low", "gemini-3.8-flash-medium", "gemini-3.8-flash-high",
+  "gemini-4-argon-low", "gemini-4-argon-medium", "gemini-4-argon-high",
+  "claude-opus-5-5-medium", "claude-opus-5-5-high",
+  "claude-sonnet-5-5-medium", "claude-sonnet-5-5-high",
+] as const;
+/** Gemini 3.8 Flash, Gemini 4 Argon and Claude Opus/Sonnet 5.5 (Antigravity 3p pool) tiers run here; GPT and any other model are refused. */
 export function resolveAgyModel(value: unknown): string {
   const model = typeof value === "string" && value.trim() ? value.trim() : DEFAULT_MODEL;
   if (!(AGY_MODELS as readonly string[]).includes(model))
@@ -27,8 +38,9 @@ export function resolveAgyModel(value: unknown): string {
   return model;
 }
 function modelLabel(model: string): string {
-  const tier = model.split("-").pop() ?? "";
-  return `Gemini 3.8 Flash ${tier.charAt(0).toUpperCase()}${tier.slice(1)}`;
+  const i = model.lastIndexOf("-");
+  const tier = model.slice(i + 1);
+  return `${MODEL_FAMILIES[model.slice(0, i)] ?? model} ${tier.charAt(0).toUpperCase()}${tier.slice(1)}`;
 }
 const ID = /^[a-zA-Z0-9_-]{1,55}$/;
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));

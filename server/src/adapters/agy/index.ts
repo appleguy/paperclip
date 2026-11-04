@@ -25,23 +25,31 @@ export const agyAdapter: ServerAdapterModule = {
       testedAt: new Date().toISOString(), checks };
   },
   models: [
-    { id: "gemini-3.8-flash-low", label: "Gemini 3.8 Flash (Low) via shared Antigravity RC" },
-    { id: "gemini-3.8-flash-medium", label: "Gemini 3.8 Flash (Medium) via shared Antigravity RC" },
-    { id: "gemini-3.8-flash-high", label: "Gemini 3.8 Flash (High) via shared Antigravity RC" },
+    { id: "gemini-3.8-flash-low", label: "Gemini 3.8 Flash (Low) via Antigravity RC" },
+    { id: "gemini-3.8-flash-medium", label: "Gemini 3.8 Flash (Medium) via Antigravity RC" },
+    { id: "gemini-3.8-flash-high", label: "Gemini 3.8 Flash (High) via Antigravity RC" },
+    { id: "gemini-4-argon-low", label: "Gemini 4 Argon (Low) via Antigravity RC" },
+    { id: "gemini-4-argon-medium", label: "Gemini 4 Argon (Medium) via Antigravity RC" },
+    { id: "gemini-4-argon-high", label: "Gemini 4 Argon (High) via Antigravity RC" },
+    { id: "claude-opus-5-5-medium", label: "Claude Opus 5.5 (Medium) via Antigravity RC" },
+    { id: "claude-opus-5-5-high", label: "Claude Opus 5.5 (High) via Antigravity RC" },
+    { id: "claude-sonnet-5-5-medium", label: "Claude Sonnet 5.5 (Medium) via Antigravity RC" },
+    { id: "claude-sonnet-5-5-high", label: "Claude Sonnet 5.5 (High) via Antigravity RC" },
   ],
   supportsLocalAgentJwt: true,
   supportsInstructionsBundle: true,
   instructionsPathKey: "instructionsFilePath",
   agentConfigurationDoc: `# agy_local: one shared Antigravity Remote Control session
 
-Requires macOS, agy 1.4.12 and tmux. Runs ONLY gemini-3.8-flash-low, -medium or -high.
+Requires macOS, agy 1.4.12 and tmux. Runs ONLY gemini-3.8-flash-{low,medium,high}, gemini-4-argon-{low,medium,high},
+claude-opus-5-5-{medium,high} and claude-sonnet-5-5-{medium,high} (Claude draws the Antigravity 3p pool).
 One persistent interactive TUI with a stable https://antigravity.google.com/r/... instance.
 Paperclip turns are serialized. Each issue is isolated with /new, while the
 owner sees/steers that same live process from the single RC instance.
 
 Config:
 - cwd: fixed, trusted work directory; all turns share it
-- model: gemini-3.8-flash-{low,medium,high}, default low (all other models refused); one
+- model: any model listed above, default gemini-3.8-flash-low (all other models refused); one
   TUI per tmuxSocket/tmuxSession, so give each model tier its own socket
 - tmuxSocket (default paperclip-agy-rc); tmuxSession (default agy)
 - stateDir (default ~/.paperclip/agy-rc-state): private lock, active checkpoint,
