@@ -431,6 +431,36 @@ export function unresolvedExecutionDispositions(db: Db, limit: number) {
     .limit(limit);
 }
 
+/**
+ * A claude_rc run interrupted by a server restart adopts or reconciles its own
+ * on-disk op/receipt on the next dispatch and never re-enqueues (SCO-626), so
+ * the interruption itself carries no replay hazard and must not hold the issue.
+ */
+export function isDeployInterruptedClaudeRcRun(run: Pick<typeof heartbeatRuns.$inferSelect, "runnerProfileJson" | "errorCode">) {
+  return run.errorCode === "server_shutdown_interrupted" && claimedAdapterType(run) === "claude_rc";
+}
+
+/** Idempotent sweep: releases resolved no-replay holds left by a deploy-interrupted claude_rc run. */
+export async function releaseDeployInterruptedReplayHolds(db: Db, now = new Date()) {
+  const released = await db.execute<{ id: string }>(sql`
+    update ${issueRecoveryActions} set
+      evidence = jsonb_set(${issueRecoveryActions.evidence}, '{automaticRecovery,replay}', '"allowed"'::jsonb),
+      updated_at = ${now.toISOString()}::timestamptz
+    from ${heartbeatRuns}
+    where ${heartbeatRuns.companyId} = ${issueRecoveryActions.companyId}
+      and ${heartbeatRuns.id}::text = ${issueRecoveryActions.evidence}->>'runId'
+      and ${issueRecoveryActions.status} = 'resolved'
+      and ${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'
+      and ${issueRecoveryActions.evidence}->'executionReconciliation' is null
+      and not (${issueRecoveryActions.evidence} ? 'workspaceRestoreFailure')
+      and not (${issueRecoveryActions.evidence} ? 'workspaceRestoreRecovery')
+      and not (${issueRecoveryActions.evidence} ? 'systemRecovery')
+      and ${heartbeatRuns.errorCode} = 'server_shutdown_interrupted'
+      and ${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType' = 'claude_rc'
+    returning ${issueRecoveryActions.id} as id`);
+  return released.length;
+}
+
 export function obsoleteExecutionConversationHold() {
   return and(
     conversationRecoveryActionPredicate(),
@@ -487,6 +517,7 @@ export async function settleUnrecoverableExecutions(
       });
     }
   });
+  await releaseDeployInterruptedReplayHolds(db, now);
   // Filter eligibility before applying the batch limit. A queue of sessions
   // awaiting replacement must not starve settled incidents behind it.
   const candidates = await unresolvedExecutionDispositions(db, 25);
@@ -643,7 +674,7 @@ export async function settleUnrecoverableExecutions(
               automaticRecovery: {
                 policy: "preserve_without_replay_v1",
                 runId: run.id,
-                replay: "blocked",
+                replay: isDeployInterruptedClaudeRcRun(run) ? "allowed" : "blocked",
                 actionOutcome: "unknown",
                 recordedAt: now.toISOString(),
               },
