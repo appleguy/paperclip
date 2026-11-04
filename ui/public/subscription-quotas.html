@@ -125,14 +125,14 @@ summary{cursor:pointer}
 </section>
 <div id="cards" aria-live="polite"></div>
 <section id="short-windows" class="short-windows" aria-label="Five hour and session quota windows"></section>
-<footer>Read-only. Quota Sentinel collects a snapshot approximately every 30 minutes; this page reloads it each minute. Reload does not initiate a provider check. Unknown readings are never zero. Pace labels describe recent usage rate, not an obligation to spend. Promotional Claude Cloud Session Credits are not included in these provider usage windows. Banked Codex resets are displayed only when reported; redemption is always manual.</footer>
+<footer>Read-only. Quota Sentinel collects a snapshot approximately every 30 minutes; this page reloads it each minute. Reload does not initiate a provider check. Unknown readings are never zero. Pace labels describe recent usage rate, not an obligation to spend. Banked Codex resets are displayed only when reported; redemption is always manual. The reader reports only the next banked-credit expiration, not every credit expiration.</footer>
 
 </main>
 <script>
 (function(){
 "use strict";
-var labels={antigravity:"Antigravity",codex:"ChatGPT / Codex",claude:"Claude"};
-var pools={"3p:5h":"Third-party · 5-hour","3p:weekly":"Third-party · weekly","gemini-argon-wtu:weekly":"Gemini Argon · weekly","gemini:5h":"Gemini · 5-hour","gemini:weekly":"Gemini · weekly",session:"Session",weekly:"Weekly"};
+var labels={antigravity:"Antigravity",codex:"ChatGPT / Codex",claude:"Claude","chatgpt-web":"ChatGPT Web"};
+var pools={"pro:weekly":"Pro power · weekly","3p:5h":"Third-party · 5-hour","3p:weekly":"Third-party · weekly","gemini-argon-wtu:weekly":"Gemini Argon · weekly","gemini:5h":"Gemini · 5-hour","gemini:weekly":"Gemini · weekly",session:"Session",weekly:"Weekly"};
 // These labels describe the RECENT rate of quota consumption (up to 48h), not
 // whether cumulative weekly usage is ahead of an even-use schedule.
 var paceLabels={behind_pace:"recent rate below goal",ahead_of_pace:"recent rate above goal",on_pace:"recent rate near goal",need_trend:"recent trend unmeasured",reset_imminent_underused:"reset soon, allowance left",exhausted_early:"allowance exhausted early",target_reached:"target reached",reset_due:"reset due",unknown:"usage or reset unknown"};
@@ -191,20 +191,13 @@ function buildTimeline(data){
     stake:left,type:"reset",source:"Account quota observation"});
  });
  (Array.isArray(data.creditOffers)?data.creditOffers:[]).forEach(function(item){
+  if(!item||item.status==="spent"||item.status==="invalidated"||item.balanceLastReportedUsd===0)return;
   var at=Date.parse(item.expiresAt||"");
   if(!Number.isFinite(at)||at<=now)return;
   var balance=typeof item.balanceLastReportedUsd==="number"?"Up to $"+item.balanceLastReportedUsd.toFixed(2)+" last reported":"Remaining balance unknown";
   events.push({at:at,name:item.label||"Cloud credits",stake:balance,type:"credit",exclusive:true,
     source:(item.source||"Unknown source")+"; live balance unverified"});
  });
- // A date-only fallback is safe to display but never a replacement for account data.
- // Remove this when the installed authenticated API supplies creditOffers.
- if(!(Array.isArray(data.creditOffers)&&data.creditOffers.length)){
-  var cutoff=Date.parse("2026-11-05T08:00:00Z");
-  if(cutoff>now)events.push({at:cutoff,name:"Claude cloud-session credits",
-    stake:"Credit balance unavailable until account verification",type:"credit",exclusive:true,
-    source:"Previously reported expiry · not a live credit reading"});
- }
  function addManual(deadline,expiry,bank,source){
   if(Number.isFinite(deadline)&&deadline>now){
    events.push({at:deadline,name:"Codex · manual redemption deadline",
@@ -212,15 +205,15 @@ function buildTimeline(data){
      type:"manual",source:source});
   }
   if(Number.isFinite(expiry)&&expiry>now){
-   events.push({at:expiry,name:"Codex · banked reset expires",
-     stake:bank&&Number.isInteger(bank.available)?bank.available+" reset(s) source-reported; verify availability":"Reset balance unknown; verify in pcq",
+   events.push({at:expiry,name:"Codex · next banked reset expiry",
+     stake:bank&&Number.isInteger(bank.available)?bank.available+" reset(s) available in total; only the next expiry is known":"Reset balance unknown; verify in pcq",
      type:"manual",source:source});
   }
  }
  if(data.bankedReset&&Number.isFinite(Date.parse(data.bankedReset.expiresAt||""))){
   var b=data.bankedReset,expiry=Date.parse(b.expiresAt),manual=Date.parse(b.redeemNoLaterThan||"");
   var dispute=data.bankedResetDispute&&b.available!==data.bankedResetDispute.ownerExpected;
-  var origin=dispute?"DISPUTED account count; owner expects "+data.bankedResetDispute.ownerExpected:"Account reader; redemption is never automatic";
+  var origin=dispute?"DISPUTED account count; owner expects "+data.bankedResetDispute.ownerExpected:"Account reader (next expiry only); redemption is never automatic";
   addManual(manual,expiry,b,origin);
  }else{
   // Last observed bank deadline, no public balance/count. Fail visibly provisional.
@@ -251,9 +244,9 @@ function buildTimeline(data){
   deadlines.append(li);
  });
  if(!events.length)deadlines.append(el("li","timeline-empty","No currently known deadlines. Missing account data is not zero."));
- var cloud=(Array.isArray(data.creditOffers)?data.creditOffers:[]).some(function(c){return c&&c.label&&c.label.includes("Cloud")});
- creditNote.replaceChildren(el("span",null,cloud?"Credit amounts are last-reported and not live-verified. ":"Current server API cannot read promotional credit balances. "));
- var link=el("a",null,"Check Claude cloud credits");link.href="https://claude.ai/settings/usage";link.rel="noopener noreferrer";creditNote.append(link);
+ var activeCredits=(Array.isArray(data.creditOffers)?data.creditOffers:[]).filter(function(c){return c&&c.status!=="spent"&&c.status!=="invalidated"&&c.balanceLastReportedUsd!==0});
+ creditNote.replaceChildren();
+ if(activeCredits.length)creditNote.append(el("span",null,"Credit amounts are last-reported and not live-verified."));
 }
 function render(data){
  if(!data||data.source!=="quota-sentinel"||!Array.isArray(data.pools))throw new Error("Quota snapshot has an unexpected format.");
@@ -266,10 +259,10 @@ function render(data){
    metric("Observed windows",String(known.length),"of "+data.pools.length+" windows have usage readings"),
    metric("Next known reset",resets.length?timeLeft(resets[0].resetsAt).replace(" remaining",""):"Unknown",resets.length?(labels[resets[0].provider]||resets[0].provider)+" · "+(pools[resets[0].pool]||resets[0].pool):"No reset clock observed"),
    metric("Snapshot",data.stale?"Stale":age!=null&&age>=0?age+"m old":"Unknown",unknownCount+" windows with unknown usage"),
-   metric("Codex banked resets",data.bankedReset&&Number.isInteger(data.bankedReset.available)?data.bankedResetDispute&&Number.isInteger(data.bankedResetDispute.ownerExpected)&&data.bankedReset.available!==data.bankedResetDispute.ownerExpected?"Disputed":String(data.bankedReset.available):"Unknown",data.bankedReset&&data.bankedReset.expiresAt?"Reader "+data.bankedReset.available+(data.bankedResetDispute?" · owner expects "+data.bankedResetDispute.ownerExpected:"")+" · expires "+when(data.bankedReset.expiresAt):"Not reported by current API")
+   metric("Codex banked resets",data.bankedReset&&Number.isInteger(data.bankedReset.available)?data.bankedResetDispute&&Number.isInteger(data.bankedResetDispute.ownerExpected)&&data.bankedReset.available!==data.bankedResetDispute.ownerExpected?"Disputed":String(data.bankedReset.available):"Unknown",data.bankedReset&&data.bankedReset.expiresAt?"Reader "+data.bankedReset.available+(data.bankedResetDispute?" · owner expects "+data.bankedResetDispute.ownerExpected:"")+" · next expiry "+when(data.bankedReset.expiresAt):"Not reported by current API")
  );
- ["antigravity","codex","claude"].forEach(function(provider){
-  var section=el("section"),title=el("h2",null,labels[provider]),subtitle=el("p","note",provider==="antigravity"?"Gemini and third-party allowances":provider==="codex"?"ChatGPT subscription quota":"Claude subscription quota");
+ ["antigravity","codex","claude","chatgpt-web"].forEach(function(provider){
+  var section=el("section"),title=el("h2",null,labels[provider]),subtitle=el("p","note",provider==="antigravity"?"Gemini and third-party allowances":provider==="codex"?"ChatGPT subscription quota":provider==="chatgpt-web"?"Pro power dispatches by the fleet runner; separate weekly reset from Codex":"Claude subscription quota");
   section.append(title,subtitle);
   var found=data.pools.filter(function(v){return v&&v.provider===provider&&!isShort(v)});
   if(found.length===0)section.append(el("p","reset","Provider reading unavailable."));

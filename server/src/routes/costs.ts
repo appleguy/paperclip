@@ -365,6 +365,26 @@ export function costRoutes(
           });
         }
       }
+      // ChatGPT Web Pro power has its own weekly quota, counted by zagent chatgpt-beta-run pro-quota tick.
+      try {
+        const web = JSON.parse(await readFile(process.env.PAPERCLIP_CHATGPT_WEB_QUOTA_PATH
+          ?? "/Volumes/NVM/Paperclip/knowledge/raw/model-routing/chatgpt_web_quota.json", "utf8")) as Record<string, any>;
+        const pro = web.pro && typeof web.pro === "object" ? web.pro : null;
+        if (pro) {
+          pools.push({
+            provider: "chatgpt-web",
+            pool: "pro:weekly",
+            usedPercent: typeof pro.used_pct === "number" && Number.isFinite(pro.used_pct)
+              ? Math.max(0, Math.min(100, pro.used_pct)) : null,
+            resetsAt: typeof pro.next_reset_latest === "string" ? pro.next_reset_latest : null,
+            state: typeof pro.state === "string" ? pro.state : "unknown",
+            requiredPtsPerHour: null,
+            requiredPtsPerDay: null,
+          });
+        }
+      } catch {
+        // No Pro ledger feed yet; leave the pool out rather than invent usage.
+      }
       const credit = raw.codex_banked_reset && typeof raw.codex_banked_reset === "object" ? raw.codex_banked_reset : {};
       const bankedReset = {
         available: Number.isSafeInteger(credit.available) && credit.available >= 0 ? credit.available as number : null,
