@@ -128,7 +128,9 @@ async function collectOutcome(
   }
   let sessionOutcome: string | null = null;
   // llama-swap concurrency_limit surfaces as a provider.rate-limit / HTTP 429 error on the last op message or the session.
-  let capacityRefusal = ops.length > 0 && isCapacityError(ops[ops.length - 1]?.error);
+  // A later platform receipt or other trailing message must not hide the failed assistant message: use the last one carrying an error.
+  const errored = [...ops].reverse().find((m) => m?.error != null || m?.finish === "error" || m?.finish?.type === "error");
+  let capacityRefusal = errored != null && isCapacityError(errored.error ?? errored.finish ?? errored);
   try {
     const sess = (await get(`/api/session/${sid}`))?.data;
     if (!capacityRefusal && !ops.some((m) => m?.content?.some?.((c: any) => c?.type === "text" && c.text?.trim()))) {

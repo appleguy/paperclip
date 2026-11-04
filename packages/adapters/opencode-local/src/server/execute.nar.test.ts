@@ -33,6 +33,7 @@ describe("OpenCode adapter nativeRuntime nar", () => {
   let messagePageSize: number | undefined;
   let clock: number;
   let assistantError: unknown;
+  let trailing = false;
 
   beforeEach(async () => {
     root = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-nar-adapter-"));
@@ -47,6 +48,7 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     messagePageSize = undefined;
     clock = 1000;
     assistantError = undefined;
+    trailing = false;
     vi.stubEnv("XDG_CONFIG_HOME", root);
     runProcess.mockReset();
     const expected = "Basic " + Buffer.from("opencode:local-secret").toString("base64");
@@ -88,6 +90,10 @@ describe("OpenCode adapter nativeRuntime nar", () => {
                 content: [{ type: "text", text: `answer ${n}` }, { type: "tool", name: "read" }],
                 cost: 0.5, tokens: { input: 100 * n, output: 10 * n, reasoning: 1, cache: { read: 7, write: 2 } },
                 ...(assistantError ? { error: assistantError } : {}) });
+              if (trailing) {
+                s.msgs.push({ id: `msg_r${n}`, type: "assistant", time: { created: clock++, completed: clock++ },
+                  content: [{ type: "text", text: "receipt" }] });
+              }
               s.info.time.idle = clock++;
               s.info.outcome = assistantError ? "failed" : "succeeded";
             } else {
@@ -168,6 +174,14 @@ describe("OpenCode adapter nativeRuntime nar", () => {
   it("records a llama-swap 429 concurrency_limit as a capacity refusal, not an adapter failure", async () => {
     assistantError = { name: "provider.rate-limit", data: { statusCode: 429, code: "concurrency_limit", retryAfterMs: 1000 } };
     const result = await execute(context("run-429", { nativeRuntime: "nar" }) as never);
+    expect(result.exitCode).toBe(1);
+    expect(result.resultJson).toMatchObject({ adapterPreInferenceAdmission: { kind: "opencode_capacity_refusal_v1", providerWorkStarted: false } });
+  });
+
+  it("still sees a 429 when a later non-error assistant message follows the failed one", async () => {
+    assistantError = { name: "provider.rate-limit", data: { statusCode: 429, code: "concurrency_limit", retryAfterMs: 1000 } };
+    trailing = true;
+    const result = await execute(context("run-429t", { nativeRuntime: "nar" }) as never);
     expect(result.exitCode).toBe(1);
     expect(result.resultJson).toMatchObject({ adapterPreInferenceAdmission: { kind: "opencode_capacity_refusal_v1", providerWorkStarted: false } });
   });
