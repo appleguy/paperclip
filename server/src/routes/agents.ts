@@ -65,6 +65,7 @@ import { readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
+import { listPoolNames, resolvePoolLimit } from "../services/heartbeat/capacity-pools.js";
 import { activityLog, agents as agentsTable, chatConversations, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
 import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
 import { sha256Digest } from "../services/feedback-redaction.js";
@@ -3979,6 +3980,25 @@ export function agentRoutes(
     }
     res.setHeader("Cache-Control", "private, no-store");
     res.json(await listExternalOpenCodeActivity(companyId));
+  });
+
+  router.get("/companies/:companyId/capacity-pools", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const rows = await db
+      .select({ pool: sql<string>`${agentsTable.runtimeConfig}->>'capacityPool'`, status: heartbeatRuns.status, count: sql<number>`count(*)` })
+      .from(heartbeatRuns)
+      .innerJoin(agentsTable, eq(agentsTable.id, heartbeatRuns.agentId))
+      .where(and(eq(agentsTable.companyId, companyId), inArray(heartbeatRuns.status, ["running", "queued"]),
+        sql`${agentsTable.runtimeConfig}->>'capacityPool' is not null`))
+      .groupBy(sql`${agentsTable.runtimeConfig}->>'capacityPool'`, heartbeatRuns.status);
+    const names = new Set([...(await listPoolNames()), ...rows.map((r) => r.pool)]);
+    res.json(await Promise.all([...names].map(async (name) => ({
+      name,
+      limit: await resolvePoolLimit(name),
+      running: Number(rows.find((r) => r.pool === name && r.status === "running")?.count ?? 0),
+      queued: Number(rows.find((r) => r.pool === name && r.status === "queued")?.count ?? 0),
+    }))));
   });
 
   router.get("/companies/:companyId/agents", async (req, res) => {

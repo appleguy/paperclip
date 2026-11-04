@@ -162,6 +162,7 @@ import {
 import { readContinuationAttempt } from "../recovery/index.js";
 import { allowsIssueInteractionWake, wakeChatConversationsConflict } from "../../modules/run-dispatch/index.js";
 import { withAgentStartLock } from "../agent-start-lock.js";
+import { agentCapacityPool, resolvePoolLimit } from "./capacity-pools.js";
 import {
   evaluateAgentInvokability,
   shouldCancelRunsForNonInvokableAgent,
@@ -1893,7 +1894,104 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     }
   }
 
-  async function startNextQueuedRunForAgent(agentId: string) {
+  async function countRunningRunsForPool(companyId: string, pool: string) {
+    const [{ count }] = await db
+      .select({ count: sql<number>`count(*)` })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
+      .where(
+        and(
+          eq(agents.companyId, companyId),
+          eq(heartbeatRuns.status, "running"),
+          sql`${agents.runtimeConfig}->>'capacityPool' = ${pool}`,
+        ),
+      );
+    return Number(count ?? 0);
+  }
+
+  // Queued runs across every agent in the pool, best first: issue priority, then age.
+  async function listPoolQueuedAgentOrder(companyId: string, pool: string, cutoff: Date | null) {
+    const rows = await db
+      .select({ run: heartbeatRuns })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
+      .where(
+        and(
+          eq(agents.companyId, companyId),
+          eq(heartbeatRuns.status, "queued"),
+          sql`${agents.runtimeConfig}->>'capacityPool' = ${pool}`,
+          cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
+        ),
+      );
+    const issueIds = [
+      ...new Set(
+        rows
+          .map(({ run }) => readNonEmptyString(parseObject(run.contextSnapshot).issueId))
+          .filter((id): id is string => Boolean(id)),
+      ),
+    ];
+    const prio = new Map<string, string>();
+    if (issueIds.length > 0) {
+      const issueRows = await db
+        .select({ id: issues.id, priority: issues.priority })
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), inArray(issues.id, issueIds)));
+      for (const row of issueRows) prio.set(row.id, row.priority);
+    }
+    const best = new Map<string, { rank: number; at: number }>();
+    for (const { run } of rows) {
+      const issueId = readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+      const cand = {
+        rank: issueRunPriorityRank(issueId ? prio.get(issueId) : null),
+        at: run.createdAt.getTime(),
+      };
+      const cur = best.get(run.agentId);
+      if (!cur || cand.rank < cur.rank || (cand.rank === cur.rank && cand.at < cur.at)) {
+        best.set(run.agentId, cand);
+      }
+    }
+    return [...best.entries()]
+      .sort(([, a], [, b]) => a.rank - b.rank || a.at - b.at)
+      .map(([agentId]) => agentId);
+  }
+
+  // Pool admission: serialize per pool, start at most one run per pass for the
+  // best-waiting agent, and repeat until the pool is full or nothing is startable.
+  // A finished run in the pool therefore promotes the best waiting wake across
+  // all of the pool's agents, not only the finished run's own agent.
+  async function startNextQueuedRunForPool(
+    companyId: string,
+    pool: string,
+    limit: number,
+  ): Promise<Array<typeof heartbeatRuns.$inferSelect>> {
+    return withAgentStartLock(`capacity-pool:${companyId}:${pool}`, async () => {
+      const started: Array<typeof heartbeatRuns.$inferSelect> = [];
+      const exhausted = new Set<string>();
+      for (let guard = 0; guard < 100; guard += 1) {
+        if ((await countRunningRunsForPool(companyId, pool)) >= limit) break;
+        const cutoff = await getWorktreeExecutionCutoff();
+        const order = (await listPoolQueuedAgentOrder(companyId, pool, cutoff)).filter((id) => !exhausted.has(id));
+        const next = order[0];
+        if (!next) break;
+        const claimed = await startNextQueuedRunForAgentUnpooled(next, 1);
+        if (claimed.length === 0) exhausted.add(next);
+        else started.push(...(claimed as Array<typeof heartbeatRuns.$inferSelect>));
+      }
+      return started;
+    });
+  }
+
+  async function startNextQueuedRunForAgent(agentId: string, maxClaims?: number) {
+    if ((await getSchedulingSuppression()).suppressed) return [];
+    const agent = await getAgent(agentId);
+    const pool = agent ? agentCapacityPool(agent) : null;
+    const limit = pool ? await resolvePoolLimit(pool) : null;
+    if (!agent || !pool || limit === null) return startNextQueuedRunForAgentUnpooled(agentId, maxClaims);
+    if ((await getSchedulingSuppression()).suppressed) return [];
+    return startNextQueuedRunForPool(agent.companyId, pool, limit);
+  }
+
+  async function startNextQueuedRunForAgentUnpooled(agentId: string, maxClaims?: number) {
     if ((await getSchedulingSuppression()).suppressed) return [];
     const cutoff = await getWorktreeExecutionCutoff();
     // Cancelled after the start lock is released: cancelRunInternal promotes the
@@ -1914,9 +2012,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       }
       const policy = parseHeartbeatPolicy(agent);
       const runningCount = await countRunningRunsForAgent(agentId);
-      const availableSlots = Math.max(
-        0,
-        policy.maxConcurrentRuns - runningCount,
+      const availableSlots = Math.min(
+        maxClaims ?? Infinity,
+        Math.max(0, policy.maxConcurrentRuns - runningCount),
       );
       if (availableSlots <= 0) return [];
 

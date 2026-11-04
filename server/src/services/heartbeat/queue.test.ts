@@ -727,4 +727,38 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     expect(deps.treeControlSvc.getActivePauseHoldGate).not.toHaveBeenCalled();
     expect(deps.executeRun).not.toHaveBeenCalled();
   });
+
+  it("admits at most M runs per capacity pool and promotes the best waiting wake across agents", async () => {
+    const poolFile = `${process.env.TMPDIR ?? "/tmp"}/capacity-pools-${Date.now()}.json`;
+    await (await import("node:fs/promises")).writeFile(poolFile, JSON.stringify({ "test-pool": { limit: 4 } }));
+    process.env.PAPERCLIP_CAPACITY_POOLS_FILE = poolFile;
+    const [company] = await db.insert(companies).values({ name: "Pool co", issuePrefix: "PL" }).returning();
+    const priorities = ["low", "low", "medium", "medium", "critical", "high"] as const;
+    const poolAgents: Array<typeof agents.$inferSelect> = [];
+    const runIds: string[] = [];
+    for (const [i, priority] of priorities.entries()) {
+      const [agent] = await db.insert(agents).values({ companyId: company.id, name: `Pool agent ${i}`, role: "engineer", status: "idle",
+        adapterType: "process", adapterConfig: {}, runtimeConfig: { capacityPool: "test-pool" } }).returning();
+      const [issue] = await db.insert(issues).values({ companyId: company.id, title: `Pool task ${i}`, status: "todo", priority, assigneeAgentId: agent.id }).returning();
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id, status: "queued", invocationSource: "assignment",
+        responsibleUserId: "queue-test-user", contextSnapshot: { issueId: issue.id } }).returning();
+      poolAgents.push(agent); runIds.push(run.id);
+    }
+    const deps = callbacks(db);
+    deps.getAgent.mockImplementation(async (id: string) => poolAgents.find(a => a.id === id) ?? null);
+    const queue = createHeartbeatQueue(db, deps);
+    await queue.startNextQueuedRunForAgent(poolAgents[0].id);
+    const status = async () => Object.fromEntries((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, company.id))).map(r => [r.id, r.status]));
+    let now = await status();
+    expect(Object.values(now).filter(v => v === "running")).toHaveLength(4);
+    // critical (4), high (5), then the two medium runs (2, 3); the low ones wait.
+    expect([runIds[4], runIds[5], runIds[2], runIds[3]].every(id => now[id] === "running")).toBe(true);
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, runIds[4]));
+    await queue.startNextQueuedRunForAgent(poolAgents[4].id);
+    now = await status();
+    expect(Object.values(now).filter(v => v === "running")).toHaveLength(4);
+    expect(now[runIds[0]]).toBe("running");
+    expect(now[runIds[1]]).toBe("queued");
+    delete process.env.PAPERCLIP_CAPACITY_POOLS_FILE;
+  });
 });
