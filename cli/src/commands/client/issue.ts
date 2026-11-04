@@ -77,6 +77,7 @@ interface IssueUpdateOptions extends BaseClientOptions {
   billingCode?: string;
   comment?: string;
   hiddenAt?: string;
+  blockedBy?: string;
 }
 
 interface IssueCommentOptions extends BaseClientOptions {
@@ -339,6 +340,7 @@ export function registerIssueCommands(program: Command): void {
       .option("--billing-code <code>", "Billing code")
       .option("--comment <text>", "Optional comment to add with update")
       .option("--hidden-at <iso8601|null>", "Set hiddenAt timestamp or literal 'null'")
+      .option("--blocked-by <ids>", "Comma-separated blockedByIssueIds (replaces the list; empty string clears it)")
       .action(async (issueId: string, opts: IssueUpdateOptions) => {
         try {
           const ctx = resolveCommandContext(opts);
@@ -355,6 +357,8 @@ export function registerIssueCommands(program: Command): void {
             billingCode: opts.billingCode,
             comment: opts.comment,
             hiddenAt: parseHiddenAt(opts.hiddenAt),
+            blockedByIssueIds: opts.blockedBy === undefined ? undefined
+              : opts.blockedBy.split(",").map((id) => id.trim()).filter(Boolean),
           });
 
           const updated = await ctx.api.patch<Issue & { comment?: IssueComment | null }>(apiPath`/api/issues/${issueId}`, payload);

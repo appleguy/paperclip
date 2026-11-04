@@ -278,6 +278,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const issueId = asString(ctx.context.issueId, asString(ctx.context.taskId, ""));
   const timeoutMs = Math.min(3600, Math.max(30, Number(cfg.timeoutSec) || 900)) * 1000;
   let unlock: (() => Promise<void>) | undefined;
+  let runEnvPath: string | undefined;
   let dispatched = false;
   const failure = (reason: string, timedOut = false): AdapterExecutionResult => ({
     exitCode: 1, signal: null, timedOut, model, provider: "anthropic", biller: "anthropic",
@@ -299,6 +300,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     await fs.mkdir(stateDir, { recursive: true, mode: 0o700 });
     await fs.chmod(stateDir, 0o700);
     unlock = await acquire(stateDir, Date.now() + timeoutMs);
+    // SCO-653: run-scoped write path for the pane. 0600 file read only by bin/pcrc; never printed.
+    const port = Number(process.env.PAPERCLIP_LISTEN_PORT ?? process.env.PORT ?? "3100");
+    const sq = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
+    runEnvPath = path.join(stateDir, "run-env.sh");
+    await fs.writeFile(runEnvPath, [
+      `export PAPERCLIP_API_URL=${sq(`http://127.0.0.1:${port}`)}`,
+      `export PAPERCLIP_API_KEY=${sq(ctx.authToken)}`,
+      `export PAPERCLIP_RUN_ID=${sq(ctx.runId)}`,
+      `export PAPERCLIP_TASK_ID=${sq(issueId)}`, ""].join("\n"), { mode: 0o600 });
+    await fs.chmod(runEnvPath, 0o600);
     const activePath = path.join(stateDir, "active.json");
     // A checkpoint retained by an earlier run whose op already reached a terminal state
     // (block ledger entry or receipt file) would otherwise fail every later dispatch.
@@ -392,7 +403,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const instructions = [
         `Paperclip run ${ctx.runId}, issue ${issueId}. Work on ONLY the assigned issue.`,
         "This is the owner's live Claude Code Remote Control session: messages they send mid-task steer this issue.",
-        "Run every command in the foreground; never background a tool call. Never use secrets or guess Paperclip API credentials.",
+        "Run every command in the foreground; never background a tool call. Never print secrets or guess Paperclip API credentials.",
+        `To comment or edit this issue (e.g. blockedByIssueIds) prefix the shared api command: PAPERCLIP_RC_RUN_ENV=${runEnvPath} pcrc api POST ./comments '{"body":"..."}' or ... pcrc api PATCH . '{"blockedByIssueIds":[]}'. pcrc supplies the run-scoped credentials; never print them.`,
         "Finish the requested issue work, then use your Write tool to create the JSON receipt",
         `${receiptPath} with exactly these keys: runId = ${ctx.runId}, issueId = ${issueId},`,
         'status = "done", summary = a short factual summary, report = a detailed Markdown result (at least 250 characters).',
@@ -502,6 +514,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     await ctx.onLog("stderr", `[claude-rc] ${error}\n`);
     return failure(error);
   } finally {
+    if (runEnvPath) await fs.rm(runEnvPath, { force: true });
     if (unlock) await unlock();
   }
 }
