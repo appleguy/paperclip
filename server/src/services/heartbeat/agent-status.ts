@@ -7,6 +7,7 @@ import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../../telemetry.js";
 import { logActivity, publishActivity, type ActivityPublication } from "../activity-log.js";
 import { publishLiveEvent } from "../live-events.js";
+import { claudeRcConversationLive } from "../../adapters/claude-rc/liveness.js";
 import { finishedIdleRun, finishedIdleWake, finishedFailedIdleLease } from "../idle-work-proof.js";
 
 type Outcome = "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out";
@@ -82,6 +83,16 @@ export function createHeartbeatAgentStatus(db: Db) {
     failureReason?: string | null,
     options?: { keepIdleOnFailure?: boolean; wasFirstHeartbeat?: boolean },
   ) {
+    // SCO-648: a failed run (deploy SIGTERM) must not error a seat whose RC conversation is still live.
+    if (outcome === "failed" || outcome === "timed_out") {
+      const [seat] = await db.select({ adapterType: agents.adapterType, adapterConfig: agents.adapterConfig })
+        .from(agents).where(eq(agents.id, agentId));
+      if (seat?.adapterType === "claude_rc_local" &&
+          await claudeRcConversationLive((seat.adapterConfig ?? {}) as Record<string, unknown>, null)) {
+        outcome = "interrupted";
+        failureReason = null;
+      }
+    }
     const result = await db.transaction(async (tx) => {
       const [existing] = await tx.select().from(agents)
         .where(eq(agents.id, agentId)).for("no key update");

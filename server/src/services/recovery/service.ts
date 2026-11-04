@@ -89,6 +89,7 @@ import {
 } from "@paperclipai/db";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
+import { claudeRcConversationLive } from "../../adapters/claude-rc/liveness.js";
 import {
   isNativeRunnerOwnershipHeld,
   nativeRunnerOwnershipNotHeldCondition,
@@ -4047,6 +4048,15 @@ export function recoveryService(
     recoveryCause?: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
   }) {
+    // SCO-648: a claude_rc conversation that is still writing/busy is working, not stranded.
+    if (input.previousStatus === "in_progress" && input.issue.assigneeAgentId) {
+      const seat = await getAgent(input.issue.assigneeAgentId);
+      if (seat?.adapterType === "claude_rc_local" &&
+          await claudeRcConversationLive(parseObject(seat.adapterConfig), input.issue.id)) {
+        logger.info({ issueId: input.issue.id, agentId: seat.id }, "recovery: claude_rc conversation live; not blocking in_progress issue");
+        return null;
+      }
+    }
     const publications: ActivityPublication[] = [];
     const postCommitActions: IssuePostCommitAction[] = [];
     const updated = await db.transaction(async (tx) => {
