@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { adoptableActive, inputGuard, isEmptyInputBox, isIdleScreen, normalizeOneLine, parseReceipt, parseRemoteUrl, parseRemoteConversationId, pasteSettleMs, STALE_IDLE, resolveAgyModel } from "./execute.js";
+import { adoptableActive, inputGuard, isEmptyInputBox, isIdleScreen, normalizeOneLine, parseReceipt, parseRemoteUrl, parseRemoteConversationId, pasteSettleMs, STALE_IDLE, resolveAgyModel, needsCompaction, AGY_CONTEXT_LIMIT_TOKENS } from "./execute.js";
 
 describe("agy single-RC dispatch safety", () => {
   it("parses shared /r/ base URL and drops conversation query", () => {
@@ -127,6 +127,7 @@ describe("agy single-RC dispatch safety", () => {
     const input = (agent_state: string, cwd = "/work", conversation_id = "c1") => JSON.stringify({
       agent_state, cwd, conversation_id, email: "not-persisted@example.com",
       pending_input_count: 0, tool_confirmation_pending: false,
+      context_window: { total_input_tokens: 250_000 },
     });
     const run = (value: string) => spawnSync(process.execPath, [script, dest, "/work"], { input: value, encoding: "utf8" });
     try {
@@ -135,6 +136,7 @@ describe("agy single-RC dispatch safety", () => {
       expect(first.agentState).toBe("idle");
       expect(first.idleSince).toBe(first.observedAt);
       expect(first.email).toBeUndefined();
+      expect(first.contextTokens).toBe(250_000);
       expect(run(input("idle")).status).toBe(0);
       const second = JSON.parse(await readFile(dest, "utf8"));
       expect(second.idleSince).toBe(first.idleSince);
@@ -154,6 +156,16 @@ describe("agy single-RC dispatch safety", () => {
     expect(() => adoptableActive(JSON.stringify(a), "i2", "/s")).toThrow(/Never replay/);
     expect(() => adoptableActive(JSON.stringify({ ...a, receiptPath: "/etc/x.json" }), "i1", "/s")).toThrow(/Never replay/);
     expect(() => adoptableActive("{not json", "i1", "/s")).toThrow(/Never replay/);
+  });
+});
+
+describe("agy 200k context cap", () => {
+  it("compacts only when the recorded context exceeds 200k", () => {
+    expect(AGY_CONTEXT_LIMIT_TOKENS).toBe(200_000);
+    expect(needsCompaction({ contextTokens: 200_000 })).toBe(false);
+    expect(needsCompaction({ contextTokens: 200_001 })).toBe(true);
+    expect(needsCompaction({ contextTokens: null })).toBe(false);
+    expect(needsCompaction(null)).toBe(false);
   });
 });
 

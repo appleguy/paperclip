@@ -97,7 +97,16 @@ export type AgyStatusLineSnapshot = {
   conversationId: string | null;
   pendingInputCount: number;
   toolConfirmationPending: boolean;
+  contextTokens?: number | null;
 };
+/** Owner 2026-11-04: every agent defaults to a 200k max context. agy's CLI has no working threshold setting
+ *  (`contextWindow` is accepted but ignored; window stays 1M), so the adapter compacts when usage passes this. */
+export const AGY_CONTEXT_LIMIT_TOKENS = 200_000;
+export const AGY_COMPACT_PROMPT = "/compact Continue the assigned issue work from the summary; write the receipt once work is complete.";
+export function needsCompaction(snapshot: unknown, limit = AGY_CONTEXT_LIMIT_TOKENS): boolean {
+  const t = (snapshot as Partial<AgyStatusLineSnapshot> | null)?.contextTokens;
+  return typeof t === "number" && Number.isSafeInteger(t) && t > limit;
+}
 
 /**
  * Advisory two-source check: only a verified idle status plus an empty input
@@ -175,6 +184,9 @@ export async function tmux(socket: string, args: string[]): Promise<string> {
 const target = (session: string) => ["-t", session];
 export async function pane(socket: string, session: string): Promise<string> {
   return tmux(socket, ["capture-pane", ...target(session), "-p", "-J", "-S", "-150"]);
+}
+async function readStatusSnapshot(stateDir: string): Promise<unknown> {
+  try { return JSON.parse(await fs.readFile(path.join(stateDir, "status-line.json"), "utf8")); } catch { return null; }
 }
 async function inputReadiness(
   socket: string, session: string, stateDir: string, cwd: string,
@@ -465,6 +477,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const deadline = Date.now() + timeoutMs;
     let receipt: Receipt | null = null;
     let idleWithoutReceipt = 0;
+    let compactAfter = 0;
     while (Date.now() < deadline) {
       if (ctx.signal?.aborted) throw new Error("agy run cancelled; shared TUI left intact, active checkpoint preserved");
       const raw = await fs.readFile(receiptPath, "utf8").catch(() => "");
@@ -477,6 +490,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           ? idleWithoutReceipt + 1 : 0;
         if (idleWithoutReceipt >= 5)
           return failure("agy adopted dispatch is idle without a receipt; checkpoint retained for operator reconciliation");
+      }
+      // 200k context cap: at an idle prompt with no receipt yet, compact once per overshoot, then resume.
+      if (!receipt && Date.now() >= compactAfter && needsCompaction(await readStatusSnapshot(stateDir))
+          && (await inputReadiness(socket, session, stateDir, cwd, conversationId)).allowed) {
+        await ctx.onLog("stdout", `[agy] context over ${AGY_CONTEXT_LIMIT_TOKENS} tokens; sending /compact\n`);
+        await send(socket, session, AGY_COMPACT_PROMPT, stateDir, cwd, conversationId);
+        compactAfter = Date.now() + 120_000;
       }
       // A terminated pane must never be mistaken for successful agent work.
       await tmux(socket, ["has-session", ...target(session)]);

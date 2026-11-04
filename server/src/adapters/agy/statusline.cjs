@@ -79,6 +79,9 @@ function writeSnapshot(raw) {
     pendingInputCount: Number.isSafeInteger(payload?.pending_input_count)
       && payload.pending_input_count >= 0 ? payload.pending_input_count : 0,
     toolConfirmationPending: payload?.tool_confirmation_pending === true,
+    // Context size after the last turn; the adapter compacts at 200k (agy has no settable threshold).
+    contextTokens: Number.isSafeInteger(payload?.context_window?.total_input_tokens)
+      && payload.context_window.total_input_tokens >= 0 ? payload.context_window.total_input_tokens : null,
   };
   const tmp = `${stateFile}.${process.pid}.tmp`;
   try {
