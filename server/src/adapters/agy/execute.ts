@@ -403,6 +403,26 @@ async function settleForeignCheckpoint(
   await fs.rename(activePath, path.join(stateDir, `active.stale-${a.runId}-${Date.now()}.json`));
 }
 
+/**
+ * Deploy-interrupted run of the SAME issue: no receipt, idle quiet TUI older than minAgeMs means the work is over.
+ * Adopting it would idle-fail every later wake, so archive it and let the caller redispatch.
+ */
+export async function archiveDeadSameIssueCheckpoint(
+  raw: string, issueId: string, stateDir: string, activePath: string,
+  socket: string, session: string, cwd: string, minAgeMs = 180_000,
+): Promise<boolean> {
+  let a: Partial<ActiveDispatch> & { startedAt?: string };
+  try { a = JSON.parse(raw); } catch { return false; }
+  if (!a || a.issueId !== issueId || typeof a.runId !== "string" || !/^[0-9a-f-]{36}$/i.test(a.runId)
+      || a.receiptPath !== path.join(stateDir, `receipt-${a.runId}.json`)) return false;
+  const started = Date.parse(a.startedAt ?? "");
+  if (!Number.isFinite(started) || Date.now() - started < minAgeMs) return false;
+  if (await fs.stat(a.receiptPath).then(() => true, () => false)) return false;
+  if (!(await inputReadiness(socket, session, stateDir, cwd, a.conversationId)).allowed) return false;
+  await fs.rename(activePath, path.join(stateDir, `active.unverified-${a.runId}.json`));
+  return true;
+}
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const cfg = ctx.config;
   const session = asString(cfg.tmuxSession, "agy");
@@ -436,6 +456,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (activeRaw) {
       await settleForeignCheckpoint(ctx, activeRaw, issueId, stateDir, activePath, socket, session, cwd);
       activeRaw = await fs.readFile(activePath, "utf8").catch(() => "");
+    }
+    if (activeRaw && await archiveDeadSameIssueCheckpoint(activeRaw, issueId, stateDir, activePath, socket, session, cwd)) {
+      await ctx.onLog("stdout", "[agy] Archived deploy-interrupted checkpoint for this issue (idle, no receipt); redispatching\n");
+      activeRaw = "";
     }
     const adopted = adoptableActive(activeRaw, issueId, stateDir);
     const rcUrl = await ensureSession(socket, session, cwd, stateDir, Boolean(adopted), model);
