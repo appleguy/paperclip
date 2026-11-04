@@ -197,7 +197,8 @@ async function deliverBlock(ctx: AdapterExecutionContext, issueId: string, reaso
   const issue = encodeURIComponent(issueId);
   for (const [method, suffix, body] of [
     ["POST", "/comments", { body: `Claude RC worker reported a blocker:\n\n${reason}` }],
-    ["PATCH", "", { status: "blocked" }],
+    ["PATCH", "", { status: "blocked", unblockDescriptor: {
+      owner: { agentId: ctx.agent.id }, action: `Resolve the worker-reported blocker, then reassign or reopen:\n${reason}`.slice(0, 2000) } }],
   ] as const) {
     const res = await fetch(new URL(`/api/issues/${issue}${suffix}`, `http://127.0.0.1:${port}`), {
       method, redirect: "manual", body: JSON.stringify(body), signal: AbortSignal.timeout(15_000),
