@@ -14,7 +14,7 @@ import {
   joinPromptSections, renderTemplate, selectPaperclipPromptSections,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
-  acquire, adoptableActive, deliver, normalizeOneLine, parseReceipt, tmux,
+  acquire, adoptableActive, isTargetBusyRefusal, deliver, normalizeOneLine, parseReceipt, tmux,
   type Receipt,
 } from "../agy/execute.js";
 import {
@@ -283,6 +283,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const failure = (reason: string, timedOut = false): AdapterExecutionResult => ({
     exitCode: 1, signal: null, timedOut, model, provider: "anthropic", biller: "anthropic",
     billingType: "subscription", costStatus: "unpriced", errorMessage: reason,
+    ...(!dispatched && isTargetBusyRefusal(reason) ? { errorFamily: "target_busy" as const } : {}),
     ...(dispatched ? {} : { executionRecovery: { kind: "bootstrap" as const, providerWorkStarted: false as const } }),
   });
   try {

@@ -32,6 +32,10 @@ function historicalFailureCount(run: RetryRun): number {
     const saved = count(run.contextSnapshot?.failureRetriesBeforeAiConnectionWait);
     if (saved !== null) return saved;
   }
+  if (run.scheduledRetryReason === "target_busy") {
+    const saved = count(run.contextSnapshot?.failureRetriesBeforeTargetWait);
+    if (saved !== null) return saved;
+  }
   if (run.scheduledRetryReason === "workspace_busy") {
     const saved = count(run.contextSnapshot?.failureRetriesBeforeWorkspaceWait);
     if (saved !== null) return saved;
@@ -44,7 +48,7 @@ function historicalFailureCount(run: RetryRun): number {
 export const SERVER_SHUTDOWN_REJOIN_RETRY_REASON = "server_shutdown_rejoin";
 export const SERVER_SHUTDOWN_REJOIN_MAX_ATTEMPTS = 12;
 /** Lanes counted only against their own consecutive attempts, never the failure budget. */
-const PER_REASON_LANES = ["workspace_busy", "ai_connection_busy", "ai_connection_pool_wait", SERVER_SHUTDOWN_REJOIN_RETRY_REASON];
+const PER_REASON_LANES = ["workspace_busy", "target_busy", "ai_connection_busy", "ai_connection_pool_wait", SERVER_SHUTDOWN_REJOIN_RETRY_REASON];
 
 export function executionRetryAccounting(run: RetryRun): ExecutionRetryAccounting {
   const saved = savedAccounting(run);

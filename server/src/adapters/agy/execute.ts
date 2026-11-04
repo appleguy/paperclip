@@ -48,6 +48,11 @@ const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, m
 function asString(v: unknown, fallback: string): string {
   return typeof v === "string" && v.trim() ? v.trim() : fallback;
 }
+/** Pre-dispatch refusals meaning the seat is occupied: the wake waits instead of failing. */
+export function isTargetBusyRefusal(reason: string): boolean {
+  return /TUI not (?:safely )?idle|previous task unresolved|input guard refused/i.test(reason);
+}
+
 export function normalizeOneLine(value: string): string {
   // tmux paste-buffer with embedded newlines submits partial TUI prompts.
   return value.replace(/[\r\n\t]+/g, " ").replace(/\s{2,}/g, " ").trim();
@@ -387,6 +392,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const failure = (reason: string, timedOut = false): AdapterExecutionResult => ({
     exitCode: 1, signal: null, timedOut, model, provider: "google", biller: "google",
     billingType: "subscription", costStatus: "unpriced", errorMessage: reason,
+    ...(!dispatched && isTargetBusyRefusal(reason) ? { errorFamily: "target_busy" as const } : {}),
     ...(dispatched ? {} : { executionRecovery: { kind: "bootstrap" as const, providerWorkStarted: false as const } }),
   });
   try {

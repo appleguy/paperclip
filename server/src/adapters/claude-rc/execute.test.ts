@@ -59,3 +59,16 @@ describe("SCO-626 orphan active.json after deploy cancel", () => {
     expect(() => adoptableActive("{}", "B", "/x", "claude_rc_local")).toThrow(/^claude_rc_local previous task unresolved/);
   });
 });
+
+describe("target-busy refusals", () => {
+  it("classifies occupied-seat refusals as waits, not failures", async () => {
+    const { isTargetBusyRefusal } = await import("../agy/execute.js");
+    for (const m of [
+      "Claude TUI not idle; leave the owner's live work intact",
+      "agy TUI not safely idle; inspect statusLine and leave owner's live input intact",
+      "claude_rc_local previous task unresolved; inspect active.json",
+      "Claude input guard refused: owner input nonempty or TUI not idle",
+    ]) expect(isTargetBusyRefusal(m)).toBe(true);
+    expect(isTargetBusyRefusal("Claude workspace trust prompt: approve this dedicated workspace")).toBe(false);
+  });
+});

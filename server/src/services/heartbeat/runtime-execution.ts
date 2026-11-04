@@ -49,7 +49,7 @@ import { withAdapterExecutionPhase } from "@paperclipai/adapter-utils/execution-
 import { remoteExecutionHasStopped } from "../remote-execution-termination.js";
 import { registerAdapterExecutionControl } from "../adapter-execution-control.js";
 import { resolveManagedOpenAiBilling } from "@paperclipai/adapter-utils";
-import { and, eq, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
 import { heartbeatRuns, nativeRunFinalizations, workspaceOperations } from "@paperclipai/db";
 import { conflict } from "../../errors.js";
 import { getStartupTraceContext } from "../../instrumentation.js";
@@ -233,6 +233,27 @@ export class NativeWorkspaceFinalizeScheduledError extends Error {
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+/** Pre-provider result while the agent's last finished run reported a provider quota whose reset is still ahead. */
+async function readAgentQuotaPause(db: Db, agentId: string, excludeRunId: string): Promise<AdapterExecutionResult | null> {
+  const [last] = await db
+    .select({ resultJson: heartbeatRuns.resultJson })
+    .from(heartbeatRuns)
+    .where(and(eq(heartbeatRuns.agentId, agentId), ne(heartbeatRuns.id, excludeRunId),
+      inArray(heartbeatRuns.status, ["succeeded", "failed", "cancelled", "timed_out"])))
+    .orderBy(desc(heartbeatRuns.finishedAt))
+    .limit(1);
+  const result = (last?.resultJson ?? {}) as Record<string, unknown>;
+  const raw = result.providerQuotaRetryNotBefore ?? result.retryNotBefore;
+  const resetAt = result.errorFamily === "provider_quota" && typeof raw === "string" ? new Date(raw) : null;
+  if (!resetAt || !(resetAt.getTime() > Date.now())) return null;
+  return {
+    exitCode: 1, signal: null, timedOut: false,
+    errorMessage: `Provider quota paused until ${resetAt.toISOString()}; no request sent`,
+    errorFamily: "provider_quota", retryNotBefore: resetAt.toISOString(),
+    executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+  };
 }
 
 export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExecutionInput): Promise<HeartbeatRuntimeExecutionResult> {
@@ -844,9 +865,15 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       if (managedMcpConfig) {
         adapterContext.paperclipManagedMcp = managedMcpConfig;
       }
+      // A quota-exhausted agent waits for its reset instead of spending a new failed run per wake.
+      const quotaPause = await readAgentQuotaPause(db, agent.id, run.id);
       const guardedDispatch =
         await dispatchWithTiming(
           (markDispatchStarted) => {
+            if (quotaPause) {
+              markDispatchStarted();
+              return Promise.resolve(quotaPause);
+            }
             input.effects.onLegacyAdapterEntered();
             return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
               getFreshSessionHandoff,
