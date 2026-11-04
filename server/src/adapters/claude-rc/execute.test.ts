@@ -95,3 +95,15 @@ describe("claude_rc_local keepConversation", () => {
     expect(shouldReuseConversation({ ...base, acrossProjects: true, sizeBytes: 100 })).toBe(false);
   });
 });
+
+import { goalForConversation } from "./execute.js";
+describe("SCO-756 managed goal on a kept conversation", () => {
+  const goal = { state: "active", objective: "o", key: "active:k" };
+  it("passes the key this conversation last received for the issue", () => {
+    const state = { conversationId: "c", projectId: "p", issueIds: ["i"], goalKeys: { i: "active:k" } };
+    expect(goalForConversation(goal, true, state, "i")).toMatchObject({ deliveredKey: "active:k" });
+    expect(goalForConversation(goal, true, state, "j")).toMatchObject({ deliveredKey: null });
+    expect(goalForConversation(goal, false, state, "i")).toMatchObject({ deliveredKey: null });
+    expect(goalForConversation(undefined, true, state, "i")).toBeUndefined();
+  });
+});

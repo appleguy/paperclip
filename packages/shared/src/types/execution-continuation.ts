@@ -46,6 +46,8 @@ export interface ExecutionContinuationEnvelope {
   resumeDelta?: {
     baseRunId: string;
     messages: ExecutionContinuationEnvelope["messages"];
+    /** Managed goal key the base run delivered (SCO-756); null when it carried none. */
+    goalKey?: string | null;
   };
   recoveryOutcomes?: Array<{ recoveryActionId: string; decision: unknown }>;
   completedWork: string | null;

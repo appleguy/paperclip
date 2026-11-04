@@ -21,7 +21,7 @@ import type {
 import { hasConnectedRunnerPrpAuthority, queueLiveRunnerPrpCommand } from "../realtime/runner-prp-ws.js";
 import { dispatchLiveRunnerGoalControl } from "./runner-goal-control-broker.js";
 import { publishLiveEvent } from "./live-events.js";
-import { managedGoalControllerFor, OPENCODE_GOAL_SOURCE_ID } from "./opencode-goal-controller.js";
+import { managedGoalControllerFor, MANAGED_GOAL_SOURCE_ID } from "./managed-goal-controller.js";
 
 const ACTIVE_RUN_STATUSES = ["queued", "scheduled_retry", "running"] as const;
 const OPEN_ACTION_STATUSES = ["pending", "delivering", "delivered"] as const;
@@ -54,8 +54,6 @@ function capabilityForAgent(agent: AgentBinding): RunnerGoalCapability {
   const managed = managedGoalControllerFor(agent);
   if (managed) return managed.capability;
   const config = asRecord(agent.adapterConfig) ?? {};
-  const engine = typeof config.engine === "string" ? config.engine : null;
-  const sessionMode = typeof config.mode === "string" ? config.mode : "persistent";
   if (agent.adapterType === "paperclip_runner") {
     const provider = typeof config.provider === "string" ? config.provider : "codex";
     const acpxAgent = typeof config.acpxAgent === "string" ? config.acpxAgent : "pi";
@@ -109,19 +107,8 @@ function capabilityForAgent(agent: AgentBinding): RunnerGoalCapability {
       reason,
     };
   }
-  const directAcp = (agent.adapterType === "codex_local" || agent.adapterType === "claude_local")
-    && engine !== "cli" && sessionMode !== "oneshot";
-  const reason = agent.adapterType === "opencode_local"
-    ? "Unsupported by OpenCode."
-    : directAcp
-      ? "This direct ACP adapter has no live session goal controller. Use Paperclip Runner with a supported provider."
-    : (agent.adapterType === "claude_local" || agent.adapterType === "codex_local") && sessionMode === "oneshot"
-      ? "Session goals require a persistent ACP session."
-    : agent.adapterType === "claude_local"
-      ? "Requires persistent Claude ACP."
-      : agent.adapterType === "codex_local"
-        ? "Requires persistent Codex ACP."
-        : "This runner does not expose a durable session goal lifecycle.";
+  // Every adapter whose prompt can carry a goal is managed above (SCO-756); what is left
+  // (process, http) builds its own input and has no place to put one.
   return {
     availability: "unsupported",
     verified: true,
@@ -131,10 +118,8 @@ function capabilityForAgent(agent: AgentBinding): RunnerGoalCapability {
     maxObjectiveChars: 4_000,
     tokenBudgetControl: false,
     usageReporting: false,
-    reasonCode: agent.adapterType === "opencode_local"
-      ? "opencode_structured_goals_unavailable"
-      : directAcp ? "direct_adapter_goal_controller_unavailable" : "persistent_session_goal_extension_required",
-    reason,
+    reasonCode: "persistent_session_goal_extension_required",
+    reason: "This runner builds its own input and does not carry a session goal.",
   };
 }
 
@@ -464,7 +449,7 @@ export function runnerGoalService(
           goalStatus: nextGoal?.status ?? null,
           // The recovery sweep wakes sessions whose desired state is "active"; a managed goal has no provider session to resume.
           goalDesiredState: null,
-          goalSourceId: nextGoal ? OPENCODE_GOAL_SOURCE_ID : null,
+          goalSourceId: nextGoal ? MANAGED_GOAL_SOURCE_ID : null,
           goalObservedAt: now,
           goalRevision: completedRevision,
           updatedAt: now,

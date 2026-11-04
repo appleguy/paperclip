@@ -330,6 +330,9 @@ export async function buildExecutionContinuation(input: {
     deliveredMessages && input.previousContextRunId
       ? {
           baseRunId: input.previousContextRunId,
+          goalKey: typeof object(previousRun?.context?.paperclipRunnerGoal).key === "string"
+            ? object(previousRun?.context?.paperclipRunnerGoal).key as string
+            : null,
           messages: messages.filter(
             (message) =>
               originCommentIds.includes(message.id) ||

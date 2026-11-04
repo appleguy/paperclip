@@ -90,22 +90,36 @@ describeEmbeddedPostgres("runner goal service", () => {
     return { companyId, agentId, issueId };
   }
 
-  it.each(["codex_local", "claude_local"])("does not convert %s into another execution path for goals", async (adapterType) => {
+  it.each(["codex_local", "claude_local", "claude_rc_local", "agy_local"])("gives %s a Paperclip-managed goal that never goes through a runner (SCO-756)", async (adapterType) => {
     const binding = await seed();
     await db.update(agents).set({ adapterType, adapterConfig: { engine: "acp", mode: "persistent" } });
     const enqueueOfflineControl = vi.fn(async () => {});
-    const service = runnerGoalService(db, { enqueueOfflineControl });
+    const dispatchLiveControl = vi.fn(() => null);
+    const service = runnerGoalService(db, { enqueueOfflineControl, dispatchLiveControl });
     const projection = await service.projection(binding.companyId, binding.issueId);
     expect(projection?.capability).toMatchObject({
-      availability: "unsupported",
-      reasonCode: "direct_adapter_goal_controller_unavailable",
-      actions: [],
+      availability: "available", reasonCode: "paperclip_managed_goal", actions: ["set", "pause", "resume", "clear"],
     });
+    const accepted = await service.act(binding.companyId, binding.issueId, {
+      requestId: randomUUID(), agentId: binding.agentId, expectedRevision: 0,
+      action: "create", objective: "Keep the board moving",
+    });
+    expect(accepted.status).toBe("completed");
+    expect(accepted.projection.goal).toMatchObject({ objective: "Keep the board moving", status: "active" });
+    expect(enqueueOfflineControl).not.toHaveBeenCalled();
+    expect(dispatchLiveControl).not.toHaveBeenCalled();
+  });
+
+  it("keeps process adapters unsupported: their prompt cannot carry a managed goal", async () => {
+    const binding = await seed();
+    await db.update(agents).set({ adapterType: "process", adapterConfig: {} });
+    const service = runnerGoalService(db, { enqueueOfflineControl: vi.fn(async () => {}) });
+    const projection = await service.projection(binding.companyId, binding.issueId);
+    expect(projection?.capability).toMatchObject({ availability: "unsupported", actions: [] });
     await expect(service.act(binding.companyId, binding.issueId, {
       requestId: randomUUID(), agentId: binding.agentId, expectedRevision: 0,
       action: "create", objective: "Never start an ordinary prompt",
     })).rejects.toThrow();
-    expect(enqueueOfflineControl).not.toHaveBeenCalled();
     expect(await db.select().from(agentSessionGoalActions)).toHaveLength(0);
   });
 

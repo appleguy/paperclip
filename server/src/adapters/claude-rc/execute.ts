@@ -164,7 +164,17 @@ export function assertWorkableCwd(cwd: string): void {
 /** SCO-560 (opt-in keepConversation): reuse the live conversation instead of /clear.
  * keepConversationAcrossProjects: a cross-project seat (Board) keeps one conversation
  * whatever project the next issue is in; compaction, not /clear, bounds its size. */
-export interface KeepState { conversationId: string; projectId: string; issueIds?: string[] }
+export interface KeepState {
+  conversationId: string; projectId: string; issueIds?: string[];
+  /** SCO-756: managed goal key this conversation last received, per issue. */
+  goalKeys?: Record<string, string>;
+}
+
+/** SCO-756: the managed goal with the key this kept conversation already holds for the issue. */
+export function goalForConversation(goal: unknown, reuse: boolean, state: KeepState | null, issueId: string): unknown {
+  if (!goal || typeof goal !== "object") return goal;
+  return { ...(goal as Record<string, unknown>), deliveredKey: reuse ? state?.goalKeys?.[issueId] ?? null : null };
+}
 export function shouldReuseConversation(o: {
   enabled: boolean; state: KeepState | null; newestId: string | null; projectId: string;
   sizeBytes: number; maxBytes: number; acrossProjects?: boolean;
@@ -410,8 +420,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const seenIssueIds = reuse ? keepState?.issueIds ?? [] : [];
       const seenIssue = seenIssueIds.includes(issueId);
       const wake = ctx.context.paperclipWake;
-      const promptContext = seenIssue && wake && typeof wake === "object"
-        ? { ...ctx.context, paperclipWake: { ...(wake as Record<string, unknown>), continuationSummary: null } } : ctx.context;
+      const goal = goalForConversation(ctx.context.paperclipRunnerGoal, reuse, keepState, issueId);
+      const promptContext = {
+        ...ctx.context,
+        ...(goal ? { paperclipRunnerGoal: goal } : {}),
+        ...(seenIssue && wake && typeof wake === "object"
+          ? { paperclipWake: { ...(wake as Record<string, unknown>), continuationSummary: null } } : {}),
+      };
       const { taskContextNote, wakePrompt } = selectPaperclipPromptSections(promptContext, { resumedSession: seenIssue });
       const instructionsFilePath = asString(cfg.instructionsFilePath, "");
       const instructionsFull = instructionsFilePath ? await fs.readFile(instructionsFilePath, "utf8") : "";
@@ -442,8 +457,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (keepEnabled) {
         await ctx.onLog("stdout", `[claude-rc] keepConversation ${reuse ? "reuse" : "fresh"}: prompt ${prompt.length} bytes (instructions ${reuse ? 0 : instructionsFull.length} of ${instructionsFull.length}); conversation ${Math.round(keepSize)} bytes\n`);
         const issueIds = [...seenIssueIds.filter(id => id !== issueId), issueId].slice(-200);
-        await fs.writeFile(keepPath, JSON.stringify({ conversationId, projectId, issueIds }), { mode: 0o600 });
+        const goalKey = (goal as { key?: unknown } | undefined)?.key;
+        const goalKeys = { ...(reuse ? keepState?.goalKeys ?? {} : {}) };
+        if (typeof goalKey === "string") goalKeys[issueId] = goalKey;
+        for (const id of Object.keys(goalKeys)) if (!issueIds.includes(id)) delete goalKeys[id];
+        await fs.writeFile(keepPath, JSON.stringify({ conversationId, projectId, issueIds, goalKeys }), { mode: 0o600 });
       }
+      // SCO-756: owner-guard's Stop gate maps this seat's conversation to its agent and managed goals.
+      const seatPath = path.join(stateDir, "seat.json");
+      const seat = await fs.readFile(seatPath, "utf8").then(t => JSON.parse(t) as { goals?: Record<string, string> }).catch(() => null);
+      const goals = { ...(seat?.goals ?? {}) };
+      const goalState = (goal as { state?: unknown } | undefined)?.state;
+      if (typeof goalState === "string") goals[issueId] = goalState; else delete goals[issueId];
+      for (const id of Object.keys(goals).slice(0, -200)) delete goals[id];
+      await fs.writeFile(seatPath, JSON.stringify({
+        agentId: ctx.agent.id, companyId: ctx.agent.companyId, cwd, conversationId, goals,
+      }), { mode: 0o600 });
       const active: Record<string, unknown> = {
         runId: ctx.runId, issueId, op_id: ctx.runId, receiptPath, rcUrl,
         tmuxSocket: socket, tmuxSession: session, conversationId,

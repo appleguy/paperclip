@@ -2275,14 +2275,41 @@ export function selectPaperclipPromptSections(
   const taskContextNote = selectPaperclipTaskMarkdown(context, options);
   return {
     taskContextNote,
-    wakePrompt: renderPaperclipWakePrompt(context?.paperclipWake, {
+    wakePrompt: joinPromptSections([renderPaperclipGoalNote(context?.paperclipRunnerGoal, options), renderPaperclipWakePrompt(context?.paperclipWake, {
       resumedSession: options.resumedSession,
       includeExecutionContract: options.includeExecutionContract,
       nativeWakeReaderAvailable: options.nativeWakeReaderAvailable,
       conversationMode: context?.conversationMode === true,
       suppressIssueDescription: taskContextNote.length > 0,
-    }),
+    })]),
   };
+}
+
+/**
+ * SCO-756: a Paperclip-managed session goal (server managed-goal-controller). A fresh
+ * conversation gets an active goal every run; a resumed one only when the goal state differs
+ * from the key it last received (deliveredKey), including a pause or clear of a goal it saw.
+ */
+export function renderPaperclipGoalNote(
+  value: unknown,
+  options: { resumedSession?: boolean } = {},
+): string {
+  const goal = parseObject(value);
+  const state = asString(goal.state, "");
+  const objective = asString(goal.objective, "").trim();
+  const key = asString(goal.key, "");
+  const delivered = typeof goal.deliveredKey === "string" ? goal.deliveredKey : null;
+  // A pre-SCO-756 context carried only {objective}: treat it as active.
+  const active = state === "active" || (!state && objective.length > 0);
+  if (options.resumedSession && delivered !== null && delivered === key) return "";
+  if (active && objective) {
+    return `Standing goal for this issue, set by the board and in force until it is changed, paused or cleared:\n${objective}\n` +
+      "The goal motivates the work; it never overrides the issue scope, owner steering or approval gates.";
+  }
+  if (!options.resumedSession || delivered === null || delivered === "cleared") return "";
+  return state === "paused"
+    ? "The standing goal for this issue is paused: do not pursue it until it is resumed."
+    : "The standing goal for this issue was cleared: stop pursuing it.";
 }
 
 // Runtime-only connector skills are supplied by the server after assignment resolution.
