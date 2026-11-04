@@ -240,6 +240,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     await fs.chmod(stateDir, 0o700);
     unlock = await acquire(stateDir, Date.now() + timeoutMs);
     const activePath = path.join(stateDir, "active.json");
+    // A checkpoint retained by an earlier run whose op already reached a terminal state
+    // (block ledger entry or receipt file) would otherwise fail every later dispatch.
+    try {
+      const prevRaw = await fs.readFile(activePath, "utf8");
+      const prev = JSON.parse(prevRaw) as { op_id?: string; runId?: string; receiptPath?: string };
+      const prevOp = asString(prev.op_id, asString(prev.runId, ""));
+      if (prevOp && prevOp !== ctx.runId && !adoptableActive(prevRaw, issueId, stateDir)
+        && (await readBlockTerminal(stateDir, prevOp) !== null
+          || (prev.receiptPath && await fs.stat(prev.receiptPath).then(() => true, () => false)))) {
+        await fs.rename(activePath, path.join(stateDir, `active.stale-${prevOp}.json`));
+        await ctx.onLog("stdout", `[claude-rc] Archived terminal checkpoint for finished op ${prevOp}\n`);
+      }
+    } catch { /* no checkpoint or unreadable: existing handling applies */ }
     const adopted = adoptableActive(await fs.readFile(activePath, "utf8").catch(() => ""), issueId, stateDir);
     const bridgeRoot = await findBridgeRoot(asString(cfg.channelBridgeRoot, "") || undefined);
     const channel = await prepareChannelHost(stateDir, bridgeRoot);
