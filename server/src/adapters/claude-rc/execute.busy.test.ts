@@ -168,4 +168,19 @@ describe("SCO-947 busy delivery and completion", () => {
     expect(await typeNativeGoal("socket", "seat", "/goal finish", /Goal set:/)).toBe(false);
     expect(deps.tmux).toHaveBeenCalledTimes(1);
   });
+
+  it("applies a managed runner-goal edit to the busy seat before dispatch", async () => {
+    ctx.context.paperclipRunnerGoal = { state: "active", objective: "Finish the busy wake", key: "active:edited" };
+    deps.tmux.mockImplementation(async (_socket: string, args: string[]) => {
+      if (args[0] === "capture-pane") return screen;
+      if (args[0] === "display-message") return args.at(-1) === "#{pane_current_path}" ? cwd : "claude";
+      if (args[0] === "send-keys" && args.at(-1) === "Enter") screen = busy + "\nGoal set: Finish the busy wake";
+      return "";
+    });
+    expect((await execute(ctx)).exitCode).toBe(0);
+    const seat = JSON.parse(await fs.readFile(path.join(stateDir, "seat.json"), "utf8"));
+    expect(seat.nativeGoalKey).toBe("active:edited");
+    const typed = deps.tmux.mock.calls.map(([, args]) => args as string[]).filter(args => args.includes("-l"));
+    expect(typed.map(args => args.at(-1)).join("")).toBe("/goal Finish the busy wake");
+  });
 });
