@@ -57,4 +57,22 @@ describe("Antigravity persistent headless controller", () => {
     expect(() => AntigravityHeadlessController.launch({ executable: "/bin/agy", verifiedVersion: "1.4.12", cwd: "/tmp", conversationId: "exact-id", env: {}, authorize: () => true, onEvent: () => {}, onUncertain: () => {}, spawnProcess: spawnProcess as never, readVersion: () => "1.4.13" })).toThrow(/version mismatch/);
     expect(spawnProcess).not.toHaveBeenCalled();
   });
+  it("launches 1.5.1 with its qualified model and effort and parses its stream", () => {
+    const child = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), pid: 123, exitCode: null, signalCode: null });
+    const spawnProcess = vi.fn((_file: string, _args: string[], _options: unknown) => child);
+    const events = vi.fn();
+    const controller = AntigravityHeadlessController.launch({ executable: "/bin/agy", verifiedVersion: "1.5.1", cwd: "/tmp", model: "model-a", effort: "xhigh", env: {}, authorize: () => true, onEvent: events, onUncertain: () => {}, spawnProcess: spawnProcess as never, readProcessBirth: () => "birth", readVersion: () => "1.5.1" });
+    expect(spawnProcess.mock.calls[0]![1]).toEqual(["--input-format", "stream-json", "--output-format", "stream-json", "--model", "model-a", "--effort", "xhigh"]);
+    child.stdout.write(JSON.stringify({ event: "init", conversation_id: "new", init: { cwd: "/tmp", permission_mode: "request-review" } }) + "\n");
+    controller.assertOwnedLive();
+    expect(events).toHaveBeenCalledWith(expect.objectContaining({ kind: "init", conversationId: "new" }));
+  });
+  it("rejects unqualified versions and invalid settings before spawn", () => {
+    const spawnProcess = vi.fn();
+    const base = { executable: "/bin/agy", verifiedVersion: "1.5.1", cwd: "/tmp", env: {}, authorize: () => true, onEvent: () => {}, onUncertain: () => {}, spawnProcess: spawnProcess as never, readVersion: () => "1.5.1" };
+    for (const options of [{ verifiedVersion: "1.5.2" }, { model: "--bad" }, { effort: "invalid" }, { verifiedVersion: "1.4.12", model: "model-a" }]) {
+      expect(() => AntigravityHeadlessController.launch({ ...base, ...options } as Parameters<typeof AntigravityHeadlessController.launch>[0])).toThrow();
+    }
+    expect(spawnProcess).not.toHaveBeenCalled();
+  });
 });

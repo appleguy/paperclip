@@ -10202,7 +10202,7 @@ async function executePaperclipNativeSessionWithinScope(
         runnerInstanceId: effectiveRunnerInstanceId, environmentLeaseId, turnId: randomUUID(), itemId: randomUUID(),
         bindingId: randomUUID(), bindingGeneration: generation, cwd: input.execution.workspace.cwd!,
         stateDirectory: join(parent, randomUUID()), runnerBinary: resolvePaperclipRunnerBinary(), executable: cli,
-        verifiedVersion: "1.4.12", env: process.env, admit, withAdmission,
+        verifiedVersion: input.execution.provider.cliVersion, model: input.execution.provider.model ?? undefined, effort: input.execution.provider.effort, env: process.env, admit, withAdmission,
       } });
     }
     let openCodeAdmission: Awaited<ReturnType<typeof startOpenCodeManagedBackend>> | undefined;

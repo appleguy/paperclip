@@ -101,6 +101,7 @@ export interface BuildNativeExecutionInput {
   normalizedSessionId: string | null;
   provider?: "cursor_cloud" | "codex" | "opencode" | "opencode_shared_v2" | "claude_interactive" | "claude_managed" | "aws_agentcore" | "acpx" | "openai_dot" | "grok_bot" | "muse" | "antigravity_headless";
   opencodeEffort?: string;
+  antigravityEffort?: "low" | "medium" | "high" | "xhigh" | "max";
   claudeAutoCompactTokens?: number;
   museBinding?: MuseBindingSnapshot;
   dotBinding?: DotBindingSnapshot;
@@ -407,7 +408,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
     session: { ...prepared.session, normalizedSessionId: input.normalizedSessionId, driverKind: "opencode_shared_v2" },
   } : input.provider === "antigravity_headless" ? { ...prepared,
     schema: "paperclip.native-execution-input.v11", homeMode: "preconfigured",
-    provider: { kind: "antigravity_headless", model: null, cliVersion: "1.4.12" },
+    provider: { kind: "antigravity_headless", model: input.model ?? null, ...(input.antigravityEffort !== undefined ? { effort: input.antigravityEffort } : {}), cliVersion: "1.5.1" },
     session: { ...prepared.session, normalizedSessionId: input.normalizedSessionId ?? `session-${input.runId}`, driverKind: "antigravity_headless", lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } }
   } : input.provider === "muse" ? { ...prepared,
     schema: "paperclip.native-execution-input.v8", provider: { kind: "muse", model: null, binding: input.museBinding, bridgeRevision: "muse-v1" },

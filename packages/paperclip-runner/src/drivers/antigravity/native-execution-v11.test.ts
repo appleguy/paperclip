@@ -11,4 +11,19 @@ describe("Antigravity v11 admission",()=>{
   it("accepts the closed native provider schema but requires server authority",()=>{const parsed=parseNativeExecutionInput(input);expect(parsed.schema).toBe(input.schema);expect(()=>createNativeSessionBackend(parsed)).toThrow(/authority/);});
   it("describes native headless limits without a Codex fallback",async()=>{const descriptor=await describeRunnerdNativeSessionBackend(parseNativeExecutionInput(input));expect(descriptor.name).toBe("antigravity_headless");expect(descriptor.capabilities).toMatchObject({structuredResult:false,steering:false,dynamicTools:false,usage:false});expect(descriptor.capabilities.unsupported).toEqual(expect.arrayContaining(["managed tool accounting","native tool ingress fencing","shared interactive remote control"]));});
   it("rejects caller supplied authority and mismatched provider settings",()=>{expect(()=>parseNativeExecutionInput({...input,provider:{...input.provider,leaseId:"forged"}})).toThrow();expect(()=>parseNativeExecutionInput({...input,provider:{...input.provider,cliVersion:"other"}})).toThrow();});
+  it("retains qualified 1.5.1 model/effort and rejects invalid or unqualified settings",()=>{
+    const provider={kind:"antigravity_headless",model:"gemini-3.1-pro",effort:"xhigh",cliVersion:"1.5.1"};
+    expect(parseNativeExecutionInput({...input,provider}).provider).toEqual(provider);
+    for(const bad of [{...provider,effort:"unlimited"},{...provider,model:""},{...provider,model:"--bad"},{...provider,model:"bad\nmodel"},{...provider,cliVersion:"1.5.2"},{...provider,cliVersion:"1.4.12"}]){
+      expect(()=>parseNativeExecutionInput({...input,provider:bad})).toThrow();
+    }
+  });
+  it("binds model and effort to the server admission before creating a backend",()=>{
+    const parsed=parseNativeExecutionInput({...input,provider:{kind:"antigravity_headless",model:"gemini-3.1-pro",effort:"max",cliVersion:"1.5.1"}});
+    const authority={identity:{companyId:"c",runId:"r",issueId:"i",agentId:"a",sessionId:"session"},cwd:"/workspace",verifiedVersion:"1.5.1",model:"gemini-3.1-pro",effort:"max" as const,runnerInstanceId:"runner",environmentLeaseId:"lease",turnId:"turn",itemId:"item",bindingId:"binding",bindingGeneration:1,stateDirectory:"/state",runnerBinary:"/runner",executable:"/agy",env:{},admit:()=>true,withAdmission:async(_id:string,dispatch:()=>void)=>dispatch()};
+    expect(()=>createNativeSessionBackend(parsed,{antigravityAuthority:authority})).not.toThrow();
+    for(const patch of [{model:"other"},{effort:"high" as const},{model:undefined},{effort:undefined}]){
+      expect(()=>createNativeSessionBackend(parsed,{antigravityAuthority:{...authority,...patch}})).toThrow(/authority/);
+    }
+  });
 });

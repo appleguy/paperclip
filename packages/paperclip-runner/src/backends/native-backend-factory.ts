@@ -81,7 +81,7 @@ export function createNativeSessionBackend(
   }
   if (input.schema === "paperclip.native-execution-input.v11") {
     const authority = options.antigravityAuthority;
-    if (!authority || !authority.withAdmission || authority.identity.runId !== input.binding.runId || authority.identity.companyId !== input.binding.companyId || authority.identity.issueId !== input.binding.issueId || authority.identity.agentId !== input.binding.agentId || authority.cwd !== input.workspace.cwd || (input.session.normalizedSessionId !== null && authority.identity.sessionId !== input.session.normalizedSessionId) || authority.verifiedVersion !== input.provider.cliVersion) {
+    if (!authority || !authority.withAdmission || authority.identity.runId !== input.binding.runId || authority.identity.companyId !== input.binding.companyId || authority.identity.issueId !== input.binding.issueId || authority.identity.agentId !== input.binding.agentId || authority.cwd !== input.workspace.cwd || (input.session.normalizedSessionId !== null && authority.identity.sessionId !== input.session.normalizedSessionId) || authority.verifiedVersion !== input.provider.cliVersion || (authority.model ?? null) !== input.provider.model || authority.effort !== input.provider.effort) {
       throw new Error("Antigravity server lease authority is missing or does not match execution");
     }
     return createAntigravityHeadlessBackend(authority);

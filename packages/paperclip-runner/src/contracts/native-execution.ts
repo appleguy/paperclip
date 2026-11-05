@@ -287,7 +287,7 @@ export interface NativeExecutionInputV10 extends Omit<NativeExecutionInputV9, "s
 /** Provider settings only; process identity and lease authority are supplied by the server. */
 export interface NativeExecutionInputV11 extends Omit<NativeExecutionInputV10, "schema" | "provider" | "session"> {
   schema: typeof NATIVE_EXECUTION_INPUT_SCHEMA_V11;
-  provider: { kind: "antigravity_headless"; model: null; cliVersion: "1.4.12" };
+  provider: { kind: "antigravity_headless"; model: string | null; effort?: "low" | "medium" | "high" | "xhigh" | "max"; cliVersion: "1.4.12" | "1.5.1" };
   session: Omit<NativeExecutionInputV10["session"], "driverKind"> & { driverKind: "antigravity_headless" };
 }
 
@@ -477,16 +477,18 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
   }
   if (input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V11) {
     const provider = record(input.provider, "input.provider");
-    exactKeys(provider, ["kind", "model", "cliVersion"], "input.provider");
+    exactKeys(provider, ["kind", "model", "effort", "cliVersion"], "input.provider");
     const session = record(input.session, "input.session");
-    if (provider.kind !== "antigravity_headless" || provider.model !== null || provider.cliVersion !== "1.4.12" || session.driverKind !== "antigravity_headless" || typeof session.normalizedSessionId !== "string" || !session.normalizedSessionId || record(session.lifecyclePolicy, "input.session.lifecyclePolicy").mode !== "per_turn" || !Array.isArray(input.credentialBindings) || input.credentialBindings.length !== 0) {
+    const model = provider.model;
+    const effort = provider.effort;
+    if (provider.kind !== "antigravity_headless" || (model !== null && (typeof model !== "string" || !model.trim() || model.length > 200 || model.startsWith("-") || /[\x00-\x1f\x7f]/.test(model))) || (provider.cliVersion !== "1.4.12" && provider.cliVersion !== "1.5.1") || (effort !== undefined && effort !== "low" && effort !== "medium" && effort !== "high" && effort !== "xhigh" && effort !== "max") || (provider.cliVersion === "1.4.12" && (model !== null || effort !== undefined)) || session.driverKind !== "antigravity_headless" || typeof session.normalizedSessionId !== "string" || !session.normalizedSessionId || record(session.lifecyclePolicy, "input.session.lifecyclePolicy").mode !== "per_turn" || !Array.isArray(input.credentialBindings) || input.credentialBindings.length !== 0) {
       throw new NativeExecutionInputError("Antigravity v11 requires the pinned headless provider, per-turn lifecycle, and no credential bindings");
     }
     const common = parseNativeExecutionInput({ ...input, schema: NATIVE_EXECUTION_INPUT_SCHEMA_V10,
       provider: { kind: "codex", model: null, approvalPolicy: "never" },
       session: { ...session, driverKind: "codex_app_server" } }) as NativeExecutionInputV10;
     return { ...common, schema: NATIVE_EXECUTION_INPUT_SCHEMA_V11,
-      provider: { kind: "antigravity_headless", model: null, cliVersion: "1.4.12" },
+      provider: { kind: "antigravity_headless", model: model as string | null, ...(effort !== undefined ? { effort: effort as "low" | "medium" | "high" | "xhigh" | "max" } : {}), cliVersion: provider.cliVersion as "1.4.12" | "1.5.1" },
       session: { ...common.session, driverKind: "antigravity_headless" } };
   }
   if (input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V8) return parseMuseNativeExecutionInput(input);

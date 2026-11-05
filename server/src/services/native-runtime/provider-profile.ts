@@ -44,7 +44,7 @@ type AdmittedPaperclipRunnerAcpxAgent = QualifiedPaperclipRunnerAcpxAgent | Acpx
 
 export type PaperclipRunnerProviderProfile =
   | { provider: "claude_interactive"; backend: "claude_interactive"; model: string; effort: "low" | "medium" | "high" | "max" }
-  | { provider: "antigravity_headless"; backend: "antigravity_headless"; model: null }
+  | { provider: "antigravity_headless"; backend: "antigravity_headless"; model: string | null; effort?: "low" | "medium" | "high" | "xhigh" | "max" }
   | { provider: "cursor_cloud"; backend: "cursor_cloud_api"; model: string }
   | { provider: "muse"; backend: "muse_external"; model: null; museBindingId: string }
   | { provider: "grok_bot"; backend: "grok_bot_mcp"; model: null; externalBindingId: string }
@@ -82,7 +82,7 @@ export type PaperclipRunnerProviderProfile =
 
 export type PaperclipRunnerNativeProviderInput =
   | { provider: "claude_interactive"; model: string; homeMode: "preconfigured"; claudeEffort: "low" | "medium" | "high" | "max"; claudeAutoCompactTokens: number }
-  | { provider: "antigravity_headless"; model: null; homeMode: "preconfigured" }
+  | { provider: "antigravity_headless"; model: string | null; homeMode: "preconfigured"; antigravityEffort?: "low" | "medium" | "high" | "xhigh" | "max" }
   | { provider: "cursor_cloud"; model: string; cursorCloud: NativeCursorCloudConfig }
   | { provider: "muse"; model: null; museBinding: import("../../vendor/paperclip-runner/index.js").MuseBindingSnapshot }
   | { provider: "grok_bot"; model: null; dotBinding: import("../../vendor/paperclip-runner/index.js").DotBindingSnapshot }
@@ -466,10 +466,11 @@ export function resolvePaperclipRunnerProviderProfile(
     return { provider: "claude_interactive", backend: "claude_interactive", model, effort };
   }
   if (candidate === "antigravity_headless") {
-    if (optionalString(config.model) || (config.homeMode !== undefined && config.homeMode !== "preconfigured") || (config.lifecycleMode !== undefined && config.lifecycleMode !== "per_turn") || [config.acpxAgent, config.modelReasoningEffort, config.reasoningEffort, config.effort, config.acpxPermissionMode].some(value => value !== undefined && value !== null)) {
-      throw new PaperclipRunnerProviderProfileError("paperclip_runner_antigravity_headless_config_invalid", "Native Antigravity headless requires per-turn lifecycle and the preconfigured subscription; model, effort and ACPX settings are unsupported.");
+    const model = optionalString(config.model), effort = config.modelReasoningEffort ?? config.reasoningEffort ?? config.effort;
+    if ((config.model !== undefined && config.model !== null && (typeof config.model !== "string" || !model || model.length > 200 || model.startsWith("-") || /[\x00-\x1f\x7f]/.test(config.model))) || (effort !== undefined && effort !== "low" && effort !== "medium" && effort !== "high" && effort !== "xhigh" && effort !== "max") || (config.homeMode !== undefined && config.homeMode !== "preconfigured") || (config.lifecycleMode !== undefined && config.lifecycleMode !== "per_turn") || [config.acpxAgent, config.acpxPermissionMode].some(value => value !== undefined && value !== null)) {
+      throw new PaperclipRunnerProviderProfileError("paperclip_runner_antigravity_headless_config_invalid", "Native Antigravity headless requires per-turn lifecycle, the preconfigured subscription, an optional model and effort (low|medium|high|xhigh|max); ACPX settings are unsupported.");
     }
-    return { provider: "antigravity_headless", backend: "antigravity_headless", model: null };
+    return { provider: "antigravity_headless", backend: "antigravity_headless", model, ...(effort !== undefined ? { effort } : {}) };
   }
   if (!isPaperclipRunnerProvider(candidate)) {
     throw new PaperclipRunnerProviderProfileError(
@@ -729,7 +730,7 @@ export function resolvePaperclipRunnerNativeProviderInput(input: {
     );
   }
   if (profile.provider === "claude_interactive") return { provider: "claude_interactive", model: profile.model, homeMode: "preconfigured", claudeEffort: profile.effort, claudeAutoCompactTokens: 200000 };
-  if (profile.provider === "antigravity_headless") return { provider: "antigravity_headless", model: null, homeMode: "preconfigured" };
+  if (profile.provider === "antigravity_headless") return { provider: "antigravity_headless", model: profile.model, homeMode: "preconfigured", ...(profile.effort !== undefined ? { antigravityEffort: profile.effort } : {}) };
   if (profile.provider === "cursor_cloud") {
     return { provider: "cursor_cloud", model: profile.model, cursorCloud: resolvePaperclipRunnerCursorCloudConfig(config) };
   }

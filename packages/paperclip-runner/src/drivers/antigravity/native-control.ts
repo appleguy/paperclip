@@ -1,4 +1,4 @@
-/** Documented agy 1.4.12 headless NDJSON boundary; this is not interactive RC.
+/** Qualified agy headless NDJSON boundary; this is not interactive RC.
  * https://antigravity.google/docs/cli/headless/
  */
 export type NativeEvent =
@@ -16,7 +16,7 @@ export class AntigravityHeadlessStream {
   private conversationId?: string;
   private failed = false;
   constructor(readonly cliVersion: string, readonly expectedConversationId?: string, readonly maxLineBytes = 1024 * 1024) {
-    if (cliVersion !== "1.4.12") throw new Error("Unsupported agy version");
+    if (cliVersion !== "1.4.12" && cliVersion !== "1.5.1") throw new Error("Unsupported agy version");
     if (!Number.isSafeInteger(maxLineBytes) || maxLineBytes < 1) throw new Error("Invalid line limit");
   }
 

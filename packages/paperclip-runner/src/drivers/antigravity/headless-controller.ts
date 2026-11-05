@@ -16,11 +16,11 @@ export class AntigravityHeadlessController {
   private failed = false;
   private active?: string;
   private readonly seen = new Set<string>();
-  private constructor(private readonly child: ChildProcessWithoutNullStreams, private readonly conversation: string | undefined, private readonly cwd: string, private readonly birth: string, private readonly readBirth: (pid: number) => string | null,
+  private constructor(private readonly child: ChildProcessWithoutNullStreams, private readonly conversation: string | undefined, private readonly cwd: string, private readonly birth: string, private readonly readBirth: (pid: number) => string | null, version: string,
     private readonly authorize: (operationId: string) => boolean, private readonly onEvent: (event: NativeEvent) => void,
     private readonly onUncertain: (operationId: string) => void) {
     this.generation = `${child.pid}:${birth}:${randomUUID()}`;
-    this.parser = new AntigravityHeadlessStream("1.4.12", conversation);
+    this.parser = new AntigravityHeadlessStream(version, conversation);
     child.stdout.on("data", (data: Buffer) => {
       if (this.failed) return;
       try {
@@ -47,16 +47,20 @@ export class AntigravityHeadlessController {
     child.stderr.resume();
   }
   static launch(options: { executable: string; verifiedVersion: string; cwd: string; conversationId?: string;
+    model?: string; effort?: "low" | "medium" | "high" | "xhigh" | "max";
     env: NodeJS.ProcessEnv; authorize: (operationId: string) => boolean; onEvent: (event: NativeEvent) => void;
     onUncertain: (operationId: string) => void;
     spawnProcess?: typeof spawn; readProcessBirth?: (pid: number) => string | null; readVersion?: (executable: string) => string }): AntigravityHeadlessController {
-    if (!isAbsolute(options.executable) || !isAbsolute(options.cwd) || options.verifiedVersion !== "1.4.12" ||
+    if (!isAbsolute(options.executable) || !isAbsolute(options.cwd) || !["1.4.12", "1.5.1"].includes(options.verifiedVersion) ||
+      (options.verifiedVersion === "1.4.12" && (options.model !== undefined || options.effort !== undefined)) ||
+      (options.model !== undefined && (typeof options.model !== "string" || !options.model.trim() || options.model.length > 200 || options.model.startsWith("-") || /[\x00-\x1f\x7f]/.test(options.model))) ||
+      (options.effort !== undefined && !["low", "medium", "high", "xhigh", "max"].includes(options.effort)) ||
       (options.conversationId !== undefined && (!options.conversationId || options.conversationId.startsWith("-") || /[\x00-\x1f]/.test(options.conversationId)))) throw new Error("Invalid launch binding");
     const env = Object.fromEntries(Object.entries(options.env).filter(([key, value]) => value !== undefined && (allowedEnvironment.has(key) || /^LC_[A-Z_]+$/.test(key))));
     const readVersion = options.readVersion ?? ((executable: string) => execFileSync(executable, ["--version"], { encoding: "utf8", timeout: 5000, maxBuffer: 4096, env }).trim());
     if (readVersion(options.executable) !== options.verifiedVersion) throw new Error("Antigravity CLI version mismatch");
     const child = (options.spawnProcess ?? spawn)(options.executable,
-      ["--input-format", "stream-json", "--output-format", "stream-json", ...(options.conversationId ? ["--conversation", options.conversationId] : [])],
+      ["--input-format", "stream-json", "--output-format", "stream-json", ...(options.conversationId ? ["--conversation", options.conversationId] : []), ...(options.model ? ["--model", options.model] : []), ...(options.effort ? ["--effort", options.effort] : [])],
       { cwd: options.cwd, env, stdio: "pipe" }) as ChildProcessWithoutNullStreams;
     const readBirth = options.readProcessBirth ?? ((pid: number) => {
       try { return execFileSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], { encoding: "utf8", timeout: 2000, env: { LC_ALL: "C" } }).trim() || null; }
@@ -64,7 +68,7 @@ export class AntigravityHeadlessController {
     });
     const birth = child.pid ? readBirth(child.pid) : null;
     if (!birth) { child.on("error", () => {}); child.kill(); throw new Error("Owned Antigravity process birth unavailable"); }
-    return new AntigravityHeadlessController(child, options.conversationId, options.cwd, birth, readBirth, options.authorize, options.onEvent, options.onUncertain);
+    return new AntigravityHeadlessController(child, options.conversationId, options.cwd, birth, readBirth, options.verifiedVersion, options.authorize, options.onEvent, options.onUncertain);
   }
   /** Verifies this initialized child still has the OS birth recorded at launch. */
   assertOwnedLive(): void {
