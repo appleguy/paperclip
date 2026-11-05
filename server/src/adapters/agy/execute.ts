@@ -240,7 +240,13 @@ async function ensureSession(
   }
   const processName = (await tmux(socket, ["display-message", "-p", ...target(session), "#{pane_current_command}"])).trim();
   if (processName !== "agy") throw new Error(`tmux pane is ${processName}, not agy; refusing to commandeer it`);
-  const screen = await pane(socket, session);
+  let screen = await pane(socket, session);
+  // A freshly launched seat prints its RC URL and empty editor only after start-up.
+  for (const until = Date.now() + 45_000; !exists && Date.now() < until
+      && !/Do you trust the contents/.test(screen) && !(parseRemoteUrl(screen) && isEmptyInputBox(screen));) {
+    await sleep(1000);
+    screen = await pane(socket, session);
+  }
   if (/Do you trust the contents/.test(screen))
     throw new Error("agy workspace trust prompt: approve this dedicated workspace in the terminal, then retry");
   if (!rejoinOnly) {
@@ -318,6 +324,20 @@ async function claimSlot(
     }
     return null;
   })();
+  if (ctx.context.paperclipRestartReattach === true) {
+    // A restart is not permission to submit a new turn, or to adopt another
+    // run on the same issue. The old provider may still be working.
+    if (!owner) throw new Error("agy restart checkpoint missing; provider ownership requires reconciliation");
+    const unlock = await acquire(owner.stateDir, deadline);
+    try {
+      const active = adoptableActive(await activeOf(owner), issueId, owner.stateDir);
+      if (!active || active.runId !== ctx.runId) throw new Error("agy restart checkpoint run mismatch; provider ownership requires reconciliation");
+      return { slot: owner, unlock };
+    } catch (error) {
+      await unlock();
+      throw error;
+    }
+  }
   if (owner) return { slot: owner, unlock: await acquire(owner.stateDir, deadline) };
   while (Date.now() < deadline) {
     let lastError = "";
@@ -429,8 +449,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const failure = (reason: string, timedOut = false): AdapterExecutionResult => ({
     exitCode: 1, signal: null, timedOut, model, provider: "google", biller: "google",
     billingType: "subscription", costStatus: "unpriced", errorMessage: reason,
-    ...(!dispatched && isTargetBusyRefusal(reason) ? { errorFamily: "target_busy" as const } : {}),
-    ...(dispatched ? {} : { executionRecovery: { kind: "bootstrap" as const, providerWorkStarted: false as const } }),
+    ...(!dispatched && ctx.context.paperclipRestartReattach !== true && isTargetBusyRefusal(reason) ? { errorFamily: "target_busy" as const } : {}),
+    ...(!dispatched && ctx.context.paperclipRestartReattach !== true
+      ? { executionRecovery: { kind: "bootstrap" as const, providerWorkStarted: false as const } } : {}),
   });
   try {
     resolveAgyModel(requestedModel);
@@ -446,6 +467,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const activePath = path.join(stateDir, "active.json");
     const activeRaw = await fs.readFile(activePath, "utf8").catch(() => "");
     const adopted = adoptableActive(activeRaw, issueId, stateDir);
+    if (ctx.context.paperclipRestartReattach === true && (!adopted || adopted.runId !== ctx.runId))
+      throw new Error("agy restart checkpoint changed; provider ownership requires reconciliation");
     const rcUrl = await ensureSession(socket, session, cwd, stateDir, Boolean(adopted), model);
     if (!rcUrl) throw new Error("agy RC URL unavailable: use /remote-control in its TUI, then retry");
     // Owner 2026-11-03: auto re-pin, logged. The URL rotates on every agy restart; ensureSession only reads it from the
