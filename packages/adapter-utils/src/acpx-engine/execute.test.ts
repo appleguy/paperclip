@@ -195,6 +195,7 @@ async function runExecutor(
     runtimeMcp?: AdapterRuntimeMcpAccess;
     prepareRemoteManagedHome?: AcpxEngineExecutorOptions["prepareRemoteManagedHome"];
     startupTraceContext?: AdapterExecutionContext["startupTraceContext"];
+    expectedExitCode?: number;
   } = {},
 ) {
   // Skill reconciliation must never inspect or modify the developer's real
@@ -231,6 +232,7 @@ async function runExecutor(
     agent: {
       id: "agent-1",
       companyId: "company-1",
+      name: "test seat",
     },
       runtime: options.runtime ?? {},
       config,
@@ -254,7 +256,7 @@ async function runExecutor(
     onUsage: async (receipt: unknown) => { receipts.push(receipt); },
   } as never);
 
-  expect(result.exitCode).toBe(0);
+  expect(result.exitCode).toBe(options.expectedExitCode ?? 0);
   return { logs, meta, events, receipts, runtimeOptions, configOptions, sessionInputs, turnInputs, result };
 }
 
@@ -410,6 +412,15 @@ const ALLOWED_TURN_SPAN_ATTRIBUTE_KEYS = new Set<string>([
 ]);
 
 describe("shared ACPX engine runtime behavior", () => {
+  it("refuses an oversized Paperclip prompt before starting an ACP turn", async () => {
+    const root = await makeTempRoot();
+    const { result, turnInputs } = await runExecutor({
+      agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state"),
+      cwd: root, model: "gpt-6.1-terra", tokenPreflightShare: 0.000001,
+    }, { expectedExitCode: 1 });
+    expect(turnInputs).toHaveLength(0);
+    expect(result.errorMessage).toMatch(/test seat.*gpt-6\.1-terra.*272000/);
+  });
   it("passes the current prompt, session, cancellation and diagnostic inputs to the runtime turn", async () => {
     const root = await makeTempRoot();
     const { result, turnInputs, meta } = await runExecutor({

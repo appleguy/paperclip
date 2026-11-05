@@ -1,5 +1,6 @@
 import { isOpenRouterUrl, openRouterClaudeHeaders } from "@paperclipai/shared/openrouter-attribution";
 import { prepareAcpxCodexObservabilityHome } from "../codex-observability-home.js";
+import { assertPromptTokenShare } from "../token-preflight.js";
 import { readableRuntimePath } from "../readable-runtime-paths.js";
 import { codexShellEnvironmentKeys } from "../codex-shell-environment.js";
 import { applyObservabilityEnvironment } from "../agent-observability.js";
@@ -5034,6 +5035,12 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         preparePhaseStart = now();
         const { prompt, promptMetrics, commandNotes } = await buildPrompt(ctx, resumedSession, prepared.env);
         runPrompt = joinPromptSections([prepared.skillPromptInstructions, prompt]);
+        assertPromptTokenShare({
+          seat: ctx.agent.name,
+          model: prepared.requestedModel,
+          prompt: runPrompt,
+          share: ctx.config.tokenPreflightShare === undefined ? undefined : Number(ctx.config.tokenPreflightShare),
+        });
         await emitAcpxLog(ctx, {
           type: "acpx.session",
           agent: prepared.acpxAgent,
