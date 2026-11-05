@@ -18,3 +18,17 @@ the code they started with. A marker for another build is ignored, so a restart 
 
 Adding a hot module: it must be a leaf with no shared singleton state, be loaded through `hotImport`, and be listed in
 `server/src/hot/hot-paths.txt`. Modules imported statically elsewhere (e.g. `claude-rc/liveness.ts`) stay full.
+
+## Hot reload vs reattach (owner direction)
+
+Runner detach/reattach across server restarts (SCO-817) is the preferred route wherever hot reload of a module is not
+practical. Hot reload is reserved for leaf modules that are cheap to swap safely.
+
+| Module | Route | Why |
+|---|---|---|
+| claude-rc `execute`, `done-gate`, `channel`, `rc-name` | hot | leaf, no shared singleton state, edited most often; in-flight calls finish on old code |
+| plugin UI bundles and workers | plugin system (restart-free) | upstream already supports it |
+| externally installed adapters | `POST /api/adapters/:type/reload` | upstream path |
+| claude-rc `liveness`, wake/routing in `services/`, heartbeat | reattach (full restart) | statically imported, hold timers and in-memory run state; swapping risks split-brain |
+| db/migrations, `shared`, auth, routes, UI server bundle | reattach (full restart) | process-wide state or schema; no safe partial swap |
+| opencode-local / codex_local / NAR adapters | reattach (full restart) | long-lived runner state already survives restarts via detach/reattach |
