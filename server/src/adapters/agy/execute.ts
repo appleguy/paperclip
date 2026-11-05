@@ -289,7 +289,7 @@ async function ensureSession(
 }
 
 /** One non-blocking attempt at a seat's dispatch mutex; null while another live adapter run holds it. */
-export async function tryAcquire(stateDir: string): Promise<(() => Promise<void>) | null> {
+export async function tryAcquire(stateDir: string, reclaimed = false): Promise<(() => Promise<void>) | null> {
   const dir = path.join(stateDir, "dispatch.lock");
   try {
     await fs.mkdir(dir);
@@ -304,6 +304,8 @@ export async function tryAcquire(stateDir: string): Promise<(() => Promise<void>
         if ((e as NodeJS.ErrnoException).code === "ESRCH") {
           // No replay; only stale mutex reclaimed. active.json remains.
           await fs.rename(dir, path.join(stateDir, `stale-lock-${Date.now()}`)).catch(() => {});
+          // SCO-1053: a holder that died (the server a deploy replaced) must not make this claim busy.
+          if (!reclaimed) return tryAcquire(stateDir, true);
         }
       }
     }

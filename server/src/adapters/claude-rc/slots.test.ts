@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { claimSlot, rcSlot, rcSlotCount, RC_MAX_SLOTS } from "./execute.js";
@@ -54,6 +55,24 @@ describe("claude_rc_local concurrent seats (SCO-965)", () => {
       await writeFile(path.join(root, "active.json"), JSON.stringify({ issueId: "i1" }));
       await writeFile(path.join(root, "s1", "active.json"), JSON.stringify({ issueId: "i9" }));
       await expect(claimSlot(ctx, slots, "i3", Date.now() + 2000)).rejects.toThrow(/previous task unresolved/);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("a run re-entered after a restart takes its own seat over the dead server's lock (SCO-1053)", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "rc-slots-"));
+    try {
+      const slots = [rcSlot(0, "claude", root)];
+      await writeFile(path.join(root, "active.json"), JSON.stringify({ runId, issueId: "i1",
+        receiptPath: path.join(root, `receipt-${runId}.json`), rcUrl: "https://claude.ai/code/test" }));
+      const deadPid = spawnSync("/usr/bin/true").pid;
+      await mkdir(path.join(root, "dispatch.lock"));
+      await writeFile(path.join(root, "dispatch.lock", "pid"), String(deadPid));
+      const ownCtx = { runId, context: { issueId: "i1" }, agent: { id: "a" }, onLog: async () => {} } as never;
+      const claimed = await claimSlot(ownCtx, slots, "i1", Date.now() + 2000);
+      expect(claimed.slot.index).toBe(0);
+      expect((await readdir(root)).filter(f => f.startsWith("stale-lock-"))).toHaveLength(1);
+      expect(await readFile(path.join(root, "dispatch.lock", "pid"), "utf8")).toBe(String(process.pid));
+      await claimed.unlock();
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 });
