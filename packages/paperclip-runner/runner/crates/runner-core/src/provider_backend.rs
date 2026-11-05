@@ -5876,6 +5876,32 @@ impl CodexCommandExecutor {
                     }
                 }
             }
+            if managed {
+                // A thread-scoped warning without an id or provider turn binding is a
+                // startup diagnostic, not another actor's execution; the bootstrap loop
+                // in open_shared_session already treats it that way. Only while we hold
+                // no turn of our own, so it can never mask a settled or ambiguous turn.
+                if let Ok(Some(value)) = &observed {
+                    let state = self.state.as_ref();
+                    if is_shared_bootstrap_warning(value)
+                        && state.is_some_and(|state| {
+                            state.active_provider_turn_id.is_none()
+                                && !state.ambiguous_turn_start_pending
+                                && state.lifecycle != "reconciliation_required"
+                        })
+                    {
+                        self.state.as_mut().expect("shared state").push_event(
+                            NormalizedProviderEvent {
+                                event_type: "harness.diagnostic".to_owned(),
+                                priority: EventPriority::P1,
+                                payload: json!({"code":"shared_bootstrap_warning","severity":"warning","warning":sanitize_value(&value["params"])}),
+                            },
+                        )?;
+                        self.save_state()?;
+                        return Ok(());
+                    }
+                }
+            }
             if managed && !matches!(&observed, Ok(None)) {
                 let (method, turn) = match &observed {
                     Ok(Some(value)) => (
@@ -6937,7 +6963,9 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
-    fn shared_writer_paused_goal_fake_socket_fixture(lost_ack: bool, owner_event: bool) {
+    fn shared_writer_paused_goal_fake_socket_fixture(lost_ack: bool, injected: Option<Value>) {
+        let owner_event = injected.is_some();
+        let benign_warning = injected.as_ref().is_some_and(|value| value["method"] == "warning" && value["params"].get("turnId").is_none());
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         use std::os::unix::net::UnixListener;
         let root = PathBuf::from(format!(
@@ -7001,7 +7029,7 @@ mod tests {
                 event_rx
                     .recv_timeout(std::time::Duration::from_secs(2))
                     .unwrap();
-                ws.send(tungstenite::Message::Text(json!({"method":"turn/started","params":{"threadId":"thread","turn":{"id":"owner-turn"}}}).to_string().into())).unwrap();
+                ws.send(tungstenite::Message::Text(injected.unwrap().to_string().into())).unwrap();
                 sent_tx.send(()).unwrap();
             }
             assert!(ws.read().is_err());
@@ -7081,19 +7109,29 @@ mod tests {
                     .unwrap();
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 let events = executor.poll_events().unwrap();
-                assert!(events
-                    .iter()
-                    .any(|event| event.event_type == "harness.diagnostic"
-                        && event.payload["code"] == "shared_native_intervention"
-                        && event.payload["origin"] == "unknown"
-                        && event.payload["providerTurnId"] == "owner-turn"));
-                assert_eq!(
-                    executor.state.as_ref().unwrap().lifecycle,
-                    "reconciliation_required"
-                );
-                assert!(executor
-                    .execute(&cmd("session.goal.set", payload, 5))
-                    .is_err());
+                if benign_warning {
+                    // A bare thread warning is a diagnostic: no reconciliation, the session keeps working.
+                    assert!(events
+                        .iter()
+                        .any(|event| event.event_type == "harness.diagnostic"
+                            && event.payload["code"] == "shared_bootstrap_warning"));
+                    assert!(!events.iter().any(|event| event.payload["code"] == "shared_native_intervention"));
+                    assert_eq!(executor.state.as_ref().unwrap().lifecycle, "session_open");
+                } else {
+                    assert!(events
+                        .iter()
+                        .any(|event| event.event_type == "harness.diagnostic"
+                            && event.payload["code"] == "shared_native_intervention"
+                            && event.payload["origin"] == "unknown"
+                            && event.payload["providerTurnId"] == "owner-turn"));
+                    assert_eq!(
+                        executor.state.as_ref().unwrap().lifecycle,
+                        "reconciliation_required"
+                    );
+                    assert!(executor
+                        .execute(&cmd("session.goal.set", payload, 5))
+                        .is_err());
+                }
             }
         }
         drop(executor);
@@ -7104,17 +7142,24 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn shared_writer_paused_goal_fake_socket() {
-        shared_writer_paused_goal_fake_socket_fixture(false, false);
+        shared_writer_paused_goal_fake_socket_fixture(false, None);
     }
     #[cfg(target_os = "macos")]
     #[test]
     fn shared_writer_lost_ack_is_not_redispatched() {
-        shared_writer_paused_goal_fake_socket_fixture(true, false);
+        shared_writer_paused_goal_fake_socket_fixture(true, None);
     }
     #[cfg(target_os = "macos")]
     #[test]
     fn shared_writer_observes_owner_turn_and_holds_automation() {
-        shared_writer_paused_goal_fake_socket_fixture(false, true);
+        shared_writer_paused_goal_fake_socket_fixture(false, Some(json!({"method":"turn/started","params":{"threadId":"thread","turn":{"id":"owner-turn"}}})));
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_writer_bare_warning_is_diagnostic_not_intervention() {
+        shared_writer_paused_goal_fake_socket_fixture(false, Some(json!({"method":"warning","params":{"threadId":"thread","message":"startup warning"}})));
+        // A warning that names a turn is still an unknown actor and must reconcile.
+        shared_writer_paused_goal_fake_socket_fixture(false, Some(json!({"method":"warning","params":{"threadId":"thread","turnId":"owner-turn"}})));
     }
 
     #[cfg(target_os = "macos")]
