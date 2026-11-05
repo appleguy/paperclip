@@ -599,7 +599,9 @@ jobs:
   # canary publish, so the nightly publish skips re-verification.
 
   select_nightly:
-    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.channel == 'nightly')
+    # The scheduled nightly publishes to npm with upstream-only credentials; forks
+    # have none (ENEEDAUTH) and only burn hosted macOS runner capacity.
+    if: (github.event_name == 'schedule' && github.repository == 'paperclipai/paperclip') || (github.event_name == 'workflow_dispatch' && inputs.channel == 'nightly')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
