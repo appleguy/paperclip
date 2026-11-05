@@ -81,7 +81,7 @@ export async function evaluateDoneGate(receipt: GateReceipt, edited: string[], d
   for (const [repo, files] of touched) {
     const st = await deps.git(repo, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ...files.map(f => path.relative(repo, f))]);
     const dirty = st.out.split("\0").filter(l => l.length > 3).map(l => l.slice(3)).filter(p => !notMine.has(p));
-    if (dirty.length) reasons.push(`uncommitted edits of this run in ${repo}: ${dirty.slice(0, 12).join(", ")}${dirty.length > 12 ? ` (+${dirty.length - 12})` : ""}. Commit your own paths on the checkout (git add <paths>; git commit) or revert them, then resubmit.`);
+    if (dirty.length) reasons.push(`uncommitted edits of this run in ${repo}: ${dirty.slice(0, 12).join(", ")}${dirty.length > 12 ? ` (+${dirty.length - 12})` : ""}. Commit your own paths on the checkout (git add <paths>; git commit) or revert them; if the dirt is another agent's, list those paths in "notMine". Then resubmit.`);
   }
   if (touched.size > 0 && commits.length === 0)
     reasons.push(`receipt has no commits: this run edited ${[...touched.keys()].join(", ")}. Add "commits": ["<sha>", ...] (the SHAs that carry your change).`);
@@ -128,10 +128,10 @@ export function productionDeps(): GateDeps {
     git: async (repo, args) => {
       try {
         const { stdout } = await run("/usr/bin/git", ["-C", repo, ...args], { timeout: 20_000, maxBuffer: 8_000_000 });
-        return { code: 0, out: stdout.trim() };
+        return { code: 0, out: stdout.replace(/\n+$/, "") }; // not trim(): status lines start with a space
       } catch (e) {
         const err = e as { code?: number | string; stdout?: string };
-        return { code: typeof err.code === "number" ? err.code : 1, out: (err.stdout ?? "").trim() };
+        return { code: typeof err.code === "number" ? err.code : 1, out: (err.stdout ?? "").replace(/\n+$/, "") };
       }
     },
     liveSha: async () => {
