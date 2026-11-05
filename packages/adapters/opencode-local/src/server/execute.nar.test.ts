@@ -13,6 +13,7 @@ import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/exe
 import { execute } from "./execute.js";
 import { OpenCodeHttpDriver, messageIdFor, sessionIdFor } from "./nar/opencode-http-driver.js";
 import { narOpIdFor } from "./nar/nar-attempt.js";
+import { estimatePromptTokens } from "@paperclipai/adapter-utils/token-preflight";
 
 const runProcess = vi.mocked(runAdapterExecutionTargetProcess);
 
@@ -243,6 +244,68 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     // Only this op's assistant message is counted, not the earlier run's.
     expect(next).toMatchObject({ exitCode: 0, summary: "answer 3", costUsd: 0.5, usage: { inputTokens: 302 } });
     expect(runProcess).not.toHaveBeenCalled();
+  });
+
+  it("keeps a saved NAR session and sends only the wake delta with a bounded first-request fixture", async () => {
+    const standing = "Standing instructions: preserve completed work.\n".repeat(140).slice(0, 6401);
+    const instructionsFilePath = path.join(root, "AGENTS.md");
+    await fs.writeFile(instructionsFilePath, standing);
+    const bootstrap = "Bootstrap this agent once.";
+    const makeContext = (runId: string, savedSession: string | null) => ({
+      ...context(runId, { nativeRuntime: "nar", instructionsFilePath, bootstrapPromptTemplate: bootstrap }, "issue-one", savedSession),
+      context: {
+        taskId: "issue-one",
+        paperclipTaskMarkdownAssignment: "Finish the owned assignment.",
+        paperclipTaskMarkdownAssignmentCompact: "Continue the unfinished assignment.",
+        paperclipWake: {
+          reason: "issue_commented",
+          issue: { id: "issue-one", identifier: "SCO-857", title: "Prompt continuity", status: "in_progress" },
+          executionContinuation: {
+            version: 1, companyId: "company-one", issueId: "issue-one",
+            trigger: { reason: "issue_commented", interactionId: null, sourceRunId: null },
+            originCommentIds: [], messages: [], humanResponses: [], unresolvedInteractionIds: [],
+            interactionOutcomes: [], completedActions: [], completedWork: null, recoveryOutcomes: [],
+            coverage: { kind: "full_task_history", throughCommentId: null, summaryThroughCommentId: null },
+          },
+        },
+      },
+    });
+    const first = await execute(makeContext("run-prompt-first", null) as never);
+    const metrics: Record<string, unknown>[] = [];
+    const next = await execute({ ...makeContext("run-prompt-next", first.sessionId!),
+      onMeta: async (meta: Record<string, unknown>) => { metrics.push(meta.promptMetrics as Record<string, unknown>); },
+    } as never);
+    expect(first.exitCode).toBe(0);
+    expect(next).toMatchObject({ exitCode: 0, sessionId: first.sessionId });
+    expect(sessions.size).toBe(1);
+    const [fresh, resumed] = userMsgs().map((message) => message.text as string);
+    expect(fresh).toContain(standing);
+    expect(fresh).toContain(bootstrap);
+    expect(resumed).toContain("## Paperclip Resume Delta");
+    expect(resumed).toContain("Continue the unfinished assignment.");
+    expect(resumed).toContain("No prior-run outcomes recorded.");
+    expect(resumed).not.toContain("Standing instructions:");
+    expect(resumed).not.toContain("The above agent instructions were loaded from");
+    expect(resumed).not.toContain(bootstrap);
+    expect(resumed).not.toContain("Full assignment");
+    expect(metrics[0]?.instructionsChars).toBe(0);
+    // Complete credential-free request fixture. The system/tool surface is
+    // deliberately fixed here; this does not claim the fleet's live schemas fit.
+    const request = {
+      model: "openai/fixture",
+      system: "You are a coding assistant. Continue the assigned work.",
+      tools: [{ name: "read_file", description: "Read a workspace file", parameters: {
+        type: "object", properties: { path: { type: "string" } }, required: ["path"],
+      } }],
+      messages: [{ role: "user", content: fresh }],
+    };
+    const firstRequestTokenBound = estimatePromptTokens(JSON.stringify(request));
+    expect(firstRequestTokenBound).toBeLessThanOrEqual(12_000);
+    expect(estimatePromptTokens(resumed!)).toBeLessThan(estimatePromptTokens(fresh!) - 6401);
+    console.info("SCO-857 first-request fixture", JSON.stringify({
+      method: "one-token-per-UTF8-byte upper bound", firstRequestTokenBound,
+      freshPromptBytes: Buffer.byteLength(fresh!), resumedPromptBytes: Buffer.byteLength(resumed!),
+    }));
   });
 
   it("a wake that arrives without a resumable session after one existed rotates to a fresh generation", async () => {

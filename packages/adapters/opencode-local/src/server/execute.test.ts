@@ -111,6 +111,8 @@ describe("OpenCode local skill injection", () => {
   it("delivers assignment context on an ordinary task turn and rebuilds it after resume fallback", async () => {
     const commandPath = path.join(configHome, "fake-opencode-context");
     await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const instructionsFilePath = path.join(configHome, "AGENTS.md");
+    await fs.writeFile(instructionsFilePath, "Standing instruction marker.");
     const prompts: string[] = [];
     runProcessMock
       .mockReset()
@@ -120,17 +122,21 @@ describe("OpenCode local skill injection", () => {
       runId: "run-context-fallback",
       agent: { id: "agent-1", companyId: "company-1", name: "OpenCode", adapterType: "opencode_local", adapterConfig: {} },
       runtime: { sessionId: "previous", sessionParams: null, sessionDisplayId: null, taskKey: null },
-      config: { command: commandPath, cwd: configHome, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+      config: { command: commandPath, cwd: configHome, instructionsFilePath, model: "openai/gpt-5", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
       context: createPromptContextFixture(),
       onLog: async () => {},
       onMeta: async (meta) => { prompts.push(String(meta.prompt ?? "")); },
     });
     expect(prompts).toHaveLength(2);
     expect(prompts[0]).toContain("## Compact assignment");
+    expect(prompts[0]).not.toContain("Standing instruction marker.");
+    expect(prompts[0]).not.toContain("The above agent instructions were loaded from");
     expect(prompts[1]).toContain("## Owned assignment");
+    expect(prompts[1]).toContain("Standing instruction marker.");
+    expect(prompts[1]).toContain("The above agent instructions were loaded from");
     for (const prompt of prompts) expect(prompt).not.toContain("Execution contract:");
     expect(prompts[1]).toContain("You are agent agent-1 (OpenCode).");
-    expect(prompts[1]).toContain("Connection tools:");
+    expect(prompts[1]).not.toContain("Connection tools:");
   });
 
   it.each([

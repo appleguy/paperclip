@@ -607,7 +607,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (instructionsPrefix.length > 0) {
         notes.push(`Loaded agent instructions from ${resolvedInstructionsFilePath}`);
         notes.push(
-          `Prepended instructions + path directive to stdin prompt (relative references from ${instructionsDir}).`,
+          `Instructions + path directive are included in fresh-session prompts (relative references from ${instructionsDir}).`,
         );
         return notes;
       }
@@ -628,6 +628,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       context,
     };
     const buildPrompt = (resumedSession: boolean) => {
+      const renderedInstructions = resumedSession ? "" : instructionsPrefix;
       const renderedBootstrapPrompt =
         !resumedSession && bootstrapPromptTemplate.trim().length > 0
           ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
@@ -649,7 +650,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           (sharedSession.recovered || isPaperclipRecoveryWakePayload(context.paperclipWake))
           ? "Controller restart recovery: inspect the existing session history. Do not repeat any completed tool actions; continue only unfinished work."
           : "",
-        instructionsPrefix,
+        renderedInstructions,
         renderedBootstrapPrompt,
         wakePrompt,
         taskContextNote,
@@ -660,7 +661,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         basePrompt,
         promptMetrics: {
           promptChars: basePrompt.length,
-          instructionsChars: instructionsPrefix.length,
+          instructionsChars: renderedInstructions.length,
           bootstrapPromptChars: renderedBootstrapPrompt.length,
           wakePromptChars: wakePrompt.length,
           taskContextChars: taskContextNote.length,
