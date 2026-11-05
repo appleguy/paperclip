@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mac Pro dashboard</title>
+<link rel="icon" href="/favicon.svg">
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font: 16px/1.4 -apple-system, BlinkMacSystemFont, sans-serif; background: #0b0d10; color: #e6e8eb; }
+  main { max-width: 640px; margin: 0 auto; padding: 20px 16px 40px; }
+  h1 { font-size: 22px; margin: 4px 0 16px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: #8b93a1; margin: 24px 0 8px; }
+  a.card { display: block; padding: 14px 16px; margin: 8px 0; border-radius: 12px; background: #161a20; color: inherit; text-decoration: none; border: 1px solid #232933; }
+  a.card:active { background: #1d232b; }
+  .t { font-weight: 600; }
+  .d { color: #8b93a1; font-size: 14px; margin-top: 2px; }
+  .soon { opacity: .6; }
+</style>
+</head>
+<body>
+<main>
+<h1>Mac Pro dashboard</h1>
+
+<h2>Pages</h2>
+<a class="card" href="/SCO/issues"><div class="t">Paperclip</div><div class="d">Issues, agents, runs</div></a>
+<a class="card" href="/subscription-quotas.html"><div class="t">Quota</div><div class="d">Claude, Codex, Antigravity subscription quotas and resets</div></a>
+<a class="card" href="/optloop/"><div class="t">Runtime statistics</div><div class="d">Maya GLM / DeepSeek engine stats (Qwen pool stats: SCO-775)</div></a>
+<a class="card soon" href="/SCO/issues/SCO-747"><div class="t">Steering</div><div class="d">Strategy and reversible-decision review page, in progress (SCO-747)</div></a>
+<a class="card" href="/hf-review/"><div class="t">HF review</div><div class="d">Model review queue</div></a>
+
+<h2>Follow</h2>
+<a class="card" href="/SCO/issues/SCO-777"><div class="t">Elastic runner</div><div class="d">Quota-adaptive scaling across Codex, Claude, Antigravity (SCO-777)</div></a>
+<a class="card" href="/SCO/issues/SCO-585"><div class="t">Codex burst</div><div class="d">Reset-credit burst plan and progress (SCO-585)</div></a>
+<a class="card" href="/SCO/issues/SCO-776"><div class="t">Owner-intent task tree</div><div class="d">Senior synthesis of what you are trying to accomplish (SCO-776)</div></a>
+<a class="card" href="/SCO/issues/SCO-778"><div class="t">Dropped-ask sweep</div><div class="d">Last 48h of owner inputs, tracked to resolution (SCO-778)</div></a>
+</main>
+</body>
+</html>
