@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { adoptableActive, inputGuard, isEmptyInputBox, isIdleScreen, normalizeOneLine, parseReceipt, parseRemoteUrl, parseRemoteConversationId, pasteSettleMs, STALE_IDLE, resolveAgyModel, needsCompaction, AGY_CONTEXT_LIMIT_TOKENS } from "./execute.js";
+import { adoptableActive, inputGuard, isEmptyInputBox, normalizeOneLine, parseReceipt, parseRemoteUrl, parseRemoteConversationId, pasteSettleMs, resolveAgyModel, needsCompaction, AGY_CONTEXT_LIMIT_TOKENS } from "./execute.js";
 
 describe("agy single-RC dispatch safety", () => {
   it("parses shared /r/ base URL and drops conversation query", () => {
@@ -40,12 +40,12 @@ describe("agy single-RC dispatch safety", () => {
     expect(pasteSettleMs(20000)).toBe(3000);
   });
 
-  it("recognizes idle vs generating TUI screens", () => {
-    expect(isIdleScreen([
+  it("checks editor text independently of generating TUI markers", () => {
+    expect(isEmptyInputBox([
       "Gemini 3.8 Flash", "─────────────────", ">", "─────────────────",
       "? for shortcuts                 Gemini 3.8 Flash · low",
     ].join("\n"))).toBe(true);
-    expect(isIdleScreen([
+    expect(isEmptyInputBox([
       "Generating...", "─────────────────", "> message", "─────────────────",
       "esc to cancel                  Gemini 3.8 Flash · low",
     ].join("\n"))).toBe(false);
@@ -62,62 +62,33 @@ describe("agy single-RC dispatch safety", () => {
     expect(() => parseReceipt(JSON.stringify({ ...JSON.parse(r), report: "short" }), "r1", "i1")).toThrow(/250/);
     expect(() => parseReceipt(JSON.stringify({ ...JSON.parse(r), status: "blocked" }), "r1", "i1")).toThrow(/done/);
   });
-  it("allows a fresh idle status only when the current editor is empty", () => {
-    const now = Date.parse("2026-11-02T23:00:00Z");
-    const snapshot = {
-      schemaVersion: 1, agentState: "idle", observedAt: new Date(now).toISOString(),
-      idleSince: new Date(now).toISOString(), cwd: "/work", conversationId: "c1",
-      pendingInputCount: 0, toolConfirmationPending: false,
-    };
+  it("allows an empty editor without a status-line snapshot", () => {
     const empty = ["previous > input", "────────────", ">", "────────────", "agy idle"].join("\n");
     expect(isEmptyInputBox(empty)).toBe(true);
-    expect(inputGuard(empty, snapshot, "/work", now, "c1").allowed).toBe(true);
-    expect(inputGuard(empty, snapshot, "/wrong", now, "c1").allowed).toBe(false);
-    expect(inputGuard(empty, snapshot, "/work", now, "other").allowed).toBe(false);
-    expect(inputGuard(empty, null, "/work", now).allowed).toBe(false);
+    expect(inputGuard(empty)).toEqual({ allowed: true, reason: "empty input editor" });
   });
 
-  it("refuses half-typed or wrapped input even with a long-idle signal", () => {
-    const now = Date.parse("2026-11-02T23:00:00Z");
-    const old = new Date(now - 6 * 60_000).toISOString();
-    const idle = {
-      schemaVersion: 1, agentState: "idle", observedAt: old, idleSince: old,
-      cwd: "/work", conversationId: "c1", pendingInputCount: 0, toolConfirmationPending: false,
-    };
+  it("refuses half-typed or wrapped input and unrecognizable editors", () => {
     for (const editor of ["> half typed", "> draft\ncontinued on next line"]) {
       const screen = ["────────────", editor, "────────────", "agy idle"].join("\n");
-      expect(inputGuard(screen, idle, "/work", now).allowed).toBe(false);
+      expect(inputGuard(screen).allowed).toBe(false);
+    }
+    expect(inputGuard("old > prompt\nGenerating...").allowed).toBe(false);
+  });
+
+  it("allows busy turns and queued work with an empty editor", () => {
+    for (const marker of ["esc to cancel", "Generating...", "Working...", "agy working", "agy tool_use"]) {
+      expect(inputGuard(["────────────", ">", "────────────", marker].join("\n")).allowed).toBe(true);
     }
   });
 
-  it("refuses a busy agent or pending owner input despite an empty editor", () => {
-    const now = Date.parse("2026-11-02T23:00:00Z");
-    const screen = ["────────────", ">", "────────────", "agy idle"].join("\n");
-    const idle = {
-      schemaVersion: 1, agentState: "idle", observedAt: new Date(now).toISOString(),
-      idleSince: new Date(now - 6 * 60_000).toISOString(), cwd: "/work",
-      conversationId: "c1", pendingInputCount: 0, toolConfirmationPending: false,
-    };
-    expect(inputGuard(screen, { ...idle, agentState: "working" }, "/work", now).allowed).toBe(false);
-    expect(inputGuard(screen, { ...idle, agentState: "tool_use" }, "/work", now).allowed).toBe(false);
-    expect(inputGuard(screen, { ...idle, pendingInputCount: 1 }, "/work", now).allowed).toBe(false);
-    expect(inputGuard(screen, { ...idle, toolConfirmationPending: true }, "/work", now).allowed).toBe(false);
-    expect(inputGuard(["────────────", ">", "────────────", "esc to cancel"].join("\n"), idle, "/work", now).allowed).toBe(false);
-  });
-
-  it("allows a >=5-minute idle signal; a short stale one needs the stable-screen check", () => {
-    const now = Date.parse("2026-11-02T23:00:00Z");
-    const screen = ["────────────", ">", "────────────", "agy idle"].join("\n");
-    const status = {
-      schemaVersion: 1, agentState: "idle", observedAt: new Date(now - 45_000).toISOString(),
-      idleSince: new Date(now - 45_000).toISOString(), cwd: "/work",
-      conversationId: "c1", pendingInputCount: 0, toolConfirmationPending: false,
-    };
-    expect(inputGuard(screen, status, "/work", now)).toEqual({ allowed: true, reason: STALE_IDLE });
-    expect(inputGuard(screen, {
-      ...status, observedAt: new Date(now - 300_001).toISOString(),
-      idleSince: new Date(now - 300_001).toISOString(),
-    }, "/work", now).allowed).toBe(true);
+  it("finds the editor above the bordered running-task strip", () => {
+    const screen = (editor: string) => [
+      "────────────", editor, "────────────", "● /bin/sleep 40 running",
+      "────────────", "? for shortcuts · 1 task(s) · /tasks", "agy working",
+    ].join("\n");
+    expect(inputGuard(screen(">")).allowed).toBe(true);
+    expect(inputGuard(screen("> owner draft")).allowed).toBe(false);
   });
 
   it("persists only scoped agy statusLine fields and preserves idleSince", async () => {

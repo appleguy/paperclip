@@ -2,7 +2,7 @@
  * Paperclip -> one long-lived Antigravity TUI Remote Control instance.
  * agy 1.4.x has no supported daemon injection protocol; the tmux pane is
  * the *same* interactive process users see and steer at the stable /r/ URL.
- * Deliberately serialized, fail-closed on ambiguous completion/recovery.
+ * Paperclip runs are serialized; TUI work may continue across dispatch and receipt.
  */
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -51,7 +51,7 @@ function asString(v: unknown, fallback: string): string {
 }
 /** Pre-dispatch refusals meaning the seat is occupied: the wake waits instead of failing. */
 export function isTargetBusyRefusal(reason: string): boolean {
-  return /TUI not (?:safely )?idle|previous task unresolved|input guard refused/i.test(reason);
+  return /previous task unresolved|input guard refused/i.test(reason);
 }
 
 export function normalizeOneLine(value: string): string {
@@ -81,17 +81,16 @@ export function parseRemoteConversationId(screen: string): string | null {
 export function isEmptyInputBox(screen: string): boolean {
   const lines = screen.replace(/\r/g, "").trimEnd().split("\n").slice(-35);
   const borders = lines.flatMap((line, i) => /^\s*[─━═]{6,}\s*$/.test(line) ? [i] : []);
-  if (borders.length < 2) return false;
-  const bottom = borders[borders.length - 1]!;
-  const top = borders[borders.length - 2]!;
-  if (lines.length - bottom > 10) return false;
-  const editor = lines.slice(top + 1, bottom).filter(line => line.trim() !== "");
-  if (editor.length !== 1 || !/^\s*>\s*$/.test(editor[0]!)) return false;
-  return !/esc to cancel|Generating\.\.\.|Working\.\.\./i.test(lines.slice(top).join("\n"));
-}
-
-export function isIdleScreen(screen: string): boolean {
-  return isEmptyInputBox(screen);
+  // Running background tasks add another bordered strip beneath the editor.
+  for (let i = borders.length - 1; i > 0; i--) {
+    const bottom = borders[i]!;
+    const top = borders[i - 1]!;
+    if (lines.length - bottom > 10) return false;
+    const editor = lines.slice(top + 1, bottom).filter(line => line.trim() !== "");
+    if (!/^\s*>/.test(editor[0] ?? "")) continue;
+    return editor.length === 1 && /^\s*>\s*$/.test(editor[0]!);
+  }
+  return false;
 }
 
 export type AgyStatusLineSnapshot = {
@@ -115,42 +114,16 @@ export function needsCompaction(snapshot: unknown, limit = AGY_CONTEXT_LIMIT_TOK
 }
 
 /**
- * Advisory two-source check: only a verified idle status plus an empty input
- * editor permits pane input. Status-line callbacks are event-driven, not
- * heartbeats; a stale status can qualify once it has been idle for >=5min.
+ * Only the current editor protects owner typing. Working/tool-use markers,
+ * queued input and status-line freshness do not gate delivery.
  */
 export function inputGuard(
-  screen: string, snapshot: unknown, expectedCwd: string,
-  now = Date.now(), expectedConversationId?: string | null,
+  screen: string,
 ): { allowed: boolean; reason: string } {
-  const refuse = (reason: string) => ({ allowed: false, reason });
-  if (!isEmptyInputBox(screen)) return refuse("TUI input is nonempty, busy, or not recognizable");
-  if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot))
-    return refuse("agy statusLine snapshot missing");
-  const s = snapshot as Partial<AgyStatusLineSnapshot>;
-  if (s.schemaVersion !== 1 || s.agentState !== "idle")
-    return refuse("agy statusLine is not idle");
-  if (s.cwd !== expectedCwd) return refuse("agy statusLine workspace mismatch");
-  if (expectedConversationId && s.conversationId !== expectedConversationId)
-    return refuse("agy statusLine conversation mismatch");
-  if (s.toolConfirmationPending === true || typeof s.pendingInputCount !== "number"
-      || s.pendingInputCount !== 0)
-    return refuse("agy has pending input or confirmation");
-  const observed = Date.parse(s.observedAt ?? "");
-  const idleSince = Date.parse(s.idleSince ?? "");
-  if (!Number.isFinite(observed) || !Number.isFinite(idleSince)
-      || observed > now + 2000 || idleSince > observed || observed < 0)
-    return refuse("agy idle timestamps invalid");
-  const fresh = now - observed <= 15_000;
-  const longIdle = now - idleSince >= 300_000;
-  if (fresh || longIdle)
-    return { allowed: true, reason: fresh ? "current idle + empty input" : "idle >=5min + empty input" };
-  // agy rewrites its statusLine only on state changes, so right after a turn the idle
-  // snapshot is stale. Owner amendment 1 permits typing when the input is empty; the
-  // caller must confirm the empty editor is stable across two captures (STALE_IDLE).
-  return { allowed: true, reason: STALE_IDLE };
+  return isEmptyInputBox(screen)
+    ? { allowed: true, reason: "empty input editor" }
+    : { allowed: false, reason: "TUI input is nonempty or not recognizable" };
 }
-export const STALE_IDLE = "idle statusLine (stale) + empty input; stable-screen check required";
 export type Receipt = { runId: string; issueId: string; status: string; summary: string; report: string };
 export function parseReceipt(raw: string, runId: string, issueId: string): Receipt {
   const parsed: unknown = JSON.parse(raw);
@@ -202,34 +175,21 @@ async function readStatusSnapshot(stateDir: string): Promise<unknown> {
   try { return JSON.parse(await fs.readFile(path.join(stateDir, "status-line.json"), "utf8")); } catch { return null; }
 }
 async function inputReadiness(
-  socket: string, session: string, stateDir: string, cwd: string,
-  expectedConversationId?: string | null,
+  socket: string, session: string,
 ): Promise<{ allowed: boolean; reason: string }> {
-  let snapshot: unknown = null;
-  try { snapshot = JSON.parse(await fs.readFile(path.join(stateDir, "status-line.json"), "utf8")); }
-  catch { /* Missing/unreadable statusLine is NOT proof that agy is idle. */ }
-  const screen = await pane(socket, session);
-  const verdict = inputGuard(screen, snapshot, cwd, Date.now(), expectedConversationId);
-  if (!verdict.allowed || verdict.reason !== STALE_IDLE) return verdict;
-  // Stale idle snapshot: require the same empty, non-busy screen 1.5s later
-  // (no owner keystrokes, no new turn rendering) before any pane input.
-  await sleep(1500);
-  return (await pane(socket, session)) === screen
-    ? verdict
-    : { allowed: false, reason: "agy screen changed during stale-idle stability check" };
+  return inputGuard(await pane(socket, session));
 }
 
 export async function send(
-  socket: string, session: string, message: string, stateDir: string, cwd: string,
-  expectedConversationId?: string | null,
+  socket: string, session: string, message: string, stateDir: string,
 ): Promise<void> {
   if (/[\r\n]/.test(message)) throw new Error("multiline TUI submissions forbidden");
-  const readiness = await inputReadiness(socket, session, stateDir, cwd, expectedConversationId);
+  const readiness = await inputReadiness(socket, session);
   if (!readiness.allowed) throw new Error(`agy input guard refused: ${readiness.reason}`);
   await pasteSubmit(socket, session, message, stateDir);
 }
 
-/** One-line bracketed paste + Enter. Callers own their input guard (agy: send(); claude-rc: its own idle check). */
+/** One-line bracketed paste + Enter. Callers own their editor-text guard. */
 export async function pasteSubmit(socket: string, session: string, message: string, stateDir: string): Promise<void> {
   if (/[\r\n]/.test(message)) throw new Error("multiline TUI submissions forbidden");
   // Private UTF-8 file and named tmux buffer: no prompt in argv, no shared
@@ -249,33 +209,6 @@ export async function pasteSubmit(socket: string, session: string, message: stri
     await tmux(socket, ["delete-buffer", "-b", buffer]).catch(() => {});
     await fs.rm(file, { force: true });
   }
-}
-
-async function waitIdle(
-  socket: string, session: string, stateDir: string, cwd: string, deadline: number,
-  expectedConversationId?: string | null,
-): Promise<boolean> {
-  while (Date.now() < deadline) {
-    try {
-      if ((await inputReadiness(socket, session, stateDir, cwd, expectedConversationId)).allowed) return true;
-    } catch { return false; }
-    await sleep(900);
-  }
-  return false;
-}
-
-async function inspectRemoteConversation(
-  socket: string, session: string, stateDir: string, cwd: string,
-): Promise<{ url: string; id: string }> {
-  await send(socket, session, "/remote-control", stateDir, cwd);
-  await sleep(500);
-  if (!(await waitIdle(socket, session, stateDir, cwd, Date.now() + 12_000)))
-    throw new Error("agy /remote-control did not return to idle");
-  const screen = await pane(socket, session);
-  const url = parseRemoteUrl(screen);
-  const id = parseRemoteConversationId(screen);
-  if (!url || !id) throw new Error("agy /remote-control did not expose the instance URL and conversation ID");
-  return { url, id };
 }
 
 const AGENT_TMP_ROOT = "/Volumes/NVM/AI_Agent_Runtime/tmp";
@@ -304,14 +237,13 @@ async function ensureSession(
   }
   const processName = (await tmux(socket, ["display-message", "-p", ...target(session), "#{pane_current_command}"])).trim();
   if (processName !== "agy") throw new Error(`tmux pane is ${processName}, not agy; refusing to commandeer it`);
-  if (!rejoinOnly && !(await waitIdle(socket, session, stateDir, cwd, Date.now() + 20_000))) {
-    const s = await pane(socket, session);
-    if (/Do you trust the contents/.test(s)) {
-      throw new Error("agy workspace trust prompt: approve this dedicated workspace in the terminal, then retry");
-    }
-    throw new Error("agy TUI not safely idle; inspect statusLine and leave owner's live input intact");
-  }
   const screen = await pane(socket, session);
+  if (/Do you trust the contents/.test(screen))
+    throw new Error("agy workspace trust prompt: approve this dedicated workspace in the terminal, then retry");
+  if (!rejoinOnly) {
+    const readiness = inputGuard(screen);
+    if (!readiness.allowed) throw new Error(`agy input guard refused: ${readiness.reason}`);
+  }
   const url = parseRemoteUrl(screen);
   if (url) await fs.writeFile(path.join(stateDir, "remote-control-url.txt"), url + "\n", { mode: 0o600 });
   const previous = await fs.readFile(path.join(stateDir, "remote-control-url.txt"), "utf8").catch(() => "");
@@ -386,22 +318,19 @@ export async function deliver(ctx: AdapterExecutionContext, receipt: Receipt, ti
 
 /**
  * active.json naming a DIFFERENT issue: a finished receipt is settled onto its issue and the checkpoint archived;
- * a TUI still working defers the wake (busy refusal); only an idle TUI with no receipt is an unknown state and fails.
+ * an unresolved checkpoint remains an ownership conflict, independent of TUI state.
  * The caller holds the state mutex, so no live adapter run owns this checkpoint.
  */
 async function settleForeignCheckpoint(
   ctx: AdapterExecutionContext, raw: string, issueId: string, stateDir: string, activePath: string,
-  socket: string, session: string, cwd: string,
 ): Promise<void> {
   let a: Partial<ActiveDispatch>;
   try { a = JSON.parse(raw) as Partial<ActiveDispatch>; } catch { return; }
   if (!a || typeof a.runId !== "string" || !/^[0-9a-f-]{36}$/i.test(a.runId) || typeof a.issueId !== "string"
       || a.issueId === issueId || !validReceiptPath(stateDir, a.runId, a.receiptPath)) return;
-  const idle = (await inputReadiness(socket, session, stateDir, cwd, a.conversationId)).allowed;
   let receipt: Receipt | null = null;
   try { receipt = parseReceipt(await fs.readFile(a.receiptPath, "utf8"), a.runId, a.issueId); } catch { /* none yet */ }
-  if (!idle) throw new Error(`agy TUI not idle: previous run ${a.runId} (issue ${a.issueId}) is still working`);
-  if (!receipt) return; // idle, no valid receipt: adoptableActive refuses as unknown state
+  if (!receipt) return; // adoptableActive preserves the unresolved ownership conflict
   try {
     await deliver(ctx, receipt);
     await ctx.onLog("stdout", `[agy] Settled finished receipt of run ${a.runId} onto issue ${a.issueId}\n`);
@@ -409,26 +338,6 @@ async function settleForeignCheckpoint(
     await ctx.onLog("stderr", `[agy] Could not settle receipt of run ${a.runId} onto issue ${a.issueId} (${e instanceof Error ? e.message : e}); receipt kept at ${a.receiptPath}\n`);
   }
   await fs.rename(activePath, path.join(stateDir, `active.stale-${a.runId}-${Date.now()}.json`));
-}
-
-/**
- * Deploy-interrupted run of the SAME issue: no receipt, idle quiet TUI older than minAgeMs means the work is over.
- * Adopting it would idle-fail every later wake, so archive it and let the caller redispatch.
- */
-export async function archiveDeadSameIssueCheckpoint(
-  raw: string, issueId: string, stateDir: string, activePath: string,
-  socket: string, session: string, cwd: string, minAgeMs = 180_000,
-): Promise<boolean> {
-  let a: Partial<ActiveDispatch> & { startedAt?: string };
-  try { a = JSON.parse(raw); } catch { return false; }
-  if (!a || a.issueId !== issueId || typeof a.runId !== "string" || !/^[0-9a-f-]{36}$/i.test(a.runId)
-      || !validReceiptPath(stateDir, a.runId, a.receiptPath)) return false;
-  const started = Date.parse(a.startedAt ?? "");
-  if (!Number.isFinite(started) || Date.now() - started < minAgeMs) return false;
-  if (await fs.stat(a.receiptPath).then(() => true, () => false)) return false;
-  if (!(await inputReadiness(socket, session, stateDir, cwd, a.conversationId)).allowed) return false;
-  await fs.rename(activePath, path.join(stateDir, `active.unverified-${a.runId}.json`));
-  return true;
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
@@ -462,12 +371,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const activePath = path.join(stateDir, "active.json");
     let activeRaw = await fs.readFile(activePath, "utf8").catch(() => "");
     if (activeRaw) {
-      await settleForeignCheckpoint(ctx, activeRaw, issueId, stateDir, activePath, socket, session, cwd);
+      await settleForeignCheckpoint(ctx, activeRaw, issueId, stateDir, activePath);
       activeRaw = await fs.readFile(activePath, "utf8").catch(() => "");
-    }
-    if (activeRaw && await archiveDeadSameIssueCheckpoint(activeRaw, issueId, stateDir, activePath, socket, session, cwd)) {
-      await ctx.onLog("stdout", "[agy] Archived deploy-interrupted checkpoint for this issue (idle, no receipt); redispatching\n");
-      activeRaw = "";
     }
     const adopted = adoptableActive(activeRaw, issueId, stateDir);
     const rcUrl = await ensureSession(socket, session, cwd, stateDir, Boolean(adopted), model);
@@ -496,18 +401,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       dispatched = true;
       await ctx.onLog("stdout", `[agy] Adopting dispatched run ${adopted.runId} for issue ${issueId}; no re-dispatch; receipt ${receiptPath}\n`);
     } else {
-    const before = await inspectRemoteConversation(socket, session, stateDir, cwd);
-    if (before.url !== rcUrl) throw new Error("agy RC instance URL changed during inspection");
-    // Verify /new via /remote-control's live conversation ID, NOT the cache:
-    // last_conversations.json is updated only after a model turn in agy 1.4.12.
-    await send(socket, session, "/new", stateDir, cwd, before.id);
-    await sleep(500);
-    if (!(await waitIdle(socket, session, stateDir, cwd, Date.now() + 12_000)))
-      throw new Error("agy /new did not settle to an idle prompt");
-    const fresh = await inspectRemoteConversation(socket, session, stateDir, cwd);
-    if (fresh.url !== rcUrl || fresh.id === before.id)
-      throw new Error("agy /new did not isolate a conversation under the same RC instance");
-    conversationId = fresh.id;
+    // Reuse the live conversation: /new could interrupt work or drop a queued wake.
+    // Exact run/issue IDs in the receipt bind completion without clearing the TUI.
+    conversationId = parseRemoteConversationId(await pane(socket, session));
     const promptBase = asString(cfg.promptTemplate, DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE);
     const { taskContextNote, wakePrompt } = selectPaperclipPromptSections(ctx.context);
     const instructionsFilePath = asString(cfg.instructionsFilePath, "");
@@ -534,7 +430,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (prompt.length > 50_000) throw new Error("agy prompt exceeds TUI paste budget");
     // No checkpoint is created for an initial guard refusal. Once a checkpoint
     // exists, a crash or uncertain paste still requires reconciliation.
-    const preflight = await inputReadiness(socket, session, stateDir, cwd, conversationId);
+    const preflight = await inputReadiness(socket, session);
     if (!preflight.allowed) throw new Error(`agy input guard refused before dispatch: ${preflight.reason}`);
     await fs.writeFile(activePath, JSON.stringify({
       runId: ctx.runId, issueId, receiptPath, rcUrl, tmuxSocket: socket, tmuxSession: session,
@@ -543,38 +439,31 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ctx.onDispatch?.();
     dispatched = true;
     await ctx.onLog("stdout", `[agy] Dispatching issue ${issueId} in shared RC ${rcUrl}; receipt ${receiptPath}\n`);
-    await send(socket, session, prompt, stateDir, cwd, conversationId);
+    await send(socket, session, prompt, stateDir);
     }
     const deadline = Date.now() + timeoutMs;
     let receipt: Receipt | null = null;
-    let idleWithoutReceipt = 0;
     let compactAfter = 0;
     while (Date.now() < deadline) {
       if (ctx.signal?.aborted) throw new Error("agy run cancelled; shared TUI left intact, active checkpoint preserved");
       const raw = await fs.readFile(receiptPath, "utf8").catch(() => "");
       if (raw) {
         receipt = parseReceipt(raw, receiptRunId, issueId);
-        if (await waitIdle(socket, session, stateDir, cwd, Date.now() + 4000, conversationId)) break;
-      } else if (adopted) {
-        // An adopted turn that has gone idle with no receipt will not finish by itself.
-        idleWithoutReceipt = (await inputReadiness(socket, session, stateDir, cwd, conversationId)).allowed
-          ? idleWithoutReceipt + 1 : 0;
-        if (idleWithoutReceipt >= 5)
-          return failure("agy adopted dispatch is idle without a receipt; checkpoint retained for operator reconciliation");
+        break;
       }
-      // 200k context cap: at an idle prompt with no receipt yet, compact once per overshoot, then resume.
+      // 200k context cap: compact with an empty editor, regardless of turn activity.
       if (!receipt && Date.now() >= compactAfter && needsCompaction(await readStatusSnapshot(stateDir))
-          && (await inputReadiness(socket, session, stateDir, cwd, conversationId)).allowed) {
+          && (await inputReadiness(socket, session)).allowed) {
         await ctx.onLog("stdout", `[agy] context over ${AGY_CONTEXT_LIMIT_TOKENS} tokens; sending /compact\n`);
-        await send(socket, session, AGY_COMPACT_PROMPT, stateDir, cwd, conversationId);
+        await send(socket, session, AGY_COMPACT_PROMPT, stateDir);
         compactAfter = Date.now() + 120_000;
       }
       // A terminated pane must never be mistaken for successful agent work.
       await tmux(socket, ["has-session", ...target(session)]);
       await sleep(1100);
     }
-    if (!receipt || !(await waitIdle(socket, session, stateDir, cwd, Date.now() + 1500, conversationId)))
-      return failure("agy did not produce a validated completion receipt at an idle TUI; checkpoint retained", true);
+    if (!receipt)
+      return failure("agy did not produce a validated completion receipt; checkpoint retained", true);
     await deliver(ctx, receipt);
     await ctx.onLog("stdout", `[agy] Done ${issueId}: ${receipt.summary}; conversation=${conversationId ?? "unknown"}\n`);
     await fs.rm(activePath); // completed only after authenticated report + issue closure
