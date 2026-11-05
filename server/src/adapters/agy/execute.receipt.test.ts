@@ -126,6 +126,33 @@ describe("agy busy dispatch and receipt completion", () => {
     expect(api).toHaveBeenCalledTimes(3);
   });
 
+  it("reattaches the exact run checkpoint without submitting another prompt", async () => {
+    await fs.writeFile(path.join(dir, "active.json"), JSON.stringify({
+      runId: RUN, issueId: "probe", receiptPath: receiptFilePath(dir, RUN), rcUrl: URL, conversationId: conversation,
+    }));
+    await fs.writeFile(receiptFilePath(dir, RUN), JSON.stringify(receipt()));
+    const ctx = context(dir);
+    ctx.context.paperclipRestartReattach = true;
+    const result = await execute(ctx);
+    expect(result.exitCode).toBe(0);
+    expect(submitted).toEqual([]);
+    expect(ctx.onDispatch).toHaveBeenCalledOnce();
+  });
+
+  it.each(["missing", "other run"])("does not submit on restart when the checkpoint is %s", async (kind) => {
+    if (kind === "other run") await fs.writeFile(path.join(dir, "active.json"), JSON.stringify({
+      runId: OLD, issueId: "probe", receiptPath: receiptFilePath(dir, OLD), rcUrl: URL,
+    }));
+    const ctx = context(dir);
+    ctx.context.paperclipRestartReattach = true;
+    const result = await execute(ctx);
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toMatch(/restart checkpoint/);
+    expect(result.executionRecovery).toBeUndefined();
+    expect(submitted).toEqual([]);
+    expect(api).not.toHaveBeenCalled();
+  });
+
   it("settles a foreign receipt while busy, then dispatches the current wake", async () => {
     await fs.writeFile(path.join(dir, "active.json"), JSON.stringify({
       runId: OLD, issueId: "previous", receiptPath: receiptFilePath(dir, OLD), rcUrl: URL,

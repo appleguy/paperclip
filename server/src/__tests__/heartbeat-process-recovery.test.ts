@@ -4450,9 +4450,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
-  it("re-enters a restart-reattachable legacy run under the same run id", async () => {
+  it.each(["claude_rc_local", "agy_local"])("re-enters a %s restart-reattachable run under the same run id", async (adapterType) => {
     const { companyId, agentId, runId } = await seedRunFixture({
-      adapterType: "claude_rc_local",
+      adapterType,
       agentStatus: "running",
       processPid: null,
       processGroupId: null,
@@ -4476,7 +4476,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       const heartbeat = heartbeatService(db);
       await heartbeat.prepareHotRestartShutdown("SIGTERM", new Date("2026-08-01T00:06:00.000Z"));
 
-      const adoption = await heartbeat.reconcileHotRestartAdoption(new Date("2026-08-01T00:07:00.000Z"));
+      // Startup uses a new service instance; the shutting-down instance must
+      // continue to refuse execution even after writing its snapshot.
+      const restartedHeartbeat = heartbeatService(db);
+      const adoption = await restartedHeartbeat.reconcileHotRestartAdoption(new Date("2026-08-01T00:07:00.000Z"));
       expect(adoption).toMatchObject({ mode: "reported", adoptedRunIds: [runId], lostRunIds: [], skippedRunIds: [] });
 
       await vi.waitFor(async () => {
@@ -4485,6 +4488,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       }, { timeout: 10_000 });
       expect(mockAdapterExecute).toHaveBeenCalledOnce();
       expect(mockAdapterExecute.mock.calls[0]?.[0]).toMatchObject({ runId });
+      if (adapterType === "agy_local") expect(mockAdapterExecute.mock.calls[0]?.[0]).toMatchObject({ context: { paperclipRestartReattach: true } });
       const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0]);
       const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
       expect(events.map((event) => event.message)).toContain("Re-entering run after hot restart; the adapter rejoins its provider work");

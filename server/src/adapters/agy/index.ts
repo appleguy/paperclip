@@ -38,6 +38,9 @@ export const agyAdapter: ServerAdapterModule = {
   ],
   supportsLocalAgentJwt: true,
   supportsInstructionsBundle: true,
+  // The provider lives in tmux; restart recovery re-enters only the exact
+  // run checkpoint and never submits a replacement prompt.
+  supportsRestartReattach: true,
   instructionsPathKey: "instructionsFilePath",
   agentConfigurationDoc: `# agy_local: one shared Antigravity Remote Control session
 

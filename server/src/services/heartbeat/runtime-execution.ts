@@ -816,6 +816,11 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       // heartbeat run snapshot.
       const adapterContext: Record<string, unknown> = {
         ...context,
+        // This value comes from the claimed run, not the incoming wake payload.
+        // An agy reattach must not submit again if its checkpoint is missing.
+        ...(agent.adapterType === "agy_local" ? {
+          paperclipRestartReattach: typeof parseObject(parseObject(run.resultJson).restartReattach).count === "number",
+        } : {}),
         ...(legacyQuestionResponse
           ? {
               [PAPERCLIP_WAKE_PAYLOAD_KEY]: {
