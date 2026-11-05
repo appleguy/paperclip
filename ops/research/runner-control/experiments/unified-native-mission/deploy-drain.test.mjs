@@ -1,7 +1,8 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
-import { verifyOwned, jsonRequest, pauseOwned, selectStaleUnowned,
+import { spawn } from "node:child_process";
+import { verifyOwned, jsonRequest, pauseOwned, selectStaleUnowned, reclaimOrphan,
   interruptStaleUnowned, waitForRestartReady, retryHealthyIdentity } from "./deploy-drain.mjs";
 
 const id = "11111111-1111-4111-8111-111111111111";
@@ -15,6 +16,63 @@ const agent = { adapterType: "opencode_local", url, cwd };
 const binding = { version: 1, agentId, taskId: issue, runId: id, sessionId: sid, url, cwd };
 const plan = (runs = [run], bindings = [binding], active = { [sid]: { type: "busy" } }) =>
   verifyOwned(runs, new Map([[agentId, agent]]), bindings, new Map([[url, active]]));
+
+describe("orphan deploy fence recovery", () => {
+  it("reclaims only a matching dead owner, retaining live, unrelated, and replaced fences", async () => {
+    const dir = await fs.mkdtemp("/Volumes/NVM/AI_Agent_Runtime/tmp/sco1020-test-");
+    const original = { draining: true, startedAt: "2020-01-01T00:00:00.000Z", serverPid: 123 };
+    await fs.writeFile(dir + "/pc-deploy-drain-456.json", JSON.stringify({ schema: 1,
+      startedAt: original.startedAt, serverPid: original.serverPid }));
+    const calls = [];
+    let state = original;
+    let reads = 0;
+    const client = { api: async method => {
+      calls.push(method);
+      if (method === "DELETE") return {};
+      reads++;
+      return state;
+    } };
+    assert.equal(await reclaimOrphan(client, dir, () => true), false);
+    assert.deepEqual(calls, ["GET"]);
+    calls.length = 0;
+    state = { ...original, ownerId: "other" };
+    assert.equal(await reclaimOrphan(client, dir, () => false), false);
+    assert.deepEqual(calls, ["GET"]);
+    calls.length = 0;
+    reads = 0;
+    state = original;
+    const changed = { api: async method => {
+      calls.push(method);
+      return ++reads === 1 ? original : { ...original, startedAt: "different" };
+    } };
+    assert.equal(await reclaimOrphan(changed, dir, () => false), false);
+    assert.deepEqual(calls, ["GET", "GET"]);
+    calls.length = 0;
+    assert.equal(await reclaimOrphan(client, dir, () => false), true);
+    assert.deepEqual(calls, ["GET", "GET", "DELETE"]);
+  });
+});
+
+describe("live deploy session isolation", () => {
+  it("continues after its launcher's process group is killed", async () => {
+    const dir = await fs.mkdtemp("/Volumes/NVM/AI_Agent_Runtime/tmp/sco1020-session-");
+    const source = await fs.readFile("/Volumes/NVM/Paperclip/bin/pc-deploy", "utf8");
+    const prefix = source.split("# Self-copy:")[0];
+    assert.match(prefix, /POSIX::setsid/);
+    const fixture = dir + "/deploy.sh";
+    await fs.writeFile(fixture, prefix + '\nprintf ready > "$1/ready"\nsleep 2\nprintf survived > "$1/result"\n');
+    const child = spawn("/bin/sh", [fixture, dir], { detached: true, stdio: "ignore" });
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      if (await fs.stat(dir + "/ready").then(() => true, () => false)) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    await fs.stat(dir + "/ready");
+    process.kill(-child.pid, "SIGKILL");
+    await new Promise(resolve => setTimeout(resolve, 2400));
+    assert.equal(await fs.readFile(dir + "/result", "utf8"), "survived");
+  });
+});
 
 describe("deploy drain exact ownership and fail-closed rules", () => {
   it("selects only a run-owned active OpenCode session", () => {

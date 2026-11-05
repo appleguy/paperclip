@@ -170,6 +170,34 @@ async function held(client, manifest) {
   ensure(s.draining && s.startedAt === manifest.startedAt, "deploy admission fence was lost or replaced");
   return s;
 }
+
+// Legacy manifests encode the deploy shell PID in their filename. A reused
+// PID is treated as live: never free a fence on an inconclusive observation.
+export async function reclaimOrphan(client, directory = SCRATCH, alive = pid => {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { if (error.code === "ESRCH") return false; throw error; }
+}) {
+  const before = await client.api("GET", "/api/instance/task-drain?upgradeReadiness=1");
+  if (!before.draining) return false;
+  if (before.ownerId || typeof before.startedAt !== "string" || !Number.isInteger(before.serverPid)) return false;
+  const files = await fs.readdir(directory);
+  for (const name of files) {
+    const match = /^pc-deploy-drain-([1-9][0-9]*)\.json$/.exec(name);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    if (!Number.isSafeInteger(pid) || pid <= 1) continue;
+    const record = await readJson(path.join(directory, name)).catch(() => null);
+    if (record?.schema !== 1 || record.startedAt !== before.startedAt ||
+        record.serverPid !== before.serverPid || alive(pid)) continue;
+    const current = await client.api("GET", "/api/instance/task-drain?upgradeReadiness=1");
+    if (!current.draining || current.ownerId || current.startedAt !== before.startedAt ||
+        current.serverPid !== before.serverPid || alive(pid)) return false;
+    await client.api("DELETE", "/api/instance/task-drain");
+    console.log("deploy-drain: reclaimed fence from dead deploy " + pid);
+    return true;
+  }
+  return false;
+}
 async function listRunning(client) {
   const companies = await client.api("GET", "/api/companies");
   ensure(Array.isArray(companies) && companies.length > 0 && companies.length < 100,
@@ -455,9 +483,10 @@ export async function pauseOwned(planned, providers, persist = async () => {}) {
 
 async function main() {
   const [action, filename, extra] = process.argv.slice(2);
-  ensure(["verified", "codex-live", "check", "pace", "begin", "wait", "pause", "verify", "release", "finish"].includes(action),
+  ensure(["verified", "codex-live", "check", "pace", "reclaim", "begin", "wait", "pause", "verify", "release", "finish"].includes(action),
     "unknown deploy-drain action");
   const client = await makeClient();
+  if (action === "reclaim") { await reclaimOrphan(client); return; }
   if (action === "verified") {
     const verified = await isVerified(client, filename);
     console.log("deploy-drain: serving process " + (verified ? "verified" : "unverified"));
@@ -498,6 +527,7 @@ async function main() {
   }
   const file = safePath(filename);
   if (action === "begin") {
+    await reclaimOrphan(client);
     const before = await client.api("GET", "/api/instance/task-drain?upgradeReadiness=1");
     ensure(!before.draining && Number.isInteger(before.serverPid), "another task drain owns admission");
     const started = await client.api("POST", "/api/instance/task-drain", { ttlMs: 1_200_000 });
