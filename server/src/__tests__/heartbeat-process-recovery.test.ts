@@ -3991,6 +3991,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       const heartbeat = heartbeatService(db);
       await expect(heartbeat.prepareHotRestartShutdown("SIGTERM")).resolves.toMatchObject({ mode: "not_requested" });
       expect(mockCloseIdleWarmNativeSessionsForRestart).toHaveBeenCalledOnce();
+      await expect(heartbeat.resolveSchedulingSuppression()).resolves.toEqual({ suppressed: true, reason: "server_shutdown" });
+      await expect(heartbeat.resumeQueuedRunsAfterDrain()).resolves.toBeUndefined();
+    });
+  });
+
+  it("leaves a queued run for the next server after shutdown begins", async () => {
+    const { companyId, agentId, runId } = await seedRunFixture({ agentStatus: "idle", runStatus: "queued" });
+    await withTempPaperclipHome(async () => {
+      const heartbeat = heartbeatService(db);
+      await heartbeat.prepareHotRestartShutdown("SIGTERM");
+      await expect(heartbeat.resumeQueuedRunsForAgent(companyId, agentId)).resolves.toEqual([]);
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(run.status).toBe("queued");
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
     });
   });
 

@@ -811,12 +811,15 @@ function isTruthyRuntimeEnvValue(value: string | undefined) {
 
 export function resolveHeartbeatSchedulingSuppression(
   env: Record<string, string | undefined> = process.env,
-  overrides: { allowWorktreeRunExecution?: boolean } = {},
+  overrides: { allowWorktreeRunExecution?: boolean; shutdownInProgress?: boolean } = {},
 ): {
   suppressed: boolean;
   reason:
-    "worktree_instance" | "database_restore_in_progress" | "task_drain" | null;
+    "worktree_instance" | "database_restore_in_progress" | "task_drain" | "server_shutdown" | null;
 } {
+  if (overrides.shutdownInProgress) {
+    return { suppressed: true, reason: "server_shutdown" };
+  }
   if (
     isTruthyRuntimeEnvValue(env.PAPERCLIP_IN_WORKTREE) &&
     !overrides.allowWorktreeRunExecution
@@ -941,6 +944,7 @@ export function heartbeatService(
     const override = await resolveWorktreeRunExecutionOverride(fresh);
     return resolveHeartbeatSchedulingSuppression(runtimeEnv, {
       allowWorktreeRunExecution: override.allowed,
+      shutdownInProgress,
     });
   };
   const getWorktreeExecutionCutoff = async () => {
@@ -1854,7 +1858,7 @@ export function heartbeatService(
       } catch (err) {
         logger.error(
           { err, runId },
-          "failed to release run claimed just before task-drain suppression; the run row stays running, and the orphan reaper finalizes it and releases the issue lock on its next cycle",
+          "failed to release run claimed just before scheduling suppression; the run row stays running, and the orphan reaper finalizes it and releases the issue lock on its next cycle",
         );
       }
       return;

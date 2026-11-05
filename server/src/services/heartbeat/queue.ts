@@ -214,7 +214,7 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
   isSameTaskScope: (left: string | null, right: string | null) => boolean;
   runTaskKey: (run: HeartbeatRun) => string | null;
   filterZombieCoalesceTarget: <T extends { id: string; status: string }>(run: T | null, live: { has(id: string): boolean }) => T | null;
-  getSchedulingSuppression: () => Promise<{ suppressed: boolean; reason: "worktree_instance" | "database_restore_in_progress" | "task_drain" | null }>;
+  getSchedulingSuppression: () => Promise<{ suppressed: boolean; reason: "worktree_instance" | "database_restore_in_progress" | "task_drain" | "server_shutdown" | null }>;
   canStartNewExternalBotWork: (agent: typeof agents.$inferSelect) => Promise<boolean>;
   executeRun: (runId: string) => Promise<void>;
   releaseIssueExecutionAndPromote: (run: Pick<HeartbeatRun, "id" | "companyId">, options?: { suppressImmediateRecovery?: boolean; resumeStrandedQueue?: boolean; deferredPostCommitEffects?: WakeQueuePostCommitEffect[] }) => Promise<unknown>;
@@ -2536,7 +2536,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     };
 
     const schedulingSuppression = await getSchedulingSuppression();
-    // A task drain holds ADMISSION, not the request. The drain is a
+    // A task drain or server shutdown holds ADMISSION, not the request. The drain is a
     // process-local pre-restart hold, so a wake that arrives while it is
     // active still names real work that must run once the process comes
     // back: leave it in the durable queue and let the dispatch-side checks
@@ -2547,7 +2547,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     // run and no path until a person noticed.
     if (
       schedulingSuppression.suppressed &&
-      schedulingSuppression.reason !== "task_drain"
+      schedulingSuppression.reason !== "task_drain" &&
+      schedulingSuppression.reason !== "server_shutdown"
     ) {
       await writeSkippedHeartbeatRequest("heartbeat.scheduling_suppressed", {
         reason: schedulingSuppression.reason,

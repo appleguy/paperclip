@@ -47,6 +47,16 @@ describe("heartbeat queue module boundary", () => {
     expect(deps.executeRun).not.toHaveBeenCalled();
   });
 
+  it("does not dispatch queued work during server shutdown", async () => {
+    const database = guardedDatabase();
+    const deps = callbacks(database.db);
+    deps.getSchedulingSuppression.mockResolvedValue({ suppressed: true, reason: "server_shutdown" });
+    const queue = createHeartbeatQueue(database.db, deps);
+    expect(await queue.startNextQueuedRunForAgent("agent")).toEqual([]);
+    expect(database.access).not.toHaveBeenCalled();
+    expect(deps.executeRun).not.toHaveBeenCalled();
+  });
+
   it("tracks pending wakes across instances and clears each rejected wake", async () => {
     const database = guardedDatabase();
     const deps = callbacks(database.db);
