@@ -15,7 +15,7 @@ import { claimedAdapterType, hasConversationContinuationPolicy } from "./convers
 import { canonicalExecutionUuid } from "./execution-identity.js";
 import { randomUUID } from "node:crypto";
 import { and, desc, eq, getTableColumns, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
-import { environmentLeases, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { agents, environmentLeases, heartbeatRuns, issueRecoveryActions, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
@@ -103,6 +103,12 @@ export function legacyExecutionNeedsReconciliation(
  * The synchronous classifier stays conservative for callers without a DB proof. */
 export async function legacyExecutionNeedsReconciliationWithEvidence(db: Db, run: Run): Promise<boolean> {
   if (run.status === "interrupted" && await isInterruptedNativePreparation(db, run)) return false;
+  // Runs cut off by a deploy before adapterDispatch was recorded carry no adapter claim; the agent's
+  // adapter is the only evidence left that this was a claude_rc run with its TUI and checkpoint intact.
+  if (run.errorCode === "server_shutdown_interrupted" && claimedAdapterType(run) === null) {
+    const [agent] = await db.select({ adapterType: agents.adapterType }).from(agents).where(eq(agents.id, run.agentId)).limit(1);
+    if (agent?.adapterType === "claude_rc") run = { ...run, runnerProfileJson: { ...run.runnerProfileJson, adapterDispatch: { adapterType: "claude_rc" } } };
+  }
   return await hasUnrestoredRemoteWorkspace(db, run) ||
     (legacyExecutionNeedsReconciliation(run) && !(await isPreDispatchReviewWaitVerified(db, run))
       && !(await isPreDispatchExecutionWaitVerified(db, run))

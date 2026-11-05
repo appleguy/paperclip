@@ -1,6 +1,6 @@
 import { isPreDispatchReviewWait } from "./pre-dispatch-review-wait.js";
 import { expect, it } from "vitest";
-import { legacyExecutionNeedsReconciliation } from "./legacy-execution-recovery.js";
+import { legacyExecutionNeedsReconciliation, legacyExecutionNeedsReconciliationWithEvidence } from "./legacy-execution-recovery.js";
 
 const stopped = {
   runtimeMode: "legacy", status: "cancelled", errorCode: "cancelled",
@@ -119,4 +119,11 @@ it("does not hold a claude_rc run interrupted by a server shutdown (TUI left int
     runnerProfileJson: { adapterDispatch: { adapterType: "claude_rc" } } } as never;
   expect(legacyExecutionNeedsReconciliation(run)).toBe(false);
   expect(legacyExecutionNeedsReconciliation({ ...(run as object), runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } } } as never)).toBe(true);
+});
+
+it("falls back to the agent adapter for deploy-interrupted runs that recorded no adapterDispatch (SCO-817)", async () => {
+  const fakeDb = (adapterType: string) => ({ select: () => ({ from: () => ({ where: () => ({ limit: async () => [{ adapterType }] }) }) }) }) as never;
+  const run = { id: "r", agentId: "a", runtimeMode: "legacy", status: "interrupted", errorCode: "server_shutdown_interrupted",
+    resultJson: {}, runnerProfileJson: {} } as never;
+  expect(await legacyExecutionNeedsReconciliationWithEvidence(fakeDb("claude_rc"), run)).toBe(false);
 });
