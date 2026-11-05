@@ -56,6 +56,7 @@ it("settles shell, agent and MCP writes from dispatch Git evidence and rejects d
     reasons: [expect.stringContaining(`dispatch baseline unavailable for repository ${unborn}`)] });
   // Keep subsequent negative controls scoped to the original repository.
   deps.repos = async () => [repo];
+  baseline.unbornRepos = [];
   expect(await check([own], ["peer.ts"], { ...baseline, repos: [] })).toMatchObject({ ok: false, evidence: "unknown" });
   expect((await check([old])).ok).toBe(false);
   expect((await check([own], [])).ok).toBe(true); // unchanged dirt is fingerprinted

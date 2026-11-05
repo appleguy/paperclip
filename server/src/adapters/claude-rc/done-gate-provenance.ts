@@ -7,37 +7,69 @@ import { dirtyFingerprints, statusPaths } from "./done-gate-worktree.js";
 export type GateBaseline = {
   runId: string;
   repos: Array<{ repo: string; head: string; dirtyPaths?: string[]; dirtyFingerprints?: Record<string, string> }>;
+  unbornRepos?: string[];
+  unavailableRepos?: string[];
 };
 const SHA = /^[0-9a-f]{40}$/i;
+
+/** Two bounded attempts; a failed process/read is never evidence of no commits. */
+async function readHead(repo: string, deps: GateDeps): Promise<string | "unborn" | "unavailable"> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const head = await deps.git(repo, ["rev-parse", "--verify", "HEAD^{commit}"]);
+      if (head.code === 0 && !head.error && SHA.test(head.out.trim())) return head.out.trim();
+      if (head.code !== 128 || head.error) continue;
+      // A symbolic HEAD whose branch ref is absent positively identifies an
+      // unborn repository. Corrupt objects, detached HEAD and execution errors
+      // do not qualify. No locale-dependent stderr matching is needed.
+      const branch = await deps.git(repo, ["symbolic-ref", "--quiet", "HEAD"]);
+      if (branch.code !== 0 || branch.error || !branch.out.trim().startsWith("refs/heads/")) continue;
+      const ref = await deps.git(repo, ["show-ref", "--verify", "--quiet", branch.out.trim()]);
+      if (ref.code === 1 && !ref.error) return "unborn";
+    } catch {
+      // Injected/process dependencies can reject rather than returning error.
+    }
+  }
+  return "unavailable";
+}
 
 /** Called before dispatch; a receipt must never supply or replace this record. */
 export async function captureDoneGateBaseline(runId: string, deps: GateDeps): Promise<GateBaseline> {
   const repos: GateBaseline["repos"] = [];
+  const unbornRepos: string[] = [];
+  const unavailableRepos: string[] = [];
   for (const repo of await deps.repos()) {
-    const head = await deps.git(repo, ["rev-parse", "--verify", "HEAD^{commit}"]);
-    // Unborn repositories remain absent; completion rechecks that they stayed unborn.
-    if (head.code === 0 && !head.error && SHA.test(head.out.trim())) {
+    const canonical = await fs.realpath(repo);
+    const head = await readHead(repo, deps);
+    if (head === "unborn") unbornRepos.push(canonical);
+    else if (head === "unavailable") unavailableRepos.push(canonical);
+    else {
       const dirty = await deps.git(repo, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
       const dirtyPaths = statusPaths(dirty.out);
-      repos.push({ repo: await fs.realpath(repo), head: head.out.trim(),
+      repos.push({ repo: canonical, head,
         ...(dirty.code === 0 && !dirty.error ? { dirtyPaths,
           dirtyFingerprints: await dirtyFingerprints(repo, dirtyPaths, deps) } : {}) });
     }
   }
-  return { runId, repos };
+  return { runId, repos, unbornRepos, unavailableRepos };
 }
 
 /** Unknown tools are settled against every original dispatch repository, never prose. */
 export async function baselineMutationPaths(receipt: GateReceipt, deps: GateDeps, baseline: GateBaseline, observedCommits: string[] = []): Promise<string[]> {
-  if (!baseline.runId || receipt.runId !== baseline.runId || !Array.isArray(baseline.repos) || !baseline.repos.length)
+  if (!baseline.runId || receipt.runId !== baseline.runId || !Array.isArray(baseline.repos)
+    || (!baseline.repos.length && !baseline.unbornRepos?.length && !baseline.unavailableRepos?.length))
     throw new Error("completion receipt does not match a complete dispatch baseline");
-  for (const repo of await deps.repos()) {
+  if (baseline.unavailableRepos?.length)
+    throw new Error(`dispatch HEAD evidence unavailable for repository ${baseline.unavailableRepos[0]}`);
+  // Recheck recorded unborn repos even if repository discovery changes later.
+  const currentRepos = new Set([...(await deps.repos()), ...(baseline.unbornRepos ?? [])]);
+  for (const repo of currentRepos) {
     const canonical = await fs.realpath(repo);
     if (!baseline.repos.some(start => start.repo === canonical)) {
-      const head = await deps.git(repo, ["rev-parse", "--verify", "HEAD^{commit}"]);
+      const head = await readHead(repo, deps);
       // Match capture's omission of unborn repositories, without exempting a
       // repository that gained its first commit after dispatch.
-      if (head.code !== 0 && !head.error) continue;
+      if (head === "unborn") continue;
       throw new Error(`dispatch baseline unavailable for repository ${canonical}`);
     }
   }
