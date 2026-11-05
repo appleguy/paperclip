@@ -1,4 +1,5 @@
 /**
+ * (SCO-818: first hot-deployed module; this line shipped without a server restart.)
  * SCO-782: the Remote Control name is derived, never configured:
  * "<hops below Board> <Paperclip agent name>", sanitized and capped.
  * A bad name is repaired, never a reason to fail a wake.
