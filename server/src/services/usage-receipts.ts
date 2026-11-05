@@ -25,7 +25,7 @@ import { queueBudgetEvaluation } from "./budget-evaluation-work.js";
 
 const token = z.number().int().nonnegative().max(2_147_483_647);
 const price = z.number().finite().nonnegative().nullable().optional();
-const usage = z.object({ inputTokens: token, outputTokens: token, cachedInputTokens: token.optional(), cacheWriteTokens: token.optional() });
+const usage = z.object({ inputTokens: token, outputTokens: token, cachedInputTokens: token.optional(), cacheWriteTokens: token.optional(), peakContextTokens: token.optional() });
 const checkpointSchema = z.object({
   attemptId: z.string().uuid().optional(), usage: usage.optional(),
   usageByModel: z.array(z.object({ model: z.string().min(1).max(250), usage, costUsd: z.number().finite().nonnegative() })).max(500).optional(),
@@ -642,6 +642,7 @@ export async function createRunUsageRecorder(db: Db, input: { companyId: string;
       cachedInputTokens: parts.reduce((sum, item) => sum + (item.usage?.cachedInputTokens ?? 0), 0),
       ...(parts.some(item => item.usage?.cacheWriteTokens !== undefined) ? { cacheWriteTokens: parts.reduce((sum, item) => sum + (item.usage?.cacheWriteTokens ?? 0), 0) } : {}),
       outputTokens: parts.reduce((sum, item) => sum + (item.usage?.outputTokens ?? 0), 0),
+      ...(parts.some(item => item.usage?.peakContextTokens) ? { peakContextTokens: Math.max(...parts.map(item => item.usage?.peakContextTokens ?? 0)) } : {}),
     } };
     if (parts.length > 1) {
       let total = 0n, priced = true;
