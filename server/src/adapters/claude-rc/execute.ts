@@ -33,11 +33,6 @@ const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, m
 function asString(v: unknown, fallback: string): string {
   return typeof v === "string" && v.trim() ? v.trim() : fallback;
 }
-/**
- * Fallback requires an *empty* owner editor and an idle TUI. A historical
- * prompt, active permission menu or half-written owner message never qualifies.
- * Claude's static "Try ..." placeholder is not typed owner input.
- */
 /** Screen text without dim (ghost prompt suggestion) spans or other escapes. */
 async function claudePane(socket: string, session: string): Promise<string> {
   const raw = await tmux(socket, ["capture-pane", "-t", session, "-p", "-J", "-e", "-S", "-150"]);
@@ -102,30 +97,24 @@ export async function seatConversation(session: string, cwd: string, dir = path.
 export function isDevChannelPrompt(screen: string): boolean {
   return /Loading development channels/i.test(screen) && /I am using this for local development/i.test(screen);
 }
-async function waitIdle(socket: string, session: string, deadline: number): Promise<boolean> {
-  while (Date.now() < deadline) {
-    try {
-      const s = await claudePane(socket, session);
-      if (isClaudeIdle(s)) return true;
-      if (isDevChannelPrompt(s)) await tmux(socket, ["send-keys", "-t", session, "Enter"]);
-    } catch { return false; }
-    await sleep(900);
-  }
-  return false;
-}
-
-/** SCO-771: the native /goal is a typed slash command; the input line must be empty (NBSP after the prompt glyph). */
+/** Guard owner input only; a busy turn and Claude's editor placeholders are safe. */
 export function isPromptEmpty(screen: string): boolean {
   const tail = screen.replace(/\r/g, "").trimEnd().split("\n").slice(-18);
   const line = tail.findLast(l => /^\s*❯/.test(l));
-  return line !== undefined && /^❯[\s\u00a0]*$/.test(line.trimStart());
+  if (line === undefined) return false;
+  const input = line.replace(/^\s*❯/, "").trim();
+  return input === "" || /^Try "[^"]*"$/.test(input) || input === "Press up to edit queued messages";
 }
 /** Type one slash command literally, then Enter; true when the harness echoed `expect`. */
 export async function typeNativeGoal(socket: string, session: string, text: string, expect: RegExp): Promise<boolean> {
   const screen = await claudePane(socket, session);
-  if (!isClaudeIdle(screen) || !isPromptEmpty(screen)) return false;
-  await tmux(socket, ["send-keys", "-t", session, "-l", text]);
-  await sleep(300);
+  if (!isPromptEmpty(screen)) return false;
+  // Large send-keys writes become pasted text instead of a slash command.
+  const chars = Array.from(text);
+  for (let i = 0; i < chars.length; i += 24) {
+    await tmux(socket, ["send-keys", "-t", session, "-l", "--", chars.slice(i, i + 24).join("")]);
+    await sleep(60);
+  }
   await tmux(socket, ["send-keys", "-t", session, "Enter"]);
   for (let i = 0; i < 10; i++) {
     await sleep(500);
@@ -139,8 +128,8 @@ export async function typeNativeGoal(socket: string, session: string, text: stri
 /** Named, private tmux buffer; no prompt in argv and no shared paste buffer. */
 async function sendClaudePane(socket: string, session: string, message: string, stateDir: string): Promise<void> {
   if (/[\r\n]/.test(message)) throw new Error("multiline TUI submission refused");
-  if (!isClaudeIdle(await claudePane(socket, session)))
-    throw new Error("Claude input guard refused: owner input nonempty or TUI not idle");
+  if (!isPromptEmpty(await claudePane(socket, session)))
+    throw new Error("Claude input guard refused: owner input nonempty");
   const inputFile = path.join(stateDir, `claude-input-${process.pid}.txt`);
   const buffer = `paperclip-claude-${process.pid}`;
   await fs.writeFile(inputFile, message, { mode: 0o600 });
@@ -251,9 +240,10 @@ export function fitPromptSections(sections: string[], trimmable: number[], join:
 export function shouldReuseConversation(o: {
   enabled: boolean; state: KeepState | null; newestId: string | null; projectId: string;
   sizeBytes: number; maxBytes: number; acrossProjects?: boolean;
+  busy?: boolean;
 }): boolean {
-  return o.enabled && !!o.state && !!o.newestId && o.state.conversationId === o.newestId
-    && (o.acrossProjects === true || o.state.projectId === o.projectId) && o.sizeBytes < o.maxBytes;
+  return !!o.newestId && (o.busy === true || (o.enabled && !!o.state && o.state.conversationId === o.newestId
+    && (o.acrossProjects === true || o.state.projectId === o.projectId) && o.sizeBytes < o.maxBytes));
 }
 
 /** SCO-693: true when the TUI's working folder is not the configured cwd (symlinks resolved). */
@@ -266,7 +256,8 @@ export async function paneCwdDiffers(panePath: string, cwd: string): Promise<boo
 async function ensureSession(
   socket: string, session: string, cwd: string, stateDir: string,
   name: string, model: string, effort: string, channel: ChannelHost, rejoinOnly: boolean, keepConversation = false,
-): Promise<string> {
+): Promise<{ rcUrl: string; cwd: string }> {
+  let sessionCwd = cwd;
   let exists = true;
   try { await tmux(socket, ["has-session", "-t", session]); } catch { exists = false; }
   // SCO-693: a changed adapterConfig.cwd must take effect. A non-keepConversation seat holds no state
@@ -274,12 +265,15 @@ async function ensureSession(
   if (exists && !rejoinOnly && !keepConversation) {
     const panePath = (await tmux(socket, ["display-message", "-p", "-t", session, "#{pane_current_path}"]).catch(() => "")).trim();
     if (await paneCwdDiffers(panePath, cwd)) {
-      if (!(await waitIdle(socket, session, Date.now() + 120_000)))
-        throw new Error(`Claude TUI is in ${panePath}, configured cwd is ${cwd}, but the TUI is not idle; will recreate at the next idle boundary`);
-      const proc = (await tmux(socket, ["display-message", "-p", "-t", session, "#{pane_current_command}"])).trim();
-      if (proc !== "claude") throw new Error(`tmux pane is ${proc}, not claude; refusing to commandeer it`);
-      await tmux(socket, ["kill-session", "-t", session]);
-      exists = false;
+      if (isClaudeIdle(await claudePane(socket, session))) {
+        const proc = (await tmux(socket, ["display-message", "-p", "-t", session, "#{pane_current_command}"])).trim();
+        if (proc !== "claude") throw new Error(`tmux pane is ${proc}, not claude; refusing to commandeer it`);
+        await tmux(socket, ["kill-session", "-t", session]);
+        exists = false;
+      } else {
+        // Keep live work in its actual cwd for this wake; never wait or kill it.
+        sessionCwd = panePath;
+      }
     }
   }
   if (!exists) {
@@ -303,29 +297,13 @@ async function ensureSession(
   }
   const processName = (await tmux(socket, ["display-message", "-p", "-t", session, "#{pane_current_command}"])).trim();
   if (processName !== "claude") throw new Error(`tmux pane is ${processName}, not claude; refusing to commandeer it`);
-  if (!exists) {
-    // Only for a TUI this call just launched with our own local bridge: accept
-    // the one-time development-channels notice (option 1). Never on an existing
-    // session, where the screen may hold the owner's own prompt.
-    const until = Date.now() + 20_000;
-    while (Date.now() < until) {
-      const s = await claudePane(socket, session).catch(() => "");
-      if (isDevChannelPrompt(s)) {
-        await tmux(socket, ["send-keys", "-t", session, "Enter"]);
-        break;
-      }
-      if (isClaudeIdle(s)) break;
-      await sleep(700);
-    }
-  }
-  if (!rejoinOnly && !(await waitIdle(socket, session, Date.now() + 300_000))) {
-    const s = await claudePane(socket, session);
-    if (/trust the files|Do you trust/i.test(s))
-      throw new Error("Claude workspace trust prompt: approve this dedicated workspace in the terminal, then retry");
-    throw new Error("Claude TUI not idle; leave the owner's live work intact");
-  }
+  // Single checks, including existing seats: neither check waits for an idle turn.
+  const screen = await claudePane(socket, session);
+  if (/trust the files|Do you trust/i.test(screen))
+    throw new Error("Claude workspace trust prompt: approve this dedicated workspace in the terminal, then retry");
+  if (isDevChannelPrompt(screen)) await tmux(socket, ["send-keys", "-t", session, "Enter"]);
   const urlFile = path.join(stateDir, "remote-control-url.txt");
-  // The RC URL line can render after the editor turns idle; give it a moment.
+  // The RC URL can render after startup; wait only for that identity signal.
   let url: string | null = null;
   for (const until = Date.now() + 15_000; ;) {
     url = parseClaudeRcUrl(await claudePane(socket, session).catch(() => ""));
@@ -333,7 +311,7 @@ async function ensureSession(
     await sleep(750);
   }
   if (url) await fs.writeFile(urlFile, url + "\n", { mode: 0o600 });
-  return url ?? (exists ? (await fs.readFile(urlFile, "utf8").catch(() => "")).trim() : "");
+  return { rcUrl: url ?? (exists ? (await fs.readFile(urlFile, "utf8").catch(() => "")).trim() : ""), cwd: sessionCwd };
 }
 
 /** Terminal `block` the worker recorded via pcbridge paperclip_block for this op, if any. */
@@ -408,7 +386,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // SCO-782: derived from agent name + reportsTo depth; any configured remoteControlName is ignored.
   const name = await derivedRcName(ctx);
   const stateDir = path.resolve(asString(cfg.stateDir, path.join(os.homedir(), ".paperclip/claude-rc-state")));
-  const cwd = path.resolve(asString(cfg.cwd, "/Volumes/NVM/Paperclip/workspaces/claude-rc"));
+  let cwd = path.resolve(asString(cfg.cwd, "/Volumes/NVM/Paperclip/workspaces/claude-rc"));
   const model = asString(cfg.model, "claude-sonnet-5-5");
   const effort = asString(cfg.effort, "medium");
   const issueId = asString(ctx.context.issueId, asString(ctx.context.taskId, ""));
@@ -473,9 +451,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       log: (m) => ctx.onLog("stdout", m),
     });
     const adopted = adoptableActive(await fs.readFile(activePath, "utf8").catch(() => ""), issueId, stateDir, "claude_rc_local");
+    const adoptedCwd = (adopted as { cwd?: unknown } | null)?.cwd;
+    if (typeof adoptedCwd === "string" && path.isAbsolute(adoptedCwd)) {
+      assertWorkableCwd(adoptedCwd);
+      cwd = adoptedCwd;
+    }
     const bridgeRoot = await findBridgeRoot(asString(cfg.channelBridgeRoot, "") || undefined);
     const channel = await prepareChannelHost(stateDir, bridgeRoot);
-    const rcUrl = await ensureSession(socket, session, cwd, stateDir, name, model, effort, channel, Boolean(adopted), cfg.keepConversation === true);
+    const ensured = await ensureSession(socket, session, cwd, stateDir, name, model, effort, channel, Boolean(adopted), cfg.keepConversation === true);
+    const rcUrl = ensured.rcUrl;
+    cwd = ensured.cwd;
     if (!rcUrl) throw new Error("Claude RC URL unavailable; refusing to dispatch to an unverified session");
     // Owner 2026-11-03: auto re-pin, logged. The URL comes from the owned tmux
     // pane verified above; an adopted in-flight op still requires an exact match.
@@ -517,17 +502,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const reuse = shouldReuseConversation({
         enabled: keepEnabled, state: keepState, newestId: before, projectId, sizeBytes: keepSize, maxBytes: keepMax,
         acrossProjects: cfg.keepConversationAcrossProjects === true,
-      }) && isClaudeIdle(await claudePane(socket, session));
+        busy: !isClaudeIdle(await claudePane(socket, session)),
+      });
       if (reuse) {
         conversationId = before;
       } else {
         await sendClaudePane(socket, session, "/clear", stateDir);
-        await sleep(800);
-        if (!(await waitIdle(socket, session, Date.now() + 12_000)))
-          throw new Error("Claude /clear did not settle to an idle prompt");
-        conversationId = await seatConversation(session, cwd);
-        for (let i = 0; i < 10 && conversationId === before; i++) { await sleep(500); conversationId = await seatConversation(session, cwd); }
-        if (!conversationId || conversationId === before) conversationId = await newestConversation(cwd);
+        // /clear is acknowledged by this seat's new conversation, even if busy.
+        const clearDeadline = Date.now() + 12_000;
+        do {
+          conversationId = await seatConversation(session, cwd);
+          if (conversationId && conversationId !== before) break;
+          await sleep(500);
+        } while (Date.now() < clearDeadline);
         if (!conversationId || conversationId === before)
           throw new Error("Claude /clear did not start an isolated conversation");
       }
@@ -535,10 +522,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // A kept conversation already holds the standing text (template, run rules, receipt format)
       // and the brief and history of every issue it handled, so a wake resends only the delta,
       // as claude_local does on --resume. An issue new to the conversation still gets its brief.
-      const seenIssueIds = reuse ? keepState?.issueIds ?? [] : [];
+      const knownConversation = reuse && keepState?.conversationId === before;
+      const seenIssueIds = knownConversation ? keepState?.issueIds ?? [] : [];
       const seenIssue = seenIssueIds.includes(issueId);
       const wake = ctx.context.paperclipWake;
-      const goal = goalForConversation(ctx.context.paperclipRunnerGoal, reuse, keepState, issueId);
+      const goal = goalForConversation(ctx.context.paperclipRunnerGoal, knownConversation, keepState, issueId);
       const promptContext = {
         ...ctx.context,
         ...(goal ? { paperclipRunnerGoal: goal } : {}),
@@ -548,14 +536,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const { taskContextNote, wakePrompt } = selectPaperclipPromptSections(promptContext, { resumedSession: seenIssue });
       const instructionsFilePath = asString(cfg.instructionsFilePath, "");
       const instructionsFull = instructionsFilePath ? await fs.readFile(instructionsFilePath, "utf8") : "";
-      const instructionsPrefix = reuse ? "" : instructionsFull;
-      const intro = reuse ? "" : renderTemplate(promptBase, {
+      const instructionsPrefix = knownConversation ? "" : instructionsFull;
+      const intro = knownConversation ? "" : renderTemplate(promptBase, {
         agent: ctx.agent, run: { id: ctx.runId }, context: ctx.context, companyId: ctx.agent.companyId,
       });
       const promptStateDir = await readableRuntimePath(ctx, "rc", stateDir);
       const promptReceiptPath = path.join(promptStateDir, path.basename(receiptPath));
       const promptRunEnvPath = path.join(promptStateDir, path.basename(runEnvPath));
-      const instructions = reuse ? [
+      const instructions = knownConversation ? [
         `Paperclip run ${ctx.runId}, issue ${issueId}: work on ONLY this issue; standing run rules unchanged.`,
         `Done receipt (Write tool, only on success; do not update the issue yourself): ${promptReceiptPath} with keys runId, issueId,`,
         'status "done", summary, report (Markdown, 250+ chars).',
@@ -582,7 +570,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         await ctx.onLog("stdout", `[claude-rc] keepConversation ${reuse ? "reuse" : "fresh"}: prompt ${prompt.length} bytes (instructions ${reuse ? 0 : instructionsFull.length} of ${instructionsFull.length}); conversation ${Math.round(keepSize)} bytes\n`);
         const issueIds = [...seenIssueIds.filter(id => id !== issueId), issueId].slice(-200);
         const goalKey = (goal as { key?: unknown } | undefined)?.key;
-        const goalKeys = { ...(reuse ? keepState?.goalKeys ?? {} : {}) };
+        const goalKeys = { ...(knownConversation ? keepState?.goalKeys ?? {} : {}) };
         if (typeof goalKey === "string") goalKeys[issueId] = goalKey;
         for (const id of Object.keys(goalKeys)) if (!issueIds.includes(id)) delete goalKeys[id];
         await fs.writeFile(keepPath, JSON.stringify({ conversationId, projectId, issueIds, goalKeys }), { mode: 0o600 });
@@ -600,7 +588,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const wantKey = goalObj?.state === "active" && goalObj.objective ? goalObj.key ?? null : null;
       if (wantKey && wantKey !== nativeGoalKey) {
         const cond = goalObj!.objective!.replace(/\s+/g, " ").trim().slice(0, 1500);
-        if (await typeNativeGoal(socket, session, `/goal ${cond}`, /Goal set:/)) nativeGoalKey = wantKey;
+        if (await typeNativeGoal(socket, session, `/goal ${cond}`, /Goal set:|\/goal active/i)) nativeGoalKey = wantKey;
         else await ctx.onLog("stderr", `[claude-rc] native /goal not confirmed ("Goal set:" missing or input not empty) for ${issueId}\n`);
       } else if (!wantKey && nativeGoalKey) {
         if (await typeNativeGoal(socket, session, "/goal clear", /Goal cleared|No goal|cleared/i)) nativeGoalKey = null;
@@ -611,7 +599,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }), { mode: 0o600 });
       const active: Record<string, unknown> = {
         runId: ctx.runId, issueId, op_id: ctx.runId, receiptPath, rcUrl,
-        tmuxSocket: socket, tmuxSession: session, conversationId,
+        tmuxSocket: socket, tmuxSession: session, conversationId, cwd,
         dispatchMode: "channel-pending", startedAt: new Date().toISOString(),
       };
       // Exact checkpoint, durable before any potentially side-effecting emit.
@@ -622,8 +610,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const mode = await routeChannelInput(ctx.runId, prompt, false, {
         ready: channel.ready, status: channel.status, submit: channel.submit,
         fallback: async () => {
-          if (!isClaudeIdle(await claudePane(socket, session))) {
-            throw new Error("channel unavailable and Claude editor is not empty+idle; no fallback");
+          if (!isPromptEmpty(await claudePane(socket, session))) {
+            throw new Error("channel unavailable and Claude editor is not empty; no fallback");
           }
           await recordFallback(activePath, active);
           await ctx.onLog("stderr", "[claude-rc] Channel unavailable; using guarded tmux fallback (no bridge op submitted)\n");
@@ -671,14 +659,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             await fs.rm(activePath, { force: true });
             break;
           }
-          if (await waitIdle(socket, session, Date.now() + 30_000))
-            await sendClaudePane(socket, session, normalizeOneLine(refusalMessage(gate.reasons, gateRefusals, 3)), stateDir);
+          await sendClaudePane(socket, session, normalizeOneLine(refusalMessage(gate.reasons, gateRefusals, 3)), stateDir);
           await sleep(1100);
           continue;
         }
-        if (await waitIdle(socket, session, Date.now() + 4000)) break;
+        break;
       } else if (await readBlockTerminal(stateDir, receiptRunId).then(async reason => {
-        if (reason === null || !(await waitIdle(socket, session, Date.now() + 4000))) return false;
+        if (reason === null) return false;
         await deliverBlock(ctx, issueId, reason);
         await ctx.onLog("stdout", `[claude-rc] Worker blocked ${issueId}: ${reason.slice(0, 200)}\n`);
         await fs.rm(activePath, { force: true });
@@ -704,8 +691,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (!receipt && await conversationLive()) {
       await postComment(ctx, issueId, `claude_rc run ${ctx.runId} timed out, but RC conversation ${conversationId} is still writing its transcript (${rcUrl}). It is likely still working; its later receipt at ${receiptPath} can be recovered. Do not re-dispatch.`).catch(() => {});
     }
-    if (!receipt || !(await waitIdle(socket, session, Date.now() + 1500)))
-      return failure("Claude did not produce a validated completion receipt at an idle TUI; checkpoint retained", true);
+    if (!receipt)
+      return failure("Claude did not produce a validated completion receipt; checkpoint retained", true);
     await deliver(ctx, receipt, "Claude Code execution report", "Claude Remote Control");
     await ctx.onLog("stdout", `[claude-rc] Done ${issueId}: ${receipt.summary}; conversation=${conversationId ?? "unknown"}\n`);
     await fs.rm(activePath);

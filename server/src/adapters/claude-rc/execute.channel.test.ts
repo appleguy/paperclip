@@ -5,7 +5,7 @@ import path from "node:path";
 import {
   CHANNEL_NAME, findBridgeRoot, prepareChannelHost, routeChannelInput, type ChannelIO, type ChannelStatus,
 } from "./channel.js";
-import { isClaudeIdle } from "./execute.js";
+import { isPromptEmpty } from "./execute.js";
 import { adoptableActive } from "../agy/execute.js";
 
 const homes: string[] = [];
@@ -91,7 +91,7 @@ describe("claude_rc_local channel dispatch", () => {
     expect(submits).toBe(0);
   });
 
-  it("allows channel-down tmux fallback only with an empty idle editor", async () => {
+  it("allows channel-down tmux fallback while busy and refuses owner input", async () => {
     let fallbackCount = 0;
     let screen = typed;
     const io: ChannelIO = {
@@ -99,13 +99,13 @@ describe("claude_rc_local channel dispatch", () => {
       status: async () => null,
       submit: async () => { throw new Error("unavailable channel must never submit"); },
       fallback: async () => {
-        if (!isClaudeIdle(screen)) throw new Error("editor is nonempty or busy");
+        if (!isPromptEmpty(screen)) throw new Error("editor is nonempty");
         fallbackCount++;
       },
     };
     await expect(routeChannelInput(opId, "x", false, io, { readyWaitMs: 0 })).rejects.toThrow(/nonempty/);
     expect(fallbackCount).toBe(0);
-    screen = idle;
+    screen = "✻ Thinking… (esc to interrupt)\n" + idle;
     await expect(routeChannelInput(opId, "x", false, io, { readyWaitMs: 0 })).resolves.toBe("tmux-fallback");
     expect(fallbackCount).toBe(1);
     io.status = async () => state("emitted_local");

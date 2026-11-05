@@ -45,8 +45,9 @@ export const claudeRcAdapter: ServerAdapterModule = {
 claude --print ignores --remote-control, so phone visibility needs the
 interactive TUI. One persistent tmux pane runs
 claude --remote-control <name> --name <name>; the owner sees and steers that
-same session from the Claude app. Turns are serialized; each issue gets /clear
-(new transcript UUID = Paperclip sessionId). Background tool tasks are disabled.
+same session from the Claude app. Busy turns accept channel messages and queued
+input. Only an idle seat may get /clear (new transcript UUID = Paperclip sessionId);
+busy seats keep their live conversation. Background tool tasks are disabled.
 
 Primary input is the private pcbridge MCP channel, submitted via stdin (no prompt
 in argv). --mcp-config loads it, and --settings installs local observation hooks.
@@ -65,7 +66,9 @@ The agent writes a JSON receipt; only the adapter publishes the report and
 closes the issue with the run token. The bridge needs UserPromptSubmit hook
 observation, not just a local write, before claiming accepted input.
 If the channel is unavailable before any submission, a guarded tmux fallback
-requires an empty idle editor. An uncertain submission always HOLDS and never
+requires empty input only; delivery and validated receipts never wait for idle.
+Native /goal commands are typed in small chunks so Claude executes them as commands.
+An uncertain submission always HOLDS and never
 replays. A same-issue active.json is adopted after restart without re-sending;
 any other unresolved checkpoint blocks dispatch.
 `,

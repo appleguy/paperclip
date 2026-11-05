@@ -198,7 +198,7 @@ export async function routeChannelInput(
   if (!ready) {
     // Before fallback, make sure another actor did not reserve the op.
     if (await io.status(opId)) throw new Error("bridge op appeared while unavailable; no fallback or replay");
-    await io.fallback(); // Guarded empty+idle TUI; checkpoint updated BEFORE paste.
+    await io.fallback(); // Guarded empty input; busy is fine. Checkpoint updated BEFORE paste.
     return "tmux-fallback";
   }
   await io.submit(opId, prompt); // Promise rejection is an UNKNOWN effect; never fallback.

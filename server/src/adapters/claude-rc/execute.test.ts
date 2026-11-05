@@ -77,10 +77,8 @@ describe("target-busy refusals", () => {
   it("classifies occupied-seat refusals as waits, not failures", async () => {
     const { isTargetBusyRefusal } = await import("../agy/execute.js");
     for (const m of [
-      "Claude TUI not idle; leave the owner's live work intact",
-      "agy TUI not safely idle; inspect statusLine and leave owner's live input intact",
       "claude_rc_local previous task unresolved; inspect active.json",
-      "Claude input guard refused: owner input nonempty or TUI not idle",
+      "Claude input guard refused: owner input nonempty",
     ]) expect(isTargetBusyRefusal(m)).toBe(true);
     expect(isTargetBusyRefusal("Claude workspace trust prompt: approve this dedicated workspace")).toBe(false);
   });
@@ -98,6 +96,11 @@ describe("claude_rc_local keepConversation", () => {
   it("still clears on a different conversation or the size cap", () => {
     expect(shouldReuseConversation({ ...base, acrossProjects: true, newestId: "c2" })).toBe(false);
     expect(shouldReuseConversation({ ...base, acrossProjects: true, sizeBytes: 100 })).toBe(false);
+  });
+  it("keeps busy conversations even across projects, size limits or disabled reuse", () => {
+    expect(shouldReuseConversation({ ...base, busy: true })).toBe(true);
+    expect(shouldReuseConversation({ ...base, busy: true, enabled: false, state: null, sizeBytes: 100 })).toBe(true);
+    expect(shouldReuseConversation({ ...base, busy: true, newestId: null })).toBe(false);
   });
 });
 
@@ -118,6 +121,11 @@ describe("isPromptEmpty (SCO-771)", () => {
     const { isPromptEmpty } = await import("./execute.js");
     expect(isPromptEmpty("x\n❯ \n  bypass permissions on")).toBe(true);
     expect(isPromptEmpty("❯ hello\n")).toBe(false);
+    expect(isPromptEmpty('✻ Thinking… (esc to interrupt)\n❯ Try "build something"\n' + footer)).toBe(true);
+    expect(isPromptEmpty("✻ Working…\n❯ Press up to edit queued messages\n" + footer)).toBe(true);
+    expect(isPromptEmpty('❯ Try "build something" plus my text\n')).toBe(false);
+    expect(isPromptEmpty("❯ Press up to edit queued messages plus my text\n")).toBe(false);
+    expect(isPromptEmpty("starting…")).toBe(false);
   });
 });
 
