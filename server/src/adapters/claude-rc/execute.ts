@@ -24,6 +24,7 @@ import {
 import { deriveRcName, reportsToDepth, sanitizeRcName, slotRcName, type RcAgentNode } from "./rc-name.js";
 import { gateReceiptRaw, refusalMessage, productionDeps } from "./done-gate.js";
 import { captureDoneGateBaseline, type GateBaseline } from "./done-gate-provenance.js";
+import { excludeEnvBoundMcp } from "./mcp-exclusion.js";
 import { isReviewContinuation, reconcileForeignSettlement, settleOutcome } from "./settlement.js";
 import {
   CHANNEL_NAME, findBridgeRoot, prepareChannelHost, routeChannelInput, type ChannelHost,
@@ -469,6 +470,8 @@ async function ensureSession(
     }
     await fs.mkdir(cwd, { recursive: true });
     await fs.mkdir(agentTmpDir(session), { recursive: true });
+    // SCO-1033: a fresh TUI is the safe boundary to drop the env-bound paperclip MCP for this cwd (no key minted).
+    await excludeEnvBoundMcp(cwd).catch(() => undefined);
     // [ASSUMPTION] The experimental channel flag remains accepted by Claude
     // Code 2.1.x; it is hidden in some versions of --help. Live verify before use.
     // No --strict-mcp-config: that would hide the owner's other required MCPs.
