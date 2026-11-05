@@ -5,17 +5,29 @@
 // sessionIdFor mirrors packages/adapters/opencode-local/src/server/nar/opencode-http-driver.ts (pinned by
 // src/server/nar/session-id-mirror.test.ts); a session id is a hash, so every generation up to the cap is enumerated.
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 export const MAX_SESSION_GENERATION = 500;
+// Runners that create their own random-id session (backends/opencode-qwen-*/bin/opencode) write the owning run id here.
+export const SESSION_RUNS_DIR = "/Volumes/NVM/Paperclip/backends/session-runs";
+
+const recordedRunId = (id, dir) => {
+  try { return readFileSync(`${dir}/${id}`, "utf8").trim(); } catch { return ""; }
+};
 
 export const sessionIdFor = (agentId, issueId, generation = 0) =>
   `ses_${createHash("sha256").update(`nar|${agentId}|${issueId}${generation > 0 ? `|g${generation}` : ""}`).digest("hex").slice(0, 26)}`;
 
 /** @param {Array<{status?: string, agentId?: string, issueId?: string}>} runs @param {Iterable<string>} wanted */
-export function ownedSessions(runs, wanted) {
+export function ownedSessions(runs, wanted, recordDir = SESSION_RUNS_DIR) {
   const ids = new Set(wanted);
   const owned = new Map();
+  const byRunId = new Map(runs.filter((r) => r?.id).map((r) => [r.id, r]));
+  for (const id of ids) {
+    const run = byRunId.get(recordedRunId(id, recordDir));
+    if (run) owned.set(id, run.status === "running" ? "running" : "queued");
+  }
   for (const run of runs) {
     if (!run?.agentId || !run?.issueId) continue;
     const state = run.status === "running" ? "running" : "queued";
