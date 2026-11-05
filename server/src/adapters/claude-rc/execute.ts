@@ -272,40 +272,6 @@ export async function reconcileOrphanActive(o: {
   return "archived";
 }
 
-/** A fresh same-issue wake may replace an idle, unverified dispatch, never replay its op. */
-export async function reconcileIdleAdoption(o: {
-  stateDir: string; activePath: string; issueId: string; runId: string; wakeStartedAt: number;
-  paneIdle: () => Promise<boolean>; log: (m: string) => Promise<void> | void;
-}): Promise<boolean> {
-  const raw = await fs.readFile(o.activePath, "utf8").catch(error => {
-    if (error.code === "ENOENT") return "";
-    throw error;
-  });
-  const active = adoptableActive(raw, o.issueId, o.stateDir, "claude_rc_local");
-  if (!active || active.runId === o.runId) return false;
-  const started = Date.parse(asString((active as { startedAt?: unknown }).startedAt, ""));
-  const olderWake = Number.isFinite(started) && started < o.wakeStartedAt;
-  const receiptName = path.basename(active.receiptPath);
-  const refused = (await fs.readdir(o.stateDir)).some(name =>
-    name.startsWith(`${receiptName}.refused-`) && /^\d+$/.test(name.slice(`${receiptName}.refused-`.length)));
-  if ((!olderWake && !refused) || !(await o.paneIdle())) return false;
-  const receipt = await fs.readFile(active.receiptPath, "utf8").catch(error => {
-    if (error.code === "ENOENT") return "";
-    throw error;
-  });
-  try {
-    parseReceipt(receipt, active.runId, o.issueId);
-    return false; // Keep an available receipt for the normal done gate and settlement.
-  } catch { /* Missing or malformed receipt cannot settle this dispatch. */ }
-  if (await readBlockTerminal(o.stateDir, active.runId) !== null) return false;
-  const dest = path.join(o.stateDir, `active.unverified-${active.runId}-${Date.now()}.json`);
-  await fs.rename(o.activePath, dest);
-  const dir = await fs.open(o.stateDir, "r");
-  try { await dir.sync(); } finally { await dir.close(); }
-  await o.log(`[claude-rc] Archived idle unverified run ${active.runId} at ${dest}; dispatching fresh without replaying the old op\n`);
-  return true;
-}
-
 const AGENT_TMP_ROOT = "/Volumes/NVM/AI_Agent_Runtime/tmp";
 function agentTmpDir(session: string): string { return path.join(AGENT_TMP_ROOT, `claude-rc-${session}`); }
 
@@ -479,7 +445,6 @@ async function derivedRcName(ctx: AdapterExecutionContext): Promise<string> {
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
-  const wakeStartedAt = Date.now();
   const cfg = ctx.config;
   const baseSession = asString(cfg.tmuxSession, "claude");
   let session = baseSession;
@@ -555,11 +520,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         const st = await fs.stat(path.join(projectDir(cwd), `${conv}.jsonl`)).catch(() => null);
         return Boolean(st) && Date.now() - st!.mtimeMs < (Number(cfg.liveWindowSec) || 600) * 1000;
       },
-      paneIdle: async () => isClaudeIdle(await claudePane(socket, session)),
-      log: (m) => ctx.onLog("stdout", m),
-    });
-    await reconcileIdleAdoption({
-      stateDir, activePath, issueId, runId: ctx.runId, wakeStartedAt,
       paneIdle: async () => isClaudeIdle(await claudePane(socket, session)),
       log: (m) => ctx.onLog("stdout", m),
     });
