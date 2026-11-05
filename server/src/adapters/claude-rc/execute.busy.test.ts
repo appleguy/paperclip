@@ -22,7 +22,7 @@ vi.mock("./channel.js", async importOriginal => ({
 vi.mock("./done-gate.js", async importOriginal => ({
   ...await importOriginal<typeof import("./done-gate.js")>(), gateReceiptRaw: deps.gate,
 }));
-import { execute, isClaudeIdle, projectDir, reconcileIdleAdoption, typeNativeGoal } from "./execute.js";
+import { execute, isClaudeIdle, projectDir, reconcileOrphanActive, typeNativeGoal } from "./execute.js";
 import { receiptFilePath } from "../agy/execute.js";
 
 const rcUrl = "https://claude.ai/code/session_busy";
@@ -85,14 +85,14 @@ afterEach(async () => {
 });
 
 describe("SCO-947 busy delivery and completion", () => {
-  it.each(["refused", "missing", "malformed"])("SCO-1018 archives an idle %s receipt checkpoint and completes a fresh dispatch", async kind => {
+  it.each(["refused", "missing", "malformed"])("SCO-980 retains an idle %s receipt checkpoint across repeated execute wakes", async kind => {
     const oldRun = "11111111-1111-4111-8111-111111111111";
     certifyTerminalCheckpoint(oldRun, "issue-busy");
     const oldReceiptPath = receiptFilePath(stateDir, oldRun);
     const checkpoint = JSON.stringify({ runId: oldRun, op_id: oldRun, issueId: "issue-busy",
       receiptPath: oldReceiptPath, rcUrl, cwd, conversationId: "conversation-busy",
       dispatchMode: "channel-pending",
-      ...(kind === "refused" ? {} : { startedAt: new Date(Date.now() - 1000).toISOString() }),
+      ...(kind === "refused" ? {} : { startedAt: new Date(Date.now() - 600_000).toISOString() }),
       doneGateBaseline: { old: "unprovable baseline" },
     });
     await fs.writeFile(path.join(stateDir, "active.json"), checkpoint);
@@ -103,16 +103,23 @@ describe("SCO-947 busy delivery and completion", () => {
     await fs.writeFile(path.join(stateDir, "keep-conversation.json"), JSON.stringify({
       conversationId: "conversation-busy", projectId: "", issueIds: ["issue-busy"],
     }));
-    const result = await execute(ctx);
-    expect(result.exitCode).toBe(0);
-    const archives = (await fs.readdir(stateDir)).filter(n => n.startsWith(`active.unverified-${oldRun}-`));
-    expect(archives).toHaveLength(1);
-    expect(await fs.readFile(path.join(stateDir, archives[0]!), "utf8")).toBe(checkpoint);
-    expect(deps.route).toHaveBeenCalledOnce();
-    expect(deps.route.mock.calls[0][0]).toBe(ctx.runId);
-    expect(deps.route.mock.calls[0][2]).toBe(false);
-    expect(deps.deliver).toHaveBeenCalledWith(ctx, stateDir, ctx.runId, "issue-busy", expect.objectContaining({ kind: "done" }));
-    await expect(fs.stat(path.join(stateDir, "active.json"))).rejects.toThrow();
+    // Stop at the real execute transport boundary, before its receipt wait loop.
+    // A fresh dispatch instead of adoption must fail these argument assertions.
+    deps.route.mockImplementation(async (op: string, prompt: string, adopted: boolean) => {
+      expect([op, prompt, adopted]).toEqual([oldRun, "", true]);
+      throw new Error("fixture stops after observing adoption");
+    });
+    for (let i = 0; i < 4; i++) {
+      ctx.runId = `wake-${i}`;
+      const result = await execute(ctx);
+      expect(result.errorMessage).toContain("fixture stops after observing adoption");
+      expect(await fs.readFile(path.join(stateDir, "active.json"), "utf8")).toBe(checkpoint);
+    }
+    expect(deps.route).toHaveBeenCalledTimes(4);
+    expect(deps.submit).not.toHaveBeenCalled();
+    expect(deps.deliver).not.toHaveBeenCalled();
+    expect((await fs.readdir(stateDir)).filter(n => n.startsWith("active.") && n !== "active.json")).toEqual([]);
+    if (kind === "malformed") expect(await fs.readFile(oldReceiptPath, "utf8")).toBe("{");
     if (kind === "refused") expect(await fs.readFile(`${oldReceiptPath}.refused-1`, "utf8")).toBe("refused evidence");
   });
 
@@ -133,11 +140,12 @@ describe("SCO-947 busy delivery and completion", () => {
         ev: "terminal", op_id: oldRun, kind: "block", reason: "Required input unavailable",
       }) + "\n");
     }
-    expect(await reconcileIdleAdoption({ stateDir, activePath, issueId: "issue-busy",
-      runId: kind === "same-run" ? oldRun : ctx.runId, wakeStartedAt: kind === "not-older" ? 1000 : 2000,
+    expect(await reconcileOrphanActive({ stateDir, activePath, issueId: "issue-busy",
+      runId: kind === "same-run" ? oldRun : ctx.runId, sameIssueMinAgeMs: kind === "not-older" ? Number.MAX_SAFE_INTEGER : 0,
+      live: async () => false, status: async () => null,
       paneIdle: async () => kind === "synthesizing"
         ? isClaudeIdle("✻ Synthesizing… 9m\n❯ \n  bypass permissions on") : kind !== "busy", log: () => {},
-    })).toBe(false);
+    })).not.toBe("archived");
     expect(await fs.readFile(activePath, "utf8")).toBe(checkpoint);
   });
 
