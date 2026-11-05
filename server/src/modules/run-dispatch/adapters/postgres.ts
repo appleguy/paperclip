@@ -37,7 +37,7 @@ import type { ActivityPublication } from "../../../services/activity-log.js";
 import { parseObject } from "../../../adapters/utils.js";
 import { evaluateAgentInvokabilityFromDb } from "../../../services/agent-invokability.js";
 import { budgetService, budgetServiceInTransaction, recheckAdmittedRunBudgetReadOnly } from "../../../services/budgets.js";
-import { lockRunBudgetRecoveryOwnerInTransaction, recheckRunBudgetReservationInTransaction } from "../../../services/budget-reservations.js";
+import { lockRunBudgetRecoveryOwnerInTransaction, recheckRunBudgetReservationInTransaction, restartReattachGeneration } from "../../../services/budget-reservations.js";
 import { isCompletedOnboardingHandoffWake } from "../../../services/chat-completion-delivery.js";
 import { isHeartbeatWakeOnDemandEnabled } from "../../../services/heartbeat-policy.js";
 import { notifyChatRunMilestones } from "../../../services/chat-run-milestone-notifications.js";
@@ -1344,14 +1344,18 @@ export function createPostgresRunDispatchAdapter(
 
       const priorDispatch = parseObject(parseObject(run.usageJson).budgetDispatch);
       const recoveryLeaseOwner = input.recoveryLeaseOwner ?? null;
-      if (priorDispatch.reservationId === input.reservationId && (priorDispatch.recoveryLeaseOwner ?? null) === recoveryLeaseOwner)
+      const restartReattach = restartReattachGeneration(run);
+      if (priorDispatch.reservationId === input.reservationId && (priorDispatch.recoveryLeaseOwner ?? null) === recoveryLeaseOwner
+        && (priorDispatch.restartReattach ?? null) === restartReattach)
         return { dispatched: false as const, admissionBlockReason: "Provider dispatch already admitted this reservation generation" };
       // The committed claim is the dispatch linearization point. A concurrent
       // charge wins before it, or targets already-admitted work afterwards.
       // Preserve usage/cancellation evidence and fence duplicate handoffs even
       // for zero-valued holds. A newly proven native recovery owner has its own
       // generation; its ordinary stopped-execution checks remain upstream.
-      const claim = { reservationId: input.reservationId, recoveryLeaseOwner, admittedAt: new Date().toISOString() };
+      // A hot-restart reattach rejoins provider work the adapter already owns.
+      const claim = { reservationId: input.reservationId, recoveryLeaseOwner, admittedAt: new Date().toISOString(),
+        ...(restartReattach === null ? {} : { restartReattach }) };
       await tx.update(heartbeatRuns).set({
         usageJson: sql`coalesce(${heartbeatRuns.usageJson}, '{}'::jsonb) || ${JSON.stringify({ budgetDispatch: claim })}::jsonb`,
       }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)));

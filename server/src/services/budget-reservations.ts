@@ -11,6 +11,17 @@ import type { ActivityPublication } from "./activity-log.js";
 import { readClaimedNativeStopRecovery } from "./native-runtime/native-cancellation-request.js";
 import { legacyControllerBootId } from "./legacy-controller-lease.js";
 
+/** The restart-reattach count when this server process re-entered a legacy run
+ * after a hot restart (see supportsRestartReattach), else null. Each reattach is
+ * its own dispatch generation over the run's original budget hold. */
+export function restartReattachGeneration(run: {
+  runtimeMode?: string | null; controllerBootId?: string | null; resultJson?: Record<string, unknown> | null;
+}): number | null {
+  const reattach = run.resultJson?.restartReattach as { count?: unknown; newServerPid?: unknown } | undefined;
+  return run.runtimeMode === "legacy" && run.controllerBootId === legacyControllerBootId
+    && reattach?.newServerPid === process.pid && typeof reattach.count === "number" ? reattach.count : null;
+}
+
 /** Native finalization takes its coordinator before issue/run locks. Recovery
  * admission uses the same order after the company accounting lock, so its
  * later ownership checks never wait for a coordinator while holding a run. */
@@ -101,9 +112,7 @@ export async function reserveRunBudget(db: Db, companyId: string, runId: string,
       // A hot restart re-entered this legacy run under the same id (see
       // supportsRestartReattach): its provider work is already running, so this
       // controller boot keeps the original hold instead of dispatching again.
-      const restartReattach = run.resultJson?.restartReattach as { newServerPid?: unknown } | undefined;
-      if (run.runtimeMode === "legacy" && existing.state === "held" && existing.projectId === projectId
-        && run.controllerBootId === legacyControllerBootId && restartReattach?.newServerPid === process.pid)
+      if (existing.state === "held" && existing.projectId === projectId && restartReattachGeneration(run) !== null)
         return { ...existing, reused: true };
       if (owner) {
         if (stopRecovery) return { ...existing, reused: true };

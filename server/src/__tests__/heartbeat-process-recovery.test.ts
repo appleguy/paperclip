@@ -4444,10 +4444,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       processGroupId: null,
     });
     // The previous boot already reserved budget and dispatched provider work.
-    await db.insert(budgetReservations).values({ companyId, runId, agentId, projectId: null, amountCents: "0", providerStartedAt: new Date() });
+    const [reservation] = await db.insert(budgetReservations)
+      .values({ companyId, runId, agentId, projectId: null, amountCents: "0", providerStartedAt: new Date() }).returning();
     await db
       .update(heartbeatRuns)
-      .set({ controllerBootId: "00000000-0000-4000-8000-00000000b007", executionStage: "dispatching" })
+      .set({ controllerBootId: "00000000-0000-4000-8000-00000000b007", executionStage: "dispatching",
+        usageJson: { budgetDispatch: { reservationId: reservation!.id, recoveryLeaseOwner: null,
+          admittedAt: "2026-08-01T00:00:00.000Z", handedOffAt: "2026-08-01T00:00:01.000Z" } } })
       .where(eq(heartbeatRuns.id, runId));
 
     await withTempPaperclipHome(async () => {
