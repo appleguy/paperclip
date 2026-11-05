@@ -38,10 +38,12 @@ const native = vi.hoisted(() => ({
 }));
 const hotRestart = vi.hoisted(() => ({
   read: vi.fn<() => Promise<HotRestartIntent | null>>(async () => null),
+  write: vi.fn(async () => undefined),
 }));
 vi.mock("../hot-restart.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../hot-restart.js")>(),
   readHotRestartIntent: hotRestart.read,
+  writeHotRestartShutdownSnapshot: hotRestart.write,
 }));
 vi.mock("../native-runtime/index.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../native-runtime/index.js")>(),
@@ -135,6 +137,26 @@ describe("heartbeat recovery module callbacks", () => {
     expect(native.closeIdle).toHaveBeenCalledAfter(deps.enterShutdown);
     expect(hotRestart.read).toHaveBeenCalledAfter(native.closeIdle);
     expect(database.access).not.toHaveBeenCalled();
+  });
+
+  it("detaches native controllers even when a separate stdio run must drain", async () => {
+    const nativeRunId = randomUUID(), acpRunId = randomUUID();
+    const rows = [
+      { adapterType: "paperclip_runner", adapterConfig: {}, run: {
+        id: nativeRunId, status: "running", runtimeMode: "native", nativeSessionId: randomUUID(), contextSnapshot: {},
+      } },
+      { adapterType: "codex_local", adapterConfig: {}, run: {
+        id: acpRunId, status: "running", runtimeMode: "legacy", contextSnapshot: { processTopology: "server_stdio" },
+      } },
+    ];
+    const db = { select: () => ({ from: () => ({ innerJoin: () => ({ where: async () => rows }) }) }) } as unknown as Db;
+    hotRestart.read.mockResolvedValueOnce({ previousServerPid: process.pid, drainRequired: false } as HotRestartIntent);
+    const result = await createHeartbeatRecovery(db, callbacks(db)).prepareHotRestartShutdown("SIGTERM");
+    expect(result).toMatchObject({ mode: "acp_drain_required", drainRunIds: [acpRunId] });
+    expect(hotRestart.write).toHaveBeenCalledBefore(native.detach);
+    expect(native.detach).toHaveBeenCalledExactlyOnceWith([nativeRunId]);
+    expect(hotRestart.write).toHaveBeenCalledWith(expect.objectContaining({ drainRunIds: [acpRunId],
+      activeRuns: expect.arrayContaining([expect.objectContaining({ runId: nativeRunId })]) }));
   });
 
   it("does not adopt or query runs without a restart intent", async () => {

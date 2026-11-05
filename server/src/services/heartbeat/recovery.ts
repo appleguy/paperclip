@@ -575,23 +575,35 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     };
 
     const serverStdioRuns = activeRuns.filter(isServerStdioBoundHotRestartRun);
-    if (serverStdioRuns.length > 0) {
-      const activeServerStdioRunIds = serverStdioRuns.map(({ run }) => run.id);
-      await writeHotRestartShutdownSnapshot({
-        intent: intentWithVersion,
-        signal,
-        activeRuns: snapshotRuns,
-        drainReason: "active_acp_run",
-        drainRunIds: activeServerStdioRunIds,
-        capturedAt: now,
-      });
+    const activeServerStdioRunIds = serverStdioRuns.map(({ run }) => run.id);
+    await writeHotRestartShutdownSnapshot({
+      intent: intentWithVersion,
+      signal,
+      activeRuns: snapshotRuns,
+      ...(activeServerStdioRunIds.length > 0
+        ? { drainReason: "active_acp_run" as const, drainRunIds: activeServerStdioRunIds }
+        : {}),
+      capturedAt: now,
+    });
 
+    // A mixed restart still needs to release the controller for durable native
+    // runs. Draining an unrelated server-owned pipe must not strand their owner.
+    const nativeRunIds = activeRuns
+      .filter(({ run, adapterType }) =>
+        adapterType === "paperclip_runner" &&
+        isNativeSessionId(run.nativeSessionId) &&
+        !activeServerStdioRunIds.includes(run.id))
+      .map(({ run }) => run.id);
+    const detachedNativeSessions = await detachNativeSessionsForRestart(nativeRunIds);
+
+    if (serverStdioRuns.length > 0) {
       logger.warn(
         {
           signal,
           previousServerPid: intent.previousServerPid,
           activeRunIds: snapshotRuns.map((run) => run.runId),
           activeServerStdioRunIds,
+          detachedNativeSessions,
           drainReason: "active_acp_run",
         },
         "server-stdio agent run prevents hot-restart adoption; using graceful drain and retry",
@@ -606,13 +618,6 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         drainReason: "active_acp_run" as const,
       };
     }
-
-    await writeHotRestartShutdownSnapshot({
-      intent: intentWithVersion,
-      signal,
-      activeRuns: snapshotRuns,
-      capturedAt: now,
-    });
 
     for (const { run } of activeRuns) {
       await appendRunEvent(run, {
@@ -630,16 +635,6 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         },
       });
     }
-
-    const nativeRunIds = activeRuns
-      .filter(
-        ({ run, adapterType }) =>
-          adapterType === "paperclip_runner" &&
-          isNativeSessionId(run.nativeSessionId),
-      )
-      .map(({ run }) => run.id);
-    const detachedNativeSessions =
-      await detachNativeSessionsForRestart(nativeRunIds);
 
     logger.info(
       {
