@@ -176,6 +176,7 @@ export interface HeartbeatRecoveryDependencies extends Pick<HeartbeatRetryDepend
   dispatchPendingNativeStatusWakeups: () => Promise<unknown>;
   cancelRunInternal: (runId: string, reason?: string, options?: Pick<CancelRunOptions, "resultJson" | "expectedStatus" | "errorCode">) => Promise<unknown>;
   startNextQueuedRunForAgent: (agentId: string) => Promise<unknown>;
+  wakeNextAssignedIssueAfterRun?: (run: HeartbeatRun) => Promise<unknown>;
 }
 
 export const DETACHED_PROCESS_ERROR_CODE = "process_detached";
@@ -2089,7 +2090,19 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     });
   }
 
-  const nativeEnvironmentSettlement = nativeEnvironmentSettlementWork(db, input => settleRecoveredNativeEnvironment(input, true));
+  const nativeEnvironmentSettlement = nativeEnvironmentSettlementWork(db, async input => {
+    await settleRecoveredNativeEnvironment(input, true);
+    await settleRecoveredNativeWorkspace(input, { skipEnvironmentSettlement: true });
+  });
+
+  async function driveRecoveredRun(run: HeartbeatRun) {
+    // A live executor will drive its own completion after process/lease teardown.
+    if (!dependencies.wakeNextAssignedIssueAfterRun || activeRunExecutions.has(run.id)) return;
+    await startNextQueuedRunForAgent(run.agentId);
+    await dependencies.wakeNextAssignedIssueAfterRun(run).catch(error => {
+      logger.warn({ err: error, runId: run.id }, "failed to wake next assigned issue after recovery cleanup");
+    });
+  }
 
   async function settleRecoveredNativeWorkspace(input: {
     runId: string; companyId: string; agentId: string; succeeded: boolean;
@@ -2109,6 +2122,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           : undefined,
       },
     ).catch(() => undefined);
+    if (settledRun) await driveRecoveredRun(settledRun);
   }
 
   function cleanupRetainedNativeSession(input: { companyId: string; runId: string }) {
@@ -2755,6 +2769,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       });
       await startNextQueuedRunForAgent(run.agentId);
       runningProcesses.delete(run.id);
+      await driveRecoveredRun(finalizedRun);
       reaped.push(run.id);
     }
 

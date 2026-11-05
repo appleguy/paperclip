@@ -1,4 +1,5 @@
 import { createHeartbeatTimerPolicy } from "./timer-policy.js";
+import { QUEUE_DRIVE_WAKE_REASON } from "./queue-drive.js";
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
 import { PersistedExecutionWaitRefusal, writeDeferredExecutionWait } from "../deferred-execution-wait.js";
 import { notifyDeferredExecutionWork } from "../deferred-execution-notifications.js";
@@ -2872,6 +2873,25 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
       const outcome = await db
         .transaction(withDurableChatAdmission(durableRequest, async (tx) => {
+          const queueDriveSource = readNonEmptyString(enrichedContextSnapshot.completedRunId);
+          if (reason === QUEUE_DRIVE_WAKE_REASON && isUuidLike(queueDriveSource) &&
+              opts.idempotencyKey === `queue-drive:${queueDriveSource}:${issueId}`) {
+            // Deduplicate completion delivery inside the ordinary admission transaction.
+            await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`queue-drive:${agent.companyId}:${agentId}`}, 0))`);
+            const [receipt] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+              eq(agentWakeupRequests.companyId, agent.companyId), eq(agentWakeupRequests.agentId, agentId),
+              or(eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey), and(
+                sql`starts_with(${agentWakeupRequests.idempotencyKey}, ${`queue-drive:${queueDriveSource}:`})`,
+                ne(agentWakeupRequests.status, "skipped"),
+              )),
+            )).limit(1);
+            if (receipt) return { kind: "skipped" as const };
+            const [active] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.agentId, agentId),
+              inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
+            )).limit(1);
+            if (active) return { kind: "skipped" as const };
+          }
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
           );

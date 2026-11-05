@@ -46,6 +46,7 @@ export const ISSUE_REWAKE_RUN_SAMPLE_LIMIT = 8;
  * resolved, interactions, approvals, monitors, reviews, …) passes through.
  */
 export const THROTTLED_ISSUE_REWAKE_REASONS: ReadonlySet<string> = new Set([
+  "issue_queue_drive",
   "issue_assigned",
   "issue_continuation_needed",
   "issue_assignment_recovery",

@@ -95,6 +95,7 @@ function callbacks(db: Db) {
     dispatchPendingNativeStatusWakeups: vi.fn(async () => undefined),
     cancelRunInternal: vi.fn(async () => undefined),
     startNextQueuedRunForAgent: vi.fn(async () => undefined),
+    wakeNextAssignedIssueAfterRun: vi.fn<NonNullable<HeartbeatRecoveryDependencies["wakeNextAssignedIssueAfterRun"]>>(async () => null),
   } satisfies HeartbeatRecoveryDependencies;
 }
 
@@ -1050,6 +1051,30 @@ describePostgres("heartbeat recovery module ownership", () => {
     finish();
     await Promise.all([...deps.activeRunExecutionPromises]);
     await vi.waitFor(() => expect(deps.activeRunExecutionPromises.size).toBe(0));
+  });
+
+  it.each([false, true])("drives recovered native completion only after cleanup and outside a live executor (active: %s)", async active => {
+    const source = await seedRun();
+    const [run] = await db.update(heartbeatRuns).set({ status: "succeeded", runtimeMode: "native",
+      nativeIssueId: source.issueId, finishedAt: new Date() }).where(eq(heartbeatRuns.id, source.id)).returning();
+    const deps = callbacks(db);
+    deps.getRun.mockResolvedValue(run);
+    if (active) deps.activeRunExecutions.add(run.id);
+    native.finalizations.mockImplementationOnce(async (_db, _ids, options) => {
+      const callback = options as { onWorkspaceSettled(input: {
+        runId: string; companyId: string; agentId: string; succeeded: boolean;
+      }): Promise<void> };
+      await callback.onWorkspaceSettled({ runId: run.id, companyId: run.companyId, agentId: run.agentId, succeeded: true });
+    });
+    await createHeartbeatRecovery(db, deps).recoverNativeRunsAfterRestart();
+    if (active) expect(deps.wakeNextAssignedIssueAfterRun).not.toHaveBeenCalled();
+    else {
+      expect(deps.wakeNextAssignedIssueAfterRun).toHaveBeenCalledExactlyOnceWith(run);
+      expect(deps.wakeNextAssignedIssueAfterRun).toHaveBeenCalledAfter(deps.releaseEnvironmentLeasesForRun);
+      expect(deps.wakeNextAssignedIssueAfterRun).toHaveBeenCalledAfter(deps.finalizeAgentStatus);
+      expect(deps.wakeNextAssignedIssueAfterRun).toHaveBeenCalledAfter(deps.startNextQueuedRunForAgent);
+    }
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
   });
 
   it.each(["completion", "failure_before_dispatch"] as const)("stops preparation renewal after recovered %s", async outcome => {

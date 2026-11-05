@@ -33,6 +33,7 @@ describe("isThrottleCandidateIssueRewake", () => {
 
   it("throttles state-poll reasons and reason-less invokes", () => {
     expect(isThrottleCandidateIssueRewake(base)).toBe(true);
+    expect(isThrottleCandidateIssueRewake({ ...base, reason: "issue_queue_drive" })).toBe(true);
     expect(isThrottleCandidateIssueRewake({ ...base, reason: null })).toBe(true);
     expect(isThrottleCandidateIssueRewake({ ...base, reason: "issue_continuation_needed" })).toBe(true);
     expect(isThrottleCandidateIssueRewake({ ...base, reason: "issue_assignment_recovery" })).toBe(true);

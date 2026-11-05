@@ -46,6 +46,7 @@ import { preserveNativeFailedWorkspace } from "./native-runtime/native-failed-wo
 import { nativeRunHasNoWorkspaceAccess } from "./workspace-restore-recovery-state.js";
 import { selectHeartbeatRuntime } from "./heartbeat/runtime-selection.js";
 import { createHeartbeatRunCompletion } from "./heartbeat/run-completion.js";
+import { createHeartbeatQueueDrive } from "./heartbeat/queue-drive.js";
 export {
   MAX_TURN_CONTINUATION_WAKE_REASON,
   parseSandboxProviderPluginNotReadyFailureMessage,
@@ -1045,6 +1046,11 @@ export function heartbeatService(
     applyRunDispatchPostCommitEffects,
   });
 
+  const { wakeNextAssignedIssueAfterRun } = createHeartbeatQueueDrive(db, {
+    getAgent, getAgentInvokability, getSchedulingSuppression, getWorktreeExecutionCutoff,
+    issuesSvc, treeControlSvc, enqueueWakeup,
+  });
+
   const {
     registerResidualRecoveryWork: registerResidualRecoveryOwner,
     sweepPendingCleanupLeases,
@@ -1093,6 +1099,7 @@ export function heartbeatService(
     getAgent,
     scheduleInteractionContinuationInfrastructureRetryIfEligible,
     startNextQueuedRunForAgent,
+    wakeNextAssignedIssueAfterRun,
   });
 
   // Applies the post-commit effects a run-dispatch operation returns, on a
@@ -4049,6 +4056,12 @@ export function heartbeatService(
           });
         }
         await startNextQueuedRunForAgent(run.agentId);
+        if (caseHandoffCleanupSettled && latestRun && !nativeOwnershipHeld &&
+            !nativeStartupCleanupScheduled && !nativeStartupCleanupError) {
+          await wakeNextAssignedIssueAfterRun(latestRun).catch(err => {
+            logger.warn({ err, runId: run.id }, "failed to wake next assigned issue after execution cleanup");
+          });
+        }
       }
     }
   }
