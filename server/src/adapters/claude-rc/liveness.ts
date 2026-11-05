@@ -23,7 +23,7 @@ const defaultDeps: ClaudeRcLivenessDeps = {
   mtimeMs: async p => (await fs.stat(p).catch(() => null))?.mtimeMs ?? null,
   paneIdle: async (socket, session) => {
     try {
-      const raw = await tmux(socket, ["capture-pane", "-t", session, "-p", "-J", "-e", "-S", "-150"]);
+      const raw = await tmux(socket, ["capture-pane", "-t", `=${session}:`, "-p", "-J", "-e", "-S", "-150"]);
       return isClaudeIdle(raw.replace(/\x1b\[2m[^\x1b\n]*/g, "").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, ""));
     } catch { return null; }
   },

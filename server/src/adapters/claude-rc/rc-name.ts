@@ -29,7 +29,14 @@ export function reportsToDepth(agentId: string, agents: RcAgentNode[]): number {
   return depth;
 }
 
-export function deriveRcName(agentName: string, depth: number): string {
+/** SCO-965: seats beyond slot 0 carry " s<k>" so each Remote Control session is distinguishable; the suffix survives the cap. */
+export function slotRcName(name: string, slot: number): string {
+  if (!(slot > 0)) return name;
+  const suffix = ` s${Math.floor(slot)}`;
+  return `${name.slice(0, RC_NAME_MAX - suffix.length).trim()}${suffix}`;
+}
+
+export function deriveRcName(agentName: string, depth: number, slot = 0): string {
   const d = Number.isFinite(depth) && depth >= 0 ? Math.floor(depth) : 0;
-  return sanitizeRcName(`${d} ${agentName}`);
+  return slotRcName(sanitizeRcName(`${d} ${agentName}`), slot);
 }

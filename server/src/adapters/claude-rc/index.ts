@@ -60,7 +60,11 @@ any remoteControlName config is ignored.
 Config: cwd, stateDir, tmuxSocket (pc-claude-rc), tmuxSession (claude),
 model (claude-sonnet-5-5|claude-haiku-5-5),
 effort (low|medium|high|xhigh|max, default medium), expectedRemoteControlUrl, timeoutSec,
-channelBridgeRoot (optional repository package directory).
+channelBridgeRoot (optional repository package directory),
+slots (1-4, default 1): concurrent seats (SCO-965). Seat 1 is the configured tmux session and stateDir,
+unchanged; seat k+1 is session <tmuxSession>-s<k> with stateDir <stateDir>/s<k>, its own Remote Control
+session named "<name> s<k>" and its own checkpoint/receipts. A run takes the seat holding its issue's
+checkpoint, else the first seat with none. Pair with maxConcurrentRuns = slots.
 
 The agent writes a JSON receipt; only the adapter publishes the report and
 closes the issue with the run token. The bridge needs UserPromptSubmit hook
@@ -81,6 +85,7 @@ any other unresolved checkpoint blocks dispatch.
       { key: "effort", label: "Effort", type: "text", default: "medium" },
       { key: "expectedRemoteControlUrl", label: "Expected RC session URL", type: "text" },
       { key: "channelBridgeRoot", label: "Claude channel bridge package directory (optional)", type: "text" },
+      { key: "slots", label: "Concurrent seats (1-4)", type: "number", default: 1 },
       { key: "timeoutSec", label: "Run timeout (seconds)", type: "number", default: 900 },
     ],
   }),

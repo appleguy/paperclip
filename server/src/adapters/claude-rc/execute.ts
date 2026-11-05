@@ -16,10 +16,10 @@ import {
   joinPromptSections, renderTemplate, selectPaperclipPromptSections,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
-  acquire, adoptableActive, isTargetBusyRefusal, normalizeOneLine, parseReceipt, receiptFilePath, tmux,
+  acquire, adoptableActive, isTargetBusyRefusal, normalizeOneLine, parseReceipt, receiptFilePath, target, tmux, tryAcquire,
   type Receipt,
 } from "../agy/execute.js";
-import { deriveRcName, reportsToDepth, sanitizeRcName, type RcAgentNode } from "./rc-name.js";
+import { deriveRcName, reportsToDepth, sanitizeRcName, slotRcName, type RcAgentNode } from "./rc-name.js";
 import { gateReceiptRaw, refusalMessage, productionDeps } from "./done-gate.js";
 import { captureDoneGateBaseline, type GateBaseline } from "./done-gate-provenance.js";
 import { reconcileForeignSettlement, settleOutcome } from "./settlement.js";
@@ -32,6 +32,46 @@ const CLAUDE = "/opt/homebrew/bin/claude";
 const MODELS = new Set(["claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5-5"]);
 const EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 const ID = /^[a-zA-Z0-9_-]{1,55}$/;
+/** SCO-965: one tmux seat per concurrent run. Slot 0 is the agent's configured seat, unchanged. */
+export type RcSlot = { index: number; session: string; stateDir: string };
+export const RC_MAX_SLOTS = 4;
+export function rcSlotCount(slots: unknown): number {
+  const n = Math.trunc(Number(slots));
+  return Number.isFinite(n) ? Math.min(RC_MAX_SLOTS, Math.max(1, n)) : 1;
+}
+export function rcSlot(index: number, session: string, stateDir: string): RcSlot {
+  return index === 0 ? { index, session, stateDir }
+    : { index, session: `${session}-s${index}`, stateDir: path.join(stateDir, `s${index}`) };
+}
+
+/**
+ * Pick and lock one seat: the seat already holding this issue's checkpoint (adoption), else the first seat
+ * with no checkpoint after verified foreign settlements are archived. One seat keeps today's exact path.
+ */
+export async function claimSlot(
+  ctx: AdapterExecutionContext, slots: RcSlot[], issueId: string, deadline: number,
+): Promise<{ slot: RcSlot; unlock: () => Promise<void> }> {
+  if (slots.length === 1) return { slot: slots[0]!, unlock: await acquire(slots[0]!.stateDir, deadline) };
+  for (const slot of slots) await fs.mkdir(slot.stateDir, { recursive: true, mode: 0o700 });
+  const activeOf = (slot: RcSlot) => fs.readFile(path.join(slot.stateDir, "active.json"), "utf8").catch(() => "");
+  for (const slot of slots) {
+    try { if ((JSON.parse(await activeOf(slot)) as { issueId?: unknown }).issueId === issueId)
+      return { slot, unlock: await acquire(slot.stateDir, deadline) }; } catch { /* no checkpoint */ }
+  }
+  while (Date.now() < deadline) {
+    let held = false;
+    for (const slot of slots) {
+      const unlock = await tryAcquire(slot.stateDir);
+      if (!unlock) { held = true; continue; }
+      await reconcileForeignSettlement(ctx, slot.stateDir, path.join(slot.stateDir, "active.json")).catch(() => {});
+      if (!(await activeOf(slot))) return { slot, unlock };
+      await unlock();
+    }
+    if (!held) throw new Error("claude_rc_local previous task unresolved; inspect active.json and its receipt before dispatch. Never replay actions");
+    await sleep(1000);
+  }
+  throw new Error("claude_rc_local Remote Control seats busy: serialization timeout");
+}
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
 function asString(v: unknown, fallback: string): string {
@@ -39,7 +79,7 @@ function asString(v: unknown, fallback: string): string {
 }
 /** Screen text without dim (ghost prompt suggestion) spans or other escapes. */
 async function claudePane(socket: string, session: string): Promise<string> {
-  const raw = await tmux(socket, ["capture-pane", "-t", session, "-p", "-J", "-e", "-S", "-150"]);
+  const raw = await tmux(socket, ["capture-pane", ...target(session), "-p", "-J", "-e", "-S", "-150"]);
   return raw.replace(/\x1b\[2m[^\x1b\n]*/g, "").replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
 }
 export function isClaudeIdle(screen: string): boolean {
@@ -116,14 +156,14 @@ export async function typeNativeGoal(socket: string, session: string, text: stri
   // Large send-keys writes become pasted text instead of a slash command.
   const chars = Array.from(text);
   for (let i = 0; i < chars.length; i += 24) {
-    await tmux(socket, ["send-keys", "-t", session, "-l", "--", chars.slice(i, i + 24).join("")]);
+    await tmux(socket, ["send-keys", ...target(session), "-l", "--", chars.slice(i, i + 24).join("")]);
     await sleep(60);
   }
-  await tmux(socket, ["send-keys", "-t", session, "Enter"]);
+  await tmux(socket, ["send-keys", ...target(session), "Enter"]);
   for (let i = 0; i < 10; i++) {
     await sleep(500);
     // The echo line is rendered dim, which claudePane drops; match on the raw screen.
-    const raw = await tmux(socket, ["capture-pane", "-t", session, "-p", "-J", "-e", "-S", "-30"]);
+    const raw = await tmux(socket, ["capture-pane", ...target(session), "-p", "-J", "-e", "-S", "-30"]);
     if (expect.test(raw.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, ""))) return true;
   }
   return false;
@@ -139,9 +179,9 @@ async function sendClaudePane(socket: string, session: string, message: string, 
   await fs.writeFile(inputFile, message, { mode: 0o600 });
   try {
     await tmux(socket, ["load-buffer", "-b", buffer, inputFile]);
-    await tmux(socket, ["paste-buffer", "-p", "-r", "-d", "-b", buffer, "-t", session]);
+    await tmux(socket, ["paste-buffer", "-p", "-r", "-d", "-b", buffer, ...target(session)]);
     await sleep(Math.min(3000, Math.max(350, 500 + Math.ceil(message.length / 1500) * 300)));
-    await tmux(socket, ["send-keys", "-t", session, "Enter"]);
+    await tmux(socket, ["send-keys", ...target(session), "Enter"]);
   } finally {
     await tmux(socket, ["delete-buffer", "-b", buffer]).catch(() => {});
     await fs.rm(inputFile, { force: true });
@@ -275,16 +315,16 @@ async function ensureSession(
 ): Promise<{ rcUrl: string; cwd: string }> {
   let sessionCwd = cwd;
   let exists = true;
-  try { await tmux(socket, ["has-session", "-t", session]); } catch { exists = false; }
+  try { await tmux(socket, ["has-session", ...target(session)]); } catch { exists = false; }
   // SCO-693: a changed adapterConfig.cwd must take effect. A non-keepConversation seat holds no state
   // worth keeping between wakes, so at an idle boundary recreate its TUI in the new cwd.
   if (exists && !rejoinOnly && !keepConversation) {
-    const panePath = (await tmux(socket, ["display-message", "-p", "-t", session, "#{pane_current_path}"]).catch(() => "")).trim();
+    const panePath = (await tmux(socket, ["display-message", "-p", ...target(session), "#{pane_current_path}"]).catch(() => "")).trim();
     if (await paneCwdDiffers(panePath, cwd)) {
       if (isClaudeIdle(await claudePane(socket, session))) {
-        const proc = (await tmux(socket, ["display-message", "-p", "-t", session, "#{pane_current_command}"])).trim();
+        const proc = (await tmux(socket, ["display-message", "-p", ...target(session), "#{pane_current_command}"])).trim();
         if (proc !== "claude") throw new Error(`tmux pane is ${proc}, not claude; refusing to commandeer it`);
-        await tmux(socket, ["kill-session", "-t", session]);
+        await tmux(socket, ["kill-session", ...target(session)]);
         exists = false;
       } else {
         // Keep live work in its actual cwd for this wake; never wait or kill it.
@@ -311,13 +351,13 @@ async function ensureSession(
       "--settings", channel.hookSettingsPath,
       "--dangerously-load-development-channels", `server:${CHANNEL_NAME}`]);
   }
-  const processName = (await tmux(socket, ["display-message", "-p", "-t", session, "#{pane_current_command}"])).trim();
+  const processName = (await tmux(socket, ["display-message", "-p", ...target(session), "#{pane_current_command}"])).trim();
   if (processName !== "claude") throw new Error(`tmux pane is ${processName}, not claude; refusing to commandeer it`);
   // Single checks, including existing seats: neither check waits for an idle turn.
   const screen = await claudePane(socket, session);
   if (/trust the files|Do you trust/i.test(screen))
     throw new Error("Claude workspace trust prompt: approve this dedicated workspace in the terminal, then retry");
-  if (isDevChannelPrompt(screen)) await tmux(socket, ["send-keys", "-t", session, "Enter"]);
+  if (isDevChannelPrompt(screen)) await tmux(socket, ["send-keys", ...target(session), "Enter"]);
   const urlFile = path.join(stateDir, "remote-control-url.txt");
   // The RC URL can render after startup; wait only for that identity signal.
   let url: string | null = null;
@@ -381,11 +421,16 @@ async function derivedRcName(ctx: AdapterExecutionContext): Promise<string> {
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const cfg = ctx.config;
-  const session = asString(cfg.tmuxSession, "claude");
+  const baseSession = asString(cfg.tmuxSession, "claude");
+  let session = baseSession;
   const socket = asString(cfg.tmuxSocket, "pc-claude-rc");
   // SCO-782: derived from agent name + reportsTo depth; any configured remoteControlName is ignored.
-  const name = await derivedRcName(ctx);
-  const stateDir = path.resolve(asString(cfg.stateDir, path.join(os.homedir(), ".paperclip/claude-rc-state")));
+  let name = await derivedRcName(ctx);
+  const baseStateDir = path.resolve(asString(cfg.stateDir, path.join(os.homedir(), ".paperclip/claude-rc-state")));
+  let stateDir = baseStateDir;
+  // SCO-965: `slots` seats (default 1); slot 0 is the configured seat, others are <session>-s<k> with own state dir.
+  const slots = Array.from({ length: rcSlotCount(cfg.slots) }, (_, i) => rcSlot(i, baseSession, baseStateDir));
+  let slotIndex = 0;
   let cwd = path.resolve(asString(cfg.cwd, "/Volumes/NVM/Paperclip/workspaces/claude-rc"));
   const model = asString(cfg.model, "claude-sonnet-5-5");
   const effort = asString(cfg.effort, "medium");
@@ -404,7 +449,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (!MODELS.has(model)) throw new Error(`claude_rc_local permits only ${[...MODELS].join(", ")}; received ${model}`);
     if (!EFFORTS.has(effort)) throw new Error(`invalid effort ${effort}`);
     assertWorkableCwd(cwd);
-    if (!ID.test(socket) || !ID.test(session)) throw new Error("invalid tmux socket/session/name");
+    if (!ID.test(socket) || !slots.every(slot => ID.test(slot.session))) throw new Error("invalid tmux socket/session/name");
     if (!issueId) return {
       exitCode: 0, signal: null, timedOut: false, provider: "anthropic", biller: "anthropic", model,
       billingType: "subscription", costStatus: "unpriced", summary: "claude_rc_local: no issue on this wake; nothing to dispatch",
@@ -412,9 +457,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (!ctx.authToken) throw new Error("claude_rc_local requires a Paperclip run-scoped token before dispatch");
     if (ctx.executionTarget?.kind && ctx.executionTarget.kind !== "local")
       throw new Error("claude_rc_local runs on the Mac Pro local host only");
-    await fs.mkdir(stateDir, { recursive: true, mode: 0o700 });
-    await fs.chmod(stateDir, 0o700);
-    unlock = await acquire(stateDir, Date.now() + timeoutMs);
+    await fs.mkdir(baseStateDir, { recursive: true, mode: 0o700 });
+    await fs.chmod(baseStateDir, 0o700);
+    const claimed = await claimSlot(ctx, slots, issueId, Date.now() + timeoutMs);
+    unlock = claimed.unlock;
+    ({ session, stateDir } = claimed.slot);
+    slotIndex = claimed.slot.index;
+    if (slotIndex > 0) {
+      await fs.chmod(stateDir, 0o700);
+      name = slotRcName(name, slotIndex);
+    }
+    if (slots.length > 1) await ctx.onLog("stdout", `[claude-rc] seat ${slotIndex + 1}/${slots.length}: tmux ${socket}/${session}\n`);
     const activePath = path.join(stateDir, "active.json");
     // F07: do not replace the original run's environment or touch its transport
     // until a foreign checkpoint is durably settled under its own issue scope.
@@ -457,7 +510,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // pane verified above; an adopted in-flight op still requires an exact match.
     const pinPath = path.join(stateDir, "rc-url.json");
     const pinned = await fs.readFile(pinPath, "utf8").then(t => asString(JSON.parse(t)?.url, "")).catch(() => "")
-      || asString(cfg.expectedRemoteControlUrl, rcUrl);
+      || (slotIndex === 0 ? asString(cfg.expectedRemoteControlUrl, rcUrl) : rcUrl);
     if (pinned !== rcUrl)
       await ctx.onLog("stdout", `[claude-rc] RC URL re-pinned ${pinned} -> ${rcUrl} (owned tmux ${socket}/${session})\n`);
     if (pinned !== rcUrl || !(await fs.stat(pinPath).catch(() => null)))
@@ -488,7 +541,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const keepMax = typeof cfg.keepConversationMaxBytes === "number" ? cfg.keepConversationMaxBytes : 400_000;
       const keepState: KeepState | null = keepEnabled
         ? await fs.readFile(keepPath, "utf8").then(t => JSON.parse(t) as KeepState).catch(() => null) : null;
-      const before = await seatConversation(session, cwd) ?? await newestConversation(cwd);
+      const before = await seatConversation(session, cwd) ?? (slots.length === 1 ? await newestConversation(cwd) : null);
       const keepSize = before ? (await fs.stat(path.join(projectDir(cwd), `${before}.jsonl`)).catch(() => null))?.size ?? 0 : 0;
       let reuse = shouldReuseConversation({
         enabled: keepEnabled, state: keepState, newestId: before, projectId, sizeBytes: keepSize, maxBytes: keepMax,
@@ -694,7 +747,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         if (idleWithoutReceipt >= 5)
           return failure("Claude adopted dispatch idle without a receipt; checkpoint retained for reconciliation");
       }
-      await tmux(socket, ["has-session", "-t", session]);
+      await tmux(socket, ["has-session", ...target(session)]);
       await sleep(1100);
     }
     if (blockedReason !== null) return {
