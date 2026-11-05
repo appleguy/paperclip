@@ -1,4 +1,6 @@
 import { createHeartbeatTimerPolicy } from "./timer-policy.js";
+import { getStartupRecoveryState } from "../../startup-recovery-state.js";
+import { decideQueuedReceipt, reconcileQueuedReceipt, recordQueuedReason } from "./queued-reconciliation.js";
 import { QUEUE_DRIVE_WAKE_REASON } from "./queue-drive.js";
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
 import { PersistedExecutionWaitRefusal, writeDeferredExecutionWait } from "../deferred-execution-wait.js";
@@ -797,12 +799,24 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     }
   }
 
+  async function reconcileRunReceipt(run: typeof heartbeatRuns.$inferSelect, deferredPostCommitEffects?: WakeQueuePostCommitEffect[]) {
+    const receiptState = await reconcileQueuedReceipt(db, run);
+    if (receiptState.kind === "superseded" && receiptState.run) {
+      await appendRunEvent(receiptState.run, { eventType: "lifecycle", stream: "system", level: "info", message: receiptState.reason });
+      await releaseIssueExecutionAndPromote(receiptState.run, { suppressImmediateRecovery: true, deferredPostCommitEffects });
+      publishRunLifecyclePluginEvent(receiptState.run);
+    }
+    return receiptState.kind === "ready";
+  }
+
   async function claimQueuedRun(
     run: typeof heartbeatRuns.$inferSelect,
     companyAgents?: AgentOrgRow[],
     deferredPostCommitEffects?: WakeQueuePostCommitEffect[],
   ) {
     if (run.status !== "queued") return run;
+    if (getStartupRecoveryState().phase !== "ready") return null;
+    if (!await reconcileRunReceipt(run, deferredPostCommitEffects)) return null;
     const [caseHandoffReceipt] = run.wakeupRequestId ? await db.select().from(caseHandoffs).where(and(
       eq(caseHandoffs.wakeupRequestId, run.wakeupRequestId), eq(caseHandoffs.companyId, run.companyId),
     )).limit(1) : [];
@@ -1294,6 +1308,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   .update(heartbeatRuns)
                   .set({
                     status: "running",
+                    nextAction: lockedRun.nextAction?.startsWith("Queued:") ? null : lockedRun.nextAction,
                     runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
                     ...legacyControllerClaim(run.runtimeMode),
                     responsibleUserId,
@@ -1401,6 +1416,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 .update(heartbeatRuns)
                 .set({
                   status: "running",
+                  nextAction: lockedRun.nextAction?.startsWith("Queued:") ? null : lockedRun.nextAction,
                   runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
                     ...legacyControllerClaim(run.runtimeMode),
                   responsibleUserId,
@@ -1468,6 +1484,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       : await withChatControlRecoveryGate(run, "claim", async (tx) => {
           const claimValues = {
             status: "running",
+            nextAction: run.nextAction?.startsWith("Queued:") ? null : run.nextAction,
             runnerProfileJson: sql`(case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object' then ${heartbeatRuns.runnerProfileJson} else '{}'::jsonb end) || ${JSON.stringify({ adapterDispatch: { adapterType: agent.adapterType } })}::jsonb`,
             ...legacyControllerClaim(run.runtimeMode),
             responsibleUserId,
@@ -1487,13 +1504,16 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           return tx.transaction(async (claimTx) => {
             const issueClaim = await lockIssueExecutionClaim(claimTx as unknown as Db);
             if (issueClaim.blocked) return null;
-            if (run.wakeupRequestId) await claimTx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+            const [lockedWake] = run.wakeupRequestId ? await claimTx.select().from(agentWakeupRequests).where(and(
               eq(agentWakeupRequests.id, run.wakeupRequestId), eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
-            )).for("update");
+            )).for("update") : [];
             const [lockedRun] = await claimTx.select().from(heartbeatRuns).where(and(
               eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.agentId, run.agentId),
             )).for("update");
             if (!lockedRun || lockedRun.status !== "queued") return null;
+            // Receipt ownership may change after the queue scan. Keep this
+            // check under the same locks as the running transition.
+            if (decideQueuedReceipt(lockedRun, lockedWake ?? null, null).kind !== "ready") return null;
             await withExternalAdmissionGuard(claimTx, run.companyId, run.agentId, () => assertNoExternalOverlap(claimTx, run.companyId, run.agentId));
             await notifyChatRunMilestones(claimTx, { companyId: run.companyId, runId: run.id, issueId: issueId ?? undefined });
             const claimedRun = await claimTx.update(heartbeatRuns).set(claimValues).where(and(
@@ -1596,6 +1616,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const [candidate] = await tx.select({ companyId: heartbeatRuns.companyId, contextSnapshot: heartbeatRuns.contextSnapshot })
         .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running"))).for("update");
       if (!candidate) return;
+      await notifyRunDispatch(tx, { companyId: candidate.companyId });
       await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentTimers);
       await notifyChatRunMilestones(tx, { companyId: candidate.companyId, runId,
         issueId: readNonEmptyString(parseObject(candidate.contextSnapshot).issueId) ?? undefined });
@@ -1846,7 +1867,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     if ((await getSchedulingSuppression()).suppressed) return;
     const cutoff = await getWorktreeExecutionCutoff();
     const queuedRuns = await db
-      .select({ agentId: heartbeatRuns.agentId })
+      .select({ run: heartbeatRuns })
       .from(heartbeatRuns)
       .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
       .where(
@@ -1858,10 +1879,20 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         ),
       );
 
-    const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];
+    const agentIds = [...new Set(queuedRuns.map(({ run }) => run.agentId))];
+    const errors: unknown[] = [];
     for (const agentId of agentIds) {
-      await startNextQueuedRunForAgent(agentId);
+      try {
+        for (const { run } of queuedRuns.filter(row => row.run.agentId === agentId)) await reconcileRunReceipt(run);
+        await startNextQueuedRunForAgent(agentId);
+      } catch (error) {
+        errors.push(error);
+        logger.error({ err: error, agentId }, "failed to resume agent queue; continuing other agents");
+      }
     }
+    // Retain the failed dispatch obligation in the delivery worker after giving
+    // every other seat its chance. A broken seat must not strand idle seats.
+    if (errors.length) throw new AggregateError(errors, "Some agent queues could not resume");
   }
 
   // A 403 from claimQueuedRun comes from the run's own persisted identity
@@ -1977,7 +2008,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const started: Array<typeof heartbeatRuns.$inferSelect> = [];
       const exhausted = new Set<string>();
       for (let guard = 0; guard < 100; guard += 1) {
-        if ((await countRunningRunsForPool(companyId, pool)) >= limit) break;
+        const running = await countRunningRunsForPool(companyId, pool);
+        if (running >= limit) {
+          const waiting = await db.select({ run: heartbeatRuns }).from(heartbeatRuns)
+            .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId)).where(and(
+              eq(heartbeatRuns.companyId, companyId), eq(agents.companyId, companyId), eq(heartbeatRuns.status, "queued"),
+              sql`${agents.runtimeConfig}->>'capacityPool' = ${pool}`,
+            ));
+          for (const { run } of waiting) await recordQueuedReason(db, run,
+            `capacity blocked (${running}/${limit} pool slots in use). Waiting for an active execution to settle.`);
+          break;
+        }
         const cutoff = await getWorktreeExecutionCutoff();
         const order = (await listPoolQueuedAgentOrder(companyId, pool, cutoff)).filter((id) => !exhausted.has(id));
         const next = order[0];
@@ -1991,6 +2032,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
   }
 
   async function startNextQueuedRunForAgent(agentId: string, maxClaims?: number) {
+    if (getStartupRecoveryState().phase !== "ready") return [];
     if ((await getSchedulingSuppression()).suppressed) return [];
     const agent = await getAgent(agentId);
     const pool = agent ? agentCapacityPool(agent) : null;
@@ -2001,6 +2043,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
   }
 
   async function startNextQueuedRunForAgentUnpooled(agentId: string, maxClaims?: number) {
+    if (getStartupRecoveryState().phase !== "ready") return [];
     if ((await getSchedulingSuppression()).suppressed) return [];
     const cutoff = await getWorktreeExecutionCutoff();
     // Cancelled after the start lock is released: cancelRunInternal promotes the
@@ -2014,6 +2057,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       if (!agent) return [];
       const invokability = await getAgentInvokability(agent);
       if (!invokability.invokable) {
+        await db.update(heartbeatRuns).set({ nextAction: `Queued: agent unavailable (${invokability.reason}). Restore its execution readiness.` })
+          .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.status, "queued"),
+            sql`(${heartbeatRuns.nextAction} is null or ${heartbeatRuns.nextAction} not like 'Queued: receipt reconciliation.%')`));
         if (shouldCancelRunsForNonInvokableAgent(invokability)) {
           cancellationReason = `Cancelled because the agent is not invokable: ${invokability.reason}`;
         }
@@ -2025,8 +2071,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         maxClaims ?? Infinity,
         Math.max(0, policy.maxConcurrentRuns - runningCount),
       );
-      if (availableSlots <= 0) return [];
-
       const queuedRuns = await db
         .select()
         .from(heartbeatRuns)
@@ -2039,6 +2083,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         )
         .orderBy(asc(heartbeatRuns.createdAt));
       if (queuedRuns.length === 0) return [];
+      if (availableSlots <= 0) {
+        for (const run of queuedRuns) await recordQueuedReason(db, run,
+          `capacity blocked (${runningCount}/${policy.maxConcurrentRuns} agent slots in use). Waiting for an active execution to settle.`);
+        return [];
+      }
       if (queuedRuns.every(run => !run.startedAt) && !await canStartNewExternalBotWork(agent)) return [];
 
       const dependencyReadiness = await listQueuedRunDependencyReadiness(
@@ -2119,6 +2168,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         if (claimedRuns.length >= availableSlots) break;
         let claimed: typeof heartbeatRuns.$inferSelect | null;
         try {
+          await recordQueuedReason(db, queuedRun, "waiting for task ownership, dependencies, or an execution gate to release.");
           claimed = await claimQueuedRun(queuedRun, companyAgents, deferredPostCommitEffects);
         } catch (err) {
           if (isPermanentClaimRejection(err)) {
@@ -2126,6 +2176,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             continue;
           }
           if (!isDeferrableClaimRejection(err)) throw err;
+          await recordQueuedReason(db, queuedRun, `execution gate. ${err instanceof Error ? err.message : "Reconcile the execution admission before retrying."}`);
           logger.warn(
             { err, runId: queuedRun.id, agentId: queuedRun.agentId, companyId: queuedRun.companyId },
             "queued heartbeat run claim was rejected; leaving it queued for the next recovery pass",
@@ -4330,6 +4381,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             enrichedContextSnapshot.explicitUserContinuation = explicitContinuation;
           }
 
+          // Persist the dispatch obligation with the receipt and run. The
+          // immediate start below is only a latency shortcut and may be lost
+          // when this controller exits during a deploy.
+          await notifyRunDispatch(tx, { companyId: agent.companyId });
           const wakeupValues = {
             ...durableReceiptFields,
             companyId: agent.companyId,

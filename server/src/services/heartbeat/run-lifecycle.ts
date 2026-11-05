@@ -312,6 +312,7 @@ export function isHeartbeatRunRuntimeStatusActive(
 
 type HeartbeatRunRuntimeStatusRunLike = {
   id: string;
+  createdAt?: Date | string | null;
   status?: string | null;
   companyId?: string | null;
   agentId?: string | null;
@@ -344,6 +345,7 @@ export function decorateHeartbeatRunRuntimeStatus<
   currentToolName: string | null;
   lastAssistantSnippet: string | null;
   lastEventAt: Date | null;
+  queuedAgeMs: number | null;
 } {
   if (isHeartbeatRunTerminalStatus(run.status)) {
     clearHeartbeatRunRuntimeStatus(run.id);
@@ -384,6 +386,8 @@ export function decorateHeartbeatRunRuntimeStatus<
     currentToolName: currentStatus?.currentToolName ?? null,
     lastAssistantSnippet: currentStatus?.lastAssistantSnippet ?? null,
     lastEventAt: currentStatus?.lastEventAt ?? null,
+    queuedAgeMs: run.status === "queued" && run.createdAt && Number.isFinite(new Date(run.createdAt).getTime())
+      ? Math.max(0, Date.now() - new Date(run.createdAt).getTime()) : null,
   };
 }
 

@@ -2,7 +2,7 @@ import { idleWorkSnapshot } from "../services/task-admission.js";
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { agents, companies, costEvents, createDb, databaseWorkPending, heartbeatRuns, issues } from "@paperclipai/db";
+import { agents, authUsers, companies, companyMemberships, costEvents, createDb, databaseWorkPending, heartbeatRuns, issues } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 import { issueService } from "../services/issues.js";
@@ -171,6 +171,31 @@ describe.skipIf(!support.supported)("run dispatch production wiring (controlled 
     setStartupRecoveryPhase("ready");
     worker!.wake();
     await completed(scheduled.run.id); await quiet();
+  });
+  it("starts a run queued during restart on the first ready dispatch without another producer or restart", async () => {
+    const f = await fixture();
+    await db.insert(authUsers).values({ id: "dispatch-user", name: "Dispatch owner", email: "dispatch@example.test",
+      createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
+    await db.insert(companyMemberships).values({ companyId: f.companyId, principalType: "user", principalId: "dispatch-user",
+      status: "active", membershipRole: "owner" });
+    setStartupRecoveryPhase("recovering");
+    await start();
+    const [issue] = await db.insert(issues).values({ companyId: f.companyId, title: "Queued during restart",
+      status: "todo", assigneeAgentId: f.agentId }).returning();
+    // Emulate controller loss after admission commits but before its immediate
+    // start call. This is the production task admission path, not raw SQL.
+    const pending = await heartbeat.wakeup(f.agentId, { source: "assignment", reason: "issue_assigned",
+      requestedByActorType: "system", contextSnapshot: { issueId: issue.id } });
+    if (!pending) throw new Error("Expected saved restart wake");
+    await heartbeat.drainActiveRunExecutions();
+    expect((await status(pending.id)).status).toBe("queued");
+    setStartupRecoveryPhase("ready");
+    worker!.wake(); // index.ts's ready transition
+    await completed(pending.id);
+    // Normal issue completion may schedule a continuation with its own wake;
+    // restart must consume this exact admitted receipt only once.
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, pending.wakeupRequestId!))).toHaveLength(1);
+    await quiet();
   });
   it("cancels a future retry and removes its old deadline", async () => {
     const f = await fixture(); await start();
