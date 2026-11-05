@@ -8,6 +8,8 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { readableRuntimePath } from "@paperclipai/adapter-utils/readable-runtime-paths";
 import { assertAssembledPrompt, preflightSessionPrompt, applyPromptRotation } from "@paperclipai/adapter-utils/token-preflight";
@@ -166,6 +168,73 @@ export function isPromptEmpty(screen: string): boolean {
   if (line === undefined) return false;
   const input = line.replace(/^\s*❯/, "").trim();
   return input === "" || /^Try "[^"]*"$/.test(input) || input === "Press up to edit queued messages";
+}
+
+type SeatSettings = { identity: string; model: string | null; effort: string | null };
+export function parseSeatLaunch(pid: string, output: string): SeatSettings | null {
+  const match = output.trim().match(/^(\S+\s+\S+\s+\d+\s+\S+\s+\d+)\s+(.+)$/);
+  if (!/^\d+$/.test(pid) || !match) return null;
+  const arg = (name: string) => match[2]!.match(new RegExp(`(?:^|\\s)--${name}(?:=|\\s+)([a-zA-Z0-9._-]+)`))?.[1] ?? null;
+  return { identity: `${pid}:${match[1]}`, model: arg("model"), effort: arg("effort") };
+}
+/** Reconcile only at an empty idle prompt; never disturb an adopted or busy turn. */
+export async function reconcileSeatSettings(o: {
+  stateDir: string; identity: string; launchModel: string | null; launchEffort: string | null;
+  model: string; effort: string; screen: () => Promise<string>;
+  submit: (command: string, confirmed: RegExp) => Promise<boolean>;
+}): Promise<void> {
+  const file = path.join(o.stateDir, "applied-settings.json");
+  const saved = await fs.readFile(file, "utf8").then(t => JSON.parse(t) as SeatSettings).catch(() => null);
+  const state: SeatSettings = saved?.identity === o.identity ? saved : {
+    identity: o.identity, model: o.launchModel, effort: o.launchEffort,
+  };
+  for (const key of ["model", "effort"] as const) {
+    if (state[key] === o[key]) continue;
+    if (!isClaudeIdle(await o.screen())) return;
+    const confirmation = key === "effort"
+      ? new RegExp(`Set effort level to ${o.effort}\\b`, "i")
+      : /(?:set|switched|changed) (?:the )?model (?:to|:)/i;
+    if (!(await o.submit(`/${key} ${o[key]}`, confirmation))) return;
+    state[key] = o[key];
+    // Claude may choose a different default effort after a model switch.
+    if (key === "model") state.effort = null;
+    const temp = `${file}.${process.pid}.tmp`;
+    await fs.writeFile(temp, JSON.stringify(state), { mode: 0o600 });
+    await fs.rename(temp, file);
+  }
+  // Record launch values even when no command was necessary.
+  if (!saved || saved.identity !== o.identity) {
+    const temp = `${file}.${process.pid}.tmp`;
+    await fs.writeFile(temp, JSON.stringify(state), { mode: 0o600 });
+    await fs.rename(temp, file);
+  }
+}
+
+export async function applySeatSettings(socket: string, session: string, stateDir: string, model: string, effort: string,
+  log: (message: string) => Promise<void> | void = () => {}): Promise<void> {
+  const pid = (await tmux(socket, ["display-message", "-p", ...target(session), "#{pane_pid}"])).trim();
+  if (!/^\d+$/.test(pid)) { await log("[claude-rc] Cannot identify seat process; settings reconciliation deferred\n"); return; }
+  const { stdout } = await promisify(execFile)("/bin/ps", ["-p", pid, "-o", "lstart=", "-o", "command="]);
+  const launch = parseSeatLaunch(pid, stdout);
+  if (!launch) { await log("[claude-rc] Cannot read seat launch settings; reconciliation deferred\n"); return; }
+  await reconcileSeatSettings({
+    stateDir, identity: launch.identity, launchModel: launch.model, launchEffort: launch.effort, model, effort,
+    screen: () => claudePane(socket, session),
+    submit: async (command, confirmed) => {
+      if (!isClaudeIdle(await claudePane(socket, session))) return false;
+      await tmux(socket, ["send-keys", ...target(session), "-l", "--", command]);
+      await tmux(socket, ["send-keys", ...target(session), "Enter"]);
+      for (let i = 0; i < 10; i++) {
+        await sleep(500);
+        const raw = await tmux(socket, ["capture-pane", ...target(session), "-p", "-J", "-e", "-S", "-30"]);
+        const text = raw.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
+        const start = text.lastIndexOf(command);
+        if (start >= 0 && confirmed.test(text.slice(start + command.length)) && isClaudeIdle(await claudePane(socket, session))) return true;
+      }
+      await log(`[claude-rc] ${command.split(" ")[0]} change was not confirmed; settings reconciliation deferred\n`);
+      return false;
+    },
+  });
 }
 /** Type one slash command literally, then Enter; true when the harness echoed `expect`. */
 export async function typeNativeGoal(socket: string, session: string, text: string, expect: RegExp): Promise<boolean> {
@@ -565,6 +634,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       dispatched = true;
       await ctx.onLog("stdout", `[claude-rc] Adopting run ${adopted.runId} for issue ${issueId}; no re-dispatch; receipt ${receiptPath}\n`);
     } else {
+      await applySeatSettings(socket, session, stateDir, model, effort, message => ctx.onLog("stderr", message));
       const keepPath = path.join(stateDir, "keep-conversation.json");
       const keepEnabled = cfg.keepConversation === true;
       const projectId = asString(ctx.context.projectId, "");
