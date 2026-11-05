@@ -9,12 +9,13 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import { readableRuntimePath } from "@paperclipai/adapter-utils/readable-runtime-paths";
 import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   joinPromptSections, renderTemplate, selectPaperclipPromptSections,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
-  acquire, adoptableActive, isTargetBusyRefusal, deliver, normalizeOneLine, parseReceipt, tmux,
+  acquire, adoptableActive, isTargetBusyRefusal, deliver, normalizeOneLine, parseReceipt, receiptFilePath, tmux,
   type Receipt,
 } from "../agy/execute.js";
 import { deriveRcName, reportsToDepth, sanitizeRcName, type RcAgentNode } from "./rc-name.js";
@@ -487,7 +488,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       await fs.writeFile(pinPath, JSON.stringify({ url: rcUrl, previous: pinned === rcUrl ? null : pinned,
         at: new Date().toISOString(), runId: ctx.runId }), { mode: 0o600 });
     let receiptRunId = ctx.runId;
-    let receiptPath = path.join(stateDir, `receipt-${ctx.runId}.json`);
+    let receiptPath = receiptFilePath(stateDir, ctx.runId);
     let conversationId: string | null = null;
 
     if (adopted) {
@@ -551,18 +552,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const intro = reuse ? "" : renderTemplate(promptBase, {
         agent: ctx.agent, run: { id: ctx.runId }, context: ctx.context, companyId: ctx.agent.companyId,
       });
+      const promptStateDir = await readableRuntimePath(ctx, "rc", stateDir);
+      const promptReceiptPath = path.join(promptStateDir, path.basename(receiptPath));
+      const promptRunEnvPath = path.join(promptStateDir, path.basename(runEnvPath));
       const instructions = reuse ? [
         `Paperclip run ${ctx.runId}, issue ${issueId}: work on ONLY this issue; standing run rules unchanged.`,
-        `Done receipt (Write tool, only on success; do not update the issue yourself): ${receiptPath} with keys runId, issueId,`,
+        `Done receipt (Write tool, only on success; do not update the issue yourself): ${promptReceiptPath} with keys runId, issueId,`,
         'status "done", summary, report (Markdown, 250+ chars).',
-        `pcrc: PAPERCLIP_RC_RUN_ENV=${runEnvPath}.`,
+        `pcrc: PAPERCLIP_RC_RUN_ENV=${promptRunEnvPath}.`,
       ].join(" ") : [
         `Paperclip run ${ctx.runId}, issue ${issueId}. Work on ONLY the assigned issue.`,
         "This is the owner's live Claude Code Remote Control session: messages they send mid-task steer this issue.",
         "Run every command in the foreground; never background a tool call. Never print secrets or guess Paperclip API credentials.",
-        `To comment or edit this issue (e.g. blockedByIssueIds) prefix the shared api command: PAPERCLIP_RC_RUN_ENV=${runEnvPath} pcrc api POST ./comments '{"body":"..."}' or ... pcrc api PATCH . '{"blockedByIssueIds":[]}'. pcrc supplies the run-scoped credentials; never print them.`,
+        `To comment or edit this issue (e.g. blockedByIssueIds) prefix the shared api command: PAPERCLIP_RC_RUN_ENV=${promptRunEnvPath} pcrc api POST ./comments '{"body":"..."}' or ... pcrc api PATCH . '{"blockedByIssueIds":[]}'. pcrc supplies the run-scoped credentials; never print them.`,
         "Finish the requested issue work, then use your Write tool to create the JSON receipt",
-        `${receiptPath} with exactly these keys: runId = ${ctx.runId}, issueId = ${issueId},`,
+        `${promptReceiptPath} with exactly these keys: runId = ${ctx.runId}, issueId = ${issueId},`,
         'status = "done", summary = a short factual summary, report = a detailed Markdown result (at least 250 characters).',
         "Write it only once actual work is complete. The Paperclip adapter publishes the report and closes the issue",
         "under the run's scoped identity. Do NOT update the issue yourself. Do not write a done receipt on failure;",

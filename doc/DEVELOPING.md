@@ -2028,6 +2028,21 @@ that file, not as the main completion path for deliverables.
 
 ## Default Agent Workspaces
 
+An explicit `executionWorkspacePreference: "agent_default"` uses the assigned
+agent's configured `cwd` instead of a previous task session's directory. To
+return an idle task to that default, PATCH the issue with
+`executionWorkspaceId: null`, `executionWorkspaceSettings: null`, and
+`executionWorkspacePreference: "agent_default"` (also clear `projectWorkspaceId`
+when it came from the old binding). These resets work with isolated workspaces
+disabled. An active run still owns its workspace; reset it after settlement.
+
+Local runtime prompts use private readable aliases under the instance's `runs/`
+directory, named for the issue, date and agent. Skill and instruction aliases
+point to the original managed directories; relative reads and writes retain
+their original destination. Concurrent runs have separate aliases. Internal
+storage identities, session compatibility and file collection remain unchanged.
+Aliases are retained with run history so saved prompts stay usable.
+
 When a local agent run has no resolved project/session workspace, Paperclip falls back to an agent home workspace under the instance root:
 
 - `~/.paperclip/instances/default/workspaces/<agent-id>`

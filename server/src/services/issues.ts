@@ -10294,9 +10294,9 @@ export function issueService(db: Db) {
         await instanceSettings.getExperimental()
       ).enableIsolatedWorkspaces;
       if (!isolatedWorkspacesEnabled) {
-        delete issueData.executionWorkspaceId;
-        delete issueData.executionWorkspacePreference;
-        delete issueData.executionWorkspaceSettings;
+        if (issueData.executionWorkspaceId !== null) delete issueData.executionWorkspaceId;
+        if (issueData.executionWorkspacePreference !== null && issueData.executionWorkspacePreference !== "agent_default") delete issueData.executionWorkspacePreference;
+        if (issueData.executionWorkspaceSettings !== null) delete issueData.executionWorkspaceSettings;
       }
       if (data.assigneeAgentId && data.assigneeUserId) {
         throw unprocessable("Issue can only have one assignee");
@@ -11281,9 +11281,11 @@ export function issueService(db: Db) {
       // opt-in UI for creating isolated worktrees. Public updates still obey
       // the feature gate; only the internal shared-workspace binding bypasses it.
       if (!isolatedWorkspacesEnabled && !options.bindRuntimeSharedWorkspace) {
-        delete issueData.executionWorkspaceId;
-        delete issueData.executionWorkspacePreference;
-        delete issueData.executionWorkspaceSettings;
+        // Clearing a stale binding returns execution to the agent's configured
+        // cwd. It must remain possible after the isolated-workspace UI is off.
+        if (issueData.executionWorkspaceId !== null) delete issueData.executionWorkspaceId;
+        if (issueData.executionWorkspacePreference !== null && issueData.executionWorkspacePreference !== "agent_default") delete issueData.executionWorkspacePreference;
+        if (issueData.executionWorkspaceSettings !== null) delete issueData.executionWorkspaceSettings;
       }
 
       if (issueData.status) {

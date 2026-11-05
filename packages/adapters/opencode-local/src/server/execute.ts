@@ -1,4 +1,5 @@
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
+import { readableRuntimePath } from "@paperclipai/adapter-utils/readable-runtime-paths";
 import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -575,9 +576,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       );
     }
     const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
-    const resolvedInstructionsFilePath = instructionsFilePath
+    const originalInstructionsFilePath = instructionsFilePath
       ? path.resolve(cwd, instructionsFilePath)
       : "";
+    const resolvedInstructionsFilePath = originalInstructionsFilePath && !executionTargetIsRemote
+      ? path.join(await readableRuntimePath(ctx, "instructions", path.dirname(originalInstructionsFilePath)), path.basename(originalInstructionsFilePath))
+      : originalInstructionsFilePath;
     const instructionsDir = resolvedInstructionsFilePath ? `${path.dirname(resolvedInstructionsFilePath)}/` : "";
     let instructionsPrefix = "";
     if (resolvedInstructionsFilePath) {

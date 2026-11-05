@@ -153,6 +153,7 @@ describe("agy single-RC dispatch safety", () => {
     const a = { runId: run, issueId: "i1", receiptPath: `/s/receipt-${run}.json`, rcUrl: "https://antigravity.google.com/r/x", conversationId: "c1" };
     expect(adoptableActive("", "i1", "/s")).toBeNull();
     expect(adoptableActive(JSON.stringify(a), "i1", "/s")?.runId).toBe(run);
+    expect(adoptableActive(JSON.stringify({ ...a, receiptPath: "/s/receipt-8e5cbb551e72.json" }), "i1", "/s")?.runId).toBe(run);
     expect(() => adoptableActive(JSON.stringify(a), "i2", "/s")).toThrow(/Never replay/);
     expect(() => adoptableActive(JSON.stringify({ ...a, receiptPath: "/etc/x.json" }), "i1", "/s")).toThrow(/Never replay/);
     expect(() => adoptableActive("{not json", "i1", "/s")).toThrow(/Never replay/);

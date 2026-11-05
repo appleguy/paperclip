@@ -1,5 +1,6 @@
 import { isOpenRouterUrl, openRouterClaudeHeaders } from "@paperclipai/shared/openrouter-attribution";
 import { prepareAcpxCodexObservabilityHome } from "../codex-observability-home.js";
+import { readableRuntimePath } from "../readable-runtime-paths.js";
 import { codexShellEnvironmentKeys } from "../codex-shell-environment.js";
 import { applyObservabilityEnvironment } from "../agent-observability.js";
 import { cancellableSandboxStartup } from "./startup-cancellation.js";
@@ -2565,6 +2566,10 @@ async function buildRuntime(input: {
       skillCommandNotes[i] = rebaseToSandbox(skillCommandNotes[i]!);
     }
   }
+  if (acpxAgent === "claude" && !executionTargetIsRemote && claudeSkillsBundleDir) {
+    const root = await readableRuntimePath(input.ctx, "skills", claudeSkillsBundleDir);
+    skillPromptInstructions = skillPromptInstructions.split(claudeSkillsBundleDir).join(root);
+  }
   // Both bridge starts run under one try so a failure at EITHER — including the
   // paperclip callback bridge — fires the same abandon-path cleanup. The
   // paperclip bridge starts after the workspace + managed home were already
@@ -2638,12 +2643,14 @@ async function buildRuntime(input: {
       ? skillsIdentity.skillsHome
       : null;
   if (currentSkillRoot && Array.isArray(skillsIdentity.selectedSkills) && skillsIdentity.selectedSkills.length > 0) {
+    const promptSkillRoot = executionTargetIsRemote ? currentSkillRoot
+      : await readableRuntimePath(input.ctx, "skills", currentSkillRoot);
     // Managed connection homes are disposable. A resumed conversation may
     // remember a previous home's skill paths; supply the current root on every
     // turn, after the remote launch environment has rebased CODEX_HOME.
     skillPromptInstructions = [
       `Paperclip has materialized selected runtime skills for this ACPX ${acpxAgent === "codex" ? "Codex" : "Gemini"} run.`,
-      `Skill root for this run: ${currentSkillRoot}`,
+      `Skill root for this run: ${promptSkillRoot}`,
       `Selected skills: ${skillsIdentity.selectedSkills.join(", ")}`,
       "When a task calls for one of these skills, read its SKILL.md from this root and follow it. Resolve referenced scripts and files relative to that skill. Use this run's root even when an earlier turn used a different path.",
       ...(acpxAgent === "gemini" && skillsIdentity.selectedSkills.includes("paperclip")
@@ -3116,7 +3123,13 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
     : context.conversationMode === true
       ? DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE
       : DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE;
-  const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
+  const configuredInstructionsPath = asString(config.instructionsFilePath, "").trim();
+  const instructionsRemote = adapterExecutionTargetSessionIdentity(readAdapterExecutionTarget({
+    executionTarget: ctx.executionTarget, legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
+  })) !== null;
+  const instructionsFilePath = configuredInstructionsPath && !instructionsRemote
+    ? path.join(await readableRuntimePath(ctx, "instructions", path.dirname(configuredInstructionsPath)), path.basename(configuredInstructionsPath))
+    : configuredInstructionsPath;
   const instructionsDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
   let instructionsPrefix = "";
   const commandNotes: string[] = [];

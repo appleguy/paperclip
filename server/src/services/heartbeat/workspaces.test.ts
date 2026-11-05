@@ -203,6 +203,18 @@ describe("heartbeat workspace module", () => {
     expect(database.select).not.toHaveBeenCalled();
   });
 
+  it("uses the seat's configured cwd over a saved session for agent_default", async () => {
+    const priorCwd = path.join(testRoot, "other-seat");
+    const ownCwd = path.join(testRoot, "own-seat");
+    await fs.mkdir(priorCwd);
+    const resolver = createHeartbeatWorkspaceResolver(databaseWithResults().db);
+    const result = await resolver.resolveWorkspaceForRun(agent(), {}, { cwd: priorCwd }, {
+      useProjectWorkspace: false, configuredCwd: ownCwd,
+    });
+    expect(result).toMatchObject({ cwd: ownCwd, workspaceId: null });
+    expect((await fs.stat(ownCwd)).isDirectory()).toBe(true);
+  });
+
   it("shares one in-flight checkout across legacy and direct module callers", async () => {
     const repoUrl = await createRepository("source", "shared checkout\n");
     const started = deferred();

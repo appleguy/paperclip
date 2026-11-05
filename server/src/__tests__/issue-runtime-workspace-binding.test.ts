@@ -46,4 +46,30 @@ const support = await getEmbeddedPostgresTestSupport();
     await expect(svc.update(isolated.issueId, binding(isolated.workspaceId), db, undefined, undefined, { bindRuntimeSharedWorkspace: true })).rejects.toThrow("existing shared workspace");
     expect(await svc.update(local.issueId, { ...binding(local.workspaceId), companyGuard: foreign.companyId }, db, undefined, undefined, { bindRuntimeSharedWorkspace: true })).toBeNull();
   });
+
+  it("allows explicitly clearing a stale binding with isolated workspaces off", async () => {
+    const f = await fixture(), svc = issueService(db);
+    await svc.update(f.issueId, binding(f.workspaceId), db, undefined, undefined, { bindRuntimeSharedWorkspace: true });
+    const cleared = await svc.update(f.issueId, {
+      executionWorkspaceId: null, executionWorkspacePreference: null, executionWorkspaceSettings: null,
+    });
+    expect(cleared).toMatchObject({
+      executionWorkspaceId: null, executionWorkspacePreference: null, executionWorkspaceSettings: null,
+    });
+    expect(await svc.getById(f.issueId)).toMatchObject({ executionWorkspaceId: null });
+  });
+
+  it("preserves an explicit agent-default choice instead of inheriting a parent's workspace", async () => {
+    const f = await fixture(), svc = issueService(db);
+    await svc.update(f.issueId, binding(f.workspaceId), db, undefined, undefined, { bindRuntimeSharedWorkspace: true });
+    const child = await svc.create(f.companyId, {
+      title: "Run in the assigned seat", parentId: f.issueId,
+      executionWorkspaceId: null, executionWorkspacePreference: "agent_default", executionWorkspaceSettings: null,
+    });
+    expect(child).toMatchObject({ executionWorkspaceId: null, executionWorkspacePreference: "agent_default" });
+    const cleared = await svc.update(f.issueId, {
+      executionWorkspaceId: null, executionWorkspacePreference: "agent_default", executionWorkspaceSettings: null,
+    });
+    expect(cleared).toMatchObject({ executionWorkspaceId: null, executionWorkspacePreference: "agent_default" });
+  });
 });

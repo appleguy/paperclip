@@ -10,6 +10,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import { readableRuntimePath } from "@paperclipai/adapter-utils/readable-runtime-paths";
 import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   joinPromptSections, renderTemplate, selectPaperclipPromptSections,
@@ -163,6 +164,14 @@ export function parseReceipt(raw: string, runId: string, issueId: string): Recei
   return r as Receipt;
 }
 export type ActiveDispatch = { runId: string; issueId: string; receiptPath: string; rcUrl: string; conversationId?: string | null };
+
+export function receiptFilePath(stateDir: string, runId: string): string {
+  return path.join(stateDir, `receipt-${runId.replaceAll("-", "").slice(0, 12)}.json`);
+}
+
+function validReceiptPath(stateDir: string, runId: string, candidate: unknown): candidate is string {
+  return candidate === receiptFilePath(stateDir, runId) || candidate === path.join(stateDir, `receipt-${runId}.json`);
+}
 /**
  * Crash reconciliation without replay: a checkpoint for the SAME issue is
  * adopted by the next run (the TUI kept working while Paperclip restarted);
@@ -172,9 +181,8 @@ export function adoptableActive(raw: string, issueId: string, stateDir: string, 
   if (!raw) return null;
   let a: Partial<ActiveDispatch>;
   try { a = JSON.parse(raw) as Partial<ActiveDispatch>; } catch { a = {}; }
-  const expectedReceipt = typeof a.runId === "string" ? path.join(stateDir, `receipt-${a.runId}.json`) : "";
   if (a.issueId !== issueId || typeof a.runId !== "string" || !/^[0-9a-f-]{36}$/i.test(a.runId)
-      || a.receiptPath !== expectedReceipt || typeof a.rcUrl !== "string") {
+      || !validReceiptPath(stateDir, a.runId, a.receiptPath) || typeof a.rcUrl !== "string") {
     throw new Error(`${adapter} previous task unresolved; inspect active.json and its receipt before dispatch. Never replay actions`);
   }
   return a as ActiveDispatch;
@@ -388,7 +396,7 @@ async function settleForeignCheckpoint(
   let a: Partial<ActiveDispatch>;
   try { a = JSON.parse(raw) as Partial<ActiveDispatch>; } catch { return; }
   if (!a || typeof a.runId !== "string" || !/^[0-9a-f-]{36}$/i.test(a.runId) || typeof a.issueId !== "string"
-      || a.issueId === issueId || a.receiptPath !== path.join(stateDir, `receipt-${a.runId}.json`)) return;
+      || a.issueId === issueId || !validReceiptPath(stateDir, a.runId, a.receiptPath)) return;
   const idle = (await inputReadiness(socket, session, stateDir, cwd, a.conversationId)).allowed;
   let receipt: Receipt | null = null;
   try { receipt = parseReceipt(await fs.readFile(a.receiptPath, "utf8"), a.runId, a.issueId); } catch { /* none yet */ }
@@ -414,7 +422,7 @@ export async function archiveDeadSameIssueCheckpoint(
   let a: Partial<ActiveDispatch> & { startedAt?: string };
   try { a = JSON.parse(raw); } catch { return false; }
   if (!a || a.issueId !== issueId || typeof a.runId !== "string" || !/^[0-9a-f-]{36}$/i.test(a.runId)
-      || a.receiptPath !== path.join(stateDir, `receipt-${a.runId}.json`)) return false;
+      || !validReceiptPath(stateDir, a.runId, a.receiptPath)) return false;
   const started = Date.parse(a.startedAt ?? "");
   if (!Number.isFinite(started) || Date.now() - started < minAgeMs) return false;
   if (await fs.stat(a.receiptPath).then(() => true, () => false)) return false;
@@ -476,7 +484,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (pinned !== rcUrl || !(await fs.stat(pinPath).catch(() => null)))
       await fs.writeFile(pinPath, JSON.stringify({ url: rcUrl, previous: pinned === rcUrl ? null : pinned, at: new Date().toISOString(), runId: ctx.runId }), { mode: 0o600 });
     let receiptRunId = ctx.runId;
-    let receiptPath = path.join(stateDir, `receipt-${ctx.runId}.json`);
+    let receiptPath = receiptFilePath(stateDir, ctx.runId);
     let conversationId: string | null = null;
     if (adopted) {
       if (adopted.rcUrl !== rcUrl) throw new Error("agy RC URL changed since the adopted dispatch; operator reconciliation required");
@@ -509,13 +517,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const intro = renderTemplate(promptBase, {
       agent: ctx.agent, run: { id: ctx.runId }, context: ctx.context, companyId: ctx.agent.companyId,
     });
+    const promptReceiptPath = path.join(await readableRuntimePath(ctx, "rc", stateDir), path.basename(receiptPath));
     const instructions = [
       `Paperclip run ${ctx.runId}, issue ${issueId}. Work on ONLY the assigned issue.`,
       "Your actions are visible and steerable through the single Antigravity Remote Control session.",
       `Use ${modelLabel(model)}. Do not switch models.`,
       " Never use secrets or guess Paperclip API credentials.",
       "Finish the requested issue work, then write a JSON receipt via your write_to_file tool",
-      `to ${receiptPath} with exactly these keys: runId = ${ctx.runId}, issueId = ${issueId},`,
+      `to ${promptReceiptPath} with exactly these keys: runId = ${ctx.runId}, issueId = ${issueId},`,
       'status = "done", summary = a short factual summary, report = a detailed Markdown result (at least 250 characters).',
       "Write this only once actual work is complete. The Paperclip adapter will publish the report and close the issue",
       "under the run's scoped identity. Do NOT update the issue yourself. Do not write a done receipt on failure.",

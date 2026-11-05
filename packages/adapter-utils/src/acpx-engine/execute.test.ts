@@ -70,7 +70,12 @@ async function makeTempRoot() {
   return root;
 }
 
+beforeEach(async () => {
+  vi.stubEnv("PAPERCLIP_HOME", await makeTempRoot());
+});
+
 afterEach(async () => {
+  vi.unstubAllEnvs();
   defaultGeminiTestHome = undefined;
   // A remote run stages a process-session bridge whose detached event writer can
   // still be flushing a trailing event file into `.../process-sessions/<id>/events`
@@ -1797,7 +1802,10 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(await fs.readFile(path.join(materializedSkill, "SKILL.md"), "utf8")).toContain("# danger");
     expect(await pathExists(path.join(materializedSkill, "leak.txt"))).toBe(false);
     expect(await pathExists(path.join(materializedSkill, "leak-dir"))).toBe(false);
-    expect(String(meta[0]?.prompt ?? "")).toContain(`Skill root: ${skillsHome}`);
+    const promptRoot = String(meta[0]?.prompt ?? "").match(/^Skill root: (.+)$/m)?.[1];
+    expect(promptRoot).toBeTruthy();
+    expect(await fs.realpath(promptRoot!)).toBe(await fs.realpath(skillsHome));
+    expect(promptRoot).not.toContain(path.basename(mountedRoot));
   });
 
   it.skipIf(process.platform === "win32")("revokes removed ACPX Codex skills and skips symlinked descendants", async () => {
@@ -1872,7 +1880,9 @@ describe("shared ACPX engine runtime behavior", () => {
         paperclipSkillSync: { desiredSkills: [] },
       });
       const skillsHome = agent === "codex" ? path.join(home, "skills") : path.join(home, ".gemini", "skills");
-      expect(String(meta[0]?.prompt ?? "")).toContain(`Skill root for this run: ${skillsHome}`);
+      const promptRoot = String(meta[0]?.prompt ?? "").match(/^Skill root for this run: (.+)$/m)?.[1];
+      expect(promptRoot).toBeTruthy();
+      expect(await fs.realpath(promptRoot!)).toBe(await fs.realpath(skillsHome));
       expect(String(meta[0]?.prompt ?? "")).toContain("Resolve referenced scripts and files relative to that skill");
       if (home === homes[1]) expect(String(meta[0]?.prompt ?? "")).not.toContain(homes[0]!);
       await fs.rm(home, { recursive: true, force: true });
@@ -4774,7 +4784,10 @@ describe("ACPX engine Claude skill bundle staging (remote ACP lane)", () => {
     const bundle = await onlyChildDir(path.join(stateDir, "runtime-skills", "claude"));
     const stagedFile = path.join(bundle, ".claude", "skills", skill.runtimeName, "SKILL.md");
     const prompt = String(meta[0]?.prompt ?? "");
-    expect(prompt).toContain(`- ${skill.runtimeName}: Use for Paperclip-managed tasks and durable task documents. (file: ${stagedFile})`);
+    const promptRoot = prompt.match(/^Skill root: (.+)$/m)?.[1];
+    const promptFile = path.join(promptRoot!, skill.runtimeName, "SKILL.md");
+    expect(prompt).toContain(`- ${skill.runtimeName}: Use for Paperclip-managed tasks and durable task documents. (file: ${promptFile})`);
+    expect(await fs.realpath(promptFile)).toBe(await fs.realpath(stagedFile));
     expect(prompt).not.toContain("PRIVATE_SKILL_BODY_RECIPE");
     expect(prompt).not.toContain(skill.source);
     expect(result.sessionParams?.skills).toMatchObject({ selectedSkills: [skill.runtimeName] });

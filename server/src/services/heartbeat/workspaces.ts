@@ -3659,7 +3659,9 @@ export function createHeartbeatWorkspaceResolver(db: Db) {
       );
     }
 
-    const sessionCwd = readNonEmptyString(previousSessionParams?.cwd);
+    // agent_default explicitly selects this seat's cwd. A saved task session
+    // can still name the previous assignee's inherited execution workspace.
+    const sessionCwd = opts?.useProjectWorkspace === false ? null : readNonEmptyString(previousSessionParams?.cwd);
     const sessionCwdLooksUnsafe = isUnsafeSessionWorkspaceCwd(sessionCwd);
     if (!forceTaskDirectory && sessionCwd && !sessionCwdLooksUnsafe) {
       const sessionCwdExists = await fs
