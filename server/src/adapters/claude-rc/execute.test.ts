@@ -9,6 +9,11 @@ describe("claude_rc_local screen parsing", () => {
     expect(isClaudeIdle([rule, "❯ ", "─".repeat(40), footer].join("\n"))).toBe(true);
     expect(isClaudeIdle([rule, '❯ Try "how does <filepath> work?"', "─".repeat(40), footer].join("\n"))).toBe(true);
   });
+  it("stays idle when the last answer merely mentions a spinner word", () => {
+    const answer = "  - Panes: one pane per generating session; thinking and working notes follow.";
+    expect(isClaudeIdle([answer, "", "✻ Worked for 13m 42s · done 12:51 PM", rule, "❯ ", "─".repeat(40), footer].join("\n"))).toBe(true);
+    expect(isClaudeIdle(["✻ Generating… (3s)", rule, "❯ ", "─".repeat(40), footer].join("\n"))).toBe(false);
+  });
   it("is busy while a turn runs or a dialog is open", () => {
     expect(isClaudeIdle(["✻ Thinking… (12s · esc to interrupt)", rule, "❯ ", footer].join("\n"))).toBe(false);
     expect(isClaudeIdle(["Do you want to proceed?", "❯ 1. Yes", "  2. No", footer].join("\n"))).toBe(false);

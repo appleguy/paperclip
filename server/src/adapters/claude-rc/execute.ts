@@ -52,7 +52,10 @@ export function isClaudeIdle(screen: string): boolean {
   // Only terminal rules/blank lines may occur between the editor and footer.
   if (after.some(l => l.trim() && !/^[\s─━═│┃]+$/.test(l) &&
     !/bypass permissions on|shift\+tab to cycle/i.test(l))) return false;
-  return !/esc to interrupt|Do you want to|❯ 1\.|Generating|Thinking…|Working…/i.test(tail.join("\n"));
+  // Spinner tokens are capitalized and end in an ellipsis; plain prose such as
+  // "one pane per generating session" in the last answer must not read as busy.
+  const text = tail.join("\n");
+  return !/esc to interrupt|Do you want to|❯ 1\./i.test(text) && !/(Generating|Thinking|Working)…/.test(text);
 }
 export function parseClaudeRcUrl(screen: string): string | null {
   return screen.match(/https:\/\/claude\.ai\/code\/session_[A-Za-z0-9]+/)?.[0] ?? null;
