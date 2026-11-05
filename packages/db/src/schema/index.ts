@@ -265,3 +265,4 @@ export { companyObservability } from "./company_observability.js";
 
 export * from "./prompt_injection_prevention.js";
 export { workflows } from "./workflows.js";
+export { nativeSessionAuthorities, nativeSessionAuthorityEvents } from "./native_session_authorities.js";

@@ -46,5 +46,8 @@ export { loadWithoutEmbeddedPostgresExitHooks } from "./embedded-postgres-lifecy
 export { issueRelations } from "./schema/issue_relations.js";
 export { issueReferenceMentions } from "./schema/issue_reference_mentions.js";
 export * from "./schema/index.js";
+export { createNativeSessionAuthorityStore, canonicalNativeProvider, SessionAuthorityConflict,
+  type AuthorityActor, type AuthorityIdentity, type AuthorityState,
+  type WriterGrant, type AuthoritySnapshot } from "./native-session-authority.js";
 
 export { databaseWorkScopeKey, signalDatabaseWork, subscribeDatabaseWork, databaseWorkPending, reconcileDatabaseWork } from "./work-signals.js";
