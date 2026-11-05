@@ -27,6 +27,17 @@ Run `node --test ops/owner-capture/event-identity.test.mjs`. All inputs and stat
 are synthetic and retained under NVM scratch. Text fixtures are archived rather
 than deleted, per `file-hygiene`; no production ledger is mutated by tests.
 
+Receipt capture and Claude, Codex and both OpenCode schema scans share the same
+Paperclip envelope classifier (SCO-977). A wake/resume envelope must start the
+message, carry its generated opening sentence, and contain reason/issue fields;
+a task-context envelope must start the message and contain its issue field.
+Owner prose mentioning markers, or preceding a quoted payload with an instruction,
+is retained. Existing transport exclusions (Codex exec, Claude metadata and
+OpenCode synthetic/compaction rows) still apply. Text structure is a fallback,
+not authentication: an exact envelope without origin metadata is ambiguous.
+Run `node --test ops/owner-capture/quoted-markers.test.mjs` for receipt/scan parity,
+mixed owner-plus-payload cases and automated-envelope exclusions.
+
 Deployment: preserve a pre-change copy under the deployment's `archive/`, then
 copy the committed `owner-guard` and `opencode/owner-guard.js` to their matching
 deployment paths. No service restart or live session interruption is required.

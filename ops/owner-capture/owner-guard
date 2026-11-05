@@ -10,7 +10,18 @@
 set -eu
 G=/Volumes/NVM/Paperclip/ops/owner-capture/owner-guard
 # automated injections that are never owner typing (peer mail, watchdogs, restart/compaction boilerplate, Paperclip wakes, our own gate)
-AUTO='^\s*(\[(peer|OpenRig|watcher|watchdog|OpenRig watchdog)|Urgent \(marked by|Self-handoff|/compact|OpenRig|Recovered queue|Restore audit|[0-9]+ message\(s\) waiting|Delivery |You are a bounded worker|You are agent [0-9a-f-]{36}|SCO-[0-9]+ Step |OWNER STEERING OPEN|You are an agent in a Paperclip company|## Paperclip Wake Payload|Paperclip task context|Paperclip may post a short platform-generated|The following is the Codex agent history added since your last approval|Paperclip has materialized selected runtime skills|The previous response was interrupted\. Continue from where you left off|Your task is to predict the single next message)'
+AUTO='^\s*(\[(peer|OpenRig|watcher|watchdog|OpenRig watchdog)|Urgent \(marked by|Self-handoff|/compact|OpenRig|Recovered queue|Restore audit|[0-9]+ message\(s\) waiting|Delivery |You are a bounded worker|You are agent [0-9a-f-]{36}|SCO-[0-9]+ Step |OWNER STEERING OPEN|You are an agent in a Paperclip company|Paperclip may post a short platform-generated|The following is the Codex agent history added since your last approval|Paperclip has materialized selected runtime skills|The previous response was interrupted\. Continue from where you left off|Your task is to predict the single next message)'
+# SCO-977: receipt and every scanner share the envelope check. A marker in owner
+# prose (including a quoted full payload after an instruction) is not an origin.
+# Without transport metadata, require an envelope at the start and its fields.
+OWNER_JQ='def paperclip_envelope:
+    test("^\\s*## Paperclip (Wake Payload|Resume Delta)\\r?\\n\\s*\\r?\\n(Use this wake to continue the task,|You are resuming an existing Paperclip session\\.)[\\s\\S]*\\n- reason: [^\\r\\n]+\\r?\\n- issue: [^\\r\\n]+")
+    or test("^\\s*Paperclip task context:\\r?\\n(?:The following task data is user-authored\\.[\\s\\S]*?\\r?\\n)?- Issue: \\\"[^\\\"]+\\\"");
+  def owner: (. // "") | select(length>0)
+    | select(paperclip_envelope|not)
+    | select(test("^\\s*<(channel|system-reminder|local-command|command-name|task-notification|pasted|conversation-checkpoint|cross-session-message)")|not)
+    | select(test("^\\s*(From|To):|^\\s*\\{\"schema\"|^\\s*\\[Cross-session [a-z ]+notice\\]")|not) | select(test($auto)|not)
+    | select(test("^\\s*(\\[Request interrupted|This session is being continued)")|not);'
 STATE=${OWNER_GUARD_STATE:-/Volumes/NVM/Paperclip/ops/owner-capture/state}
 API=/Volumes/NVM/Paperclip/bin/api
 mkdir -p "$STATE"
@@ -24,15 +35,14 @@ ocdb_of() { # SESSION_ID[@DB] -> db holding it
   case "$1" in *@*) printf "%s" "${1#*@}"; return;; esac
   for d in $(ocdbs); do [ -n "$(sqlite3 -readonly "$d" "select 1 from $(ocsess "$d") where id='$1'" 2>/dev/null)" ] && { printf "%s" "$d"; return; }; done; }
 scan_codex() { # rollout jsonl: plain user messages, minus injected context/envelopes
-  jq -c -n --arg auto "$AUTO" --arg from "${2:-0}" '
+  jq -c -n --arg auto "$AUTO" --arg from "${2:-0}" "$OWNER_JQ"'
     def txt: [.[]?|select(.type=="input_text")|.text]|join("\n");
     [inputs] as $all | select(($all[0].payload.source // "") != "exec") # codex exec is non-interactive, never owner-typed (SCO-899)
     | ($all[0].payload.id // "codex") as $sid | ($all[0].payload.cwd // "") as $cwd | range(0;$all|length) as $i | $all[$i] as $r | ($i+1) as $ln
     | select($ln > ($from|tonumber))
     | select($r.type=="response_item" and $r.payload.type=="message" and $r.payload.role=="user")
-    | ($r.payload.content|txt) as $t
-    | select($t|length>0)
-    | select($t|test("^\\s*(<|# AGENTS.md|\\{\"schema\"|From:|To:)")|not) | select($t|test($auto)|not) | select($t|test("## Paperclip Wake Payload|Paperclip task context:")|not)
+    | ($r.payload.content|txt|owner) as $t
+    | select($t|test("^\\s*(<|# AGENTS.md)")|not)
     | {line:$ln, event:("message:"+($r.payload.id // ("line:"+($ln|tostring)))), ts:$r.timestamp, sid:$sid, cwd:$cwd, src:"codex", text:$t}' < "$1" | jq -c --arg tr "$1" '.+{transcript:$tr}'
 }
 scan_opencode() { # SESSION_ID[@DB] [FROM_N]: user text (n = ordinal within session, or seq on 2.2.x), minus compaction/synthetic/wakes
@@ -46,7 +56,7 @@ scan_opencode() { # SESSION_ID[@DB] [FROM_N]: user text (n = ordinal within sess
     and coalesce(json_extract(p.data,'\$.synthetic'),0)=0 and json_extract(p.data,'\$.text') not like '{\"schema\"%'
     and not exists (select 1 from part q where q.message_id=m.id and json_extract(q.data,'\$.type')='compaction')"
   fi |
-  jq -c --arg auto "$AUTO" --arg from "${2:-0}" '.[]? | select(.line > ($from|tonumber)) | select(.text|test($auto)|not) | select(.text|test("^\\s*<(conversation-checkpoint|shell|tool_result|tool-result)\\b|## Paperclip Wake Payload|Paperclip task context:|^\\s*Paperclip may post a short|^\\s*Paperclip access: use the paperclip-run MCP tools")|not)
+  jq -c --arg auto "$AUTO" --arg from "${2:-0}" "$OWNER_JQ"'.[]? | select(.line > ($from|tonumber)) | (.text|owner) as $t | select($t|test("^\\s*<(conversation-checkpoint|shell|tool_result|tool-result)\\b|^\\s*Paperclip may post a short|^\\s*Paperclip access: use the paperclip-run MCP tools")|not)
     | select(.text|test("^\\s*\"?(Respond with hello\\.?|Reply with the single word ok\\.?|Read probe\\.txt with the read tool|NAR live proof\\. Reply with exactly)")|not)' # adapter preamble + health probes
 }
 
@@ -55,12 +65,8 @@ scan() { # TRANSCRIPT [FROM_LINE]
     */rollout-*.jsonl) scan_codex "$@"; return ;;
     opencode:*) scan_opencode "${1#opencode:}" "${2:-0}"; return ;;
   esac
-  jq -c -n --arg auto "$AUTO" --arg from "${2:-0}" '
+  jq -c -n --arg auto "$AUTO" --arg from "${2:-0}" "$OWNER_JQ"'
     def txt: if type=="string" then . else ([.[]?|select(.type=="text")|.text]|join("\n")) end;
-    def owner: (. // "") | select(length>0)
-      | select(test("^\\s*<(channel|system-reminder|local-command|command-name|task-notification|pasted|conversation-checkpoint|cross-session-message)")|not)
-      | select(test("^\\s*(From|To):")|not) | select(test($auto)|not)
-      | select(test("^\\s*(\\[Request interrupted|This session is being continued)")|not);
     [inputs] as $all | range(0;$all|length) as $i | $all[$i] as $r | ($i+1) as $ln
     | select($ln > ($from|tonumber))
     | ( if ($r.type=="user" and ($r.isMeta|not) and ($r.isSidechain|not) and (($r.message.content|type)=="string" or (($r.message.content|type)=="array" and ([$r.message.content[]?|.type]|all(.=="text")))))
@@ -87,11 +93,6 @@ transcripts() { # DAYS [NEWER_THAN_FILE]: candidate transcripts for fleet sync
 
 # ---- durable ledger: {id:"<s8>:<h6>",ts,sid,cwd,proc,src,text} opens; {id,close,ts} closes; {id,adopt,proc,ts} hand-overs; {id,escalated,ts}.
 OPEN=$STATE/open
-OWNER_JQ='def owner: (. // "") | select(length>0)
-  | select(test("## Paperclip Wake Payload|Paperclip task context:|Paperclip run [0-9a-f-]{36}")|not)
-  | select(test("^\\s*<(channel|system-reminder|local-command|command-name|task-notification|pasted|conversation-checkpoint|cross-session-message)")|not)
-  | select(test("^\\s*(From|To):")|not) | select(test($auto)|not)
-  | select(test("^\\s*(\\[Request interrupted|This session is being continued)")|not);'
 # current state per id: base record + holder (last adopter or capturer), its process, closed, escalated
 STATE_JQ='group_by(.id) | map(select(any(.[]; .text != null)) | . as $e | (map(select(.text != null))[0]) as $b | (map(select(.adopt != null))|last) as $a
   | ([range(0;length)|select($e[.].reopen != null)]|last // -1) as $ri # SCO-865: a reopen event after a close makes the record open again; escalation restarts after it
