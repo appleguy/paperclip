@@ -274,6 +274,13 @@ function isTrackedLocalChildProcessAdapter(adapterType: string) {
   return SESSIONED_LOCAL_ADAPTERS.has(adapterType);
 }
 
+// The generic process adapter persists its child pid/group too. Check liveness
+// (read-only) so a hot-restart cannot reap a run whose child is still alive
+// (SCO-961), but keep retry/termination authority limited to tracked adapters.
+function persistsLiveChildMetadataForLiveness(adapterType: string) {
+  return isTrackedLocalChildProcessAdapter(adapterType) || adapterType === "process";
+}
+
 // A positive liveness check means some process currently owns the PID.
 // On Linux, PIDs can be recycled, so this is a best-effort signal rather
 // than proof that the original child is still alive.
@@ -2355,7 +2362,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       // for a read-only liveness check so a lost in-memory handle cannot cause
       // overlapping provider/tool execution while that child is still alive.
       const checksPersistedChildLiveness =
-        currentAdapterTracksLocalChild || run.runtimeMode === "native";
+        persistsLiveChildMetadataForLiveness(adapterType) ||
+        run.runtimeMode === "native";
       const processPidAlive =
         checksPersistedChildLiveness &&
         run.processPid &&
