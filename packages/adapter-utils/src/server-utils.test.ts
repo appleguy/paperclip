@@ -3985,6 +3985,24 @@ describe("wake continuation comment ownership", () => {
     expect(prompt).not.toContain(`"objective":"${objective}"`);
   });
 
+  it("renders known wake identities readably without changing the source envelope or human text", () => {
+    const issueId = "11111111-2222-3333-4444-555555555555";
+    const companyId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const revision = "3afeec397239f147627f99ddaa883639fa50d191fc2bbce0dc7515a0f05deedb";
+    const envelope = { ...continuation([message("comment-1", `Original reference ${issueId}`)]),
+      issueId, companyId, objectiveSource: { kind: "description", id: issueId, revision } };
+    const prompt = renderPaperclipWakePrompt({ reason: "issue_assigned",
+      issue: { id: issueId, identifier: "SCO-909", title: "Readable paths", description: null },
+      executionContinuation: envelope,
+    });
+    expect(prompt).toContain('"issueId":"SCO-909"');
+    expect(prompt).toContain('"companyId":"$PAPERCLIP_COMPANY_ID"');
+    expect(prompt).toContain('"revision":"3afeec397239"');
+    expect(prompt).not.toContain(revision);
+    expect(prompt).toContain(`Original reference ${issueId}`);
+    expect(envelope).toMatchObject({ issueId, companyId, objectiveSource: { revision } });
+  });
+
   it("keeps a changed continuation objective on an ordinary compact resume", () => {
     const objective = "Changed objective must reach the compact resumed turn.";
     const prompt = renderPaperclipWakePrompt({

@@ -2634,9 +2634,17 @@ function renderPaperclipWakePromptBody(
     const requestContext = continuationObjectiveOwnedByAssignment(continuation) || objectiveOwnedByDisplayedSource
       ? { ...requestContextBase, ...(objectiveSource ? { objectiveSource } : {}) }
       : { ...requestContextBase, objective, ...(objectiveSource ? { objectiveSource } : {}) };
-    const encodeData = (data: unknown) => markdownFencedText(JSON.stringify(data, (_key, value) =>
-      typeof value === "string" ? value.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "") : value,
-    ).replace(/</g, "\\u003c").replace(/>/g, "\\u003e"));
+    const encodeData = (data: unknown) => markdownFencedText(JSON.stringify(data, (key, value) => {
+      if (typeof value !== "string") return value;
+      // Presentation only. Keep the envelope, authenticated answers and source
+      // comparisons above intact; never rewrite human text or API-only refs.
+      if ((key === "issueId" || key === "id") && value === normalized.issue?.id && normalized.issue.identifier) {
+        return normalized.issue.identifier;
+      }
+      if (key === "companyId" && /^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/i.test(value)) return "$PAPERCLIP_COMPANY_ID";
+      if (key === "revision" && /^[\da-f]{64}$/i.test(value)) return value.slice(0, 12);
+      return value.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "");
+    }).replace(/</g, "\\u003c").replace(/>/g, "\\u003e"));
     const continuationEvidenceIsEmpty = (interactionOutcomes?.length ?? 0) === 0 && (completedActions?.length ?? 0) === 0 &&
       !completedWork && (recoveryOutcomes?.length ?? 0) === 0;
     lines.push(encodeData(requestContext), "", "### Untrusted continuation evidence",
