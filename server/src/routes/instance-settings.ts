@@ -1,5 +1,6 @@
 import { verifiedIdleCapabilities } from "../middleware/cloud-control.js";
-import { trackIdleWork } from "../services/task-admission.js";
+import { withTaskDrainTransition } from "../services/task-admission.js";
+import { deployOwnerLiveness } from "../services/deploy-owner.js";
 import { Router, type Request } from "express";
 import { companies, type Db } from "@paperclipai/db";
 import {
@@ -120,20 +121,6 @@ function assertCanManageExperimentalSettings(req: Request) {
 // time, in the order they enter it: audit order and apply order then always
 // agree, and each response reports exactly the state its own request
 // produced.
-let taskDrainTransitionQueue: Promise<void> = Promise.resolve();
-
-function withTaskDrainTransition<T>(run: () => Promise<T>): Promise<T> {
-  const turn = trackIdleWork(taskDrainTransitionQueue.then(run));
-  // Normalize to a settled void promise for the next caller in line, so a
-  // rejected transition (a failed audit write, for example) cannot wedge
-  // every later transition behind it.
-  taskDrainTransitionQueue = turn.then(
-    () => undefined,
-    () => undefined,
-  );
-  return turn;
-}
-
 export function instanceSettingsRoutes(db: Db, pluginWorkers?: PluginWorkerManager, prepareIdleDatabaseBackup?: () => Promise<boolean>) {
   const router = Router();
   const svc = instanceSettingsService(db);
@@ -372,11 +359,15 @@ export function instanceSettingsRoutes(db: Db, pluginWorkers?: PluginWorkerManag
       // not the moment it arrived and was queued behind another transition.
       const drain = await withTaskDrainTransition(async () => {
         const prior = heartbeat.getTaskDrainStatus();
-        if (prior?.ownerId || (req.body.purpose === "idle" && prior?.draining)) {
+        if (prior?.ownerId || (req.body.purpose && prior?.draining)) {
           throw conflict("Another task drain is already active");
         }
+        if (req.body.purpose === "deploy" && await deployOwnerLiveness(req.body.deployOwner) !== "alive") {
+          throw conflict("Deploy owner identity is not verifiably live on this server");
+        }
         const computed = heartbeat.computeTaskDrain({ ttlMs,
-          ...(req.body.purpose === "idle" ? { purpose: "idle" as const } : {}) });
+          ...(req.body.purpose === "idle" ? { purpose: "idle" as const } : {}),
+          ...(req.body.purpose === "deploy" ? { purpose: "deploy" as const, ownerId: req.body.ownerId, deployOwner: req.body.deployOwner } : {}) });
         // One transaction for every company's audit row, so a write that
         // succeeds for one company and fails for another never leaves a
         // partial activity history behind — either every company gets the
@@ -400,7 +391,7 @@ export function instanceSettingsRoutes(db: Db, pluginWorkers?: PluginWorkerManag
                 details: {
                   startedAt: computed.startedAt,
                   expiresAt: computed.expiresAt,
-                  ...(computed.ownerId ? { purpose: "idle", ownerId: computed.ownerId } : {}),
+                  ...(computed.ownerId ? { purpose: computed.purpose, ownerId: computed.ownerId } : {}),
                 },
               }, postCommitActivityPublications),
             ),

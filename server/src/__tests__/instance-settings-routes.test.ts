@@ -1,9 +1,15 @@
 import { generateKeyPairSync, randomUUID, sign } from "node:crypto";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import express from "express";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
+import { localProcessBirth } from "../services/deploy-owner.js";
+import * as admission from "../services/task-admission.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { installDatabaseWorkSignals } from "../../../packages/db/src/work-signals.js";
 
 const mockAssertAgentsReadyForEnvironmentChange = vi.hoisted(() => vi.fn(async () => {}));
 const mockInstanceSettingsService = vi.hoisted(() => ({
@@ -1141,6 +1147,81 @@ describe("instance settings routes", () => {
       await request(app).delete("/api/instance/task-drain?ownerId=current-owner").expect(200);
       expect(mockHeartbeatService.stopTaskDrain).toHaveBeenCalledOnce();
     });
+
+    it("serializes competing deploy starts and requires the winning owner to release", async () => {
+      admission.stopTaskDrain();
+      mockHeartbeatService.computeTaskDrain.mockImplementation(admission.computeTaskDrain);
+      mockHeartbeatService.applyTaskDrain.mockImplementation(admission.applyTaskDrain);
+      mockHeartbeatService.stopTaskDrain.mockImplementation(admission.stopTaskDrain);
+      mockHeartbeatService.getTaskDrainStatus.mockImplementation(() => {
+        const state = admission.readTaskDrain(new Date());
+        return { ...idleStatus, draining: !!state, ...(state?.ownerId ? { ownerId: state.ownerId } : {}) };
+      });
+      const app = createApp(adminActor);
+      const deployOwner = { pid: process.pid, birth: await localProcessBirth(process.pid) };
+      const firstId = randomUUID(), secondId = randomUUID();
+      try {
+        const responses = await Promise.all([firstId, secondId].map(ownerId =>
+          request(app).post("/api/instance/task-drain").send({ purpose: "deploy", ownerId, deployOwner })));
+        expect(responses.map(response => response.status).sort()).toEqual([200, 409]);
+        const winner = responses.find(response => response.status === 200)!.body.ownerId;
+        const loser = winner === firstId ? secondId : firstId;
+        await request(app).delete(`/api/instance/task-drain?ownerId=${loser}`).expect(409);
+        expect(admission.readTaskDrain(new Date())?.ownerId).toBe(winner);
+        await request(app).delete(`/api/instance/task-drain?ownerId=${winner}`).expect(200);
+        expect(admission.readTaskDrain(new Date())).toBeNull();
+      } finally { admission.stopTaskDrain(); }
+    });
+
+    it("reclaims after the deploy dies during the POST audit and its response is lost", async () => {
+      admission.stopTaskDrain();
+      mockHeartbeatService.computeTaskDrain.mockImplementation(admission.computeTaskDrain);
+      mockHeartbeatService.applyTaskDrain.mockImplementation(admission.applyTaskDrain);
+      mockHeartbeatService.stopTaskDrain.mockImplementation(admission.stopTaskDrain);
+      mockHeartbeatService.getTaskDrainStatus.mockImplementation(() => {
+        const state = admission.readTaskDrain(new Date());
+        return { ...idleStatus, draining: !!state, ...(state?.ownerId ? { ownerId: state.ownerId } : {}) };
+      });
+      const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+      const coordinator = createDeliveryWorkCoordinator({ owner: installDatabaseWorkSignals({ execute: async () => [],
+        transaction: async () => { throw new Error("unexpected transaction"); } }),
+        canRun: () => true, onError: error => { throw error; } });
+      let resumed!: () => void;
+      const released = new Promise<void>(resolve => { resumed = resolve; });
+      const worker = admission.registerTaskDrainExpiryWork(coordinator, resumed);
+      let releaseAudit!: () => void;
+      let entered!: () => void;
+      const auditEntered = new Promise<void>(resolve => { entered = resolve; });
+      mockDb.transaction.mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) => {
+        entered();
+        await new Promise<void>(resolve => { releaseAudit = resolve; });
+        return fn(TX_SENTINEL);
+      });
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await worker.ready;
+        const deployOwner = { pid: child.pid!, birth: await localProcessBirth(child.pid!) };
+        const post = request(createApp(adminActor)).post("/api/instance/task-drain")
+          .send({ purpose: "deploy", ownerId: randomUUID(), deployOwner });
+        post.then(() => {}, () => {});
+        await auditEntered;
+        const exited = once(child, "exit");
+        child.kill("SIGKILL");
+        await exited;
+        post.abort();
+        releaseAudit();
+        await Promise.race([released, new Promise<never>((_, reject) => {
+          deadline = setTimeout(() => reject(new Error("owner cleanup did not run")), 10_000);
+        })]);
+        expect(admission.readTaskDrain(new Date())).toBeNull();
+      } finally {
+        if (deadline) clearTimeout(deadline);
+        child.kill("SIGKILL");
+        await worker.stop();
+        await coordinator.stop();
+        admission.stopTaskDrain();
+      }
+    }, 15_000);
 
     it("returns the opt-in instance-wide safety report to an instance admin", async () => {
       mockHeartbeatService.getTaskDrainStatus.mockReturnValue(idleStatus);

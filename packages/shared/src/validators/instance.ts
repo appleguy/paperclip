@@ -135,9 +135,15 @@ export const patchInstanceSettingsSchema = z.object({
 export const MAX_TASK_DRAIN_TTL_MS = 24 * 60 * 60 * 1000;
 
 export const startTaskDrainRequestSchema = z.object({
-  purpose: z.literal("idle").optional(),
+  purpose: z.enum(["idle", "deploy"]).optional(),
   ttlMs: z.number().int().positive().max(MAX_TASK_DRAIN_TTL_MS).nullable().optional(),
-}).strict().refine(value => value.purpose !== "idle" ||
+  ownerId: z.string().uuid().optional(),
+  deployOwner: z.object({ pid: z.number().int().min(2).max(2147483647), birth: z.string().min(1).max(128) }).strict().optional(),
+}).strict().refine(value => value.purpose === "deploy"
+  ? Boolean(value.ownerId && value.deployOwner)
+  : value.ownerId === undefined && value.deployOwner === undefined,
+  { message: "Deploy drains require an owner ID and local process identity", path: ["deployOwner"] })
+.refine(value => value.purpose !== "idle" ||
   (typeof value.ttlMs === "number" && value.ttlMs >= 5_000 && value.ttlMs <= 300_000),
   { message: "Idle holds require ttlMs between 5000 and 300000", path: ["ttlMs"] });
 

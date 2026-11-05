@@ -775,6 +775,21 @@ owns committed updates.
 
 ## Hot-Restart Deploys
 
+Deploy-specific admission holds use `POST /api/instance/task-drain` with
+`purpose: "deploy"`, a client-generated UUID `ownerId`, and `deployOwner`
+containing the local deploy process `pid` and `birth`. Capture these before
+the POST so a lost response does not lose ownership. On macOS `birth` is
+`darwin:` followed by `/bin/ps -p PID -o lstart=` output with `LC_ALL=C` and
+`TZ=UTC`, trimmed with whitespace collapsed. On Linux it is `linux:` followed
+by field 22 (start ticks) of `/proc/PID/stat`. The server checks the identity
+and, while the hold exists, periodically checks the owner; a verified death
+releases only that same hold and resumes queued admission. An inconclusive
+check retains it. macOS birth time has one-second resolution, so a same-second
+PID reuse is indistinguishable and may retain the hold until its optional TTL.
+Release with `DELETE /api/instance/task-drain?ownerId=UUID`; a conflict means
+ownership changed. Holds are process-local and disappear on server restart.
+The caller must treat a new server process as loss of its old hold.
+
 During a restart, the UI's connectivity store (`ui/src/lib/connectivity.ts`)
 confirms an outage with a `/api/health` probe, then polls health with backoff
 (1s, 2s, 5s, 10s, then every 15s; a longer `Retry-After` wins). While the server
