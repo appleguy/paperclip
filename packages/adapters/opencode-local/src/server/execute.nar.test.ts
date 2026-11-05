@@ -174,6 +174,39 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect([...sessions.values()][0]!.info.model).toEqual({ providerID: "openai", id: "fixture", variant: "medium" });
   });
 
+  it("posts stable instructions before per-run bridge material in the exact NAR body", async () => {
+    const instructionsFilePath = path.join(root, "AGENTS.md");
+    await fs.writeFile(instructionsFilePath, "Stable launch instructions.", "utf8");
+    await execute({
+      ...context("run-prefix-wire", {
+        nativeRuntime: "nar",
+        instructionsFilePath,
+        bootstrapPromptTemplate: "Stable bootstrap instructions.",
+        promptTemplate: "Stable agent template.",
+      }),
+      authToken: "test-paperclip-token",
+      context: {
+        taskId: "issue-prefix",
+        paperclipTaskCommunicationGuidance: "Stable communication guidance.",
+        paperclipTaskMarkdownAssignment: "Stable assignment context.",
+      },
+    } as never);
+
+    const prompt = String(userMsgs()[0]!.text);
+    const stablePrefix = [
+      "Stable launch instructions.",
+      "Stable bootstrap instructions.",
+      "Stable communication guidance.",
+      "Stable assignment context.",
+      "Stable agent template.",
+    ].join("\n\n");
+    expect(prompt.startsWith(stablePrefix)).toBe(true);
+    const bridgeNoteOffset = prompt.indexOf("Paperclip access: use the paperclip-run MCP tools");
+    expect(bridgeNoteOffset).toBeGreaterThan(Buffer.byteLength(stablePrefix, "utf8"));
+    expect(prompt.slice(bridgeNoteOffset)).toContain("valid for this run only.");
+    expect(prompt).not.toContain("test-paperclip-token");
+  });
+
   it("refuses an oversized new NAR prompt before submitting it", async () => {
     const result = await execute(context("run-guard", {
       nativeRuntime: "nar", model: "openai/qwen", tokenPreflightShare: 0.000001,

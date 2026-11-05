@@ -14,6 +14,14 @@ import { createPromptContextFixture } from "@paperclipai/adapter-utils/test-fixt
 
 const runProcessMock = vi.mocked(runAdapterExecutionTargetProcess);
 
+function firstDifferingByte(left: string, right: string): number {
+  const a = Buffer.from(left, "utf8");
+  const b = Buffer.from(right, "utf8");
+  let offset = 0;
+  while (offset < Math.min(a.length, b.length) && a[offset] === b[offset]) offset++;
+  return offset;
+}
+
 async function createSkillDir(root: string, name: string): Promise<string> {
   const skillDir = path.join(root, name);
   await fs.mkdir(skillDir, { recursive: true });
@@ -80,6 +88,69 @@ describe("OpenCode local skill injection", () => {
     expect(prompt).toContain(custom ? "Custom agent instruction." : "You are agent agent-1");
     expect(prompt).not.toContain("Execution contract:");
     expect(prompt).not.toContain("Create child issues");
+  });
+
+  it("keeps stable prompt sections ahead of changing wake and handoff data", async () => {
+    const commandPath = path.join(configHome, "fake-opencode-prefix-audit");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const instructionsFilePath = path.join(configHome, "AGENTS.md");
+    await fs.writeFile(instructionsFilePath, "Stable launch instructions.", "utf8");
+    const prompts: string[] = [];
+    const promptFor = async (runId: string, handoff: string, changedWakeBody?: string) => {
+      runProcessMock.mockReset().mockResolvedValue(probeResult({ stdout: JSON.stringify({
+        type: "text", sessionID: "prefix-audit-session", part: { text: "ok" },
+      }) }));
+      const fixture = createPromptContextFixture();
+      if (changedWakeBody) {
+        fixture.executionContinuation.messages[0]!.body = changedWakeBody;
+        fixture.paperclipWake.comments[0]!.body = changedWakeBody;
+      }
+      await execute({
+        runId,
+        agent: { id: "agent-prefix", companyId: "company-prefix", name: "Prefix Agent", adapterType: "opencode_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: "issue-prefix" },
+        config: {
+          command: commandPath, cwd: configHome, instructionsFilePath, model: "openai/fixture",
+          bootstrapPromptTemplate: "Stable bootstrap instructions.", promptTemplate: "Stable agent template.",
+          env: { OPENCODE_ALLOW_ALL_MODELS: "1" },
+        },
+        context: {
+          ...fixture,
+          paperclipTaskCommunicationGuidance: "Stable communication guidance.",
+          paperclipFreshSessionHandoffMarkdown: `Prior handoff ${handoff}.`,
+          paperclipTaskMarkdownAssignment: "Stable assignment context.",
+          paperclipWake: fixture.paperclipWake,
+        },
+        onLog: async () => {},
+        onMeta: async (meta) => { prompts.push(String(meta.prompt ?? "")); },
+      });
+    };
+    await promptFor("prefix-run-step-1", "A");
+    await promptFor("prefix-run-step-2", "A");
+    await promptFor("prefix-run-wake-2", "B", "Changed wake body for the second wake.");
+    expect(prompts).toHaveLength(3);
+
+    const stablePrefix = [
+      "Stable launch instructions.",
+      "Stable bootstrap instructions.",
+      "Stable communication guidance.",
+      "Stable assignment context.",
+      "Stable agent template.",
+    ].join("\n\n");
+    expect(prompts.every((prompt) => prompt.startsWith(stablePrefix))).toBe(true);
+
+    const legacyFirstDifference = firstDifferingByte(
+      "Stable communication guidance.\n\nPrior handoff A.",
+      "Stable communication guidance.\n\nPrior handoff B.",
+    );
+    const firstDifference = firstDifferingByte(prompts[1]!, prompts[2]!);
+    expect(legacyFirstDifference).toBe(46);
+    expect(firstDifference).toBeGreaterThan(Buffer.byteLength(stablePrefix, "utf8"));
+    expect(firstDifference).toBeGreaterThan(legacyFirstDifference);
+    expect(prompts[0]).toContain("The above agent instructions were loaded from");
+    expect(prompts[2]).toContain("Changed wake body for the second wake.");
+    expect(prompts[0]).toContain("Prior handoff A.");
+    expect(prompts[2]).toContain("Prior handoff B.");
   });
 
   it("states the Paperclip-managed goal in the prompt only while one is set", async () => {

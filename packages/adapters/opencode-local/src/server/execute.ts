@@ -46,7 +46,6 @@ import {
   hydrateFreshSessionHandoff,
   selectPaperclipPromptSections,
   stripConnectionGuidanceWithoutIntent,
-  selectInitialCommunicationGuidance,
   isPaperclipRecoveryWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
@@ -585,13 +584,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : originalInstructionsFilePath;
     const instructionsDir = resolvedInstructionsFilePath ? `${path.dirname(resolvedInstructionsFilePath)}/` : "";
     let instructionsPrefix = "";
+    let instructionsPathNote = "";
     if (resolvedInstructionsFilePath) {
       try {
         const instructionsContents = await fs.readFile(resolvedInstructionsFilePath, "utf8");
-        instructionsPrefix =
-          `${instructionsContents}\n\n` +
+        instructionsPrefix = `${instructionsContents}\n\n`;
+        instructionsPathNote =
           `The above agent instructions were loaded from ${resolvedInstructionsFilePath}. ` +
-          `Resolve any relative file references from ${instructionsDir}.\n\n`;
+          `Resolve any relative file references from ${instructionsDir}.`;
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
         await onLog(
@@ -627,12 +627,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       run: { id: runId, source: "on_demand" },
       context,
     };
-    const buildPrompt = (resumedSession: boolean) => {
+    const buildPrompt = (resumedSession: boolean, runHandleDirective = "") => {
       const renderedInstructions = resumedSession ? "" : instructionsPrefix;
       const renderedBootstrapPrompt =
         !resumedSession && bootstrapPromptTemplate.trim().length > 0
           ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
           : "";
+      const communicationGuidance = resumedSession
+        ? ""
+        : asString(context.paperclipTaskCommunicationGuidance, "").trim();
+      // The shared selector joins this with communication guidance; keep its per-run
+      // content in the tail.
+      const freshSessionHandoff = resumedSession
+        ? ""
+        : asString(context.paperclipFreshSessionHandoffMarkdown, "").trim();
       const { taskContextNote, wakePrompt } = selectPaperclipPromptSections(context, {
         resumedSession,
         includeCommunicationGuidance: false,
@@ -642,20 +650,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ? ""
         : stripConnectionGuidanceWithoutIntent(renderTemplate(promptTemplate, templateData), context);
       const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
-      // The managed session goal (SCO-756) is rendered by selectPaperclipPromptSections.
+      const recoveryNote = resumedSession && sharedSession?.resumed &&
+        (sharedSession.recovered || isPaperclipRecoveryWakePayload(context.paperclipWake))
+        ? "Controller restart recovery: inspect the existing session history. Do not repeat any completed tool actions; continue only unfinished work."
+        : "";
+      // Managed session goals stay in taskContextNote; stable sections precede per-run and wake data.
       const basePrompt = joinPromptSections([
-        // On a recovered server session, keep the model's prior tool outcomes
-        // in context instead of treating the assignment as a fresh execution.
-        resumedSession && sharedSession?.resumed &&
-          (sharedSession.recovered || isPaperclipRecoveryWakePayload(context.paperclipWake))
-          ? "Controller restart recovery: inspect the existing session history. Do not repeat any completed tool actions; continue only unfinished work."
-          : "",
         renderedInstructions,
         renderedBootstrapPrompt,
-        wakePrompt,
+        communicationGuidance,
         taskContextNote,
-        sessionHandoffNote,
         renderedPrompt,
+        recoveryNote,
+        sessionHandoffNote,
+        freshSessionHandoff,
+        resumedSession ? "" : instructionsPathNote,
+        runHandleDirective,
+        wakePrompt,
       ]);
       return {
         basePrompt,
@@ -708,12 +719,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : null;
     const runAttempt = async (resumeSessionId: string | null) => {
       await hydrateFreshSessionHandoff(ctx, { resumedSession: Boolean(resumeSessionId) });
-      let { basePrompt, promptMetrics } = buildPrompt(Boolean(resumeSessionId));
-      let prompt = joinPromptSections([
-        selectInitialCommunicationGuidance(context, { resumedSession: Boolean(resumeSessionId) }),
-        runHandle ? runHandleNote(runHandle.handle) : "",
-        basePrompt,
-      ]);
+      const runHandleDirective = runHandle ? runHandleNote(runHandle.handle) : "";
+      let { basePrompt, promptMetrics } = buildPrompt(Boolean(resumeSessionId), runHandleDirective);
+      let prompt = basePrompt;
       const preflight = async (actualSessionId?: string) => {
         const gate = await preflightSessionPrompt(ctx, model, prompt, actualSessionId ?? resumeSessionId);
         if (gate.rotate) {
@@ -721,9 +729,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           applyPromptRotation(ctx, gate);
           resumeSessionId = null;
           await hydrateFreshSessionHandoff(ctx, { resumedSession: false });
-          ({ basePrompt, promptMetrics } = buildPrompt(false));
-          prompt = joinPromptSections([selectInitialCommunicationGuidance(context, { resumedSession: false }),
-            runHandle ? runHandleNote(runHandle.handle) : "", basePrompt]);
+          ({ basePrompt, promptMetrics } = buildPrompt(false, runHandleDirective));
+          prompt = basePrompt;
           await assertAssembledPrompt({ seat: agent.name, model, prompt,
             share: config.tokenPreflightShare === undefined ? undefined : Number(config.tokenPreflightShare) });
           await onLog("stderr", `[paperclip] Starting fresh: ${gate.reason}\n`);
