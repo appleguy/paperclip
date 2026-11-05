@@ -508,6 +508,24 @@ describe("codex_local ACP lane", () => {
     });
   });
 
+  it("maps explicit sandbox bypass to the Codex full-access session preset", () => {
+    expect(buildCodexAcpConfig({
+      dangerouslyBypassApprovalsAndSandbox: true,
+      env: { CUSTOM: "kept", INITIAL_AGENT_MODE: "read-only" },
+    })).toMatchObject({
+      env: { CUSTOM: "kept", INITIAL_AGENT_MODE: "agent-full-access" },
+    });
+  });
+
+  it.each([undefined, false, "true"])("does not infer full access from %j", (bypass) => {
+    const config = buildCodexAcpConfig({ dangerouslyBypassApprovalsAndSandbox: bypass });
+    expect(config.env).not.toHaveProperty("INITIAL_AGENT_MODE");
+    expect(buildCodexAcpConfig({
+      dangerouslyBypassApprovalsAndSandbox: bypass,
+      env: { INITIAL_AGENT_MODE: "read-only" },
+    })).toMatchObject({ env: { INITIAL_AGENT_MODE: "read-only" } });
+  });
+
   it.each([["gpt-6-astra", "ultra"], ["gpt-6.1-sol", "ultra"], ["gpt-6-sol", "ultra"], ["gpt-6-luna", "max"], ["gpt-5.6-sol", "ultra"], ["gpt-5.6-terra", "ultra"], ["gpt-5.6-luna", "max"]])("forwards %s controls to the ACPX Codex target", (model, effort) => {
     expect(buildCodexAcpConfig({
       engine: "acp",
@@ -750,6 +768,7 @@ describe("codex_local ACP lane", () => {
         modelReasoningEffort: "high",
         fastMode: true,
         promptTemplate: "Do the assigned work.",
+        dangerouslyBypassApprovalsAndSandbox: true,
         paperclipRuntimeSkills: [skill],
         paperclipSkillSync: { desiredSkills: [skill.key] },
       },
@@ -780,6 +799,7 @@ describe("codex_local ACP lane", () => {
     expect(runtimes[0]?.setConfigInputs).toEqual([]);
     expect(meta[0]?.commandNotes?.join("\n")).toContain("Prepared ACPX Codex skill home");
     expect(meta[0]?.env?.CODEX_HOME).toBe(path.join(root, "codex-home"));
+    expect(meta[0]?.env?.INITIAL_AGENT_MODE).toBe("agent-full-access");
     expect(JSON.parse(String(meta[0]?.env?.CODEX_CONFIG))).toMatchObject({
       model: "gpt-5.5",
       model_reasoning_effort: "high",

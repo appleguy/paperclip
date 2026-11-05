@@ -151,7 +151,15 @@ export function buildCodexAcpConfig(config: Record<string, unknown>): Record<str
 
   return {
     ...config,
-    env: { ...env, PAPERCLIP_CODEX_ACP_NETWORK_ACCESS: String(networkAccess) },
+    env: {
+      ...env,
+      PAPERCLIP_CODEX_ACP_NETWORK_ACCESS: String(networkAccess),
+      // ACP tool approvals and Codex's sandbox are separate controls. Set the
+      // provider's session preset for both new and resumed ACP sessions.
+      ...(config.dangerouslyBypassApprovalsAndSandbox === true
+        ? { INITIAL_AGENT_MODE: "agent-full-access" }
+        : {}),
+    },
     agent: "codex",
     mode,
     permissionMode,
