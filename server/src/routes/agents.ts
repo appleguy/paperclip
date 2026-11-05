@@ -158,7 +158,7 @@ import type {
   AdapterEnvironmentCheck,
   AdapterEnvironmentTestResult,
 } from "@paperclipai/adapter-utils";
-import { evaluateCodexCredentialReadiness } from "@paperclipai/adapter-codex-local/server";
+import { evaluateCodexCredentialReadiness, codexRemoteControlViolation } from "@paperclipai/adapter-codex-local/server";
 import type { AdapterAuthSignal, AdapterAuthSignalResponse, CodexAccountBindingClaim } from "@paperclipai/shared";
 import { adapterSettingsService } from "../services/adapter-settings.js";
 import { skillVersionSelectionMap } from "../services/runtime-skill-selections.js";
@@ -2407,6 +2407,11 @@ export function agentRoutes(
   ) {
     if (adapterType === "paperclip_runner") {
       await assertFreshPaperclipRunnerProvider(companyId, adapterType, adapterConfig);
+      return;
+    }
+    if (adapterType === "codex_local") {
+      const violation = codexRemoteControlViolation(adapterConfig);
+      if (violation) throw unprocessable(`Invalid codex_local adapterConfig: ${violation}`);
       return;
     }
     if (adapterType !== "opencode_local") return;

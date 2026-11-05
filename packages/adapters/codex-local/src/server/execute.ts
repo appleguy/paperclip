@@ -2,6 +2,7 @@ import { asStringArray } from "@paperclipai/adapter-utils/server-utils";
 import { applyObservabilityEnvironment } from "@paperclipai/adapter-utils/agent-observability";
 import { prepareCodexObservabilityProfile, selectedCodexProfile, replaceCodexProfileArgs, disableCodexObservabilityArgs } from "@paperclipai/adapter-utils/codex-observability-profile";
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
+import { readableRuntimePath } from "@paperclipai/adapter-utils/readable-runtime-paths";
 import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -576,8 +577,23 @@ export async function ensureCodexSkillsInjected(
   );
 }
 
+import { codexRemoteControlViolation, codexRcDaemonDownReason } from "./rc-guard.js";
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const providerStop = createProviderStoppedBoundary(ctx.onProviderStopped);
+  const rcFailure = codexRemoteControlViolation(ctx.config) ?? codexRcDaemonDownReason();
+  if (rcFailure) {
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorCode: codexRemoteControlViolation(ctx.config) ? "codex_remote_control_required" : "codex_rc_daemon_down",
+      errorMessage: rcFailure,
+      resultJson: {
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+      },
+    };
+  }
   const engineSelection = await resolveCodexExecutionEngineForRun(ctx);
   if (engineSelection.unavailableReason) {
     return {
@@ -1147,7 +1163,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `[paperclip] Codex session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${effectiveExecutionCwd}".\n`,
       );
     }
-    const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
+    const configuredInstructionsPath = asString(config.instructionsFilePath, "").trim();
+    const instructionsFilePath = configuredInstructionsPath && !executionTargetIsRemote
+      ? path.join(await readableRuntimePath(ctx, "instructions", path.dirname(path.resolve(cwd, configuredInstructionsPath))), path.basename(configuredInstructionsPath))
+      : configuredInstructionsPath;
     const instructionsDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
     let instructionsPrefix = "";
     if (instructionsFilePath) {
