@@ -312,6 +312,13 @@ export function goalForConversation(goal: unknown, reuse: boolean, state: KeepSt
   return { ...(goal as Record<string, unknown>), deliveredKey: reuse ? state?.goalKeys?.[issueId] ?? null : null };
 }
 export const PROMPT_BUDGET = 50_000;
+/** Bound context before the token firewall, including fresh prompts rebuilt after rotation. */
+export async function assembleDispatchPrompt(sections: string[], seat: string, model: string, share?: number): Promise<string> {
+  const prompt = joinPromptSections(fitPromptSections(sections, [2, 3], joinPromptSections));
+  await assertAssembledPrompt({ seat, model, prompt, share });
+  if (prompt.length > PROMPT_BUDGET) throw new Error("Claude prompt exceeds dispatch budget");
+  return prompt;
+}
 /** Shrink the largest trimmable section until the joined prompt fits; a long task history must not fail the wake. */
 export function fitPromptSections(sections: string[], trimmable: number[], join: (s: string[]) => string, budget = PROMPT_BUDGET): string[] {
   const out = [...sections];
@@ -637,10 +644,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // The channel preserves Markdown/newlines; only the tmux fallback flattens.
       const sections = [instructionsPrefix, intro, taskContextNote, wakePrompt,
         asString(ctx.context.paperclipSessionHandoffMarkdown, ""), instructions];
-      const prompt = joinPromptSections(sections);
-      await assertAssembledPrompt({ seat: ctx.agent.name, model, prompt,
-        share: cfg.tokenPreflightShare === undefined ? undefined : Number(cfg.tokenPreflightShare) });
-      if (prompt.length > PROMPT_BUDGET) throw new Error("Claude prompt exceeds dispatch budget");
+      const prompt = await assembleDispatchPrompt(sections, ctx.agent.name, model,
+        cfg.tokenPreflightShare === undefined ? undefined : Number(cfg.tokenPreflightShare));
       return { prompt, goal, seenIssueIds, knownConversation, instructionsFull };
       };
       let built = await buildDispatchPrompt();
