@@ -48,6 +48,8 @@ export async function validateExecutionReconciliation(input: {
   decision: ExecutionReconciliation | undefined;
   /** Board-only source repair: never authorize a continuation of this run. */
   workspaceRepairOnly?: boolean;
+  /** Clear the hold only: the task stays as it is and no continuation is built. */
+  holdOnly?: boolean;
   /** The recovery action's recorded owner; lets a board reconcile after the task was reassigned. */
   recoveryReturnOwnerAgentId?: string | null;
 }) {
@@ -86,6 +88,7 @@ export async function validateExecutionReconciliation(input: {
   const reassigned = !repairOnly && !!task && task.assigneeAgentId === agentId &&
     !!input.recoveryReturnOwnerAgentId && input.recoveryReturnOwnerAgentId !== agentId &&
     run?.agentId === input.recoveryReturnOwnerAgentId;
+  const holdOnly = input.holdOnly === true && !repairOnly;
   const terminalRepairSource = ["failed", "interrupted", "timed_out", "cancelled"].includes(run?.status ?? "") ||
     (repairOnly && run?.runtimeMode === "legacy" && run.status === "succeeded");
   if (
@@ -171,7 +174,7 @@ export async function validateExecutionReconciliation(input: {
     throw conflict(
       "The previous execution environment has not finished releasing its authority.",
     );
-  if (!repairOnly && !reassigned) await buildExecutionContinuation({
+  if (!repairOnly && !reassigned && !holdOnly) await buildExecutionContinuation({
     db,
     companyId,
     issueId,
@@ -193,7 +196,7 @@ export async function markExecutionReconciliation(
   decision: ExecutionReconciliation,
   actorId: string,
   deliveryOwner?: { kind: "chat_failed_run_retry"; actionId: string },
-  options?: { workspaceRepairOnly?: boolean },
+  options?: { workspaceRepairOnly?: boolean; holdOnly?: boolean },
 ) {
   if (options?.workspaceRepairOnly && (deliveryOwner || !hasRequiredWorkspaceRecovery(action.evidence))) {
     throw conflict("Workspace repair must target the retained source without a continuation owner.");
@@ -246,7 +249,7 @@ export async function markExecutionReconciliation(
             actorId,
             recordedAt: new Date().toISOString(),
           },
-          continuationDelivery: options?.workspaceRepairOnly ? "not_requested" : deliveryOwner ? "delegated" : "pending",
+          continuationDelivery: options?.workspaceRepairOnly || options?.holdOnly ? "not_requested" : deliveryOwner ? "delegated" : "pending",
           ...(deliveryOwner ? { continuationDeliveryOwner: deliveryOwner } : {}),
         },
       })

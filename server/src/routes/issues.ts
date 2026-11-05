@@ -10206,12 +10206,21 @@ export function issueRoutes(
           }
         }
 
+        // A blocked task (e.g. waiting on an owner answer) may clear a stale
+        // hold without being unblocked: same validation, no continuation.
+        const holdOnlyReconciliation =
+          outcome === "restored" &&
+          sourceIssueStatus === "blocked" &&
+          lockedIssue.status === "blocked" &&
+          !!executionReconciliation &&
+          requiresExecutionReconciliation(activeRecoveryAction.cause);
         if (
-          sourceIssueStatus === "todo" &&
+          (sourceIssueStatus === "todo" || holdOnlyReconciliation) &&
           requiresExecutionReconciliation(activeRecoveryAction.cause)
         ) {
           assertBoard(req);
           await validateExecutionReconciliation({
+            holdOnly: holdOnlyReconciliation,
             db: tx as unknown as Db,
             companyId: lockedIssue.companyId,
             issueId: lockedIssue.id,
@@ -10284,6 +10293,7 @@ export function issueRoutes(
             chatRetry
               ? { kind: "chat_failed_run_retry", actionId: chatRetry.actionId }
               : undefined,
+            holdOnlyReconciliation ? { holdOnly: true } : undefined,
           );
         }
         let issue = lockedIssue;
