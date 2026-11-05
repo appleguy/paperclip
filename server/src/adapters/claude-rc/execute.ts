@@ -10,6 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { readableRuntimePath } from "@paperclipai/adapter-utils/readable-runtime-paths";
+import { assertPromptTokenShare } from "@paperclipai/adapter-utils/token-preflight";
 import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   joinPromptSections, renderTemplate, selectPaperclipPromptSections,
@@ -506,17 +507,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
       if (reuse) {
         conversationId = before;
-      } else {
-        await sendClaudePane(socket, session, "/clear", stateDir);
-        // /clear is acknowledged by this seat's new conversation, even if busy.
-        const clearDeadline = Date.now() + 12_000;
-        do {
-          conversationId = await seatConversation(session, cwd);
-          if (conversationId && conversationId !== before) break;
-          await sleep(500);
-        } while (Date.now() < clearDeadline);
-        if (!conversationId || conversationId === before)
-          throw new Error("Claude /clear did not start an isolated conversation");
       }
       const promptBase = asString(cfg.promptTemplate, DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE);
       // A kept conversation already holds the standing text (template, run rules, receipt format)
@@ -564,8 +554,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const sections = [instructionsPrefix, intro, taskContextNote, wakePrompt, instructions];
       const rawLength = joinPromptSections(sections).length;
       const prompt = joinPromptSections(fitPromptSections(sections, [2, 3], joinPromptSections));
+      assertPromptTokenShare({ seat: ctx.agent.name, model, prompt,
+        share: cfg.tokenPreflightShare === undefined ? undefined : Number(cfg.tokenPreflightShare) });
       if (prompt.length < rawLength) await ctx.onLog("stdout", `[claude-rc] prompt ${rawLength} chars trimmed to ${prompt.length} (task context/wake history)\n`);
       if (prompt.length > PROMPT_BUDGET) throw new Error("Claude prompt exceeds dispatch budget");
+      if (!reuse) {
+        await sendClaudePane(socket, session, "/clear", stateDir);
+        // /clear is acknowledged by this seat's new conversation, even if busy.
+        const clearDeadline = Date.now() + 12_000;
+        do {
+          conversationId = await seatConversation(session, cwd);
+          if (conversationId && conversationId !== before) break;
+          await sleep(500);
+        } while (Date.now() < clearDeadline);
+        if (!conversationId || conversationId === before)
+          throw new Error("Claude /clear did not start an isolated conversation");
+      }
       if (keepEnabled) {
         await ctx.onLog("stdout", `[claude-rc] keepConversation ${reuse ? "reuse" : "fresh"}: prompt ${prompt.length} bytes (instructions ${reuse ? 0 : instructionsFull.length} of ${instructionsFull.length}); conversation ${Math.round(keepSize)} bytes\n`);
         const issueIds = [...seenIssueIds.filter(id => id !== issueId), issueId].slice(-200);

@@ -11,6 +11,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { readableRuntimePath } from "@paperclipai/adapter-utils/readable-runtime-paths";
+import { assertPromptTokenShare } from "@paperclipai/adapter-utils/token-preflight";
 import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   joinPromptSections, renderTemplate, selectPaperclipPromptSections,
@@ -427,6 +428,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       "If blocked, explain the blocker visibly without a done receipt. The adapter will leave the issue open.",
     ].join(" ");
     const prompt = normalizeOneLine(joinPromptSections([instructionsPrefix, intro, taskContextNote, wakePrompt, instructions]));
+    assertPromptTokenShare({ seat: ctx.agent.name, model, prompt,
+      share: cfg.tokenPreflightShare === undefined ? undefined : Number(cfg.tokenPreflightShare) });
     if (prompt.length > 50_000) throw new Error("agy prompt exceeds TUI paste budget");
     // No checkpoint is created for an initial guard refusal. Once a checkpoint
     // exists, a crash or uncertain paste still requires reconciliation.

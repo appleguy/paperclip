@@ -9,11 +9,11 @@ describe("token preflight", () => {
     ["native-fleet/deepseek-v4.1", 131_072],
   ])("applies the configured limit to %s", (model, limit) => {
     expect(tokenPreflightModelLimit(model)).toBe(limit);
-    expect(() => assertPromptTokenShare({ seat: "S9", model, prompt: "a".repeat(limit * 3) })).not.toThrow();
-    expect(() => assertPromptTokenShare({ seat: "S9", model, prompt: "a".repeat(limit * 3 + 1) })).toThrow(`model limit ${limit}`);
+    expect(() => assertPromptTokenShare({ seat: "S9", model, prompt: "a".repeat(limit) })).not.toThrow();
+    expect(() => assertPromptTokenShare({ seat: "S9", model, prompt: "a".repeat(limit + 1) })).toThrow(`model limit ${limit}`);
   });
   it("counts UTF-8 bytes and checks the configured share", () => {
-    expect(estimatePromptTokens("😀a")).toBe(2);
+    expect(estimatePromptTokens("😀a")).toBe(5);
     expect(() => assertPromptTokenShare({ seat: "S9", model: "gpt-6.1-terra", prompt: "x".repeat(408_001), share: 0.5 })).toThrow(/S9.*gpt-6\.1-terra.*136000.*272000/);
     expect(() => assertPromptTokenShare({ seat: "S9", model: "gpt-6.1-terra", prompt: "", share: NaN })).toThrow(/Invalid/);
   });

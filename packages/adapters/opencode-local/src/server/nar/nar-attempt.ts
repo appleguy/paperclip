@@ -33,6 +33,8 @@ export interface NarAttemptInput {
   /** Session Paperclip chose to resume; null/absent means it rotated (or this is the first wake). */
   resumeSessionId?: string | null;
   prompt: string;
+  /** Check only new submissions; an in-flight recovery must remain observable. */
+  preflight?: () => void;
   timeoutSec: number;
   signal?: AbortSignal;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
@@ -273,6 +275,7 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
       await onLog("stdout", `[paperclip] NAR rejoined in-flight message ${inflight}; prompt not resent\n`);
       await onLog("stdout", narEventLine("nar_rejoin", { sessionId: conversationId, messageId: inflight }));
     } else {
+    input.preflight?.();
     const payloadSha256 = createHash("sha256").update(input.prompt).digest("hex");
     await onLog("stdout", narEventLine("nar_prompt_dispatch", { sessionId: conversationId, clientMessageId: msgId, promptSha256: payloadSha256 }));
     const sub = await driver.submit(host, conversationId, { opId, kind: "prompt", payloadSha256, text: input.prompt }, fence);

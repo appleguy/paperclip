@@ -9,9 +9,9 @@ export function tokenPreflightModelLimit(model: string): number | null {
   return null;
 }
 
-/** The requested fallback estimate; bytes/3 is not a proven token upper bound. */
+/** One token per UTF-8 byte: conservative for byte-based text tokenizers. */
 export function estimatePromptTokens(text: string): number {
-  return Math.ceil(Buffer.byteLength(text, "utf8") / 3);
+  return Buffer.byteLength(text, "utf8");
 }
 
 export function assertPromptTokenShare(input: {
@@ -29,6 +29,6 @@ export function assertPromptTokenShare(input: {
   const estimate = estimatePromptTokens(input.prompt);
   const allowance = Math.floor(limit * share);
   if (estimate > allowance) {
-    throw new Error(`Token preflight refused ${input.seat} (${input.model}): estimated ${estimate} tokens exceeds configured allowance ${allowance}; model limit ${limit} tokens`);
+    throw new Error(`Token preflight refused ${input.seat} (${input.model}): prompt bound ${estimate} tokens exceeds configured allowance ${allowance}; model limit ${limit} tokens`);
   }
 }

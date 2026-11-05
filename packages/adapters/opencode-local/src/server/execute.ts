@@ -1,5 +1,6 @@
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import { readableRuntimePath } from "@paperclipai/adapter-utils/readable-runtime-paths";
+import { assertPromptTokenShare } from "@paperclipai/adapter-utils/token-preflight";
 import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -712,6 +713,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         runHandle ? runHandleNote(runHandle.handle) : "",
         basePrompt,
       ]);
+      const preflight = () => assertPromptTokenShare({ seat: agent.name, model, prompt,
+        share: config.tokenPreflightShare === undefined ? undefined : Number(config.tokenPreflightShare) });
+      if (!narMode) preflight();
       const args = buildArgs(resumeSessionId);
       if (onMeta) {
         await onMeta({
@@ -733,7 +737,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         await ctx.onCancellationReady?.();
         return runNarOpenCodeAttempt({
           configPath: sharedConfigPath, agentId: agent.id, taskId: narTaskId, runId, cwd: effectiveExecutionCwd, resumeSessionId: sessionId,
-          model: model && variant ? `${model}#${variant}` : model, prompt, timeoutSec, signal: ctx.signal, onLog,
+          model: model && variant ? `${model}#${variant}` : model, prompt, timeoutSec, signal: ctx.signal, onLog, preflight,
           title: sessionTitleFor(wakeIssue.identifier, wakeIssue.title),
         });
       }

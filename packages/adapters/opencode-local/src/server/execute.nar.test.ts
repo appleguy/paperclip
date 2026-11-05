@@ -173,6 +173,16 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect([...sessions.values()][0]!.info.model).toEqual({ providerID: "openai", id: "fixture", variant: "medium" });
   });
 
+  it("refuses an oversized new NAR prompt before submitting it", async () => {
+    const result = await execute(context("run-guard", {
+      nativeRuntime: "nar", model: "openai/qwen", tokenPreflightShare: 0.000001,
+    }) as never);
+    expect(result.exitCode).toBe(75);
+    expect(result.errorMessage).toMatch(/Token preflight refused.*qwen.*102400/);
+    expect(result.resultJson).toMatchObject({ executionRecovery: { providerWorkStarted: false } });
+    expect(promptPosts).toBe(0);
+  });
+
   it("records a llama-swap 429 concurrency_limit as a capacity refusal, not an adapter failure", async () => {
     assistantError = { name: "provider.rate-limit", data: { statusCode: 429, code: "concurrency_limit", retryAfterMs: 1000 } };
     const result = await execute(context("run-429", { nativeRuntime: "nar" }) as never);
@@ -237,7 +247,7 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     // Interrupted run-1 left its prompt running in the per-issue session (provider not interrupted).
     const sid = sessionIdFor(scope);
     const orphan = messageIdFor(narOpIdFor("run-1"));
-    sessions.set(sid, { info: { id: sid, location: { directory: root }, model: { providerID: "openai", id: "fixture", variant: "medium" }, time: { created: clock++ } },
+    sessions.set(sid, { info: { id: sid, location: { directory: root }, model: { providerID: "openai", id: "qwen", variant: "medium" }, time: { created: clock++ } },
       msgs: [{ id: orphan, type: "user", text: "Full assignment", time: { created: clock++ } }] });
     active.add(sid);
     const finish = setTimeout(() => {
@@ -248,7 +258,7 @@ describe("OpenCode adapter nativeRuntime nar", () => {
       s.info.outcome = "succeeded";
       active.delete(sid);
     }, 60);
-    const retry = await execute(context("run-1-retry", { nativeRuntime: "nar" }) as never); // one 5s poll
+    const retry = await execute(context("run-1-retry", { nativeRuntime: "nar", model: "openai/qwen", tokenPreflightShare: 0.000001 }) as never); // one 5s poll
     clearTimeout(finish);
     expect(promptPosts).toBe(0);
     expect(userMsgs().map((m) => m.id)).toEqual([orphan]);
