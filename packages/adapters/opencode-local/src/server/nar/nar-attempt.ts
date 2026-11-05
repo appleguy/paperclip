@@ -92,15 +92,15 @@ const interrupted = (
   };
 };
 
-/** "restarted" when the server pid changed, "idle" when our message is no longer in flight, else null (unverified). */
+/** A different active or queued message does not prove that this session is idle. */
 async function verifyTermination(
-  driver: OpenCodeHttpDriver, hostPid: number | null, conversationId: string, msgId: string,
+  driver: OpenCodeHttpDriver, hostPid: number | null, conversationId: string,
 ): Promise<"server_restarted" | "session_idle" | null> {
   const pid = await driver.probePid();
   if (pid === null) return null;
   if (hostPid !== null && pid !== hostPid) return "server_restarted";
   try {
-    return (await driver.inflightMessage(conversationId)) === msgId ? null : "session_idle";
+    return (await driver.inflightMessage(conversationId)) === null ? "session_idle" : null;
   } catch {
     return null;
   }
@@ -347,7 +347,7 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
         if (interruptResult !== "rejoin") {
           // Verify from OpenCode that the turn ended (session idle/absent, or the server restarted).
           for (let i = 0; i < 10; i++) {
-            const proof = await verifyTermination(driver, hostPid, conversationId, msgId);
+            const proof = await verifyTermination(driver, hostPid, conversationId);
             if (proof) return interrupted("stopped by explicit Stop", proof, conversationId);
             await sleep(1500);
           }
@@ -387,7 +387,7 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
           }
           let inflight: string | null | undefined;
           try { inflight = await driver.inflightMessage(conversationId); } catch { inflight = undefined; }
-          if (inflight === undefined || inflight === msgId) idleSince = null;
+          if (inflight !== null) idleSince = null;
           else {
             idleSince ??= Date.now();
             if (Date.now() - idleSince >= idleGraceMs) {
@@ -410,7 +410,7 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
               await onLog("stderr", `[paperclip] NAR rejoined message ${msgId} made no progress for ${mins} min; interrupting it\n`);
               await interruptOnce().catch(() => undefined);
               for (let i = 0; i < 10; i++) {
-                const proof = await verifyTermination(driver, hostPid, conversationId, msgId);
+                const proof = await verifyTermination(driver, hostPid, conversationId);
                 if (proof) return interrupted(`rejoined message stalled ${mins} min`, proof, conversationId);
                 await sleep(1500);
               }

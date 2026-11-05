@@ -273,7 +273,13 @@ export class OpenCodeHttpDriver implements ProviderDriver {
   async inflightMessage(conversationId: string): Promise<string | null> {
     const sid = encodeURIComponent(conversationId);
     const inbox = await this.json("GET", `/api/session/${sid}/inbox`);
-    const pending = inbox.status === 200 && Array.isArray(inbox.data?.data) ? inbox.data.data : [];
+    if (inbox.status !== 200 || !Array.isArray(inbox.data?.data)) {
+      throw new OpenCodeHttpError("http", `session.inbox HTTP ${inbox.status} or malformed response`, inbox.status);
+    }
+    const pending = inbox.data.data;
+    if (pending.some((item: unknown) => !item || typeof item !== "object" || typeof (item as { id?: unknown }).id !== "string")) {
+      throw new OpenCodeHttpError("mismatch", "session.inbox contains an item without an id");
+    }
     const last = pending[pending.length - 1];
     if (typeof last?.id === "string") return last.id;
     const active = await this.json("GET", "/api/session/active");

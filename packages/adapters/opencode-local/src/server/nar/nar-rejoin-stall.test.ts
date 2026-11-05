@@ -4,7 +4,7 @@ import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // SCO-756: a rejoined in-flight message that makes no progress must not hold the run open forever.
-const d = vi.hoisted(() => ({ inflight: "msg_old" as string | null, marks: [] as (string | null)[], interrupts: 0, settleAfter: Infinity, reads: 0 }));
+const d = vi.hoisted(() => ({ inflight: "msg_old" as string | null, marks: [] as (string | null)[], interrupts: 0, settleAfter: Infinity, reads: 0, successorAfter: Infinity }));
 vi.mock("./opencode-http-driver.js", async (orig) => {
   const real = await orig<typeof import("./opencode-http-driver.js")>();
   class FakeDriver {
@@ -12,7 +12,7 @@ vi.mock("./opencode-http-driver.js", async (orig) => {
     async latestGeneration() { return 0; }
     async bindConversation() { return { conversationId: "ses_test" }; }
     async messageExists() { return false; }
-    async inflightMessage() { return d.inflight; }
+    async inflightMessage() { return d.reads >= d.successorAfter ? "msg_successor" : d.inflight; }
     async submit() { throw new Error("must not resend on rejoin"); }
     async readOutcomeMsg() { return ++d.reads >= d.settleAfter ? "hook_observed" : "working"; }
     async progressMark() { return d.marks.length > 1 ? d.marks.shift()! : d.marks[0] ?? null; }
@@ -41,7 +41,16 @@ async function run(extra: Record<string, unknown>) {
 }
 
 describe("NAR rejoin stall watchdog", () => {
-  beforeEach(() => { Object.assign(d, { inflight: messageIdFor(narOpIdFor("run-1")), marks: ["same"], interrupts: 0, settleAfter: Infinity, reads: 0 }); });
+  beforeEach(() => { Object.assign(d, { inflight: messageIdFor(narOpIdFor("run-1")), marks: ["same"], interrupts: 0, settleAfter: Infinity, reads: 0, successorAfter: Infinity }); });
+
+  it("does not call a different active message an idle session", async () => {
+    d.successorAfter = 3;
+    d.settleAfter = 8;
+    const { res } = await run({ idleGraceMs: 0, rejoinStallMs: 60_000 });
+    expect(res.providerTermination).toBeUndefined();
+    expect(res.proc.exitCode).toBe(0);
+    expect(d.interrupts).toBe(0);
+  });
 
   it("interrupts a rejoined message with no progress and ends the run as interrupted", async () => {
     const { res, log } = await run({});
