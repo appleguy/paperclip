@@ -2,14 +2,14 @@
  * Done gate (SCO-762): a fix only counts once it is committed on the canonical
  * checkout and, for Paperclip, live or queued for the autodeploy watcher.
  * The gate decides from facts, not from the worker's prose:
- *  - "the run changed a canonical repo" = the run's own transcript edited a file under one;
+ *  - the run's durable transcript must account for mutations, including uncertainty;
  *  - those files must be clean in git (no own uncommitted edits);
  *  - the receipt must list the commit SHA(s); each must be on the checkout's HEAD;
  *  - Paperclip SHAs must be live (ancestor of cli/current) or queued (ancestor of master HEAD);
  *  - a commit touching owner-visible UI must already be live and carry `liveCheck`
  *    (rendered-surface evidence with before/after), never "a reload should confirm".
- * Transcript detection sees Edit/Write/NotebookEdit tool calls; shell-only edits (sed -i)
- * are caught only when the worker lists commits or the files show up dirty via those tools.
+ * Arbitrary shell/agent tools cannot prove their write set from command prose.
+ * Without a run baseline they yield unknown, never an inferred read-only success.
  */
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
@@ -24,7 +24,8 @@ export const PROJECTS_ROOT = "/Volumes/NVM/AI_Coding_Projects";
 const UI_PREFIXES = ["ui/", "master/ui/"];
 
 export type GateReceipt = { commits?: unknown; liveCheck?: unknown; notMine?: unknown };
-export type GateVerdict = { ok: true; notes: string[] } | { ok: false; reasons: string[] };
+export type GateVerdict = { ok: true; notes: string[] } | { ok: false; reasons: string[]; evidence?: "unknown" };
+export type MutationRecord = { paths: string[]; unknown: string[] };
 
 export type GateDeps = {
   repos(): Promise<string[]>;
@@ -32,25 +33,54 @@ export type GateDeps = {
   liveSha(): Promise<string | null>;
 };
 
-/** File paths the run edited, from a Claude Code transcript (JSONL), at or after sinceMs. */
-export function editedPaths(jsonl: string, sinceMs: number): string[] {
+// Only tools with a known nonmutating contract may establish read-only work.
+// Shell, nested agents and new tools remain unknown until a durable write set exists.
+const READ_ONLY_TOOLS = new Set(["Read", "Grep", "Glob", "WebFetch", "WebSearch", "TodoWrite", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode"]);
+
+/** Run mutation record from the durable Claude transcript; keep incomplete evidence. */
+export function editedPaths(jsonl: string, sinceMs: number): MutationRecord {
   const seen = new Set<string>();
+  const unknown = new Set<string>();
+  if (!jsonl.trim()) unknown.add("transcript is empty or unavailable");
   for (const line of jsonl.split("\n")) {
-    if (!line.includes('"tool_use"')) continue;
-    let rec: { timestamp?: string; message?: { content?: unknown } };
-    try { rec = JSON.parse(line); } catch { continue; }
+    if (!line.trim()) continue;
+    let rec: { timestamp?: string; cwd?: string; message?: { content?: unknown } };
+    try { rec = JSON.parse(line); } catch { unknown.add("transcript contains an unreadable record"); continue; }
+    if (!rec || typeof rec !== "object") { unknown.add("transcript contains an invalid record"); continue; }
     const t = Date.parse(rec.timestamp ?? "");
-    // Compaction replays earlier tool_use records without a timestamp; with a known run start they predate it.
-    if (sinceMs > 0 ? !(t >= sinceMs) : Number.isFinite(t) && t < sinceMs) continue;
+    if (Number.isFinite(t) && t < sinceMs) continue;
     const content = rec.message?.content;
     if (!Array.isArray(content)) continue;
     for (const c of content as Array<{ type?: string; name?: string; input?: Record<string, unknown> }>) {
-      if (c?.type !== "tool_use" || !["Edit", "Write", "NotebookEdit", "MultiEdit"].includes(c.name ?? "")) continue;
+      if (c?.type !== "tool_use") continue;
+      if (sinceMs > 0 && !Number.isFinite(t)) {
+        unknown.add("tool record has no run timestamp");
+        continue;
+      }
+      if (READ_ONLY_TOOLS.has(c.name ?? "")) continue;
+      if (!["Edit", "Write", "NotebookEdit", "MultiEdit"].includes(c.name ?? "")) {
+        unknown.add(`write set unavailable for tool ${c.name ?? "unnamed"}`);
+        continue;
+      }
       const p = c.input?.file_path ?? c.input?.notebook_path;
-      if (typeof p === "string" && path.isAbsolute(p)) seen.add(path.normalize(p));
+      if (typeof p !== "string" || !p.trim()) { unknown.add("mutation tool has no target path"); continue; }
+      if (path.isAbsolute(p)) seen.add(path.normalize(p));
+      else if (typeof rec.cwd === "string" && path.isAbsolute(rec.cwd)) seen.add(path.resolve(rec.cwd, p));
+      else unknown.add(`relative mutation path has no absolute cwd: ${p}`);
     }
   }
-  return [...seen];
+  return { paths: [...seen], unknown: [...unknown] };
+}
+
+/** Resolve aliases even for deleted/new targets, using their nearest existing parent. */
+async function canonicalPath(file: string): Promise<string> {
+  try { return await fs.realpath(file); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    const parent = path.dirname(file);
+    if (parent === file) throw error;
+    return path.join(await canonicalPath(parent), path.basename(file));
+  }
 }
 
 export function repoOf(file: string, repos: string[]): string | null {
@@ -64,12 +94,23 @@ export function repoOf(file: string, repos: string[]): string | null {
 const SHA = /^[0-9a-f]{7,40}$/i;
 const strings = (v: unknown): string[] => Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
 
-export async function evaluateDoneGate(receipt: GateReceipt, edited: string[], deps: GateDeps): Promise<GateVerdict> {
+export async function evaluateDoneGate(receipt: GateReceipt, edited: string[] | MutationRecord, deps: GateDeps): Promise<GateVerdict> {
+  const record = Array.isArray(edited) ? { paths: edited, unknown: [] } : edited;
+  if (record.unknown.length) return { ok: false, evidence: "unknown", reasons: [`mutation evidence unknown: ${record.unknown.join("; ")}. A complete run-owned mutation record or baseline is required; commit prose cannot establish the write set.`] };
   const repos = await deps.repos();
+  const resolvedRepos = new Map<string, string>();
+  try {
+    for (const repo of repos) resolvedRepos.set(await canonicalPath(repo), repo);
+  } catch { return { ok: false, evidence: "unknown", reasons: ["mutation evidence unknown: checkout alias resolution failed"] }; }
   const touched = new Map<string, string[]>(); // repo -> edited files
-  for (const f of edited) {
-    const r = repoOf(f, repos);
-    if (r) touched.set(r, [...(touched.get(r) ?? []), f]);
+  for (const file of record.paths) {
+    if (!path.isAbsolute(file)) return { ok: false, evidence: "unknown", reasons: ["mutation evidence unknown: relative path has no run cwd"] };
+    let f: string;
+    try { f = await canonicalPath(file); }
+    catch { return { ok: false, evidence: "unknown", reasons: ["mutation evidence unknown: target alias resolution failed"] }; }
+    const resolved = repoOf(f, [...resolvedRepos.keys()]);
+    const r = resolved ? resolvedRepos.get(resolved)! : null;
+    if (r && resolved) touched.set(r, [...(touched.get(r) ?? []), path.join(r, path.relative(resolved, f))]);
   }
   const commits = strings(receipt.commits).map(s => s.trim());
   if (touched.size === 0 && commits.length === 0) return { ok: true, notes: ["no canonical repo edited"] };
