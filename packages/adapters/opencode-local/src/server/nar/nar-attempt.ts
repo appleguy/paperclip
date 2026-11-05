@@ -241,7 +241,8 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
   }
   const driver = new OpenCodeHttpDriver({ url: server.url, passwordFile: server.passwordFile, fetchImpl: f });
   const opId = narOpIdFor(input.runId);
-  let msgId = messageIdFor(opId);
+  const ownMessageId = messageIdFor(opId);
+  let msgId = ownMessageId;
   let conversationId: string | null = null;
   let rejoined = false;
   let hostPid: number | null = null;
@@ -263,7 +264,7 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
     if (signal?.aborted) {
       // An old in-flight message may have been adopted during rejoin. Only a
       // deliberate Stop may interrupt it; an ordinary shutdown must leave it.
-      if (inflight && explicitStopRequested(signal)) {
+      if (inflight === ownMessageId && explicitStopRequested(signal)) {
         await driver.interruptExpectedMessage(conversationId, inflight,
           { opId: `${opId}-interrupt`, kind: "interrupt", payloadSha256: "" }, fence);
       }
@@ -322,12 +323,16 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
   const rejoinStallMs = input.rejoinStallMs ?? 20 * 60_000;
   let progressMark: string | null = null;
   let progressAt = Date.now();
+  // A retry can observe a previous run's turn, but observing it does not
+  // transfer authority to stop it. The deterministic message id is the
+  // provider-side evidence that this run submitted the turn.
+  const ownsMessage = msgId === ownMessageId;
   let interruptPromise: Promise<"requested" | "uncertain" | "idle"> | undefined;
-  const interruptOnce = () => interruptPromise ??= driver.interruptExpectedMessage(
+  const interruptOnce = () => interruptPromise ??= ownsMessage ? driver.interruptExpectedMessage(
     conversationId, msgId,
     { opId: `${opId}-interrupt`, kind: "interrupt", payloadSha256: "" },
     { runId: input.runId, leaseGeneration: 1, hostEpoch: 0 },
-  );
+  ) : Promise.resolve("uncertain");
   // Do not wait for a possibly slow outcome read to return before initiating
   // explicit Stop. Both this callback and the poll loop join the same request.
   const onAbort = () => { if (explicitStopRequested(signal)) void interruptOnce(); };
@@ -335,6 +340,9 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
   try {
     while (true) {
       if (signal?.aborted) {
+        if (explicitStopRequested(signal) && !ownsMessage) {
+          return held("OpenCode NAR observed another run's turn; stop held without interrupting it", true, conversationId, "unowned_turn");
+        }
         const interruptResult = explicitStopRequested(signal) ? await interruptOnce() : "rejoin";
         if (interruptResult !== "rejoin") {
           // Verify from OpenCode that the turn ended (session idle/absent, or the server restarted).
@@ -394,6 +402,11 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
             if (mark === null || mark !== progressMark) { if (mark !== null) progressMark = mark; progressAt = Date.now(); }
             else if (Date.now() - progressAt >= rejoinStallMs) {
               const mins = Math.round((Date.now() - progressAt) / 60_000);
+              if (!ownsMessage) {
+                const m = `OpenCode NAR observed another run's stalled turn for ${mins} min; held without interrupting it`;
+                await onLog("stderr", `[paperclip] ${m}\n`);
+                return held(m, true, conversationId, "unowned_turn_stalled");
+              }
               await onLog("stderr", `[paperclip] NAR rejoined message ${msgId} made no progress for ${mins} min; interrupting it\n`);
               await interruptOnce().catch(() => undefined);
               for (let i = 0; i < 10; i++) {
@@ -415,6 +428,9 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
   }
 
   if (!settled) {
+    if (!ownsMessage) {
+      return held("OpenCode NAR timed out observing another run's turn; held without interrupting it", true, conversationId, "unowned_turn_timeout", { timedOut: true });
+    }
     await interruptOnce().catch(() => undefined);
     return {
       proc: { exitCode: null, signal: null, timedOut: true, stdout: "", stderr: "" }, rawStderr: "",

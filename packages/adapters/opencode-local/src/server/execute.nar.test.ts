@@ -327,6 +327,27 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect(runProcess).not.toHaveBeenCalled();
   });
 
+  it("does not stop another run's turn when a retry observing it is stopped", async () => {
+    const sid = sessionIdFor(scope);
+    const other = messageIdFor(narOpIdFor("run-original"));
+    sessions.set(sid, { info: { id: sid, location: { directory: root }, model: { providerID: "openai", id: "qwen", variant: "medium" }, time: { created: clock++ } },
+      msgs: [{ id: other, type: "user", text: "Original assignment", time: { created: clock++ } }] });
+    active.add(sid);
+    const controller = new AbortController();
+    let rejoined = false;
+    const observer = execute({ ...context("run-retry", { nativeRuntime: "nar", model: "openai/qwen" }), signal: controller.signal,
+      onLog: async (_stream: string, chunk: string) => { if (chunk.includes("NAR rejoined in-flight")) rejoined = true; } } as never);
+    await vi.waitFor(() => expect(rejoined).toBe(true));
+    controller.abort(Object.assign(new Error("Stop observer"), { code: "paperclip_explicit_run_stop" }));
+    const result = await observer;
+    expect(result.resultJson).toMatchObject({ executionRecovery: { providerWorkStarted: true } });
+    expect(result.resultJson).not.toHaveProperty("executionCancellation.state", "acknowledged");
+    expect(interruptPosts).toBe(0);
+    expect(promptPosts).toBe(0);
+    expect(active.has(sid)).toBe(true);
+    expect(userMsgs().map((m) => m.id)).toEqual([other]);
+  });
+
   it("ends the run as verified-interrupted when the OpenCode server restarts mid-run (SCO-679)", async () => {
     autoComplete = false;
     const run = execute({ ...context("run-restart", { nativeRuntime: "nar" }, "issue-one"), signal: new AbortController().signal } as never);

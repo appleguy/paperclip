@@ -21,7 +21,8 @@ vi.mock("./opencode-http-driver.js", async (orig) => {
   }
   return { ...real, OpenCodeHttpDriver: FakeDriver };
 });
-import { runNarOpenCodeAttempt } from "./nar-attempt.js";
+import { narOpIdFor, runNarOpenCodeAttempt } from "./nar-attempt.js";
+import { messageIdFor } from "./opencode-http-driver.js";
 
 async function run(extra: Record<string, unknown>) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "nar-stall-"));
@@ -40,13 +41,35 @@ async function run(extra: Record<string, unknown>) {
 }
 
 describe("NAR rejoin stall watchdog", () => {
-  beforeEach(() => { Object.assign(d, { inflight: "msg_old", marks: ["same"], interrupts: 0, settleAfter: Infinity, reads: 0 }); });
+  beforeEach(() => { Object.assign(d, { inflight: messageIdFor(narOpIdFor("run-1")), marks: ["same"], interrupts: 0, settleAfter: Infinity, reads: 0 }); });
 
   it("interrupts a rejoined message with no progress and ends the run as interrupted", async () => {
     const { res, log } = await run({});
     expect(d.interrupts).toBe(1);
     expect(res.providerTermination).toEqual({ proof: "session_idle", reason: expect.stringContaining("stalled") });
     expect(log).toContain("made no progress");
+  });
+
+  it("holds a stalled turn belonging to another run without interrupting it", async () => {
+    d.inflight = messageIdFor(narOpIdFor("other-run"));
+    const { res } = await run({});
+    expect(d.interrupts).toBe(0);
+    expect(d.inflight).toBe(messageIdFor(narOpIdFor("other-run")));
+    expect(res.providerTermination).toBeUndefined();
+    expect(res.executionRecovery).toMatchObject({ providerWorkStarted: true, reason: "unowned_turn_stalled" });
+  });
+
+  it("holds an explicit stop of an observed foreign turn without interrupting it", async () => {
+    d.inflight = messageIdFor(narOpIdFor("other-run"));
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort({ code: "paperclip_explicit_run_stop" }), 10);
+    try {
+      const { res } = await run({ signal: controller.signal, rejoinStallMs: 60_000 });
+      expect(d.interrupts).toBe(0);
+      expect(d.inflight).toBe(messageIdFor(narOpIdFor("other-run")));
+      expect(res.providerTermination).toBeUndefined();
+      expect(res.executionRecovery).toMatchObject({ providerWorkStarted: true, reason: "unowned_turn" });
+    } finally { clearTimeout(timer); }
   });
 
   it("leaves a rejoined message alone while it keeps progressing", async () => {
