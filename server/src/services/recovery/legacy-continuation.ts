@@ -28,11 +28,19 @@ export const LEGACY_DISPOSITION_REPAIR_SUPPRESSED_ERROR_CODE = "legacy_dispositi
 export function isSuppressedLegacyDispositionRepair(run: { errorCode?: string | null } | null | undefined) {
   return run?.errorCode === LEGACY_DISPOSITION_REPAIR_SUPPRESSED_ERROR_CODE;
 }
+export const DISPOSITION_REPAIR_CONTINUATION_INSTRUCTION =
+  "For unfinished work needing another turn, preserve the current assignee and active execution/checkout locks. " +
+  "Schedule a future executionPolicy.monitor.nextCheckAt with actionable monitor.notes through the issue update API, " +
+  "and verify monitorNextCheckAt is non-null before ending this run. Merge the monitor into the existing execution policy. " +
+  "This durable continuation lets source revalidation settle the recovery action. " +
+  "Do not resolve restored/todo from your own active repair run: that retry is for a blocked Board-escalated action. " +
+  "Never release or cancel a live run to hand work back.";
 export const LEGACY_DISPOSITION_REPAIR_INSTRUCTION =
   "The previous task run ended without a recorded disposition or an owned next execution path. " +
   "Re-read the current task state. Use Paperclip tools/API to record completion, a real blocker, " +
   "a question or approval request, or a supported next execution path. " +
-  "A final message alone does not record disposition. Respect Stop, pause, budget and approval gates.";
+  "A final message alone does not record disposition. Respect Stop, pause, budget and approval gates. " +
+  DISPOSITION_REPAIR_CONTINUATION_INSTRUCTION;
 
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};

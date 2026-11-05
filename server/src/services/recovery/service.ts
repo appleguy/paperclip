@@ -27,7 +27,7 @@ import { executionRetryAccounting } from "../execution-recovery-attempt.js";
 import { isExplicitContinuationRetryClaim } from "../explicit-continuation-retry-claim.js";
 import {
   decideLegacyContinuation, legacyDispositionEpisode, legacyDispositionFingerprint,
-  isSuppressedLegacyDispositionRepair, LEGACY_DISPOSITION_REPAIR_INSTRUCTION, type LegacyDispositionEpisode,
+  isSuppressedLegacyDispositionRepair, DISPOSITION_REPAIR_CONTINUATION_INSTRUCTION, LEGACY_DISPOSITION_REPAIR_INSTRUCTION, type LegacyDispositionEpisode,
 } from "./legacy-continuation.js";
 import { CONTROLLER_LEASE_LOST_FAILURE_CODE, hasLiveLegacyController, liveLegacyControllerExpiresAt } from "../legacy-controller-lease.js";
 import { isCompletedOnboardingHandoffWake } from "../chat-completion-delivery.js";
@@ -3222,7 +3222,7 @@ export function recoveryService(
         terminalReason: null,
       },
       nextAction:
-        "The original owner must replace the parked summary with a terminal, live, blocked, monitored, or typed waiting disposition.",
+        "The original owner must replace the parked summary with a terminal, live, blocked, monitored, or typed waiting disposition. " + DISPOSITION_REPAIR_CONTINUATION_INSTRUCTION,
       wakePolicy: {
         type: "bounded_owner_disposition_repair",
         retryAgentId: input.issue.assigneeAgentId,
@@ -3273,7 +3273,7 @@ export function recoveryService(
         } : {}),
         bypassContinuationSummaryPark: true,
         dispositionRepairInstruction:
-          input.legacyEpisode ? LEGACY_DISPOSITION_REPAIR_INSTRUCTION : "Revalidate the issue and replace the invalid parked summary with a durable disposition. Continue productive work when appropriate.",
+          input.legacyEpisode ? LEGACY_DISPOSITION_REPAIR_INSTRUCTION : "Revalidate the issue and replace the invalid parked summary with a durable disposition. Continue productive work when appropriate. " + DISPOSITION_REPAIR_CONTINUATION_INSTRUCTION,
       },
       "normal_model",
     );

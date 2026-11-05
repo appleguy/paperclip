@@ -2842,6 +2842,35 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(wake).toHaveBeenCalledTimes(1);
   });
 
+  it("records an active repair's monitor continuation without releasing its execution locks", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const runId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssueId });
+    await db.update(issues).set({ checkoutRunId: runId, executionRunId: runId }).where(eq(issues.id, sourceIssueId));
+    const action = await issueRecoveryActionService(db).upsertSourceScoped({
+      companyId, sourceIssueId, kind: "deliberate_wait_without_target", ownerType: "agent",
+      ownerAgentId: coderId, returnOwnerAgentId: coderId, cause: "deliberate_wait_without_target",
+      fingerprint: "disposition:active-owner", nextAction: "Record a durable continuation.",
+      wakePolicy: { type: "bounded_owner_disposition_repair", retryAgentId: coderId, attempt: 1, maxAttempts: 2 },
+    });
+    const app = createApp({ type: "agent", agentId: coderId, companyId, runId });
+    // The guarded retry remains unavailable; there is no force-release escape.
+    const rejected = await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+      .send({ actionId: action.id, outcome: "restored", sourceIssueStatus: "todo" }).expect(409);
+    expect(rejected.body.details?.code).toBe("disposition_recovery_retry_stale");
+    const nextCheckAt = new Date(Date.now() + 120_000).toISOString();
+    const saved = await request(app).patch(`/api/issues/${sourceIssueId}`).send({
+      executionPolicy: { monitor: { nextCheckAt, notes: "Continue the remaining managed-seat acceptance." } },
+    }).expect(200);
+    expect(saved.body).toMatchObject({ status: "in_progress", assigneeAgentId: coderId,
+      checkoutRunId: runId, executionRunId: runId, monitorNextCheckAt: nextCheckAt });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("running");
+    expect(await issueRecoveryActionService(db).getActiveForIssue(companyId, sourceIssueId)).toBeNull();
+    const [settled] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(settled).toMatchObject({ status: "cancelled", outcome: "cancelled" });
+  });
+
   it("retries an exhausted disposition action once, preserving the owner and audit trail", async () => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();
     await db.update(issues).set({ status: "blocked", assigneeAgentId: coderId }).where(eq(issues.id, sourceIssueId));
