@@ -18,6 +18,7 @@ import {
   type Receipt,
 } from "../agy/execute.js";
 import { deriveRcName, reportsToDepth, sanitizeRcName, type RcAgentNode } from "./rc-name.js";
+import { gateReceiptRaw, refusalMessage } from "./done-gate.js";
 import {
   CHANNEL_NAME, findBridgeRoot, prepareChannelHost, routeChannelInput, type ChannelHost,
 } from "./channel.js";
@@ -534,6 +535,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
     let receipt: Receipt | null = null;
     let idleWithoutReceipt = 0;
+    let gateRefusals = 0;
     let blockedReason = null as string | null;
     while (true) {
       if (Date.now() >= deadline) {
@@ -546,6 +548,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const raw = await fs.readFile(receiptPath, "utf8").catch(() => "");
       if (raw) {
         receipt = parseReceipt(raw, receiptRunId, issueId);
+        // SCO-762 done gate: canonical-repo edits need committed SHAs on main (live or queued for autodeploy).
+        const startedAt = Date.parse(asString(await fs.readFile(activePath, "utf8").then(t => JSON.parse(t)?.startedAt, () => ""), ""));
+        const gate = await gateReceiptRaw(raw, conversationId ? path.join(projectDir(cwd), `${conversationId}.jsonl`) : null, Number.isFinite(startedAt) ? startedAt : 0);
+        if (!gate.ok) {
+          gateRefusals += 1;
+          receipt = null;
+          await fs.rename(receiptPath, `${receiptPath}.refused-${gateRefusals}`).catch(() => {});
+          await ctx.onLog("stdout", `[claude-rc] Done gate refused receipt ${gateRefusals}/3 for ${issueId}: ${gate.reasons.join(" | ").slice(0, 600)}\n`);
+          if (gateRefusals >= 3) {
+            blockedReason = `done gate refused 3 receipts: ${gate.reasons.join(" | ").slice(0, 1500)}`;
+            await deliverBlock(ctx, issueId, blockedReason);
+            await fs.rm(activePath, { force: true });
+            break;
+          }
+          if (await waitIdle(socket, session, Date.now() + 30_000))
+            await sendClaudePane(socket, session, normalizeOneLine(refusalMessage(gate.reasons, gateRefusals, 3)), stateDir);
+          await sleep(1100);
+          continue;
+        }
         if (await waitIdle(socket, session, Date.now() + 4000)) break;
       } else if (await readBlockTerminal(stateDir, receiptRunId).then(async reason => {
         if (reason === null || !(await waitIdle(socket, session, Date.now() + 4000))) return false;
