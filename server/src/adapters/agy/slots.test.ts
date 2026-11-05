@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { agySlot, agySlotCount, tryAcquire, AGY_MAX_SLOTS } from "./execute.js";
+import { execFileSync } from "node:child_process";
+import { agySlot, agySlotCount, target, tmux, tryAcquire, AGY_MAX_SLOTS } from "./execute.js";
 
 describe("agy concurrent seats (SCO-991)", () => {
   it("gives more than one seat only to Gemini tiers", () => {
@@ -36,5 +37,17 @@ describe("agy concurrent seats (SCO-991)", () => {
       await a!(); await b!();
       expect(await tryAcquire(root)).not.toBeNull();
     } finally { await rm(root, { recursive: true, force: true }); }
+  });
+
+  it("targets the exact seat even when a later seat has a window named like seat 1", async () => {
+    const socket = `agy-slot-test-${process.pid}`;
+    const run = (...a: string[]) => execFileSync("/opt/homebrew/bin/tmux", ["-L", socket, ...a]);
+    try {
+      run("new-session", "-d", "-s", "agy", "-n", "agy", "sleep", "60");
+      run("new-session", "-d", "-s", "agy-s1", "-n", "agy", "sleep", "60");
+      expect((await tmux(socket, ["display-message", "-p", ...target("agy"), "#{session_name}"])).trim()).toBe("agy");
+      expect((await tmux(socket, ["display-message", "-p", ...target("agy-s1"), "#{session_name}"])).trim()).toBe("agy-s1");
+      await expect(tmux(socket, ["has-session", ...target("agy-s")])).rejects.toThrow();
+    } finally { try { run("kill-server"); } catch { /* already gone */ } }
   });
 });

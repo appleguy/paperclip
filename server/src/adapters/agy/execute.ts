@@ -168,7 +168,9 @@ export async function tmux(socket: string, args: string[]): Promise<string> {
   });
   return stdout;
 }
-const target = (session: string) => ["-t", session];
+// "=name:" is an exact session match. A bare name also matches a window named "agy" in the most recent session,
+// so seat 1 commands would land in seat 2 (SCO-991).
+export const target = (session: string) => ["-t", `=${session}:`];
 export async function pane(socket: string, session: string): Promise<string> {
   return tmux(socket, ["capture-pane", ...target(session), "-p", "-J", "-S", "-150"]);
 }
