@@ -33,15 +33,15 @@ scan_codex() { # rollout jsonl: plain user messages, minus injected context/enve
     | ($r.payload.content|txt) as $t
     | select($t|length>0)
     | select($t|test("^\\s*(<|# AGENTS.md|\\{\"schema\"|From:|To:)")|not) | select($t|test($auto)|not) | select($t|test("## Paperclip Wake Payload|Paperclip task context:")|not)
-    | {line:$ln, ts:$r.timestamp, sid:$sid, cwd:$cwd, src:"codex", text:$t}' < "$1"
+    | {line:$ln, event:("message:"+($r.payload.id // ("line:"+($ln|tostring)))), ts:$r.timestamp, sid:$sid, cwd:$cwd, src:"codex", text:$t}' < "$1" | jq -c --arg tr "$1" '.+{transcript:$tr}'
 }
 scan_opencode() { # SESSION_ID[@DB] [FROM_N]: user text (n = ordinal within session, or seq on 2.2.x), minus compaction/synthetic/wakes
   db=$(ocdb_of "$1"); set -- "${1%%@*}" "${2:-0}"; [ -n "$db" ] || return 0
   if ocv2 "$db"; then # 2.2.x: session_message type=user (synthetic/compaction are their own types)
-    sqlite3 -readonly -json "$db" "select m.seq as line, m.time_created as ts, m.session_id as sid, coalesce(s.directory,'') as cwd, 'opencode' as src, json_extract(m.data,'\$.text') as text
+    sqlite3 -readonly -json "$db" "select m.seq as line, 'message:'||m.id as event, m.time_created as ts, m.session_id as sid, coalesce(s.directory,'') as cwd, 'opencode' as src, json_extract(m.data,'\$.text') as text
       from session_message m left join session_v2 s on s.id=m.session_id where m.session_id='$1' and m.type='user' and json_extract(m.data,'\$.text') not like '{\"schema\"%'"
   else
-  sqlite3 -readonly -json "$db" "select row_number() over (order by p.time_created,p.id) as line, p.time_created as ts, m.session_id as sid, coalesce(s.directory,'') as cwd, 'opencode' as src, json_extract(p.data,'\$.text') as text
+  sqlite3 -readonly -json "$db" "select row_number() over (order by p.time_created,p.id) as line, 'message:'||m.id as event, p.time_created as ts, m.session_id as sid, coalesce(s.directory,'') as cwd, 'opencode' as src, json_extract(p.data,'\$.text') as text
     from part p join message m on m.id=p.message_id left join session s on s.id=m.session_id where m.session_id='$1' and json_extract(m.data,'\$.role')='user' and json_extract(p.data,'\$.type')='text'
     and coalesce(json_extract(p.data,'\$.synthetic'),0)=0 and json_extract(p.data,'\$.text') not like '{\"schema\"%'
     and not exists (select 1 from part q where q.message_id=m.id and json_extract(q.data,'\$.type')='compaction')"
@@ -68,7 +68,7 @@ scan() { # TRANSCRIPT [FROM_LINE]
         elif ($r.attachment.type=="queued_command" and ($r.attachment.origin.kind=="human" or $r.attachment.humanTurn==true))
           then ($r.attachment.prompt|txt|owner)
         else empty end ) as $t
-    | {line:$ln, ts:($r.timestamp//$r.attachment.timestamp), sid:$r.sessionId, cwd:($r.cwd//""), src:"claude", text:$t}' < "$1"
+    | {line:$ln, event:("message:"+($r.uuid // $r.attachment.uuid // ("line:"+($ln|tostring)))), ts:($r.timestamp//$r.attachment.timestamp), sid:$r.sessionId, cwd:($r.cwd//""), src:"claude", text:$t}' < "$1" | jq -c --arg tr "$1" '.+{transcript:$tr}'
 }
 
 sid_of() { # TRANSCRIPT-or-opencode:ID -> session id
@@ -110,18 +110,30 @@ proc_key() { # agent process identity pid@start: stable across /clear and compac
   [ -n "$p" ] && printf '%s@%s' "$p" "$(lstart "$p")"; return 0
 }
 alive() { case "$1" in ''|*@) return 1;; esac; [ "$(lstart "${1%%@*}")" = "${1#*@}" ]; }
-ledger_add() { # stdin: JSONL {ts,sid,text[,cwd,proc,src]} ; $1 = cwd override. Dedupe by id or normalized text; closed stays closed.
+ledger_add() { # Identity is an occurrence, never prompt text. Aliases reconcile a receipt with its later transcript row.
   mkdir -p "$OPEN"
   while IFS= read -r m; do
     sid=$(printf '%s' "$m" | jq -r .sid); [ -n "$sid" ] && [ "$sid" != null ] || continue
-    f="$OPEN/$sid.jsonl"; h=$(printf '%s' "$m" | jq -j .text | shasum | cut -c1-6)
+    event=$(printf '%s' "$m" | jq -r '.event // empty')
+    [ -n "$event" ] || event="receipt:$(uuidgen)" # no transport identity: preserve independent calls
+    f="$OPEN/$sid.jsonl"; h=$(printf '%s\n%s' "$sid" "$event" | shasum -a 256 | cut -c1-16)
     id="$(printf %.8s "$sid"):$h"
     if [ -r "$f" ]; then
-      grep -q "\"id\":\"$id\"" "$f" && continue
-      nt=$(printf '%s' "$m" | jq -r '.text|.[0:4000]|gsub("\\s+";"")')
-      jq -e --arg t "$nt" 'select(.text != null and (.text|gsub("\\s+";""))==$t)' "$f" >/dev/null 2>&1 && continue
+      jq -se --arg e "$event" 'any(.[]; .event==$e)' "$f" >/dev/null && continue
+      # A pre-append hook knows the transcript frontier, not the future message UUID.
+      # Bind only the first matching row after that frontier and before the next receipt.
+      alias=$(jq -sr --argjson m "$m" '
+        . as $all | if $m.line == null then empty else
+        [ .[] | select(.text != null and .after_line != null and .transcript==$m.transcript and .after_line < $m.line) ]
+        | sort_by(.after_line) | last
+        | select(. != null and .text==($m.text|.[0:4000]))
+        | . as $r | select(any($all[]; .id==$r.id and .reconciled==true)|not) | .id end' "$f")
+      if [ -n "$alias" ]; then
+        jq -nc --arg id "$alias" --arg event "$event" --arg ts "$(nowz)" '{id:$id,event:$event,reconciled:true,ts:$ts}' >> "$f"
+        continue
+      fi
     fi
-    printf '%s' "$m" | jq -c --arg id "$id" --arg cwd "$1" '{id:$id,ts:(.ts|if type=="number" then (./1000|floor|todate) else sub("\\.[0-9]+Z$";"Z") end),sid,
+    printf '%s' "$m" | jq -c --arg id "$id" --arg event "$event" --arg cwd "$1" '{id:$id,event:$event,transcript,after_line,line,ts:(.ts|if type=="number" then (./1000|floor|todate) else sub("\\.[0-9]+Z$";"Z") end),sid,
       cwd:(if $cwd != "" then $cwd else (.cwd // "") end),proc:(.proc // ""),src:(.src // ""),text:(.text|.[0:4000])}' >> "$f"
   done
 }
@@ -131,8 +143,22 @@ capture() { # UserPromptSubmit hook: record the owner prompt at receipt, before 
   rt=$(printf '%s' "$in" | jq -r '.transcript_path // empty' 2>/dev/null) # codex exec: non-interactive, never owner typing (SCO-899)
   case "$rt" in *rollout-*) [ -f "$rt" ] && [ "$(head -1 "$rt" | jq -r '.payload.source // empty' 2>/dev/null)" = exec ] && exit 0;; esac
   m=$(printf '%s' "$in" | jq -c --arg auto "$AUTO" --arg ts "$(nowz)" --arg proc "$(proc_key)" --arg src "${OWNER_GUARD_SRC:-}" "$OWNER_JQ"' (.prompt|owner) as $t
-    | {ts:$ts,sid:.session_id,text:$t,cwd:(.cwd//""),proc:$proc,src:(if $src != "" then $src elif ((.transcript_path//"")|test("rollout-")) then "codex" else "claude" end)}' 2>/dev/null) || exit 0
+    | {ts:$ts,sid:.session_id,text:$t,event:((.event_id // .message_id // .turn_id // .prompt_id // .uuid // "")|if .=="" then null else "message:"+. end),cwd:(.cwd//""),proc:$proc,src:(if $src != "" then $src elif ((.transcript_path//"")|test("rollout-")) then "codex" else "claude" end)}' 2>/dev/null) || exit 0
   [ -n "$m" ] || exit 0
+  if [ -r "$rt" ] && [ "$(printf '%s' "$m" | jq -r '.event // empty')" = "" ]; then
+    frontier=$(wc -l < "$rt" | tr -d ' ')
+    last=$(tail -n 1 "$rt" | jq -c --argjson n "$frontier" --argjson m "$m" '
+      def txt: if type=="string" then . else [.[]?|select(.type=="text" or .type=="input_text")|.text]|join("\n") end;
+      select((.type=="user" and (.message.content|txt)==$m.text) or
+        (.type=="response_item" and .payload.type=="message" and .payload.role=="user" and (.payload.content|txt)==$m.text))
+      | {event:("message:"+(.uuid // .payload.id // ("line:"+($n|tostring))))}')
+    if [ -n "$last" ]; then
+      m=$(printf '%s' "$m" | jq -c --argjson last "$last" '.+{event:$last.event}')
+    else
+      prompt_hash=$(printf '%s' "$m" | jq -j .text | shasum -a 256 | cut -c1-16)
+      m=$(printf '%s' "$m" | jq -c --arg tr "$rt" --arg h "$prompt_hash" --argjson n "$frontier" '.+{event:("frontier:"+$tr+":"+($n|tostring)+":"+$h),transcript:$tr,after_line:$n}')
+    fi
+  fi
   printf '%s\n' "$m" | ledger_add ""
 }
 ledger_records() { # Read each JSONL line independently; never rewrite damaged originals.
@@ -150,8 +176,10 @@ open_all() { # current open records as JSONL, oldest first; includes explicit un
 }
 note() { # SCO-747 Steering page: stdin = owner text typed there; SRC [CLOSE REASON...]; prints the record id
   src=${1:-steering}; shift || true; t=$(cat); [ -n "$t" ] || { echo "text required on stdin" >&2; exit 2; }
-  jq -nc --arg t "$t" --arg ts "$(nowz)" --arg src "$src" '{ts:$ts,sid:"steering",text:$t,cwd:"steering",proc:"",src:$src}' | ledger_add ""
-  id="steering:$(printf '%s' "$t" | shasum | cut -c1-6)"; [ -z "${1:-}" ] || close "$id" "$@" 2>/dev/null || true; printf '%s\n' "$id"
+  event="note:${OWNER_GUARD_EVENT_ID:-$(uuidgen)}"
+  id="steering:$(printf '%s\n%s' steering "$event" | shasum -a 256 | cut -c1-16)"
+  jq -nc --arg event "$event" --arg t "$t" --arg ts "$(nowz)" --arg src "$src" '{event:$event,ts:$ts,sid:"steering",text:$t,cwd:"steering",proc:"",src:$src}' | ledger_add ""
+  [ -z "${1:-}" ] || close "$id" "$@" 2>/dev/null || true; printf '%s\n' "$id"
 }
 hookin() { in=$(cat 2>/dev/null || true); sid=$(printf '%s' "$in" | jq -r '.session_id // empty' 2>/dev/null); cwd=$(printf '%s' "$in" | jq -r '.cwd // empty' 2>/dev/null); }
 resume() { # SessionStart hook: stdout becomes session context. Bounded. Adopted records become this session's (gate covers them).
