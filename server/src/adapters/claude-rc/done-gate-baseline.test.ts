@@ -58,7 +58,7 @@ it("settles shell, agent and MCP writes from dispatch Git evidence and rejects d
   deps.repos = async () => [repo];
   expect(await check([own], ["peer.ts"], { ...baseline, repos: [] })).toMatchObject({ ok: false, evidence: "unknown" });
   expect((await check([old])).ok).toBe(false);
-  expect((await check([own], [])).ok).toBe(false);
+  expect((await check([own], [])).ok).toBe(true); // unchanged dirt is fingerprinted
   const legacy = { ...baseline, repos: baseline.repos.map(({ repo, head }) => ({ repo, head })) };
   expect((await check([own], ["peer.ts"], legacy)).ok).toBe(false);
   await fs.writeFile(path.join(repo, "own.ts"), "uncommitted after valid commit\n");

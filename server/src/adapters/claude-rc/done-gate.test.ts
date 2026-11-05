@@ -19,8 +19,9 @@ function deps(over: { dirty?: string; known?: Record<string, string>; onHead?: S
     liveSha: async () => LIVE,
     git: async (repo, args) => {
       if (args[0] === "status") return { code: 0, out: over.dirty ?? "" };
-      if (args[0] === "diff-tree") return { code: 0, out: args.at(-1)! };
-      if (args[0] === "diff") return { code: args[2] === BASE ? 1 : 0, out: "" };
+      const changed = "server/a.ts\0ui/public/x.html\0go/a.go\0a.ts\0";
+      if (args[0] === "diff-tree") return { code: 0, out: changed };
+      if (args[0] === "diff") return { code: 0, out: args.includes(BASE) ? changed : "" };
       const sha = (args.find(a => /^[0-9a-f]{7,40}(\^\{commit\})?$/i.test(a)) ?? "").replace("^{commit}", "");
       if (args[0] === "cat-file") return { code: (over.known?.[sha] ?? M) === repo ? 0 : 1, out: "" };
       if (args[0] === "merge-base") {

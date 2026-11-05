@@ -16,6 +16,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { baselineMutationPaths, validateCompletionProvenance, type GateBaseline } from "./done-gate-provenance.js";
+import { statusPaths } from "./done-gate-worktree.js";
 
 const run = promisify(execFile);
 
@@ -27,7 +28,7 @@ const UI_PREFIXES = ["ui/", "master/ui/"];
 
 export type GateReceipt = { runId?: unknown; commits?: unknown; liveCheck?: unknown; notMine?: unknown };
 export type GateVerdict = { ok: true; notes: string[] } | { ok: false; reasons: string[]; evidence?: "unknown" };
-export type MutationRecord = { paths: string[]; unknown: string[] };
+export type MutationRecord = { paths: string[]; unknown: string[]; observedCommits?: string[] };
 export type GitEvidence = { code: number; out: string; error?: string };
 
 export type GateDeps = {
@@ -44,6 +45,9 @@ const READ_ONLY_TOOLS = new Set(["Read", "Grep", "Glob", "WebFetch", "WebSearch"
 export function editedPaths(jsonl: string, sinceMs: number): MutationRecord {
   const seen = new Set<string>();
   const unknown = new Set<string>();
+  const observedCommits = new Set<string>();
+  const commitTools = new Set<string>();
+  const quietCommitHeadTools = new Set<string>();
   const lines = jsonl.split("\n");
   // Untimestamped history before the first timestamp in this run is old context.
   const firstRunRecord = lines.findIndex(line => {
@@ -61,7 +65,23 @@ export function editedPaths(jsonl: string, sinceMs: number): MutationRecord {
     if (sinceMs > 0 && !Number.isFinite(t) && firstRunRecord >= 0 && index < firstRunRecord) continue;
     const content = rec.message?.content;
     if (!Array.isArray(content)) continue;
-    for (const c of content as Array<{ type?: string; name?: string; input?: Record<string, unknown> }>) {
+    for (const c of content as Array<{ type?: string; id?: string; tool_use_id?: string; name?: string; content?: unknown; is_error?: boolean; input?: Record<string, unknown> }>) {
+      if (c?.type === "tool_use" && c.id && c.name === "Bash" && typeof c.input?.command === "string"
+        && /\bgit\b[\s\S]*\bcommit\b/.test(c.input.command)) {
+        commitTools.add(c.id);
+        // Common quiet-commit receipt: success-chained, single HEAD result.
+        if (/&&\s*git\s+log\s+--oneline\s+-1(?:\s|$)/.test(c.input.command)) quietCommitHeadTools.add(c.id);
+      }
+      if (c?.type === "tool_result" && c.tool_use_id && commitTools.has(c.tool_use_id) && !c.is_error && Number.isFinite(t)) {
+        const output = typeof c.content === "string" ? c.content : Array.isArray(c.content)
+          ? c.content.map(block => block?.type === "text" ? block.text : "").join("\n") : "";
+        // Git commit's result format, not SHAs quoted in narrative or git log.
+        for (const match of output.matchAll(/^\[[^\]\r\n]+ ([0-9a-f]{7,40})\] .+$/gm)) observedCommits.add(match[1]);
+        if (quietCommitHeadTools.has(c.tool_use_id)) {
+          const heads = [...output.matchAll(/^([0-9a-f]{7,40}) .+$/gm)];
+          if (heads.length === 1) observedCommits.add(heads[0][1]);
+        }
+      }
       if (c?.type !== "tool_use") continue;
       if (sinceMs > 0 && !Number.isFinite(t)) {
         unknown.add("tool record has no run timestamp");
@@ -79,7 +99,7 @@ export function editedPaths(jsonl: string, sinceMs: number): MutationRecord {
       else unknown.add(`relative mutation path has no absolute cwd: ${p}`);
     }
   }
-  return { paths: [...seen], unknown: [...unknown] };
+  return { paths: [...seen], unknown: [...unknown], ...(observedCommits.size ? { observedCommits: [...observedCommits] } : {}) };
 }
 
 /** Resolve aliases even for deleted/new targets, using their nearest existing parent. */
@@ -126,7 +146,7 @@ export async function evaluateDoneGate(receipt: GateReceipt, edited: string[] | 
   if (record.unknown.length && (!baseline || record.unknown.some(reason => reason.startsWith("transcript ")))) return { ok: false, evidence: "unknown", reasons: [`mutation evidence unknown: ${record.unknown.join("; ")}. A complete run-owned mutation record or baseline is required; commit prose cannot establish the write set.`] };
   let candidates = record.paths;
   if (record.unknown.length && baseline) {
-    try { candidates = [...new Set([...candidates, ...await baselineMutationPaths(receipt, { ...deps, git }, baseline)])]; }
+    try { candidates = [...new Set([...candidates, ...await baselineMutationPaths(receipt, { ...deps, git }, baseline, record.observedCommits)])]; }
     catch (error) { return unknownEvidence(`mutation baseline evidence unknown: ${error instanceof Error ? error.message : "Git evidence unavailable"}`); }
   }
   const repos = await deps.repos();
@@ -142,7 +162,11 @@ export async function evaluateDoneGate(receipt: GateReceipt, edited: string[] | 
     catch { return { ok: false, evidence: "unknown", reasons: ["mutation evidence unknown: target alias resolution failed"] }; }
     const resolved = repoOf(f, [...resolvedRepos.keys()]);
     const r = resolved ? resolvedRepos.get(resolved)! : null;
-    if (r && resolved) touched.set(r, [...(touched.get(r) ?? []), path.join(r, path.relative(resolved, f))]);
+    if (r && resolved) {
+      const files = touched.get(r) ?? [];
+      files.push(path.join(r, path.relative(resolved, f)));
+      touched.set(r, files);
+    }
   }
   const commits = strings(receipt.commits).map(s => s.trim());
   if (touched.size === 0 && commits.length === 0) return { ok: true, notes: ["no canonical repo edited"] };
@@ -159,9 +183,10 @@ export async function evaluateDoneGate(receipt: GateReceipt, edited: string[] | 
 
   // Own uncommitted edits: the run's edited files that git still reports dirty.
   for (const [repo, files] of touched) {
-    const st = await git(repo, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ...files.map(f => path.relative(repo, f))]);
+    const st = await git(repo, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
     if (st.code !== 0 || st.error) return gitFailure(repo, "status", st);
-    const dirty = st.out.split("\0").filter(l => l.length > 3).map(l => l.slice(3));
+    const own = new Set(files.map(f => path.relative(repo, f)));
+    const dirty = statusPaths(st.out).filter(rel => own.has(rel));
     if (dirty.length) reasons.push(`uncommitted edits of this run in ${repo}: ${dirty.slice(0, 12).join(", ")}. Commit your own paths; notMine cannot exempt recorded run mutations.`);
   }
   if (touched.size > 0 && commits.length === 0)
