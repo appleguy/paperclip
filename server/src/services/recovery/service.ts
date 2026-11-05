@@ -2058,10 +2058,10 @@ export function recoveryService(
           // it reports the exhaustion instead of leaving the issue with no
           // live path (2026-09-25: three deploy restarts in a row spent the
           // budget and the issue sat in_progress with no run, unescalated).
-          if (input.outcome && deps.transientRetryBudgetSpent?.(predecessor)) {
-            input.outcome.retryExhausted = true;
+          if (deps.transientRetryBudgetSpent?.(predecessor)) {
+            if (input.outcome) input.outcome.retryExhausted = true;
+            return null;
           }
-          if (input.outcome?.retryExhausted) return null;
         }
         // A retry classifier declining an error is not a continuation path.
         // Re-enter ordinary admission only after ownership and cleanup settle;
