@@ -204,6 +204,9 @@ export function evaluateIssueRewakeThrottle(input: IssueRewakeThrottleInput): Is
   for (const run of runs) {
     if (!run.finishedAt) break;
     if (run.status !== "succeeded") {
+      // Pre-provider cancellations/interruption bookkeeping is not a failed
+      // reasoning attempt. Preserve its recovery path in historical samples.
+      if (run.status !== "failed") break;
       // The first failure remains recoverable. Only an identical repeat feeds
       // the streak; a new failure/result is meaningful input.
       const older = runs[noProgressStreak + 1];

@@ -229,6 +229,8 @@ describe("evaluateIssueRewakeThrottle", () => {
     expect(evaluateIssueRewakeThrottle(input).blocked).toBe(true);
     expect(evaluateIssueRewakeThrottle({ ...input, recentTerminalRuns: [{ ...runs[0], errorCode: "new-fault" }, ...runs.slice(1)] }).blocked).toBe(false);
     expect(evaluateIssueRewakeThrottle({ ...input, recentTerminalRuns: [{ ...runs[0], error: "different failure" }, ...runs.slice(1)] }).blocked).toBe(false);
+    expect(evaluateIssueRewakeThrottle({ ...input,
+      recentTerminalRuns: runs.map(run => ({ ...run, status: "cancelled" })) })).toEqual({ blocked: false, noProgressStreak: 0 });
   });
 
   it("allows when new issue input landed after the last run", () => {

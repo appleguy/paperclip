@@ -1,0 +1,53 @@
+{
+	admin off
+	auto_https off
+}
+
+(paperclip_pool) {
+	lb_policy first
+	health_uri /api/health
+	health_body `"status"\s*:\s*"ok"`
+	health_interval 1s
+	health_timeout 2s
+	fail_duration 2s
+	max_fails 1
+	lb_try_duration 30s
+	lb_try_interval 100ms
+}
+
+https://10.0.1.100:8443, https://mac.local:8443, https://Scotts-Mac-Pro.local:8443, https://localhost:8443 {
+	bind 10.0.1.100
+	tls /Volumes/NVM/Paperclip/ops/https/private/certs/paperclip-lan.pem /Volumes/NVM/Paperclip/ops/https/private/certs/paperclip-lan-key.pem
+	encode gzip
+	redir /transcripts /transcripts/ 308
+	handle_path /transcripts/* {
+		forward_auth 127.0.0.1:3100 127.0.0.1:3101 {
+			import paperclip_pool
+			uri /api/auth/get-session
+		}
+		reverse_proxy 127.0.0.1:3117
+	}
+	handle {
+		reverse_proxy 127.0.0.1:3100 127.0.0.1:3101 {
+			import paperclip_pool
+			header_up Host Scotts-Mac-Pro.local
+			header_up X-Forwarded-Host Scotts-Mac-Pro.local
+			header_up Origin ^https://mac\.local:8443$ https://Scotts-Mac-Pro.local:8443
+		}
+	}
+	header X-Content-Type-Options nosniff
+}
+
+http://10.0.1.100:8084 {
+	bind 10.0.1.100
+	root * /Volumes/NVM/Paperclip/ops/https/public
+	handle /paperclip-lan.mobileconfig {
+		header Content-Type application/x-apple-aspen-config
+		file_server
+	}
+	handle /paperclip-root-ca.cer {
+		header Content-Type application/x-x509-ca-cert
+		file_server
+	}
+	respond 404
+}
