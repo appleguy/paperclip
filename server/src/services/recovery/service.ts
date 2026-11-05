@@ -7,6 +7,7 @@ import { notifyCancelledWorkspacePreservation } from "../cancelled-workspace-pre
 import { notifyInstructionCollection } from "../instruction-collection-notifications.js";
 import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";
 import { boundRunIssueId } from "../run-task-binding.js";
+import { getExecutionBlocker, hasPendingRunCleanup } from "../execution-blocker.js";
 import { REMOTE_WORKSPACE_PREPARATION_TIMEOUT_CODE, REMOTE_WORKSPACE_RESTORE_FAILED_CODE } from "../remote-workspace-transport.js";
 import { REUSABLE_SANDBOX_RESUME_FAILED_CODE } from "../reusable-sandbox-resume-error.js";
 import { recoveryRunContextColumn, recoveryRunVersionColumn } from "./run-context-read.js";
@@ -966,7 +967,8 @@ export function recoveryService(
       runId: string,
     ) => Promise<typeof heartbeatRuns.$inferSelect | null>;
     /** Settle retained explicit retry claims through the queue-first release policy. */
-    settleExplicitContinuationRetry?: (run: typeof heartbeatRuns.$inferSelect) => Promise<void>;
+    settleExplicitContinuationRetry?: (run: typeof heartbeatRuns.$inferSelect,
+      options?: { suppressImmediateRecovery?: boolean; resumeStrandedQueue?: boolean }) => Promise<void>;
     /**
      * Whether a failed or interrupted run has consumed every bounded
      * transient retry, so `scheduleRecoveryRetry` can no longer produce a
@@ -1128,7 +1130,7 @@ export function recoveryService(
     issueId: string,
     agentId?: string | null,
   ) {
-    const [run, deferredWake, nativeRecovery] = await Promise.all([
+    const [run, nativeRecovery] = await Promise.all([
       db
         .select({ id: heartbeatRuns.id })
         .from(heartbeatRuns)
@@ -1140,19 +1142,6 @@ export function recoveryService(
             ]),
             sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
             agentId ? eq(heartbeatRuns.agentId, agentId) : sql`true`,
-          ),
-        )
-        .limit(1)
-        .then((rows) => rows[0] ?? null),
-      db
-        .select({ id: agentWakeupRequests.id })
-        .from(agentWakeupRequests)
-        .where(
-          and(
-            eq(agentWakeupRequests.companyId, companyId),
-            eq(agentWakeupRequests.status, "deferred_issue_execution"),
-            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
-            agentId ? eq(agentWakeupRequests.agentId, agentId) : sql`true`,
           ),
         )
         .limit(1)
@@ -1185,7 +1174,9 @@ export function recoveryService(
         .then((rows) => rows[0] ?? null),
     ]);
 
-    return Boolean(run || deferredWake || nativeRecovery);
+    // A deferred receipt is an obligation to reconcile, not an executor.
+    // The sweep promotes it through release before checking this predicate.
+    return Boolean(run || nativeRecovery);
   }
 
   async function wasBlockedByAssigneeAgent(
@@ -2049,9 +2040,8 @@ export function recoveryService(
           predecessor.status,
         )
       ) {
-        // Failure recovery shares the durable incident budget and delay. It
-        // cannot fall through into the productive-work continuation queue.
-        if (predecessor.runtimeMode === "native") return null;
+        // Prefer the durable incident retry budget and delay when eligible.
+        if (isOperatorCancelledRun(predecessor, input.agentId)) return null;
         if (await legacyExecutionNeedsReconciliationWithEvidence(db, predecessor)) {
           await terminalizeLegacyExecution({
             db,
@@ -2071,9 +2061,15 @@ export function recoveryService(
           if (input.outcome && deps.transientRetryBudgetSpent?.(predecessor)) {
             input.outcome.retryExhausted = true;
           }
-          return null;
+          if (input.outcome?.retryExhausted) return null;
         }
-        return null;
+        // A retry classifier declining an error is not a continuation path.
+        // Re-enter ordinary admission only after ownership and cleanup settle;
+        // it still enforces pause, budget, dependency and execution authority.
+        const issueId = input.issueId;
+        if (await hasActiveExecutionPath(predecessor.companyId, issueId) ||
+            await hasPendingRunCleanup(db, predecessor.companyId, predecessor.id) ||
+            await getExecutionBlocker(db, predecessor.companyId, issueId)) return null;
       }
     }
     if (
@@ -3887,7 +3883,7 @@ export function recoveryService(
     return decision.kind === "enqueue" ? null : decision.kind === "skip" ? decision.reason : "repair_exhausted";
   }
 
-  async function reconcileLegacyContinuation(runId: string) {
+  async function reconcileLegacyContinuation(runId: string, onSkip?: (reason: string) => void) {
     const [run] = await db.select(recoveryRunFields).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.id, runId), not(eq(heartbeatRuns.runtimeMode, "native")), eq(heartbeatRuns.status, "succeeded"),
     )).limit(1);
@@ -3897,13 +3893,13 @@ export function recoveryService(
     if (!issueId) return "skipped" as const;
     const [issue] = await db.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId))).limit(1);
     if (!issue) return "skipped" as const;
-    return reconcileDispositionRepair(issue, run, { legacyEpisode: legacyDispositionEpisode(run) });
+    return reconcileDispositionRepair(issue, run, { legacyEpisode: legacyDispositionEpisode(run), onSkip });
   }
 
   async function reconcileDispositionRepair(
     issue: Pick<RecoveryIssue, "id" | "companyId">,
     latestRun: LatestIssueRun,
-    options: { historicalAttemptCount?: number; legacyEpisode?: LegacyDispositionEpisode } = {},
+    options: { historicalAttemptCount?: number; legacyEpisode?: LegacyDispositionEpisode; onSkip?: (reason: string) => void } = {},
   ): Promise<"queued" | "escalated" | "covered" | "skipped"> {
     const current = await db
       .select()
@@ -3936,7 +3932,10 @@ export function recoveryService(
     if (episode) {
       if (!latestRun) return "skipped";
       const decision = await decidePersistedLegacyContinuation(current, latestRun.id, state, episode);
-      if (decision.kind === "skip") return "skipped";
+      if (decision.kind === "skip") {
+        options.onSkip?.(decision.reason);
+        return "skipped";
+      }
       state.fingerprint = legacyDispositionFingerprint(current.companyId, current.id, latestRun.agentId, episode.id);
     }
     if (state.hasActiveExecutionPath) return "skipped";
@@ -4597,17 +4596,27 @@ export function recoveryService(
       operatorCancelExempted: 0,
       onboardingFirstTaskExempted: 0,
       skipped: 0,
+      skipGates: [] as Array<{ issueId: string; gate: string }>,
       issueIds: [] as string[],
     };
 
+    function recordSkip(issue: RecoveryIssue, gate: string, count = true) {
+      if (count) result.skipped += 1;
+      result.skipGates.push({ issueId: issue.id, gate });
+      logger.info({ companyId: issue.companyId, issueId: issue.id, gate }, "stranded recovery skipped");
+    }
+
     const candidateIssueIds = candidates.map((issue) => issue.id);
-    const unfinishedGoalBindings = new Set<string>();
+    const unfinishedGoalBindings = new Map<string, { id: string; status: string | null; desiredState: string | null }>();
     if (candidateIssueIds.length > 0) {
       const pausedGoals = await db
         .select({
           companyId: agentTaskSessions.companyId,
           agentId: agentTaskSessions.agentId,
           taskKey: agentTaskSessions.taskKey,
+          id: agentTaskSessions.id,
+          status: agentTaskSessions.goalStatus,
+          desiredState: agentTaskSessions.goalDesiredState,
         })
         .from(agentTaskSessions)
         .where(
@@ -4618,8 +4627,8 @@ export function recoveryService(
           ),
         );
       for (const goal of pausedGoals) {
-        unfinishedGoalBindings.add(
-          `${goal.companyId}:${goal.taskKey}:${goal.agentId}`,
+        unfinishedGoalBindings.set(
+          `${goal.companyId}:${goal.taskKey}:${goal.agentId}`, goal,
         );
       }
     }
@@ -4630,7 +4639,7 @@ export function recoveryService(
 
 
           if (await pendingExternalConversationSettlement(db, issue.companyId, issue.id)) {
-            result.skipped += 1;
+            recordSkip(issue, "external_settlement_pending");
             continue;
           }
         } else {
@@ -4638,7 +4647,7 @@ export function recoveryService(
         }
         const [current] = await db.select({ externalConversationState: externalConversationStateSql() })
           .from(issues).where(and(eq(issues.companyId, issue.companyId), eq(issues.id, issue.id)));
-        if (current?.externalConversationState === "waiting") { result.skipped += 1; continue; }
+        if (current?.externalConversationState === "waiting") { recordSkip(issue, "external_conversation_waiting"); continue; }
       }
       if (issue.conversationAgentId) {
         const lastRun = await getLatestIssueRun(issue.companyId, issue.id);
@@ -4648,15 +4657,15 @@ export function recoveryService(
             if (current) Object.assign(issue, current);
           }
         }
-        if (!(await instanceSettingsService(db).getExperimental()).enableAgentChat) { result.skipped += 1; continue; }
+        if (!(await instanceSettingsService(db).getExperimental()).enableAgentChat) { recordSkip(issue, "agent_chat_disabled"); continue; }
         {
           if (await deliverConversationComments(db, issue, deps.enqueueWakeup) === "deferred") {
-            result.skipped += 1;
+            recordSkip(issue, "conversation_comments_deferred");
             continue;
           }
         }
       }
-      if (isWaitingConversation(issue)) { result.skipped += 1; continue; }
+      if (isWaitingConversation(issue)) { recordSkip(issue, "conversation_waiting"); continue; }
       const executionState = issue.status === "in_review"
         ? parseIssueExecutionState(issue.executionState)
         : null;
@@ -4673,22 +4682,33 @@ export function recoveryService(
           ? participantAgentId
           : issue.assigneeAgentId;
       if (!agentId) {
-        result.skipped += 1;
-        continue;
-      }
-
-      // An unfinished durable session goal owns its continuation lifecycle.
-      // A paused goal waits for explicit resume; an active goal is handled by
-      // dedicated goal recovery. Generic stranded-work recovery would race
-      // either authority and can replace the provider session owning the goal.
-      if (
-        unfinishedGoalBindings.has(`${issue.companyId}:${issue.id}:${agentId}`)
-      ) {
-        result.skipped += 1;
+        recordSkip(issue, "missing_agent");
         continue;
       }
 
       let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
+      const sessionGoal = unfinishedGoalBindings.get(`${issue.companyId}:${issue.id}:${agentId}`);
+      if (sessionGoal && (sessionGoal.status !== "active" || sessionGoal.desiredState !== "active")) {
+        recordSkip(issue, "session_goal_paused");
+        continue;
+      }
+      // Deferred assignment wakes need the same release reconciliation as
+      // comments. A terminal owner cannot release them on a future completion.
+      if (latestRun && isTerminalIssueRun(latestRun) &&
+          !isOperatorCancelledRun(latestRun, agentId) && deps.settleExplicitContinuationRetry) {
+        const [deferred] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.companyId, issue.companyId),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
+        )).limit(1);
+        if (deferred) {
+          const [source] = await db.select().from(heartbeatRuns).where(and(
+            eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, latestRun.id),
+          ));
+          if (source) await deps.settleExplicitContinuationRetry(source,
+            { suppressImmediateRecovery: true, resumeStrandedQueue: true });
+        }
+      }
       // Terminal run/wake rows survive a restart even if finalization never
       // reached the escalation transaction. Retry that idempotent disposition
       // before the participant-only review branch can skip pathless reviews.
@@ -4713,29 +4733,13 @@ export function recoveryService(
         latestRun?.status === "succeeded" &&
         parseObject(latestRun.resultJson).finalizationReasonCode === "conversation_turn_finished"
       ) {
-        result.skipped += 1;
+        recordSkip(issue, "conversation_finalization");
         continue;
-      }
-
-      if (latestRun?.status === "succeeded" && issue.status !== "in_review") {
-        const [source] = await db.select({ runtimeMode: heartbeatRuns.runtimeMode }).from(heartbeatRuns).where(eq(heartbeatRuns.id, latestRun.id)).limit(1);
-        if (source?.runtimeMode !== "native") {
-          const outcome = await reconcileLegacyContinuation(latestRun.id);
-          if (outcome === "queued") {
-            result.continuationRequeued += 1;
-            result.dispositionRepairRequeued += 1;
-            result.issueIds.push(issue.id);
-          } else if (outcome === "escalated") {
-            result.escalated += 1;
-            result.issueIds.push(issue.id);
-          } else result.skipped += 1;
-          continue;
-        }
       }
 
       const agent = await getAgent(agentId);
       if (agent?.companyId === issue.companyId && isAgentAwaitingSetup(agent)) {
-        result.skipped += 1;
+        recordSkip(issue, "agent_setup");
         continue;
       }
       const agentInvokable =
@@ -4747,7 +4751,7 @@ export function recoveryService(
         agent.companyId === issue.companyId &&
         (await hasCurrentNativePassiveWait(issue, latestRun))
       ) {
-        result.skipped += 1;
+        recordSkip(issue, "native_passive_wait");
         continue;
       }
       // A person paused this agent (or stopped its run) on purpose. Escalating its
@@ -4760,7 +4764,7 @@ export function recoveryService(
         latestRun.status === "cancelled" &&
         (latestRun.errorCode === "agent_paused" || isOperatorCancelledRun(latestRun, agentId))
       ) {
-        result.skipped += 1;
+        recordSkip(issue, "agent_paused");
         continue;
       }
       if (issue.status !== "in_review" && !agentInvokable) {
@@ -4774,7 +4778,7 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            recordSkip(issue, "unavailable_disposition_repair");
           }
         } else {
           const updated = await escalateStrandedAssignedIssue({
@@ -4789,7 +4793,7 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            recordSkip(issue, "unavailable_escalation");
           }
         }
         continue;
@@ -4802,12 +4806,12 @@ export function recoveryService(
           issue.status === "in_review" ? agentId : null,
         )
       ) {
-        result.skipped += 1;
+        recordSkip(issue, "active_execution_path");
         continue;
       }
 
       if (await hasPendingWakeInteraction(issue.companyId, issue.id)) {
-        result.skipped += 1;
+        recordSkip(issue, "pending_interaction");
         continue;
       }
 
@@ -4820,7 +4824,7 @@ export function recoveryService(
         issue.id,
       );
       if (activeRecoveryAction?.ownerType === "board") {
-        result.skipped += 1;
+        recordSkip(issue, "board_recovery_action");
         continue;
       }
 
@@ -4832,7 +4836,7 @@ export function recoveryService(
           treeControlSvc,
         )
       ) {
-        result.skipped += 1;
+        recordSkip(issue, "pause_hold");
         continue;
       }
 
@@ -4859,11 +4863,12 @@ export function recoveryService(
           })
         ).kind !== "clear"
       ) {
-        result.skipped += 1;
+        recordSkip(issue, "chat_control_stop");
         continue;
       }
       if (isOperatorCancelledRun(executionRecoverySource, agentId)) {
         result.operatorCancelExempted += 1;
+        recordSkip(issue, "operator_cancelled", false);
         continue;
       }
       if (
@@ -4905,7 +4910,7 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            recordSkip(issue, "budget_disposition_repair");
           }
         } else {
           const updated = await escalateStrandedAssignedIssue({
@@ -4924,10 +4929,47 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            recordSkip(issue, "budget_escalation");
           }
         }
         continue;
+      }
+      const goal = unfinishedGoalBindings.get(`${issue.companyId}:${issue.id}:${agentId}`);
+      if (goal) {
+        // Resume the durable goal, preserving its provider session. Paused
+        // goals retain their explicit-resume authority.
+        if (goal.status !== "active" || goal.desiredState !== "active") {
+          recordSkip(issue, "session_goal_paused");
+          continue;
+        }
+        const queued = await deps.enqueueWakeup(agentId, {
+          source: "automation", triggerDetail: "system", reason: "goal_control",
+          idempotencyKey: `stranded_goal:${goal.id}:${latestRun?.id ?? "initial"}`,
+          payload: { issueId: issue.id, intent: "goal_recovery" },
+          contextSnapshot: { issueId: issue.id, taskKey: issue.id,
+            resumeSessionGoalHeartbeat: true, skipIssueComment: true },
+        });
+        if (queued) {
+          result.continuationRequeued += 1;
+          result.issueIds.push(issue.id);
+        } else recordSkip(issue, "session_goal_admission");
+        continue;
+      }
+      if (latestRun?.status === "succeeded" && issue.status !== "in_review") {
+        const [source] = await db.select({ runtimeMode: heartbeatRuns.runtimeMode }).from(heartbeatRuns).where(eq(heartbeatRuns.id, latestRun.id)).limit(1);
+        if (source?.runtimeMode !== "native") {
+          let gate = "legacy_continuation_admission";
+          const outcome = await reconcileLegacyContinuation(latestRun.id, reason => { gate = `legacy_continuation_${reason}`; });
+          if (outcome === "queued") {
+            result.continuationRequeued += 1;
+            result.dispositionRepairRequeued += 1;
+            result.issueIds.push(issue.id);
+          } else if (outcome === "escalated") {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else recordSkip(issue, gate);
+          continue;
+        }
       }
       const nativeUnblockAction = await nativeBlockedUnblockAction(
         issue,
@@ -4948,7 +4990,7 @@ export function recoveryService(
           result.escalated += 1;
           result.issueIds.push(issue.id);
         } else {
-          result.skipped += 1;
+          recordSkip(issue, "native_blocked_wait");
         }
         continue;
       }
@@ -4956,7 +4998,7 @@ export function recoveryService(
         latestRun?.status === "succeeded" &&
         (await hasPersistedDurableWaitPath(issue, latestRun))
       ) {
-        result.skipped += 1;
+        recordSkip(issue, "durable_wait");
         continue;
       }
       const recoveryNow = new Date();
@@ -4971,7 +5013,7 @@ export function recoveryService(
           recoveryNow,
         )
       ) {
-        result.skipped += 1;
+        recordSkip(issue, "provider_quota_monitor");
         continue;
       }
       if (
@@ -4987,7 +5029,7 @@ export function recoveryService(
           result.escalated += 1;
           result.issueIds.push(issue.id);
         } else {
-          result.skipped += 1;
+          recordSkip(issue, "recovery_issue_escalation");
         }
         continue;
       }
@@ -5001,7 +5043,7 @@ export function recoveryService(
       if (latestRun && adapterFailureClassification) {
         const targetAgentId = getAdapterFailureRecoveryTargetAgentId(issue);
         if (!targetAgentId || latestRun.agentId !== targetAgentId) {
-          result.skipped += 1;
+          recordSkip(issue, "adapter_owner_changed");
           continue;
         }
 
@@ -5021,7 +5063,7 @@ export function recoveryService(
             result.issueIds.push(issue.id);
             continue;
           }
-          result.skipped += 1;
+          recordSkip(issue, "provider_quota_schedule");
           continue;
         } else {
           const updated = await escalateStrandedAssignedIssue({
@@ -5042,7 +5084,7 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            recordSkip(issue, "configuration_escalation");
           }
           continue;
         }
@@ -5080,17 +5122,17 @@ export function recoveryService(
 
         if (!successfulRunSinceResolution) {
           if (!agentInvokable) {
-            result.skipped += 1;
+            recordSkip(issue, "interaction_agent_unavailable");
             continue;
           }
 
           if (await hasQueuedIssueWake(issue.companyId, issue.id, agentId)) {
-            result.skipped += 1;
+            recordSkip(issue, "interaction_queued_wake");
             continue;
           }
 
           if (await isInvocationBudgetBlocked(issue, agentId)) {
-            result.skipped += 1;
+            recordSkip(issue, "interaction_budget");
             continue;
           }
 
@@ -5125,7 +5167,7 @@ export function recoveryService(
               result.escalated += 1;
               result.issueIds.push(issue.id);
             } else {
-              result.skipped += 1;
+              recordSkip(issue, "interaction_disposition_repair");
             }
             continue;
           }
@@ -5154,7 +5196,7 @@ export function recoveryService(
               result.escalated += 1;
               result.issueIds.push(issue.id);
             } else {
-              result.skipped += 1;
+              recordSkip(issue, "interaction_retry_escalation");
             }
             continue;
           }
@@ -5185,7 +5227,7 @@ export function recoveryService(
             result.continuationRequeued += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            recordSkip(issue, "interaction_admission");
           }
           continue;
         }
@@ -5193,7 +5235,7 @@ export function recoveryService(
 
       if (issue.status === "in_review") {
         if (!participantAgentId || !pendingExecutionState) {
-          result.skipped += 1;
+          recordSkip(issue, "review_no_participant");
           continue;
         }
         const participantLatestRun = participantLatestRunForRecovery;
@@ -5214,10 +5256,10 @@ export function recoveryService(
               result.escalated += 1;
               result.issueIds.push(issue.id);
             } else {
-              result.skipped += 1;
+              recordSkip(issue, "review_unavailable_escalation");
             }
           } else {
-            result.skipped += 1;
+            recordSkip(issue, "review_no_terminal_run");
           }
           continue;
         }
@@ -5246,7 +5288,7 @@ export function recoveryService(
             result.providerQuotaMonitored += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            recordSkip(issue, "review_quota_schedule");
           }
           continue;
         }
@@ -5273,7 +5315,7 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            recordSkip(issue, "review_configuration_escalation");
           }
           continue;
         }
@@ -5290,7 +5332,7 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            recordSkip(issue, "review_unavailable_escalation");
           }
           continue;
         }
@@ -5312,7 +5354,7 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            recordSkip(issue, "review_recovery_escalation");
           }
           continue;
         }
@@ -5324,12 +5366,12 @@ export function recoveryService(
             participantAgentId,
           )
         ) {
-          result.skipped += 1;
+          recordSkip(issue, "review_queued_wake");
           continue;
         }
 
         if (await isInvocationBudgetBlocked(issue, participantAgentId)) {
-          result.skipped += 1;
+          recordSkip(issue, "review_budget");
           continue;
         }
 
@@ -5374,10 +5416,10 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            recordSkip(issue, "review_retry_exhaustion_escalation");
           }
         } else {
-          result.skipped += 1;
+          recordSkip(issue, "review_admission");
         }
         continue;
       }
@@ -5392,16 +5434,17 @@ export function recoveryService(
           // as stranded).
           if (await isOnboardingFirstTaskAwaitingUser(issue)) {
             result.onboardingFirstTaskExempted += 1;
+            recordSkip(issue, "onboarding_first_task", false);
             continue;
           }
 
           if (await hasQueuedIssueWake(issue.companyId, issue.id)) {
-            result.skipped += 1;
+            recordSkip(issue, "todo_queued_wake");
             continue;
           }
 
           if (await isInvocationBudgetBlocked(issue, agentId)) {
-            result.skipped += 1;
+            recordSkip(issue, "todo_budget");
             continue;
           }
 
@@ -5413,7 +5456,7 @@ export function recoveryService(
             result.assignmentDispatched += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            recordSkip(issue, "todo_initial_admission");
           }
           continue;
         }
@@ -5422,7 +5465,7 @@ export function recoveryService(
           latestRun.status === "succeeded" &&
           !(await wasTodoHandedBackDuringOrAfterLatestRun(issue, latestRun))
         ) {
-          result.skipped += 1;
+          recordSkip(issue, "todo_successful_run");
           continue;
         }
 
@@ -5444,13 +5487,13 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            recordSkip(issue, "todo_recovery_escalation");
           }
           continue;
         }
 
         if (await isInvocationBudgetBlocked(issue, agentId)) {
-          result.skipped += 1;
+          recordSkip(issue, "todo_budget");
           continue;
         }
 
@@ -5493,16 +5536,16 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            recordSkip(issue, "todo_retry_exhaustion_escalation");
           }
         } else {
-          result.skipped += 1;
+          recordSkip(issue, "todo_admission");
         }
         continue;
       }
 
       if (!latestRun && !issue.checkoutRunId && !issue.executionRunId) {
-        result.skipped += 1;
+        recordSkip(issue, "no_run_binding");
         continue;
       }
       if (readDispositionRepairAttempt(latestRun)) {
@@ -5515,18 +5558,18 @@ export function recoveryService(
           result.escalated += 1;
           result.issueIds.push(issue.id);
         } else {
-          result.skipped += 1;
+          recordSkip(issue, "disposition_repair");
         }
         continue;
       }
       const handoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
       if (handoffEvidence) {
         if (isPluginManagedIssueLifecycle(issue)) {
-          result.skipped += 1;
+          recordSkip(issue, "plugin_lifecycle");
           continue;
         }
         if (!handoffEvidence.exhausted) {
-          result.skipped += 1;
+          recordSkip(issue, "handoff_pending");
           continue;
         }
 
@@ -5545,7 +5588,7 @@ export function recoveryService(
         // returns null for them and they escalate exactly as before.
         if (latestRun?.status === "interrupted") {
           if (await isInvocationBudgetBlocked(issue, agentId)) {
-            result.skipped += 1;
+            recordSkip(issue, "handoff_budget");
             continue;
           }
           const retried = await enqueueStrandedIssueRecovery({
@@ -5574,7 +5617,7 @@ export function recoveryService(
           result.successfulRunHandoffEscalated += 1;
           result.issueIds.push(issue.id);
         } else {
-          result.skipped += 1;
+          recordSkip(issue, "handoff_escalation");
         }
         continue;
       }
@@ -5588,13 +5631,13 @@ export function recoveryService(
         const workspace = parseObject(parseObject(successfulRun.contextSnapshot).paperclipWorkspace);
         if (workspace.mode === "shared_workspace" && (await healthyOpenChildIssues(issue, true)).length > 0) {
           result.productiveContinuationObserved += 1;
-          result.skipped += 1;
+          recordSkip(issue, "healthy_workspace_child");
           continue;
         }
 
         if (!isProductiveContinuationRun(successfulRun)) {
           result.successfulContinuationObserved += 1;
-          result.skipped += 1;
+          recordSkip(issue, "successful_nonproductive_run");
           continue;
         }
 
@@ -5622,7 +5665,7 @@ export function recoveryService(
               result.escalated += 1;
               result.issueIds.push(issue.id);
             } else {
-              result.skipped += 1;
+              recordSkip(issue, "productive_recovery_escalation");
             }
             continue;
           }
@@ -5630,7 +5673,7 @@ export function recoveryService(
         }
 
         if (await isInvocationBudgetBlocked(issue, agentId)) {
-          result.skipped += 1;
+          recordSkip(issue, "productive_budget");
           continue;
         }
 
@@ -5646,7 +5689,7 @@ export function recoveryService(
           result.continuationRequeued += 1;
           result.issueIds.push(issue.id);
         } else {
-          result.skipped += 1;
+          recordSkip(issue, "productive_admission");
         }
         continue;
       }
@@ -5655,12 +5698,12 @@ export function recoveryService(
         // child, routine, goal or recovery action). It never ran, so there is nothing to retry
         // and no missing execution path to escalate while that owner still holds.
         if (latestRun && await legacyRepairDispatchBlock(latestRun.id, { settled: true })) {
-          result.skipped += 1;
+          recordSkip(issue, "suppressed_repair_owner");
           continue;
         }
         // The owner released the issue: continue it with a fresh wake, not a retry of the repair.
         if (await isInvocationBudgetBlocked(issue, agentId)) {
-          result.skipped += 1;
+          recordSkip(issue, "suppressed_repair_budget");
           continue;
         }
         const resumed = await enqueueStrandedIssueRecovery({
@@ -5674,7 +5717,7 @@ export function recoveryService(
           result.continuationRequeued += 1;
           result.issueIds.push(issue.id);
         } else {
-          result.skipped += 1;
+          recordSkip(issue, "suppressed_repair_admission");
         }
         continue;
       }
@@ -5700,7 +5743,7 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            recordSkip(issue, "continuation_disposition_repair");
           }
           continue;
         }
@@ -5723,7 +5766,7 @@ export function recoveryService(
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
-            result.skipped += 1;
+            recordSkip(issue, "nonretryable_escalation");
           }
           continue;
         }
@@ -5756,7 +5799,7 @@ export function recoveryService(
               result.escalated += 1;
               result.issueIds.push(issue.id);
             } else {
-              result.skipped += 1;
+              recordSkip(issue, "continuation_retry_escalation");
             }
             continue;
           }
@@ -5768,7 +5811,7 @@ export function recoveryService(
               Math.pow(2, Math.max(0, consecutive - 1));
             if (elapsed < requiredDelay) {
               opts?.onDeferredDeadline?.(latestFinishedAt.getTime() + requiredDelay);
-              result.skipped += 1;
+              recordSkip(issue, "continuation_backoff");
               continue;
             }
           }
@@ -5776,7 +5819,7 @@ export function recoveryService(
       }
 
       if (await isInvocationBudgetBlocked(issue, agentId)) {
-        result.skipped += 1;
+        recordSkip(issue, "continuation_budget");
         continue;
       }
 
@@ -5820,10 +5863,34 @@ export function recoveryService(
           result.escalated += 1;
           result.issueIds.push(issue.id);
         } else {
-          result.skipped += 1;
+          recordSkip(issue, "continuation_exhaustion_escalation");
         }
       } else {
-        result.skipped += 1;
+        recordSkip(issue, "continuation_admission");
+      }
+    }
+
+    // Keep the latest gate inspectable through issue activity, including for
+    // issues with no run. Persist gate changes only; routine sweeps do not
+    // append the same diagnostic indefinitely or wake the assignee.
+    if (result.skipGates.length) {
+      const previous = await db.selectDistinctOn([activityLog.entityId], {
+        issueId: activityLog.entityId, details: activityLog.details,
+      }).from(activityLog).where(and(
+        eq(activityLog.entityType, "issue"), eq(activityLog.action, "issue.recovery_skipped"),
+        inArray(activityLog.entityId, result.skipGates.map(row => row.issueId)),
+        inArray(activityLog.companyId, [...new Set(candidates.map(issue => issue.companyId))]),
+      )).orderBy(activityLog.entityId, desc(activityLog.createdAt), desc(activityLog.id));
+      const previousGates = new Map(previous.map(row => [row.issueId, row.details?.gate]));
+      const changed = result.skipGates.filter(row => previousGates.get(row.issueId) !== row.gate);
+      if (changed.length) {
+        const byId = new Map(candidates.map(issue => [issue.id, issue]));
+        await db.insert(activityLog).values(changed.map(row => ({
+          companyId: byId.get(row.issueId)!.companyId,
+          actorType: "system", actorId: "stranded_recovery_sweep",
+          action: "issue.recovery_skipped", entityType: "issue", entityId: row.issueId,
+          details: { gate: row.gate },
+        })));
       }
     }
 

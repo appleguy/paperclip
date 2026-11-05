@@ -6,9 +6,11 @@ import { and, asc, desc, eq, gte, inArray, isNull, sql } from "drizzle-orm";
 import { executionIssueCondition } from "../issue-visibility.js";
 import { getExecutionBlocker, hasPendingRunCleanup } from "../execution-blocker.js";
 import type { HeartbeatQueueDependencies, createHeartbeatQueue } from "./queue.js";
+import { parseHeartbeatPolicy } from "./timer-policy.js";
+import { parseObject } from "../../adapters/utils.js";
 
 export const QUEUE_DRIVE_WAKE_REASON = "issue_queue_drive";
-const COMPLETED_STATUSES = ["succeeded", "failed", "timed_out"];
+const COMPLETED_STATUSES = ["succeeded", "failed", "timed_out", "cancelled", "interrupted"];
 const FAILURE_STATUSES = new Set(["failed", "timed_out"]);
 
 interface QueueDriveDependencies extends Pick<HeartbeatQueueDependencies,
@@ -31,6 +33,9 @@ export function createHeartbeatQueueDrive(db: Db, deps: QueueDriveDependencies) 
     if (!run || !COMPLETED_STATUSES.includes(run.status) || !run.finishedAt ||
         (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date()) ||
         await hasPendingRunCleanup(db, source.companyId, source.id)) return null;
+    const cancelledBy = parseObject(run.resultJson).cancelledByActorType;
+    if (run.status === "cancelled" && (cancelledBy === "user" || cancelledBy === "board" ||
+        run.errorCode === "operator_interrupted")) return null;
 
     const agent = await deps.getAgent(source.agentId);
     if (!agent || agent.companyId !== source.companyId ||
@@ -48,17 +53,24 @@ export function createHeartbeatQueueDrive(db: Db, deps: QueueDriveDependencies) 
       ));
     if (receipts.some(receipt => receipt.status !== "skipped")) return null;
     const attempted = new Set(receipts.map(receipt => receipt.key));
-    const [active] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    const [active] = await db.select({ count: sql<number>`count(*)::integer` }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, source.companyId), eq(heartbeatRuns.agentId, source.agentId),
       inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
-    )).limit(1);
-    if (active) return null; // Existing queued work and bounded retries own the next turn.
+    ));
+    // Reserve room for already admitted work, but do not let one busy slot
+    // suppress completion-driven admission on a multi-slot seat.
+    if (active.count >= parseHeartbeatPolicy(agent).maxConcurrentRuns) return null;
 
     const cutoff = await deps.getWorktreeExecutionCutoff();
     const candidates = await db.select({ id: issues.id, statusVersion: issues.statusVersion }).from(issues).where(and(
       eq(issues.companyId, source.companyId), eq(issues.assigneeAgentId, source.agentId),
       isNull(issues.assigneeUserId), executionIssueCondition(), inArray(issues.status, ["todo", "in_progress"]),
       cutoff ? gte(issues.createdAt, cutoff) : undefined,
+      sql`not exists (select 1 from ${heartbeatRuns} where
+        ${heartbeatRuns.companyId} = ${issues.companyId}
+        and coalesce(${heartbeatRuns.issueId}::text, ${heartbeatRuns.nativeIssueId}::text,
+          ${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId') = ${issues.id}::text
+        and ${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry'))`,
       // Confirmations and approvals gate work; an unanswered question alone does not.
       sql`not exists (select 1 from ${issueThreadInteractions} where
         ${issueThreadInteractions.companyId} = ${issues.companyId} and ${issueThreadInteractions.issueId} = ${issues.id}
@@ -78,12 +90,16 @@ export function createHeartbeatQueueDrive(db: Db, deps: QueueDriveDependencies) 
           await getExecutionBlocker(db, source.companyId, issue.id)) continue;
       // Per-issue history prevents alternating failing issues from resetting each other's bound.
       // A successful explicit/event-driven attempt resets the streak; other issues do not.
-      const recent = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(and(
+      const recent = await db.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode,
+        resultJson: sql<Record<string, unknown>>`jsonb_build_object('cancelledByActorType', ${heartbeatRuns.resultJson}->'cancelledByActorType')` }).from(heartbeatRuns).where(and(
         eq(heartbeatRuns.companyId, source.companyId), eq(heartbeatRuns.agentId, source.agentId),
         inArray(heartbeatRuns.status, COMPLETED_STATUSES),
         sql`coalesce(${heartbeatRuns.issueId}::text, ${heartbeatRuns.nativeIssueId}::text,
           ${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId') = ${issue.id}`,
       )).orderBy(desc(heartbeatRuns.finishedAt), desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(2);
+      const latest = recent[0];
+      if (latest?.status === "cancelled" && (latest.errorCode === "operator_interrupted" ||
+          ["user", "board"].includes(String(latest.resultJson?.cancelledByActorType)))) continue;
       if (recent.length === 2 && recent.every(row => FAILURE_STATUSES.has(row.status))) continue;
 
       const admittedRun = await deps.enqueueWakeup(source.agentId, {

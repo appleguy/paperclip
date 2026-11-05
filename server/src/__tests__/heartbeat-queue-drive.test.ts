@@ -118,6 +118,87 @@ describe.skipIf(!postgres.supported)("heartbeat completion queue-drive", () => {
     expect(f.executed).toEqual([seed.id]);
   }, 30_000);
 
+  it.each(["cancelled", "interrupted"])("drives assigned work after a system %s run", async status => {
+    const f = await fixture();
+    const target = await f.addIssue("Resume held assignment", "critical");
+    const [source] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.agent.id,
+      invocationSource: "assignment", status, errorCode: "issue_assignee_changed", finishedAt: new Date() }).returning();
+    const drive = createHeartbeatQueueDrive(db, {
+      getAgent: createHeartbeatRunState(db).getAgent,
+      getAgentInvokability: agent => evaluateAgentInvokabilityFromDb(db, agent),
+      getSchedulingSuppression: async () => ({ suppressed: false, reason: null }),
+      getWorktreeExecutionCutoff: async () => null,
+      issuesSvc: issueService(db), treeControlSvc: issueTreeControlService(db), enqueueWakeup: heartbeat.wakeup,
+    });
+    await drive.wakeNextAssignedIssueAfterRun(source);
+    await heartbeat.drainActiveRunExecutions();
+    expect(f.executed).toEqual([target.id]);
+  }, 30_000);
+
+  it("fills a free slot while another issue is still running", async () => {
+    const f = await fixture();
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: true, maxConcurrentRuns: 2 } } })
+      .where(eq(agents.id, f.agent.id));
+    const busy = await f.addIssue("Existing busy issue", "critical");
+    const target = await f.addIssue("Work for free slot", "high");
+    const [active] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.agent.id,
+      invocationSource: "assignment", status: "running", issueId: busy.id, contextSnapshot: { issueId: busy.id } }).returning();
+    const [source] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.agent.id,
+      invocationSource: "assignment", status: "succeeded", finishedAt: new Date() }).returning();
+    const drive = createHeartbeatQueueDrive(db, {
+      getAgent: createHeartbeatRunState(db).getAgent,
+      getAgentInvokability: agent => evaluateAgentInvokabilityFromDb(db, agent),
+      getSchedulingSuppression: async () => ({ suppressed: false, reason: null }),
+      getWorktreeExecutionCutoff: async () => null,
+      issuesSvc: issueService(db), treeControlSvc: issueTreeControlService(db), enqueueWakeup: heartbeat.wakeup,
+    });
+    try {
+      await drive.wakeNextAssignedIssueAfterRun(source);
+      await heartbeat.drainActiveRunExecutions();
+      expect(f.executed).toEqual([target.id]);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, active.id)))[0].status).toBe("running");
+    } finally {
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, active.id));
+    }
+  }, 30_000);
+
+  it("preserves a human cancellation", async () => {
+    const f = await fixture();
+    await f.addIssue("Stopped work", "critical");
+    const [source] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.agent.id,
+      invocationSource: "assignment", status: "cancelled", finishedAt: new Date(),
+      resultJson: { cancelledByActorType: "user" } }).returning();
+    const enqueueWakeup = vi.fn();
+    await createHeartbeatQueueDrive(db, {
+      getAgent: createHeartbeatRunState(db).getAgent,
+      getAgentInvokability: agent => evaluateAgentInvokabilityFromDb(db, agent),
+      getSchedulingSuppression: async () => ({ suppressed: false, reason: null }),
+      getWorktreeExecutionCutoff: async () => null,
+      issuesSvc: issueService(db), treeControlSvc: issueTreeControlService(db), enqueueWakeup,
+    }).wakeNextAssignedIssueAfterRun(source);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it("promotes a deferred assignment left behind by a cancelled former owner", async () => {
+    const f = await fixture();
+    const target = await f.addIssue("Reassigned held work", "critical");
+    const [former] = await db.insert(agents).values({ companyId: f.company.id, name: "Former owner",
+      status: "idle", adapterType: "http" }).returning();
+    const [source] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: former.id,
+      invocationSource: "assignment", status: "cancelled", errorCode: "issue_assignee_changed",
+      finishedAt: new Date(), runtimeMode: "legacy", issueId: target.id, contextSnapshot: { issueId: target.id },
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } }).returning();
+    await db.update(issues).set({ executionRunId: source.id }).where(eq(issues.id, target.id));
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId: f.company.id, agentId: f.agent.id,
+      source: "assignment", reason: "issue_assigned", status: "deferred_issue_execution",
+      payload: { issueId: target.id } }).returning();
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.company.id, skipRelatedRecovery: true });
+    await heartbeat.drainActiveRunExecutions();
+    expect(f.executed).toEqual([target.id]);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id)))[0].status)
+      .not.toBe("deferred_issue_execution");
+  }, 30_000);
+
   it("does not wake successors when the agent is paused during the finishing run", async () => {
     const f = await fixture();
     const seed = await f.addIssue("Initial run", "low");

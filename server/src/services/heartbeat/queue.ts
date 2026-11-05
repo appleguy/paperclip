@@ -2938,11 +2938,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               )),
             )).limit(1);
             if (receipt) return { kind: "skipped" as const };
-            const [active] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+            const [active] = await tx.select({ count: sql<number>`count(*)::integer` }).from(heartbeatRuns).where(and(
               eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.agentId, agentId),
               inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
-            )).limit(1);
-            if (active) return { kind: "skipped" as const };
+            ));
+            if (active.count >= policy.maxConcurrentRuns) return { kind: "skipped" as const };
           }
           await tx.execute(
             sql`select id from issues where id = ${issueId} and company_id = ${agent.companyId} for update`,
