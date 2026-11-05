@@ -3,8 +3,9 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
+import type { ChannelIO } from "./channel.js";
 
-const deps = vi.hoisted(() => ({ tmux: vi.fn(), deliver: vi.fn(), route: vi.fn(), gate: vi.fn() }));
+const deps = vi.hoisted(() => ({ tmux: vi.fn(), deliver: vi.fn(), route: vi.fn(), gate: vi.fn(), submit: vi.fn() }));
 vi.mock("../agy/execute.js", async importOriginal => ({
   ...await importOriginal<typeof import("../agy/execute.js")>(),
   tmux: deps.tmux, deliver: deps.deliver,
@@ -12,7 +13,7 @@ vi.mock("../agy/execute.js", async importOriginal => ({
 vi.mock("./channel.js", async importOriginal => ({
   ...await importOriginal<typeof import("./channel.js")>(),
   findBridgeRoot: async () => "/bridge",
-  prepareChannelHost: async () => ({}),
+  prepareChannelHost: async () => ({ status: async () => null, submit: deps.submit }),
   routeChannelInput: deps.route,
 }));
 vi.mock("./done-gate.js", async importOriginal => ({
@@ -71,6 +72,35 @@ afterEach(async () => {
 });
 
 describe("SCO-947 busy delivery and completion", () => {
+  it("journals possible channel effects before submit and retains intent after a crash", async () => {
+    deps.route.mockImplementation(async (op: string, prompt: string, _adopted: boolean, io: ChannelIO) => {
+      expect(JSON.parse(await fs.readFile(path.join(stateDir, "active.json"), "utf8")).dispatchMode).toBe("prepared");
+      return io.submit(op, prompt);
+    });
+    deps.submit.mockImplementation(async () => {
+      expect(JSON.parse(await fs.readFile(path.join(stateDir, "active.json"), "utf8")).dispatchMode).toBe("channel-pending");
+      throw new Error("simulated submit crash");
+    });
+    const result = await execute(ctx);
+    expect(result.errorMessage).toContain("simulated submit crash");
+    expect(JSON.parse(await fs.readFile(path.join(stateDir, "active.json"), "utf8")).dispatchMode).toBe("channel-pending");
+  });
+
+  it("journals possible tmux effects before paste and retains intent after a crash", async () => {
+    deps.route.mockImplementation(async (_op: string, _prompt: string, _adopted: boolean, io: ChannelIO) => io.fallback());
+    const original = deps.tmux.getMockImplementation()!;
+    deps.tmux.mockImplementation(async (socket: string, args: string[]) => {
+      if (args[0] === "load-buffer") {
+        expect(JSON.parse(await fs.readFile(path.join(stateDir, "active.json"), "utf8")).dispatchMode).toBe("tmux-fallback");
+        throw new Error("simulated paste crash");
+      }
+      return original(socket, args);
+    });
+    const result = await execute(ctx);
+    expect(result.errorMessage).toContain("simulated paste crash");
+    expect(JSON.parse(await fs.readFile(path.join(stateDir, "active.json"), "utf8")).dispatchMode).toBe("tmux-fallback");
+  });
+
   it("refuses peak-context rotation without clearing a working conversation", async () => {
     ctx.evaluateSessionPrompt = vi.fn(async () => ({ rotate: true, reason: "peak plus prompt", handoffMarkdown: "Unfinished work" }));
     const result = await execute(ctx);

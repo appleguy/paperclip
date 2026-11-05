@@ -24,6 +24,7 @@ import { gateReceiptRaw, refusalMessage, productionDeps } from "./done-gate.js";
 import { captureDoneGateBaseline, type GateBaseline } from "./done-gate-provenance.js";
 import {
   CHANNEL_NAME, findBridgeRoot, prepareChannelHost, routeChannelInput, type ChannelHost,
+  type ChannelStatus,
 } from "./channel.js";
 
 const CLAUDE = "/opt/homebrew/bin/claude";
@@ -155,11 +156,11 @@ async function writeCheckpoint(file: string, text: string, flag: "wx" | "w" = "w
   try { await parent.sync(); }
   finally { await parent.close(); }
 }
-/** Mark fallback BEFORE touching tmux. A crash after this point is not retried. */
-async function recordFallback(activePath: string, active: Record<string, unknown>): Promise<void> {
+/** Mark possible effects durably BEFORE touching either transport. */
+export async function recordDispatchMode(activePath: string, active: Record<string, unknown>, dispatchMode: "channel-pending" | "tmux-fallback"): Promise<void> {
   const temp = activePath + "." + process.pid + ".tmp";
   try {
-    await writeCheckpoint(temp, JSON.stringify({ ...active, dispatchMode: "tmux-fallback" }, null, 2));
+    await writeCheckpoint(temp, JSON.stringify({ ...active, dispatchMode }, null, 2));
     await fs.rename(temp, activePath);
     const dir = await fs.open(path.dirname(activePath), "r");
     try { await dir.sync(); } finally { await dir.close(); }
@@ -169,34 +170,46 @@ async function recordFallback(activePath: string, active: Record<string, unknown
 }
 
 /**
- * A checkpoint for a DIFFERENT issue, no receipt, conversation neither writing nor busy:
- * the run was cancelled (deploy) and the work is over. Archive it as unverified and free
- * the seat instead of refusing forever. A live conversation keeps the refusal.
+ * Silence is not settlement. Retain possible effects under the original op ID
+ * across wakes/issues. Only a new-format pre-submit checkpoint with a successful,
+ * empty bridge lookup proves neither transport was invoked and can free the seat.
  */
 export async function reconcileOrphanActive(o: {
   stateDir: string; activePath: string; issueId: string; runId: string;
   live: (conversationId: string | null) => Promise<boolean>; paneIdle: () => Promise<boolean>;
   log: (m: string) => Promise<void> | void;
+  status?: (opId: string) => Promise<ChannelStatus | null>;
   /** Same-issue checkpoints are only reconciled once this old (default 3 min), so a just-sent dispatch is never re-sent. */
   sameIssueMinAgeMs?: number;
 }): Promise<"none" | "kept" | "archived"> {
   const raw = await fs.readFile(o.activePath, "utf8").catch(() => "");
   if (!raw) return "none";
-  let prev: { op_id?: string; runId?: string; issueId?: string; receiptPath?: string; conversationId?: string | null; startedAt?: string };
+  let prev: { op_id?: string; runId?: string; issueId?: string; receiptPath?: string; conversationId?: string | null; startedAt?: string; dispatchMode?: string };
   try { prev = JSON.parse(raw); } catch { prev = {}; }
   const op = asString(prev.op_id, asString(prev.runId, ""));
   if (!op || op === o.runId) return "none";
   if (prev.issueId === o.issueId) {
-    // Deploy-interrupted run of this same issue: no receipt, conversation idle and quiet means
-    // the work is over; adopting it would idle-fail every later wake. Archive and redispatch.
+    // Age bounds pre-submit recovery only; it never establishes absence of effects.
     const started = Date.parse(asString(prev.startedAt, ""));
     if (!Number.isFinite(started) || Date.now() - started < (o.sameIssueMinAgeMs ?? 180_000)) return "none";
   }
   if (prev.receiptPath && await fs.stat(prev.receiptPath).then(() => true, () => false)) return "none";
+  let status: ChannelStatus | null;
+  try {
+    if (!o.status) return "kept";
+    status = await o.status(op);
+  } catch {
+    await o.log(`[claude-rc] Cannot verify bridge evidence for op ${op}; checkpoint retained, no replay\n`);
+    return "kept";
+  }
+  if (status !== null || prev.dispatchMode !== "prepared") {
+    await o.log(`[claude-rc] Unsettled op ${op} (issue ${prev.issueId ?? "?"}); checkpoint retained for receipt/block or operator reconciliation; no replay\n`);
+    return "kept";
+  }
   if (await o.live(prev.conversationId ?? null) || !(await o.paneIdle())) return "kept";
-  const dest = path.join(o.stateDir, `active.unverified-${op}.json`);
+  const dest = path.join(o.stateDir, `active.never-submitted-${op}.json`);
   await fs.rename(o.activePath, dest);
-  await o.log(`[claude-rc] Orphan checkpoint for op ${op} (issue ${prev.issueId ?? "?"}): conversation idle, no receipt; archived as UNVERIFIED at ${dest}; seat freed\n`);
+  await o.log(`[claude-rc] Archived never-submitted op ${op} at ${dest}; seat freed\n`);
   return "archived";
 }
 
@@ -428,6 +441,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       `export PAPERCLIP_TASK_ID=${sq(issueId)}`, ""].join("\n"), { mode: 0o600 });
     await fs.chmod(runEnvPath, 0o600);
     const activePath = path.join(stateDir, "active.json");
+    const bridgeRoot = await findBridgeRoot(asString(cfg.channelBridgeRoot, "") || undefined);
+    const channel = await prepareChannelHost(stateDir, bridgeRoot);
     // A checkpoint retained by an earlier run whose op already reached a terminal state
     // (block ledger entry or receipt file) would otherwise fail every later dispatch.
     try {
@@ -441,9 +456,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         await ctx.onLog("stdout", `[claude-rc] Archived terminal checkpoint for finished op ${prevOp}\n`);
       }
     } catch { /* no checkpoint or unreadable: existing handling applies */ }
-    // SCO-626: orphan checkpoint (deploy SIGTERM) whose conversation is idle with no receipt.
+    // SCO-980: inspect delivery evidence before permitting a new operation ID.
     await reconcileOrphanActive({
       stateDir, activePath, issueId, runId: ctx.runId,
+      status: channel.status,
       live: async (conv) => {
         if (!conv) return false;
         const st = await fs.stat(path.join(projectDir(cwd), `${conv}.jsonl`)).catch(() => null);
@@ -458,8 +474,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       assertWorkableCwd(adoptedCwd);
       cwd = adoptedCwd;
     }
-    const bridgeRoot = await findBridgeRoot(asString(cfg.channelBridgeRoot, "") || undefined);
-    const channel = await prepareChannelHost(stateDir, bridgeRoot);
     const ensured = await ensureSession(socket, session, cwd, stateDir, name, model, effort, channel, Boolean(adopted), cfg.keepConversation === true);
     const rcUrl = ensured.rcUrl;
     cwd = ensured.cwd;
@@ -620,7 +634,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const active: Record<string, unknown> = {
         runId: ctx.runId, issueId, op_id: ctx.runId, receiptPath, rcUrl,
         tmuxSocket: socket, tmuxSession: session, conversationId, cwd,
-        dispatchMode: "channel-pending", startedAt: new Date().toISOString(),
+        dispatchMode: "prepared", startedAt: new Date().toISOString(),
         doneGateBaseline: await captureDoneGateBaseline(ctx.runId, productionDeps()),
       };
       // Exact checkpoint, durable before any potentially side-effecting emit.
@@ -629,12 +643,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       dispatched = true;
       await ctx.onLog("stdout", `[claude-rc] Dispatching issue ${issueId} via MCP channel ${CHANNEL_NAME}; conversation ${conversationId}; receipt ${receiptPath}\n`);
       const mode = await routeChannelInput(ctx.runId, prompt, false, {
-        ready: channel.ready, status: channel.status, submit: channel.submit,
+        ready: channel.ready, status: channel.status,
+        submit: async (opId, input) => {
+          await recordDispatchMode(activePath, active, "channel-pending");
+          return channel.submit(opId, input);
+        },
         fallback: async () => {
           if (!isPromptEmpty(await claudePane(socket, session))) {
             throw new Error("channel unavailable and Claude editor is not empty; no fallback");
           }
-          await recordFallback(activePath, active);
+          await recordDispatchMode(activePath, active, "tmux-fallback");
           await ctx.onLog("stderr", "[claude-rc] Channel unavailable; using guarded tmux fallback (no bridge op submitted)\n");
           await sendClaudePane(socket, session, normalizeOneLine(prompt), stateDir);
         },
