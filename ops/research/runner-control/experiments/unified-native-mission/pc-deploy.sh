@@ -75,6 +75,14 @@ if [ "$dry_run" = 1 ]; then
   [ -z "$_h" ] || node "$hot_helper" plan "$_h" 2>&1 || :
   exit 0
 fi
+# Owner deploy hold (SCO-1060): while HOLD exists only a deploy for an issue it lists
+# (a line "allow SCO-N") runs: PC_DEPLOY_FOR=SCO-N pc-deploy. Lift: mv HOLD HOLD.lifted-<date>.
+hold=$repo/ops/deploy-hold/HOLD
+if [ -f "$hold" ] && ! { [ -n "${PC_DEPLOY_FOR:-}" ] && grep -qx "allow ${PC_DEPLOY_FOR}" "$hold"; }; then
+  echo "pc-deploy: deploys are on owner hold ($hold); PC_DEPLOY_FOR=SCO-N for a listed issue:" >&2
+  sed "s/^/  /" "$hold" >&2
+  exit 3
+fi
 if [ "${PC_DEPLOY_IN_LOCK:-}" != 1 ]; then
   [ -x "$flock" ] || { echo 'pc-deploy: atomic flock unavailable' >&2; exit 1; }
   mkdir -p "$tmp"
