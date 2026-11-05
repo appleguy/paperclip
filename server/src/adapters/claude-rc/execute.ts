@@ -20,7 +20,8 @@ import {
   type Receipt,
 } from "../agy/execute.js";
 import { deriveRcName, reportsToDepth, sanitizeRcName, type RcAgentNode } from "./rc-name.js";
-import { gateReceiptRaw, refusalMessage } from "./done-gate.js";
+import { gateReceiptRaw, refusalMessage, productionDeps } from "./done-gate.js";
+import { captureDoneGateBaseline, type GateBaseline } from "./done-gate-provenance.js";
 import {
   CHANNEL_NAME, findBridgeRoot, prepareChannelHost, routeChannelInput, type ChannelHost,
 } from "./channel.js";
@@ -620,6 +621,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         runId: ctx.runId, issueId, op_id: ctx.runId, receiptPath, rcUrl,
         tmuxSocket: socket, tmuxSession: session, conversationId, cwd,
         dispatchMode: "channel-pending", startedAt: new Date().toISOString(),
+        doneGateBaseline: await captureDoneGateBaseline(ctx.runId, productionDeps()),
       };
       // Exact checkpoint, durable before any potentially side-effecting emit.
       await writeCheckpoint(activePath, JSON.stringify(active, null, 2), "wx");
@@ -665,8 +667,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (raw) {
         receipt = parseReceipt(raw, receiptRunId, issueId);
         // SCO-762 done gate: canonical-repo edits need committed SHAs on main (live or queued for autodeploy).
-        const startedAt = Date.parse(asString(await fs.readFile(activePath, "utf8").then(t => JSON.parse(t)?.startedAt, () => ""), ""));
-        const gate = await gateReceiptRaw(raw, conversationId ? path.join(projectDir(cwd), `${conversationId}.jsonl`) : null, Number.isFinite(startedAt) ? startedAt : 0);
+        const checkpoint = await fs.readFile(activePath, "utf8").then(t => JSON.parse(t) as { startedAt?: string; doneGateBaseline?: GateBaseline });
+        const startedAt = Date.parse(asString(checkpoint.startedAt, ""));
+        // Adoption retains the original dispatch baseline; never recapture at completion.
+        const gate = await gateReceiptRaw(raw, conversationId ? path.join(projectDir(cwd), `${conversationId}.jsonl`) : null, Number.isFinite(startedAt) ? startedAt : 0, productionDeps(), checkpoint.doneGateBaseline);
         if (!gate.ok) {
           gateRefusals += 1;
           receipt = null;

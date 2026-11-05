@@ -3,11 +3,15 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { editedPaths, evaluateDoneGate, gateReceiptRaw, productionDeps, repoOf, type GateDeps } from "./done-gate.js";
+import { editedPaths, evaluateDoneGate as evaluate, gateReceiptRaw, productionDeps, repoOf, type GateDeps, type GateReceipt, type MutationRecord } from "./done-gate.js";
+import { captureDoneGateBaseline } from "./done-gate-provenance.js";
 
 const M = "/Volumes/NVM/Paperclip/master";
 const Z = "/Volumes/NVM/AI_Coding_Projects/zagent";
 const LIVE = "a".repeat(40);
+const BASE = "c".repeat(40);
+const evaluateDoneGate = (receipt: GateReceipt, paths: string[] | MutationRecord, d: GateDeps) =>
+  evaluate({ runId: "test-run", ...receipt }, paths, d, { runId: "test-run", repos: [M, Z].map(repo => ({ repo, head: BASE })) });
 
 function deps(over: { dirty?: string; known?: Record<string, string>; onHead?: Set<string>; live?: Set<string>; uiFiles?: string } = {}): GateDeps {
   return {
@@ -15,10 +19,14 @@ function deps(over: { dirty?: string; known?: Record<string, string>; onHead?: S
     liveSha: async () => LIVE,
     git: async (repo, args) => {
       if (args[0] === "status") return { code: 0, out: over.dirty ?? "" };
+      if (args[0] === "diff-tree") return { code: 0, out: args.at(-1)! };
+      if (args[0] === "diff") return { code: args[2] === BASE ? 1 : 0, out: "" };
       const sha = (args.find(a => /^[0-9a-f]{7,40}(\^\{commit\})?$/i.test(a)) ?? "").replace("^{commit}", "");
       if (args[0] === "cat-file") return { code: (over.known?.[sha] ?? M) === repo ? 0 : 1, out: "" };
       if (args[0] === "merge-base") {
         const target = args[args.length - 1];
+        if (target === BASE) return { code: 1, out: "" };
+        if (args[2] === BASE) return { code: 0, out: "" };
         const ok = target === LIVE ? (over.live ?? new Set()).has(sha) : (over.onHead ?? new Set([sha])).has(sha);
         return { code: ok ? 0 : 1, out: "" };
       }
@@ -162,6 +170,7 @@ describe("run mutation attribution (SCO-973 / S7 F01)", () => {
     expect((await git(["-c", "core.hooksPath=/dev/null", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "baseline"])).code).toBe(0);
     await fs.writeFile(file, "unfinished\n");
     const realDeps: GateDeps = { repos: async () => [repo], git: async (_repo, args) => git(args), liveSha: async () => null };
+    const baseline = await captureDoneGateBaseline("fixture-run", realDeps);
     const transcript = path.join(scratch, "run.jsonl");
     for (const record of [tool("Bash", { command: "shell edit" }, alias), tool("Edit", { file_path: "ui/page.ts" }, alias), tool("Write", { file_path: path.join(alias, "ui/page.ts") })]) {
       await fs.writeFile(transcript, record);
@@ -172,10 +181,12 @@ describe("run mutation attribution (SCO-973 / S7 F01)", () => {
     expect((await evaluateDoneGate({}, deleted, realDeps)).ok).toBe(false);
     await fs.writeFile(transcript, tool("Read", { file_path: file }));
     expect((await gateReceiptRaw("{}", transcript, 1, realDeps)).ok).toBe(true);
+    await fs.writeFile(file, "committed run change\n");
+    expect((await git(["add", "ui/page.ts"])).code).toBe(0);
+    expect((await git(["-c", "core.hooksPath=/dev/null", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "run change"])).code).toBe(0);
     const commit = (await git(["rev-parse", "HEAD"])).out.trim();
-    await fs.writeFile(file, "before\n");
     await fs.writeFile(transcript, tool("Edit", { file_path: "ui/page.ts" }, alias));
-    expect((await gateReceiptRaw(JSON.stringify({ commits: [commit] }), transcript, 1, realDeps)).ok).toBe(true);
+    expect((await gateReceiptRaw(JSON.stringify({ runId: "fixture-run", commits: [commit] }), transcript, 1, realDeps, baseline)).ok).toBe(true);
   });
 });
 
@@ -192,9 +203,9 @@ describe("done gate", () => {
     const v = await evaluateDoneGate({ commits: [sha1] }, [`${M}/server/a.ts`], deps({ dirty: " M server/a.ts\0" }));
     expect(!v.ok && v.reasons[0]).toContain("uncommitted edits of this run");
   });
-  it("accepts notMine for dirt that is another agent's", async () => {
+  it("rejects notMine for a path independently recorded as this run's mutation", async () => {
     const v = await evaluateDoneGate({ commits: [sha1], notMine: ["server/a.ts"] }, [`${M}/server/a.ts`], deps({ dirty: " M server/a.ts\0" }));
-    expect(v.ok).toBe(true);
+    expect(v.ok).toBe(false);
   });
   it("refuses a SHA that is not on HEAD or in no checkout", async () => {
     expect((await evaluateDoneGate({ commits: [sha1] }, [`${M}/a.ts`], deps({ onHead: new Set() }))).ok).toBe(false);

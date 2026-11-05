@@ -15,6 +15,7 @@ import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import { validateCompletionProvenance, type GateBaseline } from "./done-gate-provenance.js";
 
 const run = promisify(execFile);
 
@@ -23,7 +24,7 @@ export const PAPERCLIP_CURRENT = "/Volumes/NVM/Paperclip/cli/current";
 export const PROJECTS_ROOT = "/Volumes/NVM/AI_Coding_Projects";
 const UI_PREFIXES = ["ui/", "master/ui/"];
 
-export type GateReceipt = { commits?: unknown; liveCheck?: unknown; notMine?: unknown };
+export type GateReceipt = { runId?: unknown; commits?: unknown; liveCheck?: unknown; notMine?: unknown };
 export type GateVerdict = { ok: true; notes: string[] } | { ok: false; reasons: string[]; evidence?: "unknown" };
 export type MutationRecord = { paths: string[]; unknown: string[] };
 export type GitEvidence = { code: number; out: string; error?: string };
@@ -105,7 +106,7 @@ function unknownEvidence(reason: string): GateVerdict {
   return { ok: false, evidence: "unknown", reasons: [reason] };
 }
 
-export async function evaluateDoneGate(receipt: GateReceipt, edited: string[] | MutationRecord, deps: GateDeps): Promise<GateVerdict> {
+export async function evaluateDoneGate(receipt: GateReceipt, edited: string[] | MutationRecord, deps: GateDeps, baseline?: GateBaseline): Promise<GateVerdict> {
   // A dependency rejection (including timeouts) is evidence failure, not clean output.
   const git = async (repo: string, args: string[]): Promise<GitEvidence> => {
     try { return await deps.git(repo, args); }
@@ -132,17 +133,23 @@ export async function evaluateDoneGate(receipt: GateReceipt, edited: string[] | 
   }
   const commits = strings(receipt.commits).map(s => s.trim());
   if (touched.size === 0 && commits.length === 0) return { ok: true, notes: ["no canonical repo edited"] };
+  const canonicalTouched = new Map<string, string[]>();
+  for (const [repo, files] of touched) {
+    const resolved = [...resolvedRepos].find(([, original]) => original === repo)![0];
+    canonicalTouched.set(resolved, files.map(file => path.join(resolved, path.relative(repo, file))));
+  }
+  const provenance = await validateCompletionProvenance(receipt, canonicalTouched, { ...deps, git }, baseline);
+  if (!provenance.ok) return provenance;
 
   const reasons: string[] = [];
   const notes: string[] = [];
-  const notMine = new Set(strings(receipt.notMine));
 
   // Own uncommitted edits: the run's edited files that git still reports dirty.
   for (const [repo, files] of touched) {
     const st = await git(repo, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ...files.map(f => path.relative(repo, f))]);
     if (st.code !== 0 || st.error) return gitFailure(repo, "status", st);
-    const dirty = st.out.split("\0").filter(l => l.length > 3).map(l => l.slice(3)).filter(p => !notMine.has(p));
-    if (dirty.length) reasons.push(`uncommitted edits of this run in ${repo}: ${dirty.slice(0, 12).join(", ")}${dirty.length > 12 ? ` (+${dirty.length - 12})` : ""}. Commit your own paths on the checkout (git add <paths>; git commit) or revert them; if the dirt is another agent's, list those paths in "notMine". Then resubmit.`);
+    const dirty = st.out.split("\0").filter(l => l.length > 3).map(l => l.slice(3));
+    if (dirty.length) reasons.push(`uncommitted edits of this run in ${repo}: ${dirty.slice(0, 12).join(", ")}. Commit your own paths; notMine cannot exempt recorded run mutations.`);
   }
   if (touched.size > 0 && commits.length === 0)
     reasons.push(`receipt has no commits: this run edited ${[...touched.keys()].join(", ")}. Add "commits": ["<sha>", ...] (the SHAs that carry your change).`);
@@ -223,7 +230,7 @@ export function refusalMessage(reasons: string[], attempt: number, max: number):
 }
 
 /** Gate a raw receipt file against the run's transcript; used by the claude_rc adapter before deliver(). */
-export async function gateReceiptRaw(raw: string, transcriptPath: string | null, sinceMs: number, deps: GateDeps = productionDeps()): Promise<GateVerdict> {
+export async function gateReceiptRaw(raw: string, transcriptPath: string | null, sinceMs: number, deps: GateDeps = productionDeps(), baseline?: GateBaseline): Promise<GateVerdict> {
   let receipt: GateReceipt;
   try { receipt = JSON.parse(raw) as GateReceipt; } catch { return { ok: false, reasons: ["receipt is not valid JSON"] }; }
   if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) return { ok: false, reasons: ["receipt must be a JSON object"] };
@@ -231,5 +238,5 @@ export async function gateReceiptRaw(raw: string, transcriptPath: string | null,
   let jsonl: string;
   try { jsonl = await fs.readFile(transcriptPath, "utf8"); }
   catch (error) { return unknownEvidence(`Transcript evidence unknown: cannot read ${transcriptPath} (${errorDetail(error)}). Restore the run transcript and read access before resubmitting.`); }
-  return evaluateDoneGate(receipt, editedPaths(jsonl, sinceMs), deps);
+  return evaluateDoneGate(receipt, editedPaths(jsonl, sinceMs), deps, baseline);
 }
