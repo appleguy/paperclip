@@ -623,6 +623,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       conversationId = adopted.conversationId ?? null;
       // Does not consult/modify the inbox. Even an emitted-local or pending
       // op is UNKNOWN until a receipt. Never try to re-enqueue on restart.
+      ctx.onDispatch?.();
+      dispatched = true;
       const adoptedOpId = (adopted as { op_id?: string }).op_id || adopted.runId;
       await routeChannelInput(adoptedOpId, "", true, {
         ready: channel.ready, status: channel.status, submit: channel.submit,
@@ -630,8 +632,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           ? { observe: () => channel.observeInput(adoptedOpId, receiptPath, ctx.signal) } : {}),
         fallback: async () => { throw new Error("adoption may never paste"); },
       });
-      ctx.onDispatch?.();
-      dispatched = true;
       await ctx.onLog("stdout", `[claude-rc] Adopting run ${adopted.runId} for issue ${issueId}; no re-dispatch; receipt ${receiptPath}\n`);
     } else {
       await applySeatSettings(socket, session, stateDir, model, effort, message => ctx.onLog("stderr", message));

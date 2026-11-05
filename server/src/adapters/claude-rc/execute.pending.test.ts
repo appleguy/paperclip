@@ -29,6 +29,7 @@ vi.mock("./done-gate-provenance.js", async original => ({
   ...await original<typeof import("./done-gate-provenance.js")>(), captureDoneGateBaseline: async () => ({ repos: [] }),
 }));
 import { execute, projectDir } from "./execute.js";
+import { findBridgeRoot, prepareChannelHost } from "./channel.js";
 import { receiptFilePath } from "../agy/execute.js";
 
 let dir: string;
@@ -40,11 +41,52 @@ afterEach(async () => {
 });
 
 describe("pending Claude RC native delivery", () => {
+  it("marks restart adoption as dispatched before waiting and preserves ownership on cancellation", async () => {
+    dir = await fs.mkdtemp("/Volumes/NVM/AI_Agent_Runtime/tmp/sco1044-adopt-");
+    vi.spyOn(os, "homedir").mockReturnValue(dir);
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json([])));
+    const cwd = path.join(dir, "workspace");
+    const stateDir = path.join(dir, "state");
+    const runId = "11111111-1111-4111-8111-111111111111";
+    const rcUrl = "https://claude.ai/code/session_original";
+    await fs.mkdir(stateDir, { recursive: true });
+    const host = await prepareChannelHost(stateDir, await findBridgeRoot());
+    await host.submit(runId, "already submitted original work");
+    deps.submit.mockClear();
+    deps.tmux.mockImplementation(async (_socket: string, args: string[]) => {
+      if (args[0] === "capture-pane") return `${rcUrl}\n✻ Thinking… (esc to interrupt)\n❯ \n  bypass permissions on`;
+      if (args[0] === "display-message") return "claude";
+      return "";
+    });
+    const checkpoint = JSON.stringify({ runId, op_id: runId, issueId: "pending-issue", rcUrl, cwd,
+      conversationId: "original-conversation", receiptPath: receiptFilePath(stateDir, runId), dispatchMode: "channel-pending" });
+    await fs.writeFile(path.join(stateDir, "active.json"), checkpoint);
+    const abort = new AbortController();
+    const ctx = { agent: { id: "agent", name: "Original seat", companyId: "company" }, runId,
+      config: { cwd, stateDir, tmuxSocket: "socket", tmuxSession: "original-seat" },
+      context: { issueId: "pending-issue", paperclipRestartReattach: true },
+      authToken: "test-only-token", signal: abort.signal, onLog: vi.fn(), onDispatch: vi.fn(),
+    } as unknown as AdapterExecutionContext;
+    const run = execute(ctx);
+    try {
+      await vi.waitFor(() => expect(ctx.onDispatch).toHaveBeenCalledOnce(), { timeout: 5000 });
+      abort.abort();
+      const result = await run;
+      expect(result.errorMessage).toContain("pending op retained");
+      expect(result.executionRecovery).toBeUndefined();
+      expect(deps.submit).not.toHaveBeenCalled();
+      expect(await fs.readFile(path.join(stateDir, "active.json"), "utf8")).toBe(checkpoint);
+      expect(await host.status(runId)).toMatchObject({ stage: "inbox_pending" });
+    } finally { abort.abort(); await run; }
+  });
+
   it("keeps the same live run, session and checkpoint through busy-to-idle and settles once", async () => {
     dir = await fs.mkdtemp("/Volumes/NVM/AI_Agent_Runtime/tmp/sco1044-");
     vi.spyOn(os, "homedir").mockReturnValue(dir);
     vi.stubGlobal("fetch", vi.fn(async () => Response.json([])));
     deps.settle.mockResolvedValue({ status: "done" });
+    deps.submit.mockClear();
+    deps.settle.mockClear();
     const cwd = path.join(dir, "workspace");
     const stateDir = path.join(dir, "state");
     const session = "original-conversation";
