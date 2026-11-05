@@ -4342,6 +4342,9 @@ export function heartbeatService(
         dependencies: reconcileResolvedDependencyWakes,
         locks: sweepStaleIssueLocks,
         watchdogs: reconcileTaskWatchdogs,
+        pendingInteraction: async scope => taskWatchdogs.reconcilePendingInteraction({
+          ...scope, issueCreatedAtGte: await getWorktreeExecutionCutoff(),
+        }),
         schedulingSuppressed: async () => (await getSchedulingSuppression(true)).suppressed,
       }, () => canRun() && readTaskDrain(new Date()) === null),
     registerRunDispatchWork: (coordinator: Parameters<typeof registerRunDispatchWork>[0], canRun: () => boolean) =>

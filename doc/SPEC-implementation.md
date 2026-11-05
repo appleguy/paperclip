@@ -1054,6 +1054,15 @@ must exist and be authorized to respond in the issue's company before creation.
 Ordinary Agent Chat questions derive their user recipient from the persisted
 conversation owner. A conflicting explicit user recipient is rejected; IDs are
 never guessed or repaired. Ordinary task questions keep optional addressing.
+Pending task cards with neither an agent nor a user addressee wake the same-company
+agent named Board once through the task-watchdog delivery worker. This is a triage
+notification, not a change to the card's audience or authority; normal issue-read
+authorization and agent invokability apply. Durable wake receipts suppress duplicate
+delivery across restarts; undelivered attempts remain retryable. The shared scheduler
+reports pending cards with their issue and age after 30 minutes, at most once per card
+per 30 minutes. Resolved, dismissed, hidden, closed and historical Agent Chat cards
+leave this queue; no pending work means no recurring scan.
+
 A cap never widens the requested audience. Tool-action confirmations and
 other hard-governed action cards remain `human_only` (or move to the formal approval
 system) regardless of a requested open audience.

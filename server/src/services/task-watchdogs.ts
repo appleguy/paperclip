@@ -1,10 +1,11 @@
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { notifyIssueRecovery } from "./issue-recovery-notifications.js";
 import { createHash } from "node:crypto";
-import { and, asc, eq, gte, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
+  activityLog,
   agents,
   approvals,
   heartbeatRuns,
@@ -20,7 +21,9 @@ import {
 import type { IssueWatchdog, IssueWatchdogSummary } from "@paperclipai/shared";
 import { conflict, notFound } from "../errors.js";
 import { parseObject } from "../adapters/utils.js";
-import { logActivity } from "./activity-log.js";
+import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
+import { accessService } from "./access.js";
+import { logger } from "../middleware/logger.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { issueService } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
@@ -40,6 +43,21 @@ const TASK_WATCHDOG_TERMINAL_RUN_STATUSES = ["succeeded", "interrupted", "failed
 // false-positive stopped-subtree review. The periodic watchdog reconciler
 // re-evaluates after the window, so a genuinely idle issue still triggers.
 const TASK_WATCHDOG_FIRST_RUN_GRACE_MS = 15_000;
+const PENDING_INTERACTION_REPORT_MS = 30 * 60_000;
+
+// Historical chat questions stay answerable but are not stopped task work.
+export function pendingTaskInteractionCondition(companyId?: string, interactionId?: string) {
+  return and(
+    eq(issueThreadInteractions.companyId, issues.companyId),
+    eq(issueThreadInteractions.status, "pending"),
+    isNull(issueThreadInteractions.dismissedAt),
+    notInArray(issues.status, ["done", "cancelled"]),
+    isNull(issues.conversationAgentId),
+    visibleIssueCondition(),
+    companyId ? eq(issueThreadInteractions.companyId, companyId) : undefined,
+    interactionId ? eq(issueThreadInteractions.id, interactionId) : undefined,
+  );
+}
 
 type ActorFields = {
   agentId?: string | null;
@@ -900,6 +918,81 @@ export function upsertIssueWatchdogForIssue(
 export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) {
   const issuesSvc = issueService(db);
 
+  async function reconcilePendingInteraction(input: { companyId: string; interactionId: string; issueCreatedAtGte?: Date | null }) {
+    const publications: ActivityPublication[] = [];
+    const result = await db.transaction(async tx => {
+      // Serialize fallback delivery across workers without locking the source
+      // issue or changing its assignee, audience, or approval authority.
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`pending-interaction:${input.interactionId}`}, 0))`);
+      const [row] = await tx.select({ interaction: issueThreadInteractions, issue: issues })
+        .from(issueThreadInteractions).innerJoin(issues, eq(issues.id, issueThreadInteractions.issueId))
+        .where(and(pendingTaskInteractionCondition(input.companyId, input.interactionId),
+          input.issueCreatedAtGte ? gte(issues.createdAt, input.issueCreatedAtGte) : undefined));
+      if (!row) return { nextCheckAt: null, reported: null };
+      const { interaction, issue } = row;
+      const now = Date.now();
+      const overdueAt = interaction.createdAt.getTime() + PENDING_INTERACTION_REPORT_MS;
+      let nextCheckAt = overdueAt;
+      let reported: { issue: string; title: string; card: string; ageMinutes: number } | null = null;
+      if (now >= overdueAt) {
+        const [lastReport] = await tx.select({ createdAt: activityLog.createdAt }).from(activityLog).where(and(
+          eq(activityLog.companyId, input.companyId), eq(activityLog.entityId, issue.id),
+          eq(activityLog.action, "issue.pending_interaction_overdue"),
+          sql`${activityLog.details}->>'interactionId' = ${interaction.id}`,
+        )).orderBy(desc(activityLog.createdAt)).limit(1);
+        nextCheckAt = (lastReport?.createdAt.getTime() ?? 0) + PENDING_INTERACTION_REPORT_MS;
+        if (now >= nextCheckAt) {
+          reported = { issue: issue.identifier ?? issue.id.slice(0, 8), title: issue.title,
+            card: interaction.id.slice(0, 8), ageMinutes: Math.floor((now - interaction.createdAt.getTime()) / 60_000) };
+          await logActivity(tx as unknown as Db, {
+            companyId: input.companyId, actorType: "system", actorId: "system",
+            action: "issue.pending_interaction_overdue", entityType: "issue", entityId: issue.id,
+            details: { interactionId: interaction.id, ...reported },
+          }, publications);
+          nextCheckAt = now + PENDING_INTERACTION_REPORT_MS;
+        }
+      }
+      if (!interaction.addresseeAgentId && !interaction.addresseeUserId && deps.enqueueWakeup) {
+        const idempotencyKey = `interaction-pending:${interaction.id}:board-fallback`;
+        const [delivered] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+          eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+          notInArray(agentWakeupRequests.status, ["skipped", "failed", "cancelled"]),
+        )).limit(1);
+        if (!delivered) {
+          const boards = await tx.select().from(agents).where(and(
+            eq(agents.companyId, input.companyId), sql`lower(${agents.name}) = 'board'`,
+          )).limit(2);
+          const board = boards.length === 1 ? boards[0] : null;
+          const allowed = board && (await evaluateAgentInvokabilityFromDb(tx as unknown as Db, board)).invokable &&
+            (await accessService(tx as unknown as Db).decide({
+              actor: { type: "agent", agentId: board.id, companyId: input.companyId },
+              action: "issue:read", resource: { type: "issue", companyId: input.companyId, issueId: issue.id },
+            })).allowed;
+          if (allowed && board) {
+            const context = { issueId: issue.id, taskId: issue.id, interactionId: interaction.id,
+              interactionKind: interaction.kind, wakeReason: "interaction_pending",
+              source: "task_watchdogs.pending_interaction", fallbackRecipient: "board",
+              effectiveResolverPolicy: interaction.effectiveResolverPolicy };
+            await deps.enqueueWakeup(board.id, { source: "automation", triggerDetail: "system",
+              reason: "interaction_pending", payload: context, contextSnapshot: context, idempotencyKey,
+              requestedByActorType: "system", requestedByActorId: null });
+          }
+          // A null enqueue can still persist a deferred receipt. Re-read it;
+          // absence, skips and transient failures remain retryable obligations.
+          const [receipt] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+            eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+            notInArray(agentWakeupRequests.status, ["skipped", "failed", "cancelled"]),
+          )).limit(1);
+          if (!receipt) nextCheckAt = Math.min(nextCheckAt, now + 30_000);
+        }
+      }
+      return { nextCheckAt, reported };
+    });
+    for (const publication of publications) publishActivity(publication);
+    if (result.reported) logger.warn(result.reported, "Task interaction pending for more than 30 minutes");
+    return result;
+  }
+
   async function loadWatchdogSubtreeIssues(companyId: string, watchedIssueId: string) {
     const rows = await db.execute(sql`
       WITH RECURSIVE watched_issues AS (
@@ -1726,6 +1819,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
   }
 
   return {
+    reconcilePendingInteraction,
     getActiveForIssue: async (companyId: string, issueId: string): Promise<IssueWatchdog | null> => {
       const row = await db
         .select()

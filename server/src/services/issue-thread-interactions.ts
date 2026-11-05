@@ -807,6 +807,7 @@ function hydrateInteraction(
 
 async function touchIssue(db: IssueTouchDb, issueId: string, companyId: string) {
   await db.transaction(async tx => {
+    await notifyDeliveryWork(tx, DELIVERY_QUEUES.taskWatchdogs, JSON.stringify({ companyId }));
     await notifyStatusCardIssueChange(tx, companyId);
     await tx.update(issues).set({ updatedAt: new Date() }).where(eq(issues.id, issueId));
   });
@@ -3945,6 +3946,7 @@ export function issueThreadInteractionService(
                 eq(chatVoiceSessions.callerAuthority, "guest_intake"))).limit(1);
             if (guest) throw unprocessable("Ask this unverified caller a clarification in a task comment; submit_request will deliver their spoken follow-up. Protected human-input questions require authenticated access.", {code: "voice_guest_use_task_comment"});
           }
+          await notifyDeliveryWork(tx, DELIVERY_QUEUES.taskWatchdogs, JSON.stringify({ companyId: issue.companyId }));
           if (data.kind === "ask_user_questions" || data.kind === "request_confirmation") {
             await notifyChatRunMilestones(tx, { companyId: issue.companyId, issueId: issue.id });
           } else {

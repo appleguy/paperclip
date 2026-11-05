@@ -20,6 +20,7 @@ export function registerIssueRecoveryWork(
     dependencies(scope: Scope): Promise<{ enqueueFailed: number }>;
     locks(scope: Scope): Promise<unknown>;
     watchdogs(scope: { companyId: string; watchdogId: string; onDeferredDeadline: (at: number) => void }): Promise<{ incomplete: number }>;
+    pendingInteraction(scope: { companyId: string; interactionId: string }): Promise<{ nextCheckAt: number | null }>;
     schedulingSuppressed(): Promise<boolean>;
   },
   canRun: () => boolean,
@@ -105,6 +106,7 @@ export function registerIssueRecoveryWork(
   const locks = register(DELIVERY_QUEUES.staleIssueLocks, null, owner.locks);
   const watchdogs = registerTaskWatchdogWork(db, coordinator, {
     reconcile: owner.watchdogs, enabled: async () => !(await owner.schedulingSuppressed()),
+    reconcilePendingInteraction: owner.pendingInteraction,
   }, canRun);
   const workers = [assignments, orphanBlockers, recoveryActions, dependencies, locks, watchdogs];
   return { ready: Promise.all(workers.map(worker => worker.ready)),

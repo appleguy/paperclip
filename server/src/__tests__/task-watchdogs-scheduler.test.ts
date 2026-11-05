@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
   agentWakeupRequests,
@@ -27,6 +27,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { taskWatchdogService } from "../services/task-watchdogs.ts";
+import { logger } from "../middleware/logger.js";
 
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 
@@ -51,6 +52,7 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
   }, 20_000);
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await db.delete(activityLog);
     await db.delete(issueApprovals);
     await db.delete(approvals);
@@ -929,5 +931,93 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     });
 
     expect(result).toMatchObject({ checked: 0, triggered: 0 });
+  });
+
+  async function pendingCard(overrides: Partial<typeof issueThreadInteractions.$inferInsert> = {}) {
+    const companyId = overrides.companyId ?? await seedCompany();
+    const issueId = overrides.issueId ?? await seedIssue(companyId, { status: "in_review" });
+    const [card] = await db.insert(issueThreadInteractions).values({
+      companyId, issueId, kind: "ask_user_questions", status: "pending",
+      payload: { version: 1, questions: [{ id: "scope", prompt: "Which scope?", selectionMode: "single",
+        options: [{ id: "observe", label: "Observe routing" }] }] },
+      ...overrides,
+    }).returning();
+    return card;
+  }
+
+  function pendingService() {
+    const wake = vi.fn(async (agentId: string, opts: Record<string, any> = {}) => {
+      const [receipt] = await db.insert(agentWakeupRequests).values({
+        companyId: (await db.select().from(agents).where(eq(agents.id, agentId)))[0].companyId,
+        agentId, source: "automation", reason: opts.reason, payload: opts.payload,
+        status: "queued", idempotencyKey: opts.idempotencyKey,
+      }).returning();
+      return { id: receipt.id };
+    });
+    return { wake, service: taskWatchdogService(db, { enqueueWakeup: wake }) };
+  }
+
+  it("wakes only the same-company Board once for an untargeted card, including concurrent and restarted checks", async () => {
+    const card = await pendingCard({ effectiveResolverPolicy: "human_only" });
+    const boardId = await seedAgent(card.companyId, { name: "Board", status: "idle" });
+    await seedAgent(await seedCompany(), { name: "Board", status: "idle" });
+    const { service, wake } = pendingService();
+    await Promise.all([service.reconcilePendingInteraction({ companyId: card.companyId, interactionId: card.id }),
+      service.reconcilePendingInteraction({ companyId: card.companyId, interactionId: card.id })]);
+    expect(wake).toHaveBeenCalledTimes(1);
+    expect(wake).toHaveBeenCalledWith(boardId, expect.objectContaining({
+      reason: "interaction_pending", contextSnapshot: expect.objectContaining({
+        interactionId: card.id, issueId: card.issueId, effectiveResolverPolicy: "human_only",
+      }),
+    }));
+    const restarted = pendingService();
+    await restarted.service.reconcilePendingInteraction({ companyId: card.companyId, interactionId: card.id });
+    expect(restarted.wake).not.toHaveBeenCalled();
+    expect((await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, card.id)))[0])
+      .toMatchObject({ addresseeAgentId: null, addresseeUserId: null, effectiveResolverPolicy: "human_only", status: "pending" });
+  });
+
+  it("retries a failed enqueue without losing the card", async () => {
+    const card = await pendingCard();
+    await seedAgent(card.companyId, { name: "Board", status: "idle" });
+    const { service, wake } = pendingService();
+    wake.mockRejectedValueOnce(new Error("upstream unavailable"));
+    await expect(service.reconcilePendingInteraction({ companyId: card.companyId, interactionId: card.id })).rejects.toThrow("upstream unavailable");
+    await service.reconcilePendingInteraction({ companyId: card.companyId, interactionId: card.id });
+    expect(wake).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports overdue cards with issue and age, rate-limits across restarts, and schedules the next check", async () => {
+    const card = await pendingCard({ createdAt: new Date(Date.now() - 31 * 60_000) });
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    const result = await taskWatchdogService(db).reconcilePendingInteraction({ companyId: card.companyId, interactionId: card.id });
+    expect(result.reported).toMatchObject({ card: card.id.slice(0, 8), ageMinutes: 31 });
+    expect(result.nextCheckAt).toBeGreaterThan(Date.now() + 29 * 60_000);
+    expect(warn).toHaveBeenCalledTimes(1);
+    await taskWatchdogService(db).reconcilePendingInteraction({ companyId: card.companyId, interactionId: card.id });
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(await db.select().from(activityLog).where(eq(activityLog.action, "issue.pending_interaction_overdue"))).toHaveLength(1);
+  });
+
+  it("keeps targeted cards on their native route and drops resolved, dismissed, closed, chat and foreign-company cards", async () => {
+    const card = await pendingCard({ addresseeUserId: "human" });
+    const { service, wake } = pendingService();
+    const input = { companyId: card.companyId, interactionId: card.id };
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    expect((await service.reconcilePendingInteraction(input)).nextCheckAt).not.toBeNull();
+    expect(wake).not.toHaveBeenCalled(); expect(warn).not.toHaveBeenCalled();
+    expect((await service.reconcilePendingInteraction({ ...input, companyId: await seedCompany() })).nextCheckAt).toBeNull();
+    for (const update of [{ status: "answered" }, { status: "pending", dismissedAt: new Date() }]) {
+      await db.update(issueThreadInteractions).set(update).where(eq(issueThreadInteractions.id, card.id));
+      expect((await service.reconcilePendingInteraction(input)).nextCheckAt).toBeNull();
+    }
+    await db.update(issueThreadInteractions).set({ dismissedAt: null }).where(eq(issueThreadInteractions.id, card.id));
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, card.issueId));
+    expect((await service.reconcilePendingInteraction(input)).nextCheckAt).toBeNull();
+    const chatAgentId = await seedAgent(card.companyId);
+    await db.update(issues).set({ status: "in_review", conversationAgentId: chatAgentId, conversationUserId: "human",
+      conversationState: "waiting", assigneeAgentId: chatAgentId }).where(eq(issues.id, card.issueId));
+    expect((await service.reconcilePendingInteraction(input)).nextCheckAt).toBeNull();
+    expect(wake).not.toHaveBeenCalled(); expect(warn).not.toHaveBeenCalled();
   });
 });

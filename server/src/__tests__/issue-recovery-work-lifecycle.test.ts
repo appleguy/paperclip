@@ -1,6 +1,6 @@
 import { PgDialect } from "drizzle-orm/pg-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { issueRecoveryActions, issueWatchdogs } from "@paperclipai/db";
+import { issueRecoveryActions, issueThreadInteractions, issueWatchdogs } from "@paperclipai/db";
 import { installDatabaseWorkSignals } from "../../../packages/db/src/work-signals.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { notifyIssueRecovery } from "../services/issue-recovery-notifications.js";
@@ -12,15 +12,18 @@ afterEach(async () => { for (const stop of stops.splice(0)) await stop(); vi.use
 function fixture() {
   vi.useFakeTimers(); vi.setSystemTime(1_000_000);
   const dialect = new PgDialect();
-  const rows = { issues: [] as Array<{ id: string; companyId: string }>, watchdogs: [] as Array<{ id: string; companyId: string }>, blockers: [] as Array<{ id: string; companyId: string }>, actions: [] as Array<{ id: string; companyId: string }> };
+  const rows = { interactions: [] as Array<{ id: string; companyId: string }>, issues: [] as Array<{ id: string; companyId: string }>, watchdogs: [] as Array<{ id: string; companyId: string }>, blockers: [] as Array<{ id: string; companyId: string }>, actions: [] as Array<{ id: string; companyId: string }> };
   const execute = vi.fn(async (query: any) => {
     if (dialect.sqlToQuery(query).sql.includes("pg_current_xact_id")) return [{ xid: "42" }];
     throw new Error("unexpected SQL");
   });
   const load = vi.fn((table: unknown, distinct = false) => distinct
     ? table === issueRecoveryActions ? rows.actions : rows.blockers
-    : table === issueWatchdogs ? rows.watchdogs : rows.issues);
-  const query = (distinct = false) => ({ from: (table: unknown) => ({ where: () => ({ orderBy: () => ({ limit: async () => load(table, distinct) }) }) }) });
+    : table === issueThreadInteractions ? rows.interactions : table === issueWatchdogs ? rows.watchdogs : rows.issues);
+  const query = (distinct = false) => ({ from: (table: unknown) => {
+    const builder = { innerJoin: () => builder, where: () => ({ orderBy: () => ({ limit: async () => load(table, distinct) }) }) };
+    return builder;
+  } });
   const db: any = installDatabaseWorkSignals({ execute,
     select: () => query(), selectDistinct: () => query(true),
     transaction: async (callback: (tx: any) => Promise<unknown>) => callback({ execute, select: db.select, selectDistinct: db.selectDistinct, transaction: db.transaction }),
@@ -32,18 +35,35 @@ function fixture() {
   });
   const orphanBlockers = vi.fn(async () => {}), recoveryActions = vi.fn(async () => {});
   const suppression = vi.fn(async () => state.suppressed);
+  const pendingInteraction = vi.fn(async () => ({ nextCheckAt: state.deadline !== null && state.deadline > Date.now() ? state.deadline : null }));
   const owner = { orphanBlockers, recoveryActions, stranded: check, dependencies: async (scope: any) => { await check(scope); return { enqueueFailed: 0 }; },
     locks: check, watchdogs: async (scope: any) => { await check(scope); return { incomplete: state.incomplete ? 1 : 0 }; },
-    schedulingSuppressed: suppression };
+    pendingInteraction, schedulingSuppressed: suppression };
   const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => !state.standby,
     canReconcile: () => !state.standby, onError: vi.fn() });
   const worker = registerIssueRecoveryWork(db, coordinator, owner, () => !state.draining && !state.standby);
   stops.push(() => coordinator.stop());
-  return { db, rows, state, check, load, coordinator, worker, orphanBlockers, recoveryActions, suppression,
+  return { db, rows, state, check, load, coordinator, worker, orphanBlockers, recoveryActions, suppression, pendingInteraction,
     notify: () => db.transaction((tx: any) => notifyIssueRecovery(tx, { companyId: "selected" })),
     settle: () => vi.advanceTimersByTimeAsync(1_000) };
 }
 describe("issue recovery obligation lifecycle", () => {
+  it("reconstructs pending cards without a configured watchdog, then becomes quiet after resolution", async () => {
+    const f = fixture(); await f.worker.ready;
+    f.rows.interactions.push({ id: "card", companyId: "selected" });
+    f.state.deadline = Date.now() + 30 * 60_000;
+    await f.notify(); await f.settle();
+    expect(f.pendingInteraction).toHaveBeenCalledExactlyOnceWith({ companyId: "selected", interactionId: "card" });
+    expect(f.coordinator.nextWakeAt()).toBe(f.state.deadline);
+    await vi.advanceTimersByTimeAsync(30 * 60_000 - 1_001);
+    expect(f.pendingInteraction).toHaveBeenCalledTimes(1);
+    f.rows.interactions.length = 0;
+    await f.notify(); await f.settle();
+    expect(f.coordinator.nextWakeAt()).toBeNull();
+    const loads = f.load.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(60 * 60_000);
+    expect(f.load).toHaveBeenCalledTimes(loads);
+  });
   it("has no timer, SQL, or owner probe after empty reconstruction", async () => {
     const f = fixture(); await f.worker.ready;
     expect(f.coordinator.nextWakeAt()).toBeNull(); const loaded = f.load.mock.calls.length;

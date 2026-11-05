@@ -86,6 +86,7 @@ describeIssueRecovery("issue recovery production producers and deadlines", () =>
       orphanBlockers: async () => {}, recoveryActions: async () => {},
       dependencies: async () => ({ enqueueFailed: 0 }), locks: async () => {},
       watchdogs: async () => ({ incomplete: 0 }), schedulingSuppressed: async () => false,
+      pendingInteraction: async () => ({ nextCheckAt: null }),
     }, () => true);
     await state.worker.ready;
     async function settleWork() {
