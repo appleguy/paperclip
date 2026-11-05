@@ -61,7 +61,11 @@ Config:
 - input safety: statusLine agent_state must be idle AND the captured TUI input
   must be empty; a stale idle signal qualifies only after >=5 minutes.
   Every submission uses tmux bracketed paste (-p -r) and a named buffer.
-- expectedRemoteControlUrl: optional stable /r/ instance URL guard
+- slots (1-4, default 1; Gemini models only, Claude stays 1): concurrent seats (SCO-991). Seat 1 is the
+  configured session/stateDir/cwd; seat k>1 is tmux session <tmuxSession>-s<k-1> on the same socket, stateDir
+  <stateDir>/s<k-1> and cwd /Volumes/NVM/AI_Agent_Runtime/workspaces/<tmuxSocket>-s<k-1> (trust it and add its
+  statusLine pair). Set heartbeat.maxConcurrentRuns to the same N. Each seat has its own RC URL and lock.
+- expectedRemoteControlUrl: optional stable /r/ instance URL guard (seat 1)
 - timeoutSec (30-3600, default 600)
 
 The agent writes a validated JSON completion receipt; the adapter, never the
@@ -77,6 +81,7 @@ for Remote Control; it does not share this live TUI.
       { key: "stateDir", label: "Private dispatch/receipt directory", type: "text" },
       { key: "tmuxSocket", label: "tmux server socket", type: "text", default: "paperclip-agy-rc" },
       { key: "tmuxSession", label: "tmux session", type: "text", default: "agy" },
+      { key: "slots", label: "Concurrent seats (Gemini only, 1-4)", type: "number", default: 1 },
       { key: "expectedRemoteControlUrl", label: "Expected stable RC URL", type: "text" },
       { key: "timeoutSec", label: "Run timeout (seconds)", type: "number", default: 600 },
     ],

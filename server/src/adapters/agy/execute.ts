@@ -2,7 +2,7 @@
  * Paperclip -> one long-lived Antigravity TUI Remote Control instance.
  * agy 1.4.x has no supported daemon injection protocol; the tmux pane is
  * the *same* interactive process users see and steer at the stable /r/ URL.
- * Paperclip runs are serialized; TUI work may continue across dispatch and receipt.
+ * Runs are serialized per seat; Gemini agents may run `slots` seats (SCO-991), each its own tmux session.
  */
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -213,7 +213,7 @@ export async function pasteSubmit(socket: string, session: string, message: stri
 }
 
 const AGENT_TMP_ROOT = "/Volumes/NVM/AI_Agent_Runtime/tmp";
-function agentTmpDir(session: string): string { return path.join(AGENT_TMP_ROOT, `agy-${session}`); }
+function agentTmpDir(socket: string, session: string): string { return path.join(AGENT_TMP_ROOT, `agy-${socket}-${session}`); }
 
 /** SCO-534: never run from / or system temp. The default hidden ~/.paperclip cwd stays until the live session is re-pinned. */
 function assertWorkableCwd(cwd: string): void {
@@ -230,10 +230,10 @@ async function ensureSession(
     // An already-emitted op cannot be rejoined through a newly launched TUI.
     if (rejoinOnly) throw new Error("agy active op lost its original TUI; operator reconciliation required, never replay");
     await fs.mkdir(cwd, { recursive: true });
-    await fs.mkdir(agentTmpDir(session), { recursive: true });
+    await fs.mkdir(agentTmpDir(socket, session), { recursive: true });
     // tmux exec mode: no interpolated shell source or arbitrary model selection.
     await tmux(socket, ["new-session", "-d", "-s", session, "-c", cwd,
-      "-e", `TMPDIR=${agentTmpDir(session)}`,
+      "-e", `TMPDIR=${agentTmpDir(socket, session)}`,
       AGY, "--remote-control", "--dangerously-skip-permissions", "--model", model]);
   }
   const processName = (await tmux(socket, ["display-message", "-p", ...target(session), "#{pane_current_command}"])).trim();
@@ -251,29 +251,96 @@ async function ensureSession(
   return url ?? (exists ? previous.trim() : "");
 }
 
-export async function acquire(stateDir: string, deadline: number): Promise<() => Promise<void>> {
+/** One non-blocking attempt at a seat's dispatch mutex; null while another live adapter run holds it. */
+export async function tryAcquire(stateDir: string): Promise<(() => Promise<void>) | null> {
   const dir = path.join(stateDir, "dispatch.lock");
-  while (Date.now() < deadline) {
-    try {
-      await fs.mkdir(dir);
-      await fs.writeFile(path.join(dir, "pid"), String(process.pid), { mode: 0o600 });
-      return async () => { await fs.rm(dir, { recursive: true, force: true }); };
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      const pidText = await fs.readFile(path.join(dir, "pid"), "utf8").catch(() => "");
-      const pid = Number(pidText);
-      if (pid > 1 && Number.isInteger(pid)) {
-        try { process.kill(pid, 0); } catch (e) {
-          if ((e as NodeJS.ErrnoException).code === "ESRCH") {
-            // No replay; only stale mutex reclaimed. active.json remains.
-            await fs.rename(dir, path.join(stateDir, `stale-lock-${Date.now()}`)).catch(() => {});
-          }
+  try {
+    await fs.mkdir(dir);
+    await fs.writeFile(path.join(dir, "pid"), String(process.pid), { mode: 0o600 });
+    return async () => { await fs.rm(dir, { recursive: true, force: true }); };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    const pidText = await fs.readFile(path.join(dir, "pid"), "utf8").catch(() => "");
+    const pid = Number(pidText);
+    if (pid > 1 && Number.isInteger(pid)) {
+      try { process.kill(pid, 0); } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === "ESRCH") {
+          // No replay; only stale mutex reclaimed. active.json remains.
+          await fs.rename(dir, path.join(stateDir, `stale-lock-${Date.now()}`)).catch(() => {});
         }
       }
-      await sleep(1000);
     }
+    return null;
+  }
+}
+
+export async function acquire(stateDir: string, deadline: number): Promise<() => Promise<void>> {
+  while (Date.now() < deadline) {
+    const unlock = await tryAcquire(stateDir);
+    if (unlock) return unlock;
+    await sleep(1000);
   }
   throw new Error("agy single Remote Control session busy: serialization timeout");
+}
+
+/** SCO-991: one tmux seat per concurrent run. Slot 0 is the agent's configured seat, unchanged. */
+export type AgySlot = { index: number; session: string; stateDir: string; cwd: string };
+export const AGY_MAX_SLOTS = 4;
+const SLOT_WORKSPACE_ROOT = "/Volumes/NVM/AI_Agent_Runtime/workspaces";
+/** Ownership rule: agy runs one Claude/GPT job at a time, so only Gemini tiers get more than one seat. */
+export function agySlotCount(slots: unknown, model: string): number {
+  if (!model.startsWith("gemini-")) return 1;
+  const n = Math.trunc(Number(slots));
+  return Number.isFinite(n) ? Math.min(AGY_MAX_SLOTS, Math.max(1, n)) : 1;
+}
+export function agySlot(index: number, socket: string, session: string, stateDir: string, cwd: string): AgySlot {
+  if (index === 0) return { index, session, stateDir, cwd };
+  // Own cwd per seat: the global statusLine routes snapshots by cwd, and seats must not share a status file.
+  return { index, session: `${session}-s${index}`, stateDir: path.join(stateDir, `s${index}`),
+    cwd: path.join(SLOT_WORKSPACE_ROOT, `${socket}-s${index}`) };
+}
+
+/**
+ * Pick and lock one seat: the seat already holding this issue's checkpoint (adoption, waits for its mutex),
+ * else the first free seat without an unresolved checkpoint. Finished foreign receipts are settled on the way.
+ */
+async function claimSlot(
+  ctx: AdapterExecutionContext, slots: AgySlot[], issueId: string, deadline: number,
+): Promise<{ slot: AgySlot; unlock: () => Promise<void> }> {
+  for (const slot of slots) await fs.mkdir(slot.stateDir, { recursive: true, mode: 0o700 });
+  const activeOf = (slot: AgySlot) => fs.readFile(path.join(slot.stateDir, "active.json"), "utf8").catch(() => "");
+  const owner = await (async () => {
+    for (const slot of slots) {
+      const raw = await activeOf(slot);
+      try { if (raw && (JSON.parse(raw) as Partial<ActiveDispatch>).issueId === issueId) return slot; } catch { /* unresolved */ }
+    }
+    return null;
+  })();
+  if (owner) return { slot: owner, unlock: await acquire(owner.stateDir, deadline) };
+  while (Date.now() < deadline) {
+    let lastError = "";
+    let held = false;
+    for (const slot of slots) {
+      const unlock = await tryAcquire(slot.stateDir);
+      if (!unlock) { held = true; continue; }
+      let raw = await activeOf(slot);
+      if (raw) {
+        await settleForeignCheckpoint(ctx, raw, issueId, slot.stateDir, path.join(slot.stateDir, "active.json"));
+        raw = await activeOf(slot);
+      }
+      try {
+        adoptableActive(raw, issueId, slot.stateDir);
+        return { slot, unlock };
+      } catch (e) {
+        lastError = e instanceof Error ? e.message : String(e);
+        await unlock();
+      }
+    }
+    // No seat is running and every one holds an unresolved checkpoint: same target_busy refusal as one seat.
+    if (lastError && !held) throw new Error(lastError);
+    await sleep(1000);
+  }
+  throw new Error("agy Remote Control seats busy: serialization timeout");
 }
 
 export async function deliver(ctx: AdapterExecutionContext, receipt: Receipt, title = "Antigravity execution report", label = "agy Remote Control"): Promise<void> {
@@ -343,13 +410,16 @@ async function settleForeignCheckpoint(
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const cfg = ctx.config;
-  const session = asString(cfg.tmuxSession, "agy");
+  const baseSession = asString(cfg.tmuxSession, "agy");
   const socket = asString(cfg.tmuxSocket, "paperclip-agy-rc");
-  const stateDir = path.resolve(asString(cfg.stateDir, path.join(os.homedir(), ".paperclip/agy-rc-state")));
-  const cwd = path.resolve(asString(cfg.cwd, path.join(os.homedir(), ".paperclip/agy-rc-workspace")));
-  assertWorkableCwd(cwd);
+  const baseStateDir = path.resolve(asString(cfg.stateDir, path.join(os.homedir(), ".paperclip/agy-rc-state")));
+  const baseCwd = path.resolve(asString(cfg.cwd, path.join(os.homedir(), ".paperclip/agy-rc-workspace")));
+  assertWorkableCwd(baseCwd);
   const requestedModel = asString(cfg.model, DEFAULT_MODEL);
   const model = AGY_MODELS.includes(requestedModel as typeof AGY_MODELS[number]) ? requestedModel : DEFAULT_MODEL;
+  const slots = Array.from({ length: agySlotCount(cfg.slots, model) },
+    (_, i) => agySlot(i, socket, baseSession, baseStateDir, baseCwd));
+  let { session, stateDir, cwd } = slots[0]!;
   const issueId = asString(ctx.context.issueId, asString(ctx.context.taskId, ""));
   const timeoutMs = Math.min(3600, Math.max(30, Number(cfg.timeoutSec) || 600)) * 1000;
   let unlock: (() => Promise<void>) | undefined;
@@ -362,19 +432,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   });
   try {
     resolveAgyModel(requestedModel);
-    if (!ID.test(socket) || !ID.test(session)) throw new Error("invalid tmux socket/session");
+    if (!ID.test(socket) || !slots.every(slot => ID.test(slot.session))) throw new Error("invalid tmux socket/session");
     if (!issueId) throw new Error("agy adapter requires one issueId/taskId");
     if (!ctx.authToken) throw new Error("agy adapter requires a Paperclip run-scoped token before dispatch");
     if (ctx.executionTarget?.kind && ctx.executionTarget.kind !== "local")
       throw new Error("agy TUI adapter runs on Mac Pro local host only");
-    await fs.mkdir(stateDir, { recursive: true, mode: 0o700 });
-    unlock = await acquire(stateDir, Date.now() + timeoutMs);
+    const claimed = await claimSlot(ctx, slots, issueId, Date.now() + timeoutMs);
+    unlock = claimed.unlock;
+    ({ session, stateDir, cwd } = claimed.slot);
+    if (slots.length > 1) await ctx.onLog("stdout", `[agy] seat ${claimed.slot.index + 1}/${slots.length}: tmux ${socket}/${session}\n`);
     const activePath = path.join(stateDir, "active.json");
-    let activeRaw = await fs.readFile(activePath, "utf8").catch(() => "");
-    if (activeRaw) {
-      await settleForeignCheckpoint(ctx, activeRaw, issueId, stateDir, activePath);
-      activeRaw = await fs.readFile(activePath, "utf8").catch(() => "");
-    }
+    const activeRaw = await fs.readFile(activePath, "utf8").catch(() => "");
     const adopted = adoptableActive(activeRaw, issueId, stateDir);
     const rcUrl = await ensureSession(socket, session, cwd, stateDir, Boolean(adopted), model);
     if (!rcUrl) throw new Error("agy RC URL unavailable: use /remote-control in its TUI, then retry");
@@ -383,7 +451,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // stateDir (cfg.expectedRemoteControlUrl is only the initial seed). An in-flight adopted dispatch stays strict below.
     const pinPath = path.join(stateDir, "rc-url.json");
     const pinned = await fs.readFile(pinPath, "utf8").then((t) => asString(JSON.parse(t)?.url, "")).catch(() => "")
-      || asString(cfg.expectedRemoteControlUrl, rcUrl);
+      || (claimed.slot.index === 0 ? asString(cfg.expectedRemoteControlUrl, rcUrl) : rcUrl);
     if (pinned !== rcUrl) {
       await ctx.onLog("stdout", `[agy] RC URL re-pinned ${pinned} -> ${rcUrl} (owned tmux ${socket}/${session})\n`);
     }
