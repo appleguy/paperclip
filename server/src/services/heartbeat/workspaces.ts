@@ -2396,6 +2396,11 @@ export async function provisionExecutionWorkspaceForFreshnessDecision<
   };
 }
 
+// Adapters that prepend instructions/skills to the prompt and drop them on a
+// resumed delta: editing either must not orphan the conversation (SCO-867).
+export const RESUME_SAFE_INSTRUCTION_ADAPTERS: ReadonlySet<string> = new Set(["opencode_local", "codex_local"]);
+export const RESUME_SAFE_INSTRUCTION_CATEGORIES: readonly EffectiveRunSessionConfigCategory[] = ["instructions", "runtimeSkills"];
+
 const EFFECTIVE_RUN_SESSION_CONFIG_CATEGORY_LABELS: Record<
   EffectiveRunSessionConfigCategory,
   string
@@ -2871,6 +2876,11 @@ export async function buildEffectiveRunSessionConfigMetadata(input: {
       ? { key: skill.key, runtimeName: skill.runtimeName, versionId: skill.versionId }
       : entry;
   }) : value;
+  if (RESUME_SAFE_INSTRUCTION_ADAPTERS.has(input.adapterType)) {
+    delete effectiveAdapterConfig.paperclipRuntimeSkills;
+    delete effectiveAdapterConfig.instructionsRootPath;
+    delete effectiveAdapterConfig.instructionsFilePath;
+  }
   if (effectiveAdapterConfig.paperclipRuntimeSkills !== undefined) {
     effectiveAdapterConfig.paperclipRuntimeSkills = versionedSkills(effectiveAdapterConfig.paperclipRuntimeSkills);
   }
@@ -3219,6 +3229,8 @@ export function resolveTaskSessionConfigFreshness(input: {
   compatibleConfigMetadata?: readonly EffectiveRunSessionConfigMetadata[];
   wakeResetReason?: string | null;
   preserveLegacySessionWithoutConfigMetadata?: boolean;
+  /** Categories whose change alone keeps the session (adapters that resend nothing from them on resume anyway). */
+  resumeSafeCategories?: readonly EffectiveRunSessionConfigCategory[];
 }): TaskSessionConfigFreshnessDecision {
   if (!input.hasTaskSession) {
     return {
@@ -3271,9 +3283,12 @@ export function resolveTaskSessionConfigFreshness(input: {
         previous: storedConfig.categoryFingerprints,
         next: input.configMetadata.categoryFingerprints,
       });
-      reasons.push(
-        `effective run configuration changed: ${describeEffectiveRunConfigCategories(changedCategories)}`,
-      );
+      const safe = input.resumeSafeCategories;
+      if (!(safe && changedCategories.length > 0 && changedCategories.every((category) => safe.includes(category)))) {
+        reasons.push(
+          `effective run configuration changed: ${describeEffectiveRunConfigCategories(changedCategories)}`,
+        );
+      }
     }
   }
 

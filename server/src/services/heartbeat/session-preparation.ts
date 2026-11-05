@@ -14,6 +14,7 @@ import {
 } from "./run-state.js";
 import {
   buildEffectiveRunSessionConfigMetadata, readConfigFingerprintFromSessionParams,
+  RESUME_SAFE_INSTRUCTION_ADAPTERS, RESUME_SAFE_INSTRUCTION_CATEGORIES,
   readConfiguredModelFromAdapterConfig, resolveTaskSessionConfigFreshness,
   stripPaperclipSessionMetadataFromSessionParams, type EffectiveRunSessionConfigMetadata,
 } from "./workspaces.js";
@@ -197,6 +198,7 @@ export async function prepareHeartbeatSession(db: Db, input: HeartbeatSessionPre
     configMetadata: sessionConfigMetadata,
     compatibleConfigMetadata,
     wakeResetReason: wakeSessionResetReason,
+    resumeSafeCategories: RESUME_SAFE_INSTRUCTION_ADAPTERS.has(agent.adapterType) ? RESUME_SAFE_INSTRUCTION_CATEGORIES : undefined,
     preserveLegacySessionWithoutConfigMetadata:
       acceptedPlanContinuationWake && !acceptedPlanWakeRoutingDecision && !agentIdentity,
   });

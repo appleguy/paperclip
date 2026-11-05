@@ -43,6 +43,7 @@ import {
   renderTemplate,
   hydrateFreshSessionHandoff,
   selectPaperclipPromptSections,
+  stripConnectionGuidanceWithoutIntent,
   selectInitialCommunicationGuidance,
   isPaperclipRecoveryWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
@@ -633,7 +634,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const shouldUseResumeDeltaPrompt = resumedSession && wakePrompt.length > 0;
       const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
         ? ""
-        : renderTemplate(promptTemplate, templateData);
+        : stripConnectionGuidanceWithoutIntent(renderTemplate(promptTemplate, templateData), context);
       const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
       // The managed session goal (SCO-756) is rendered by selectPaperclipPromptSections.
       const basePrompt = joinPromptSections([

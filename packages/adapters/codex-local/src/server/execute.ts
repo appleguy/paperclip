@@ -54,6 +54,7 @@ import {
   hydrateFreshSessionHandoff,
   selectInitialCommunicationGuidance,
   selectPaperclipPromptSections,
+  stripConnectionGuidanceWithoutIntent,
   isPaperclipRecoveryWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
@@ -1259,7 +1260,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
       const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
         ? ""
-        : renderTemplate(promptTemplate, templateData);
+        : stripConnectionGuidanceWithoutIntent(renderTemplate(promptTemplate, templateData), context);
       const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
       const prompt = joinPromptSections([
         promptInstructionsPrefix,
