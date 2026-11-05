@@ -36,6 +36,7 @@ import {
 } from "../auth/workspace-login-handoff.js";
 import { serverVersion } from "../version.js";
 import { getStartupRecoveryState } from "../startup-recovery-state.js";
+import { getSchedulerLeadershipState } from "../services/scheduler-leader.js";
 import { nativeRestartRecoverySummary } from "../services/native-runtime/native-restart-recovery.js";
 import { readMonitorQuotaGauge } from "../services/monitor-quota-gauge.js";
 import {
@@ -137,6 +138,10 @@ export function healthRoutes(
   },
 ) {
   const router = Router();
+
+  router.get("/scheduler", (_req, res) => {
+    res.set("Cache-Control", "no-store").json(getSchedulerLeadershipState());
+  });
 
   router.post("/dev-server/restart", async (req, res) => {
     const actorType = "actor" in req ? req.actor?.type : null;
