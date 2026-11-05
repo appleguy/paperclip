@@ -26,10 +26,11 @@ const UI_PREFIXES = ["ui/", "master/ui/"];
 export type GateReceipt = { commits?: unknown; liveCheck?: unknown; notMine?: unknown };
 export type GateVerdict = { ok: true; notes: string[] } | { ok: false; reasons: string[]; evidence?: "unknown" };
 export type MutationRecord = { paths: string[]; unknown: string[] };
+export type GitEvidence = { code: number; out: string; error?: string };
 
 export type GateDeps = {
   repos(): Promise<string[]>;
-  git(repo: string, args: string[]): Promise<{ code: number; out: string }>;
+  git(repo: string, args: string[]): Promise<GitEvidence>;
   liveSha(): Promise<string | null>;
 };
 
@@ -41,7 +42,7 @@ const READ_ONLY_TOOLS = new Set(["Read", "Grep", "Glob", "WebFetch", "WebSearch"
 export function editedPaths(jsonl: string, sinceMs: number): MutationRecord {
   const seen = new Set<string>();
   const unknown = new Set<string>();
-  if (!jsonl.trim()) unknown.add("transcript is empty or unavailable");
+  if (!jsonl.trim()) unknown.add("transcript was read successfully but is empty; no run-owned mutation evidence");
   for (const line of jsonl.split("\n")) {
     if (!line.trim()) continue;
     let rec: { timestamp?: string; cwd?: string; message?: { content?: unknown } };
@@ -94,7 +95,24 @@ export function repoOf(file: string, repos: string[]): string | null {
 const SHA = /^[0-9a-f]{7,40}$/i;
 const strings = (v: unknown): string[] => Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
 
+function errorDetail(error: unknown): string {
+  const e = error as { code?: unknown; signal?: unknown; killed?: unknown } | null;
+  return [e?.killed ? "timed out or killed" : "command/read failed", e?.code, e?.signal]
+    .filter(v => typeof v === "string" || typeof v === "number").join(" ");
+}
+
+function unknownEvidence(reason: string): GateVerdict {
+  return { ok: false, evidence: "unknown", reasons: [reason] };
+}
+
 export async function evaluateDoneGate(receipt: GateReceipt, edited: string[] | MutationRecord, deps: GateDeps): Promise<GateVerdict> {
+  // A dependency rejection (including timeouts) is evidence failure, not clean output.
+  const git = async (repo: string, args: string[]): Promise<GitEvidence> => {
+    try { return await deps.git(repo, args); }
+    catch (error) { return { code: 1, out: "", error: errorDetail(error) }; }
+  };
+  const gitFailure = (repo: string, command: string, result: GitEvidence) =>
+    unknownEvidence(`Git evidence unknown: git ${command} in ${repo} failed (exit ${result.code}${result.error ? `; ${result.error}` : ""}). Restore Git access and retry; empty output is not proof of a clean checkout.`);
   const record = Array.isArray(edited) ? { paths: edited, unknown: [] } : edited;
   if (record.unknown.length) return { ok: false, evidence: "unknown", reasons: [`mutation evidence unknown: ${record.unknown.join("; ")}. A complete run-owned mutation record or baseline is required; commit prose cannot establish the write set.`] };
   const repos = await deps.repos();
@@ -121,7 +139,8 @@ export async function evaluateDoneGate(receipt: GateReceipt, edited: string[] | 
 
   // Own uncommitted edits: the run's edited files that git still reports dirty.
   for (const [repo, files] of touched) {
-    const st = await deps.git(repo, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ...files.map(f => path.relative(repo, f))]);
+    const st = await git(repo, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ...files.map(f => path.relative(repo, f))]);
+    if (st.code !== 0 || st.error) return gitFailure(repo, "status", st);
     const dirty = st.out.split("\0").filter(l => l.length > 3).map(l => l.slice(3)).filter(p => !notMine.has(p));
     if (dirty.length) reasons.push(`uncommitted edits of this run in ${repo}: ${dirty.slice(0, 12).join(", ")}${dirty.length > 12 ? ` (+${dirty.length - 12})` : ""}. Commit your own paths on the checkout (git add <paths>; git commit) or revert them; if the dirt is another agent's, list those paths in "notMine". Then resubmit.`);
   }
@@ -134,17 +153,25 @@ export async function evaluateDoneGate(receipt: GateReceipt, edited: string[] | 
     if (!SHA.test(sha)) { reasons.push(`commit "${sha}" is not a hex SHA`); continue; }
     let found: string | null = null;
     for (const repo of repos) {
-      if ((await deps.git(repo, ["cat-file", "-e", `${sha}^{commit}`])).code === 0) { found = repo; break; }
+      const exists = await git(repo, ["cat-file", "-e", `${sha}^{commit}`]);
+      if (exists.error) return gitFailure(repo, "cat-file", exists);
+      if (exists.code === 0) { found = repo; break; }
     }
     if (!found) { reasons.push(`commit ${sha} is in no canonical checkout`); continue; }
-    if ((await deps.git(found, ["merge-base", "--is-ancestor", sha, "HEAD"])).code !== 0) {
+    const onHead = await git(found, ["merge-base", "--is-ancestor", sha, "HEAD"]);
+    if (onHead.error || (onHead.code !== 0 && onHead.code !== 1)) return gitFailure(found, "merge-base HEAD", onHead);
+    if (onHead.code !== 0) {
       reasons.push(`commit ${sha} is not on ${found} HEAD (canonical main); land it there first`);
       continue;
     }
     if (found !== PAPERCLIP_MASTER) { notes.push(`${sha.slice(0, 12)} on ${found}`); continue; }
-    const files = (await deps.git(found, ["show", "--name-only", "--format=", sha])).out.split("\n");
+    const shown = await git(found, ["show", "--name-only", "--format=", sha]);
+    if (shown.code !== 0 || shown.error) return gitFailure(found, "show", shown);
+    const files = shown.out.split("\n");
     const isUi = files.some(f => UI_PREFIXES.some(p => f.startsWith(p)));
-    const isLive = live !== null && (await deps.git(found, ["merge-base", "--is-ancestor", sha, live])).code === 0;
+    const liveAncestor = live === null ? null : await git(found, ["merge-base", "--is-ancestor", sha, live]);
+    if (liveAncestor && (liveAncestor.error || (liveAncestor.code !== 0 && liveAncestor.code !== 1))) return gitFailure(found, "merge-base live", liveAncestor);
+    const isLive = liveAncestor?.code === 0;
     notes.push(`${sha.slice(0, 12)} ${isLive ? "live" : "queued for autodeploy"}`);
     if (isUi) {
       ownerVisible = true;
@@ -172,8 +199,12 @@ export function productionDeps(): GateDeps {
         const { stdout } = await run("/usr/bin/git", ["-C", repo, ...args], { timeout: 20_000, maxBuffer: 8_000_000 });
         return { code: 0, out: stdout.replace(/\n+$/, "") }; // not trim(): status lines start with a space
       } catch (e) {
-        const err = e as { code?: number | string; stdout?: string };
-        return { code: typeof err.code === "number" ? err.code : 1, out: (err.stdout ?? "").replace(/\n+$/, "") };
+        const err = e as { code?: number | string; stdout?: string; killed?: boolean };
+        return { code: typeof err.code === "number" ? err.code : 1, out: (err.stdout ?? "").replace(/\n+$/, ""),
+          // Exit 1 from merge-base and absent objects from cat-file are normal
+          // negative answers. Transport/timeout failures are never negatives.
+          ...(err.killed || typeof err.code !== "number" ? { error: errorDetail(e) } : {}),
+        };
       }
     },
     liveSha: async () => {
@@ -195,6 +226,10 @@ export function refusalMessage(reasons: string[], attempt: number, max: number):
 export async function gateReceiptRaw(raw: string, transcriptPath: string | null, sinceMs: number, deps: GateDeps = productionDeps()): Promise<GateVerdict> {
   let receipt: GateReceipt;
   try { receipt = JSON.parse(raw) as GateReceipt; } catch { return { ok: false, reasons: ["receipt is not valid JSON"] }; }
-  const jsonl = transcriptPath ? await fs.readFile(transcriptPath, "utf8").catch(() => "") : "";
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)) return { ok: false, reasons: ["receipt must be a JSON object"] };
+  if (!transcriptPath) return unknownEvidence("Transcript evidence unknown: no transcript path is available. Restore the run transcript before resubmitting.");
+  let jsonl: string;
+  try { jsonl = await fs.readFile(transcriptPath, "utf8"); }
+  catch (error) { return unknownEvidence(`Transcript evidence unknown: cannot read ${transcriptPath} (${errorDetail(error)}). Restore the run transcript and read access before resubmitting.`); }
   return evaluateDoneGate(receipt, editedPaths(jsonl, sinceMs), deps);
 }

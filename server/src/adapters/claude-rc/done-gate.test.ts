@@ -1,9 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { editedPaths, evaluateDoneGate, gateReceiptRaw, repoOf, type GateDeps } from "./done-gate.js";
+import { editedPaths, evaluateDoneGate, gateReceiptRaw, productionDeps, repoOf, type GateDeps } from "./done-gate.js";
 
 const M = "/Volumes/NVM/Paperclip/master";
 const Z = "/Volumes/NVM/AI_Coding_Projects/zagent";
@@ -28,6 +28,72 @@ function deps(over: { dirty?: string; known?: Record<string, string>; onHead?: S
   };
 }
 const sha1 = "b".repeat(40);
+
+describe("unavailable evidence (SCO-974 / S7 F02)", () => {
+  it("distinguishes an absent path, missing file, denied read, and readable empty file", async () => {
+    expect(await gateReceiptRaw("{}", null, 1, deps())).toMatchObject({ ok: false, evidence: "unknown", reasons: [expect.stringContaining("no transcript path")] });
+    const scratch = await fs.mkdtemp("/Volumes/NVM/AI_Agent_Runtime/tmp/sco974-gate-");
+    await fs.writeFile(path.join(scratch, "RETENTION.md"), "SCO-974 offline transcript fixtures. Preserve text evidence; archive with issue evidence during scratch curation. No live checkout or owner records changed.\n");
+    const transcript = path.join(scratch, "run.jsonl");
+    expect(await gateReceiptRaw("{}", transcript, 1, deps())).toMatchObject({ ok: false, evidence: "unknown", reasons: [expect.stringContaining("ENOENT")] });
+    // Deterministic denied read, independent of root/ACL permissions on the host.
+    const read = vi.spyOn(fs, "readFile").mockRejectedValueOnce(Object.assign(new Error("denied"), { code: "EACCES" }));
+    try {
+      expect(await gateReceiptRaw("{}", transcript, 1, deps())).toMatchObject({ ok: false, evidence: "unknown", reasons: [expect.stringContaining("EACCES")] });
+    } finally { read.mockRestore(); }
+    await fs.writeFile(transcript, "");
+    expect(await gateReceiptRaw("{}", transcript, 1, deps())).toMatchObject({ ok: false, evidence: "unknown", reasons: [expect.stringContaining("read successfully but is empty")] });
+    // No-code work is established by actual readable run records, not a
+    // worker's assertion that missing/empty evidence means nothing changed.
+    await fs.writeFile(transcript, JSON.stringify({ timestamp: "2026-11-05T02:00:00Z", message: { content: [{ type: "text", text: "No tool work required." }] } }));
+    expect(await gateReceiptRaw("{}", transcript, 1, deps())).toMatchObject({ ok: true });
+  });
+
+  it.each(["null", "[]", "1"])("refuses a non-object receipt %s without throwing", async raw => {
+    expect(await gateReceiptRaw(raw, null, 1, deps())).toMatchObject({ ok: false, reasons: ["receipt must be a JSON object"] });
+  });
+
+  it.each([
+    { code: 128, out: "" },
+    { code: 128, out: " M server/a.ts\0" },
+    { code: 124, out: "", error: "timed out" },
+  ])("keeps failed status unknown with a valid prior commit: %j", async status => {
+    const base = deps();
+    const v = await evaluateDoneGate({ commits: [sha1], notMine: ["server/a.ts"] }, [`${M}/server/a.ts`], {
+      ...base, git: async (repo, args) => args[0] === "status" ? status : base.git(repo, args),
+    });
+    expect(v).toMatchObject({ ok: false, evidence: "unknown", reasons: [expect.stringContaining("git status")] });
+  });
+
+  it("converts a thrown status timeout into an actionable unknown verdict", async () => {
+    const base = deps();
+    const v = await evaluateDoneGate({ commits: [sha1] }, [`${M}/server/a.ts`], {
+      ...base, git: async (repo, args) => {
+        if (args[0] === "status") throw Object.assign(new Error("timeout"), { killed: true, signal: "SIGTERM" });
+        return base.git(repo, args);
+      },
+    });
+    expect(v).toMatchObject({ ok: false, evidence: "unknown", reasons: [expect.stringContaining("timed out or killed")] });
+  });
+
+  it("preserves a real Git failure through the production subprocess boundary", async () => {
+    const base = deps();
+    // /dev/null cannot be a checkout; Git exits nonzero with empty stdout.
+    const result = await productionDeps().git("/dev/null", ["status", "--porcelain=v1", "-z"]);
+    expect(result.code).not.toBe(0);
+    expect(result.out).toBe("");
+    expect(await evaluateDoneGate({ commits: [sha1] }, [`${M}/server/a.ts`], {
+      ...base, git: async (repo, args) => args[0] === "status" ? result : base.git(repo, args),
+    })).toMatchObject({ ok: false, evidence: "unknown" });
+  });
+
+  it.each(["show", "merge-base"])("does not consume failed %s output as positive evidence", async command => {
+    const base = deps();
+    expect(await evaluateDoneGate({ commits: [sha1] }, [`${M}/server/a.ts`], {
+      ...base, git: async (repo, args) => args[0] === command ? { code: 128, out: "" } : base.git(repo, args),
+    })).toMatchObject({ ok: false, evidence: "unknown" });
+  });
+});
 
 describe("editedPaths", () => {
   it("collects Edit/Write targets at or after the run start", () => {
