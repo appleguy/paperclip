@@ -4,7 +4,7 @@ import { preDispatchExecutionWaitRecoveryActionPredicate } from "./pre-dispatch-
 import { and, desc, eq, gt, inArray, not, or, sql } from "drizzle-orm";
 import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
 import { z } from "zod";
-import { agentWakeupRequests, chatConversations, chatEndpoints, environmentLeases, heartbeatRuns, issueComments, issues, issueRecoveryActions, nativeRunFinalizations, toolConnections, type Db } from "@paperclipai/db";
+import { agents, agentWakeupRequests, chatConversations, chatEndpoints, environmentLeases, heartbeatRuns, issueComments, issues, issueRecoveryActions, nativeRunFinalizations, toolConnections, type Db } from "@paperclipai/db";
 import { canContinueCancelledRun, readRunCancellation } from "./run-cancellation.js";
 import { canRetryStoppedRun } from "./cancelled-native-startup.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
@@ -100,6 +100,16 @@ export function executionBlockerPredicate() {
   return and(
     not(conversationRecoveryActionPredicate()!),
     not(preDispatchExecutionWaitRecoveryActionPredicate()),
+    // A deploy-interrupted claude_rc run leaves its TUI and checkpoint intact: nothing to reconcile, including
+    // actions recorded before the classifier knew that (SCO-817).
+    sql`not (${issueRecoveryActions.cause} = 'legacy_execution_requires_reconciliation' and exists (
+      select 1 from ${heartbeatRuns} join ${agents} on ${agents.id} = ${heartbeatRuns.agentId}
+      where ${heartbeatRuns.companyId} = ${issueRecoveryActions.companyId}
+        and ${heartbeatRuns.id} = ${canonicalExecutionUuid(sql`coalesce(${issueRecoveryActions.evidence}->>'runId', ${issueRecoveryActions.evidence}->>'sourceRunId')`)}
+        and ${heartbeatRuns.errorCode} = 'server_shutdown_interrupted'
+        and ${heartbeatRuns.status} in ('interrupted', 'cancelled')
+        and ${agents.adapterType} in ('claude_rc_local', 'claude_rc')
+    ))`,
     sql`not (${issueRecoveryActions.cause} = 'legacy_execution_requires_reconciliation' and exists (
       select 1 from ${heartbeatRuns}
       where ${heartbeatRuns.companyId} = ${issueRecoveryActions.companyId}

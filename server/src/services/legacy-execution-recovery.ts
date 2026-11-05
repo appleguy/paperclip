@@ -27,6 +27,8 @@ import { hasVerifiedWorkspaceRepair } from "./workspace-recovery-receipt.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
+/** The registered adapter type is claude_rc_local; the bare name was never matched (SCO-817). */
+export const CLAUDE_RC_ADAPTERS: ReadonlySet<string> = new Set(["claude_rc_local", "claude_rc"]);
 
 const unusedReconciliationContextKeys = [
   "executionContinuation", "paperclipWake", "paperclipWakeComment",
@@ -75,7 +77,7 @@ export function legacyExecutionNeedsReconciliation(
   // (adapters/claude-rc/execute.ts); no provider action is lost, so redeploys must not strand the issue.
   if ((run.status === "interrupted" || run.status === "cancelled")
       && (/shared TUI left intact/i.test(String(run.error ?? ""))
-        || (run.errorCode === "server_shutdown_interrupted" && claimedAdapterType({ runnerProfileJson: run.runnerProfileJson ?? null }) === "claude_rc"))) return false;
+        || (run.errorCode === "server_shutdown_interrupted" && CLAUDE_RC_ADAPTERS.has(claimedAdapterType({ runnerProfileJson: run.runnerProfileJson ?? null }) ?? "")))) return false;
   // Waiting for a subscription or workspace precedes provider execution. It is
   // a resource wait, not a failed provider attempt or permission to replay work.
   if (run.status === "cancelled" && (run.errorCode === "ai_connection_busy" || run.errorCode === "ai_connection_pool_exhausted") &&
@@ -107,7 +109,7 @@ export async function legacyExecutionNeedsReconciliationWithEvidence(db: Db, run
   // adapter is the only evidence left that this was a claude_rc run with its TUI and checkpoint intact.
   if (run.errorCode === "server_shutdown_interrupted" && claimedAdapterType(run) === null) {
     const [agent] = await db.select({ adapterType: agents.adapterType }).from(agents).where(eq(agents.id, run.agentId)).limit(1);
-    if (agent?.adapterType === "claude_rc") run = { ...run, runnerProfileJson: { ...run.runnerProfileJson, adapterDispatch: { adapterType: "claude_rc" } } };
+    if (CLAUDE_RC_ADAPTERS.has(agent?.adapterType ?? "")) run = { ...run, runnerProfileJson: { ...run.runnerProfileJson, adapterDispatch: { adapterType: "claude_rc_local" } } };
   }
   return await hasUnrestoredRemoteWorkspace(db, run) ||
     (legacyExecutionNeedsReconciliation(run) && !(await isPreDispatchReviewWaitVerified(db, run))
