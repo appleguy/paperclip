@@ -699,7 +699,13 @@ describe("fetchCodexQuota", () => {
     });
     const windows = await fetchCodexQuota("token", null);
     expect(windows).toHaveLength(1);
-    expect(windows[0]).toMatchObject({ label: "5h limit", usedPercent: 30, resetsAt: "2026-01-02T00:00:00.000Z" });
+    expect(windows[0]).toMatchObject({ label: "1d limit", usedPercent: 30, resetsAt: "2026-01-02T00:00:00.000Z" });
+  });
+
+  it("labels a weekly primary window by duration, not its position", async () => {
+    mockFetch({ rate_limit: { primary_window: { used_percent: 14, limit_window_seconds: 604800 } } });
+    expect((await fetchCodexQuota("token", null))[0]?.label).toBe("Weekly limit");
+    expect(mapCodexRpcQuota({ rateLimits: { primary: { usedPercent: 14, windowDurationMins: 10080 } } }).windows[0]?.label).toBe("Weekly limit");
   });
 
   it("parses secondary_window alongside primary_window", async () => {

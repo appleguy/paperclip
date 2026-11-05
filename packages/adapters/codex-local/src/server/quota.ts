@@ -279,6 +279,14 @@ function normalizeCodexUsedPercent(rawPct: number | null | undefined): number | 
   return Math.max(0, Math.min(100, rawPct));
 }
 
+function quotaWindowLabel(seconds: number | null | undefined, fallback: string): string {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds <= 0) return fallback;
+  if (seconds === 604800) return "Weekly limit";
+  if (seconds % 86400 === 0) return `${seconds / 86400}d limit`;
+  if (seconds % 3600 === 0) return `${seconds / 3600}h limit`;
+  return `${seconds / 60}m limit`;
+}
+
 export async function fetchCodexQuota(
   token: string,
   accountId: string | null,
@@ -306,7 +314,7 @@ export async function fetchCodexQuota(
   if (rateLimit?.primary_window != null) {
     const w = rateLimit.primary_window;
     windows.push({
-      label: "5h limit",
+      label: quotaWindowLabel(w.limit_window_seconds, "Primary limit"),
       usedPercent: normalizeCodexUsedPercent(w.used_percent),
       resetsAt:
         typeof w.reset_at === "number"
@@ -319,7 +327,7 @@ export async function fetchCodexQuota(
   if (rateLimit?.secondary_window != null) {
     const w = rateLimit.secondary_window;
     windows.push({
-      label: "Weekly limit",
+      label: quotaWindowLabel(w.limit_window_seconds, "Secondary limit"),
       usedPercent: normalizeCodexUsedPercent(w.used_percent),
       resetsAt:
         typeof w.reset_at === "number"
@@ -437,9 +445,9 @@ export function mapCodexRpcQuota(result: CodexRpcRateLimitsResult, account?: Cod
       limitId === "codex"
         ? ""
         : `${limit.limitName ?? limitId} · `;
-    const primary = buildCodexRpcWindow(`${prefix}5h limit`, limit.primary);
+    const primary = buildCodexRpcWindow(`${prefix}${quotaWindowLabel(limit.primary?.windowDurationMins == null ? null : limit.primary.windowDurationMins * 60, "Primary limit")}`, limit.primary);
     if (primary) windows.push(primary);
-    const secondary = buildCodexRpcWindow(`${prefix}Weekly limit`, limit.secondary);
+    const secondary = buildCodexRpcWindow(`${prefix}${quotaWindowLabel(limit.secondary?.windowDurationMins == null ? null : limit.secondary.windowDurationMins * 60, "Secondary limit")}`, limit.secondary);
     if (secondary) windows.push(secondary);
     if (limitId === "codex" && limit.credits && limit.credits.unlimited !== true) {
       windows.push({

@@ -57,7 +57,7 @@ export const costsApi = {
   quotaSentinel: (companyId: string) =>
     api.get<{ source: string; observedAt: string | null; stale: boolean;
       pools: Array<{ provider: string; pool: string; usedPercent: number | null; resetsAt: string | null; state: string; requiredPtsPerHour?: number | null; requiredPtsPerDay?: number | null }>;
-      bankedReset?: { available: number | null; expiresAt: string | null; ordinaryResetAt: string | null; redeemNoLaterThan: string | null; automaticRedemption: false };
+      bankedReset?: { available: number | null; expiresAt: string | null; ordinaryResetAt: string | null; redeemNoLaterThan: string | null; checkpointAt: string | null; checkpointTargetPercent: number | null; checkpointPtsPerHour: number | null; deadlinePtsPerHour: number | null; automaticRedemption: false };
       bankedResetDispute?: { ownerExpected: number; source: string } | null;
       creditOffers?: Array<{ id: string; label: string; balanceLastReportedUsd: number | null; observedAt: string | null; expiresAt: string | null; source: string; status: string }>;
     }>(`/companies/${companyId}/costs/quota-sentinel`),

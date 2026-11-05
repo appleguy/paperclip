@@ -1114,7 +1114,7 @@ export function Costs({
               <CardTitle>Subscription quota across providers</CardTitle>
               <CardDescription>
                 Quota Sentinel · polled every 30 minutes · allowance, not API spend · pace is recent consumption speed
-                {sentinelData?.observedAt ? ` · observed ${new Date(sentinelData.observedAt).toLocaleString("en-US", { timeZone: "America/Los_Angeles", year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" })}` : ""}
+                {sentinelData?.observedAt && Number.isFinite(Date.parse(sentinelData.observedAt)) ? ` · observed ${new Date(sentinelData.observedAt).toLocaleString("en-US", { timeZone: "America/Los_Angeles", year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" })} · ${Math.max(0, Math.floor((Date.now() - Date.parse(sentinelData.observedAt)) / 60_000))} min ago` : " · observation time unknown"}
                 {sentinelData?.stale ? " · STALE snapshot" : ""}
               </CardDescription>
             </CardHeader>
@@ -1125,10 +1125,11 @@ export function Costs({
                     {(["antigravity", "codex", "claude"] as const).map(provider => (
                       <div key={provider} className="space-y-3">
                         <h3 className="font-semibold">{provider === "codex" ? "ChatGPT / Codex" : provider === "claude" ? "Claude" : "Antigravity"}</h3>
-                        {sentinelData.pools.filter(p => p.provider === provider && p.pool !== "session" && !p.pool.endsWith(":5h")).map(p => (
+                        {!sentinelData.pools.some(p => p.provider === provider) && <p className="text-sm text-muted-foreground">Quota unavailable in this snapshot.</p>}
+                        {sentinelData.pools.filter(p => p.provider === provider).map(p => (
                           <div key={p.pool} className="space-y-1 text-sm">
                             <div className="flex justify-between gap-3">
-                              <span>{p.pool}</span>
+                              <span>{p.pool === "session" ? "Session" : p.pool === "weekly" ? "Weekly" : p.pool.replace(":5h", " · 5-hour").replace(":weekly", " · weekly")}</span>
                               <span className="tabular-nums">{p.usedPercent == null ? "Unknown" : `${quotaPct(p.usedPercent)}% used`}</span>
                             </div>
                             <div className="h-2 rounded bg-muted overflow-hidden">
@@ -1152,6 +1153,14 @@ export function Costs({
                       : "Expiry unknown"}
                     {" · Manual redemption only; Paperclip never redeems automatically"}
                   </div>
+                  {sentinelData.bankedReset.checkpointTargetPercent != null && (
+                    <div className="text-xs text-muted-foreground">
+                      12-hour checkpoint: {sentinelData.bankedReset.checkpointTargetPercent}% target
+                      {sentinelData.bankedReset.checkpointAt && !Number.isNaN(Date.parse(sentinelData.bankedReset.checkpointAt)) ? ` by ${new Date(sentinelData.bankedReset.checkpointAt).toLocaleString("en-US", { timeZone: "America/Los_Angeles", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", timeZoneName: "short" })}` : ""}
+                      {sentinelData.bankedReset.checkpointPtsPerHour != null ? ` · ${sentinelData.bankedReset.checkpointPtsPerHour} pts/h needed` : ""}
+                      {sentinelData.bankedReset.deadlinePtsPerHour != null ? ` · ${sentinelData.bankedReset.deadlinePtsPerHour} pts/h by deadline` : ""}
+                    </div>
+                  )}
                 </div>
               )}
             </CardContent>

@@ -399,6 +399,10 @@ export function costRoutes(
         expiresAt: typeof credit.expires_at === "string" ? credit.expires_at : null,
         ordinaryResetAt: typeof credit.ordinary_reset_at === "string" ? credit.ordinary_reset_at : null,
         redeemNoLaterThan: typeof credit.redeem_no_later_than === "string" ? credit.redeem_no_later_than : null,
+        checkpointAt: typeof credit.twelve_hour_checkpoint === "string" ? credit.twelve_hour_checkpoint : null,
+        checkpointTargetPercent: typeof credit.target_pct_at_checkpoint === "number" && Number.isFinite(credit.target_pct_at_checkpoint) ? credit.target_pct_at_checkpoint : null,
+        checkpointPtsPerHour: typeof credit.twelve_hour_target_pts_per_hour === "number" && Number.isFinite(credit.twelve_hour_target_pts_per_hour) ? credit.twelve_hour_target_pts_per_hour : null,
+        deadlinePtsPerHour: typeof credit.required_pts_per_hour_by_deadline === "number" && Number.isFinite(credit.required_pts_per_hour_by_deadline) ? credit.required_pts_per_hour_by_deadline : null,
         automaticRedemption: false,
       };
       // Credit offers are independently sourced and *not* regular plan usage.
