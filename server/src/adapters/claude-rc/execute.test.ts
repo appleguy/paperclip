@@ -128,3 +128,12 @@ describe("seatConversation (SCO-866)", () => {
     expect(await seatConversation("tensor64-lead", "/elsewhere", dir)).toBeNull();
   });
 });
+
+describe("paneCwdDiffers (SCO-693)", () => {
+  it("flags a different folder and ignores an equal or unknown one", async () => {
+    const { paneCwdDiffers } = await import("./execute.js");
+    expect(await paneCwdDiffers("/Volumes/NVM/Paperclip/workspaces/claude-rc", "/Volumes/NVM/Paperclip/workspaces/platform-lead")).toBe(true);
+    expect(await paneCwdDiffers("/Volumes/NVM/Paperclip/workspaces/platform-lead", "/Volumes/NVM/Paperclip/workspaces/platform-lead/")).toBe(false);
+    expect(await paneCwdDiffers("", "/x")).toBe(false);
+  });
+});
