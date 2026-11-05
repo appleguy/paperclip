@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { isAbsolute } from "node:path";
 import { agentSessionGoalActions, agentTaskSessions, connectionGrants, environmentLeases, heartbeatRuns, issues, nativeRunFinalizations, toolConnections, type Db } from "@paperclipai/db";
-import { and, eq, gt, isNull, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, isNull, or, sql } from "drizzle-orm";
 import { assertCodexNativeDelegation } from "./codex-native-delegation.js";
 import { activateCodexSharedObservation, authorizeReservedCodexGoalWrite, beginCodexManagedThreadBootstrap, beginCodexSharedObservation, completeCodexManagedThreadBootstrap, preflightCodexManagedThreadBootstrap, type CodexSharedGoalBinding } from "./codex-shared-goal-authority.js";
 import { inspectCodexSharedDaemon } from "./codex-shared-daemon.js";
@@ -92,8 +92,10 @@ export async function claimRegisteredCodexSharedOption(input:{db:Db;companyId:st
     const [run]=await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id,input.runId),eq(heartbeatRuns.companyId,input.companyId),eq(heartbeatRuns.agentId,input.agentId),eq(heartbeatRuns.nativeIssueId,input.issueId),eq(heartbeatRuns.nativeSessionId,input.normalizedSessionId),eq(heartbeatRuns.runnerInstanceId,input.runnerInstanceId),eq(heartbeatRuns.status,"running"),eq(heartbeatRuns.runtimeMode,"native"))).for("update",{noWait:true}).limit(1);
     const [issue]=await tx.select().from(issues).where(and(eq(issues.id,input.issueId),eq(issues.companyId,input.companyId),eq(issues.executionRunId,input.runId),eq(issues.checkoutRunId,input.runId),eq(issues.assigneeAgentId,input.agentId),eq(issues.status,"in_progress"))).for("update",{noWait:true}).limit(1);
     if (!run || !issue?.projectId || !issue.goalId) throw new Error("codex_shared_issue_mismatch");
-    const resources=await tx.select().from(environmentLeases).where(and(eq(environmentLeases.companyId,input.companyId),eq(environmentLeases.heartbeatRunId,input.runId),eq(environmentLeases.issueId,input.issueId),eq(environmentLeases.executionWorkspaceId,input.executionWorkspaceId),eq(environmentLeases.status,"active"),or(isNull(environmentLeases.expiresAt),gt(environmentLeases.expiresAt,sql`clock_timestamp()`)))).for("update",{noWait:true}).limit(2);
-    if (resources.length!==1) throw new Error("codex_shared_resource_lease_lost");
+    const resources=await tx.select().from(environmentLeases).where(and(eq(environmentLeases.companyId,input.companyId),eq(environmentLeases.heartbeatRunId,input.runId),eq(environmentLeases.issueId,input.issueId),eq(environmentLeases.executionWorkspaceId,input.executionWorkspaceId),eq(environmentLeases.status,"active"),or(isNull(environmentLeases.expiresAt),gt(environmentLeases.expiresAt,sql`clock_timestamp()`)))).for("update",{noWait:true}).orderBy(desc(environmentLeases.createdAt)).limit(8);
+    // A failed first attempt (session.open) leaves its lease active and the same-run resume takes a second one (SCO-893): keep the newest, release the rest.
+    for (const stale of resources.slice(1)) await tx.update(environmentLeases).set({status:"released",releasedAt:sql`clock_timestamp()`}).where(and(eq(environmentLeases.id,stale.id),eq(environmentLeases.status,"active")));
+    if (resources.length<1) throw new Error("codex_shared_resource_lease_lost");
     const [selected]=await tx.select({config:toolConnections.config}).from(connectionGrants).innerJoin(toolConnections,eq(connectionGrants.connectionId,toolConnections.id)).where(and(eq(connectionGrants.id,input.delegationGrantId),eq(connectionGrants.companyId,input.companyId),eq(toolConnections.companyId,input.companyId))).limit(1);
     const revision=record(selected?.config.codexNativeDelegation).revision;
     if (typeof revision!=="string") throw new Error("codex_delegation_unavailable");
