@@ -979,6 +979,8 @@ const openCodeLocalAdapter: ServerAdapterModule = {
   models: openCodeModels,
   sessionManagement: getAdapterSessionManagement("opencode_local") ?? undefined,
   supportsToolRefreshOnResume: true,
+  // NAR keeps one OpenCode session per agent and issue and rejoins its in-flight message.
+  supportsRestartReattach: (config) => config.nativeRuntime === "nar",
   listModels: listOpenCodeModels,
   supportsLocalAgentJwt: true,
   supportsInstructionsBundle: true,

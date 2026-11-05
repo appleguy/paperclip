@@ -35,6 +35,8 @@ export const claudeRcAdapter: ServerAdapterModule = {
     { id: "claude-sonnet-5-5", label: "Claude Sonnet via shared Remote Control session" },
     { id: "claude-haiku-5-5", label: "Claude Haiku via shared Remote Control session" },
   ],
+  // The tmux session outlives the server; execute() adopts active.json without re-dispatch.
+  supportsRestartReattach: true,
   supportsLocalAgentJwt: true,
   supportsInstructionsBundle: true,
   instructionsPathKey: "instructionsFilePath",

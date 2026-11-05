@@ -4436,6 +4436,69 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("re-enters a restart-reattachable legacy run under the same run id", async () => {
+    const { runId } = await seedRunFixture({
+      adapterType: "claude_rc_local",
+      agentStatus: "running",
+      processPid: null,
+      processGroupId: null,
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ controllerBootId: "00000000-0000-4000-8000-00000000b007", executionStage: "dispatching" })
+      .where(eq(heartbeatRuns.id, runId));
+
+    await withTempPaperclipHome(async () => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "reattach-version",
+        requestedAt: new Date("2026-08-01T00:05:00.000Z"),
+      });
+      const heartbeat = heartbeatService(db);
+      await heartbeat.prepareHotRestartShutdown("SIGTERM", new Date("2026-08-01T00:06:00.000Z"));
+
+      const adoption = await heartbeat.reconcileHotRestartAdoption(new Date("2026-08-01T00:07:00.000Z"));
+      expect(adoption).toMatchObject({ mode: "reported", adoptedRunIds: [runId], lostRunIds: [], skippedRunIds: [] });
+
+      await vi.waitFor(async () => {
+        const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0]);
+        expect(run?.status).toBe("succeeded");
+      }, { timeout: 10_000 });
+      expect(mockAdapterExecute).toHaveBeenCalledOnce();
+      expect(mockAdapterExecute.mock.calls[0]?.[0]).toMatchObject({ runId });
+      const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0]);
+      const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
+      expect(events.map((event) => event.message)).toContain("Re-entering run after hot restart; the adapter rejoins its provider work");
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, run!.agentId))).toHaveLength(1);
+    });
+  });
+
+  it("stops re-entering a legacy run after the restart reattach budget", async () => {
+    const { runId } = await seedRunFixture({
+      adapterType: "claude_rc_local",
+      agentStatus: "running",
+      processPid: null,
+      processGroupId: null,
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ controllerBootId: "00000000-0000-4000-8000-00000000b007", resultJson: { restartReattach: { count: 5 } } })
+      .where(eq(heartbeatRuns.id, runId));
+
+    await withTempPaperclipHome(async () => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "reattach-budget-version",
+        requestedAt: new Date("2026-08-01T00:05:00.000Z"),
+      });
+      const heartbeat = heartbeatService(db);
+      await heartbeat.prepareHotRestartShutdown("SIGTERM", new Date("2026-08-01T00:06:00.000Z"));
+      const adoption = await heartbeat.reconcileHotRestartAdoption(new Date("2026-08-01T00:07:00.000Z"));
+      expect(adoption).toMatchObject({ mode: "reported", adoptedRunIds: [], skippedRunIds: [runId] });
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+    });
+  });
+
   it("reports preflight live runs as lost when the shutdown snapshot is missing", async () => {
     const { runId } = await seedRunFixture({
       agentStatus: "running",

@@ -519,6 +519,13 @@ export interface ServerAdapterModule {
   sessionManagement?: import("./session-compaction.js").AdapterSessionManagement;
   /** Selected harness can resume its conversation with this run's tool bindings. */
   supportsToolRefreshOnResume?: boolean | ((config: Record<string, unknown>) => boolean);
+  /**
+   * Provider work outlives the server process, and calling execute() again with
+   * the same run id rejoins that work without resending the prompt. A hot
+   * restart then re-enters a still-running legacy run under the same id instead
+   * of reaping it.
+   */
+  supportsRestartReattach?: boolean | ((config: Record<string, unknown>) => boolean);
   supportsLocalAgentJwt?: boolean;
   /** How this adapter receives Paperclip's run-scoped control tools. */
   runtimeToolDelivery?: AdapterRuntimeToolDelivery;

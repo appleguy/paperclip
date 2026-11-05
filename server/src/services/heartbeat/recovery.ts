@@ -76,7 +76,7 @@ import {
   reconcileNativeFinalizations,
   reconcileRetainedNativeSessionCleanup,
 } from "../native-runtime/index.js";
-import { runningProcesses } from "../../adapters/index.js";
+import { findServerAdapter, runningProcesses } from "../../adapters/index.js";
 import { parseObject } from "../../adapters/utils.js";
 import {
   isNativeRunnerOwnershipHeld,
@@ -290,6 +290,16 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
 
 function isTrackedLocalChildProcessAdapter(adapterType: string) {
   return SESSIONED_LOCAL_ADAPTERS.has(adapterType);
+}
+
+// Bounds re-entry of one run across consecutive hot restarts.
+const MAX_RESTART_REATTACHES = 5;
+
+function supportsRestartReattach(adapterType: string, adapterConfig: unknown) {
+  const capability = findServerAdapter(adapterType)?.supportsRestartReattach;
+  return typeof capability === "function"
+    ? capability(parseObject(adapterConfig))
+    : capability === true;
 }
 
 // A positive liveness check means some process currently owns the PID.
@@ -700,6 +710,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
             .select({
               run: heartbeatRuns,
               adapterType: agents.adapterType,
+              adapterConfig: agents.adapterConfig,
             })
             .from(heartbeatRuns)
             .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
@@ -712,6 +723,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     const finalizedWhileDownRunIds: string[] = [];
     const lostRunIds: string[] = [];
     const skippedRunIds: string[] = [];
+    const reattachRunIds: string[] = [];
 
     const classify = (
       candidate: HotRestartIntentRun,
@@ -805,6 +817,64 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
 
       if (run.runtimeMode === "native" && adapterType === "paperclip_runner") {
         classify(candidate, "skipped", "native_restart_recovery_owned", patch);
+        continue;
+      }
+
+      if (run.runtimeMode === "legacy" && supportsRestartReattach(adapterType, current.adapterConfig)) {
+        const prior = parseObject(parseObject(run.resultJson).restartReattach);
+        const count = typeof prior.count === "number" ? prior.count : 0;
+        if (count >= MAX_RESTART_REATTACHES) {
+          classify(candidate, "skipped", "restart_reattach_budget_exhausted", patch);
+          continue;
+        }
+        // Take the controller from the previous boot in one guarded write; the
+        // lease watcher in executeRun renews it from here.
+        const claimed = await db
+          .update(heartbeatRuns)
+          .set({
+            controllerBootId: legacyControllerBootId,
+            controllerLeaseExpiresAt: sql`clock_timestamp() + interval '60 seconds'`,
+            executionStage: "preparing",
+            resultJson: preserveWorkspaceRestoreRecoveryMetadataSql({
+              ...parseObject(run.resultJson),
+              restartReattach: {
+                count: count + 1,
+                at: now.toISOString(),
+                previousServerPid: intent.previousServerPid,
+                newServerPid: process.pid,
+              },
+            }, true),
+            updatedAt: now,
+          })
+          .where(and(
+            eq(heartbeatRuns.id, run.id),
+            eq(heartbeatRuns.status, "running"),
+            eq(heartbeatRuns.runtimeMode, "legacy"),
+            run.controllerBootId === null
+              ? isNull(heartbeatRuns.controllerBootId)
+              : eq(heartbeatRuns.controllerBootId, run.controllerBootId),
+          ))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!claimed) {
+          classify(candidate, "lost", "restart_reattach_claim_not_applied", patch);
+          continue;
+        }
+        await appendRunEvent(claimed, {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "info",
+          message: "Re-entering run after hot restart; the adapter rejoins its provider work",
+          payload: {
+            previousServerPid: intent.previousServerPid,
+            newServerPid: process.pid,
+            previousServerVersion: intent.previousServerVersion,
+            newServerVersion: serverVersion,
+            reattach: count + 1,
+          },
+        });
+        reattachRunIds.push(run.id);
+        classify(candidate, "adopted", "adapter_restart_reattach", patch);
         continue;
       }
 
@@ -931,6 +1001,14 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       runs: reportRuns,
     });
     await removeHotRestartIntent(undefined, intent);
+
+    for (const runId of reattachRunIds) {
+      const execution = executeRun(runId).catch((error) => {
+        logger.error({ err: error, runId }, "hot-restart reattach execution failed");
+      });
+      activeRunExecutionPromises.add(execution);
+      void execution.finally(() => activeRunExecutionPromises.delete(execution));
+    }
 
     logger.info(
       {
