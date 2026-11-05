@@ -48,7 +48,7 @@ export async function makeClient(options = {}) {
   const store = await readJson(process.env.PAPERCLIP_AUTH_STORE || path.join(home, "auth.json"));
   const token = store.credentials?.[base.replace(/\/+$/, "")]?.token;
   ensure(typeof token === "string" && token.length > 12, "missing existing instance-admin CLI credential");
-  const localUrl = options.baseUrl || "http://127.0.0.1:3100";
+  const localUrl = options.baseUrl || process.env.PAPERCLIP_DEPLOY_API_BASE || "http://127.0.0.1:3100";
   ensure(/^http:\/\/127\.0\.0\.1:[1-9][0-9]{1,4}$/.test(localUrl), "Paperclip API must be loopback");
   return {
     companyId: profile?.companyId,

@@ -281,12 +281,13 @@ describe("owned session pause lifecycle", () => {
 });
 
 describe("installed deploy shell contract", () => {
-  it("orders admission, bounded wait, owned interrupt, restart, health and completion", async () => {
+  it("coalesces under the lock before choosing hot, rolling or legacy replacement", async () => {
     const source = await fs.readFile(new URL("./pc-deploy.sh", import.meta.url), "utf8");
     const markers = [
       'node "$helper" verified "$sha"',
-      'node "$helper" begin "$manifest"', 'node "$helper" wait "$manifest" 0',
-      'node "$helper" pause "$manifest"', 'node "$helper" verify "$manifest"',
+      'node "$hot_helper" plan "$sha" || hot_rc=$?',
+      'node "$helper" begin "$manifest"',
+      'if "$handoff" handoff "$sha" "$original"',
       'launchctl kickstart -k', 'node "$helper" finish "$manifest" "$sha"',
     ];
     let previous = -1;
@@ -300,8 +301,8 @@ describe("installed deploy shell contract", () => {
     assert.match(source, /-x -w 600 -E 76/);
     // Owner 2026-11-03: a deploy never holds on a stuck process or refuses on unprovable work.
     assert.match(source, /killing stuck holder/);
-    assert.match(source, /bounded 120 node "\$helper" pause/);
-    assert.match(source, /bounded 60 node "\$helper" verify/);
+    assert.match(source, /PAPERCLIP_DEPLOY_API_BASE=\$\("\$handoff" endpoint\)/);
+    assert.doesNotMatch(source, /node "\$helper" (pause|wait|verify) "\$manifest"/);
     assert.doesNotMatch(source, /refusing restart|-w 2700|verify "\$manifest" \|\| exit/);
     assert.doesNotMatch(source, /poll_health|curl -fsS|helper" pace|wait "\$manifest" [1-9]/);
     assert.match(source, /helper" finish "\$manifest" "\$sha"/);

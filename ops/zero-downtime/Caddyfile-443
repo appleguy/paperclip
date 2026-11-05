@@ -1,0 +1,61 @@
+{
+	admin off
+	auto_https off
+}
+
+(paperclip_pool) {
+	lb_policy first
+	health_uri /api/health
+	health_body `"status"\s*:\s*"ok"`
+	health_interval 1s
+	health_timeout 2s
+	fail_duration 2s
+	max_fails 1
+	lb_try_duration 30s
+	lb_try_interval 100ms
+}
+
+https://10.0.1.100, https://mac.local, https://Scotts-Mac-Pro.local {
+	bind 10.0.1.100 10.0.1.133
+	tls /Volumes/NVM/Paperclip/ops/https/private/certs/paperclip-lan.pem /Volumes/NVM/Paperclip/ops/https/private/certs/paperclip-lan-key.pem
+	encode gzip
+	redir /optloop /optloop/ 308
+	redir /hf-review /hf-review/ 308
+	redir /asks/ /asks 308
+	handle /asks {
+		root * /Volumes/NVM/Paperclip/ops/owner-asks/site
+		rewrite * /index.html
+		header Cache-Control no-cache
+		file_server
+	}
+	handle /dashboard {
+		rewrite * /dashboard.html
+		reverse_proxy 127.0.0.1:3100 127.0.0.1:3101 {
+			import paperclip_pool
+			header_up Host Scotts-Mac-Pro.local
+			header_up X-Forwarded-Host Scotts-Mac-Pro.local
+			header_up Origin ^https://mac\.local$ https://Scotts-Mac-Pro.local
+			header_up Referer ^https://mac\.local/ https://Scotts-Mac-Pro.local/
+		}
+	}
+	handle /hf-review/* {
+		reverse_proxy 127.0.0.1:18090
+	}
+	handle_path /optloop/* {
+		reverse_proxy https://10.0.1.100:3139 {
+			transport http {
+				tls_trust_pool file /Volumes/NVM/Paperclip/ops/https/private/ca/rootCA.pem
+			}
+		}
+	}
+	handle {
+		reverse_proxy 127.0.0.1:3100 127.0.0.1:3101 {
+			import paperclip_pool
+			header_up Host Scotts-Mac-Pro.local
+			header_up X-Forwarded-Host Scotts-Mac-Pro.local
+			header_up Origin ^https://mac\.local$ https://Scotts-Mac-Pro.local
+			header_up Referer ^https://mac\.local/ https://Scotts-Mac-Pro.local/
+		}
+	}
+	header X-Content-Type-Options nosniff
+}
