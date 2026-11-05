@@ -1,6 +1,9 @@
 export {
   createDb,
   withDedicatedDbConnection,
+  acquireSessionAdvisoryLock,
+  type SessionAdvisoryLock,
+  type SessionAdvisoryLockOptions,
   livenessDb,
   closeLivenessDb,
   checkpointDb,

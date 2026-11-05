@@ -342,6 +342,80 @@ export async function closeFileStorageDb(db: Db, timeoutSeconds: number): Promis
   await fileStorageDbs.get(db)?.$client.end({ timeout: timeoutSeconds });
 }
 
+export interface SessionAdvisoryLock {
+  /** Releases the lock and its connection. Safe to call more than once. */
+  release(): Promise<void>;
+}
+
+export interface SessionAdvisoryLockOptions {
+  /** Delay between failed try-lock attempts. Default 1000 ms. */
+  retryMs?: number;
+  /** Interval of the connection check while the lock is held. Default 5000 ms. */
+  heldCheckMs?: number;
+  /** Aborts the wait for the lock; the call rejects with the signal's reason. */
+  signal?: AbortSignal;
+  /** Called once if the holding connection dies, which releases the lock. */
+  onLost?: (err: unknown) => void;
+}
+
+/**
+ * Waits for a named PostgreSQL session advisory lock and holds it on a private
+ * connection until `release()` or until that connection ends. A crashed holder
+ * therefore frees the lock without any lease expiry. The waiter polls with
+ * try-lock (as the migration lock does) so it never sits in a blocked statement.
+ */
+export async function acquireSessionAdvisoryLock(
+  db: Db,
+  name: string,
+  options: SessionAdvisoryLockOptions = {},
+): Promise<SessionAdvisoryLock> {
+  const factory = dedicatedDbFactories.get(db);
+  if (!factory) throw new Error("session_advisory_lock_requires_create_db");
+  const retryMs = options.retryMs ?? 1000;
+  const heldCheckMs = options.heldCheckMs ?? 5000;
+  const dedicated = factory();
+  // A reserved connection is exempt from pool idle and lifetime rotation, which
+  // would otherwise drop a session lock silently.
+  const sql = await dedicated.$client.reserve();
+  let released = false;
+  let timer: ReturnType<typeof setInterval> | null = null;
+  const release = async () => {
+    if (released) return;
+    released = true;
+    if (timer) clearInterval(timer);
+    try { await sql`SELECT pg_advisory_unlock(hashtextextended(${name}, 0))`; } catch { /* session ended: already released */ }
+    try { sql.release(); } catch { /* connection already gone */ }
+    await dedicated.$client.end({ timeout: 1 }).catch(() => undefined);
+  };
+  try {
+    while (!(await sql<{ locked: boolean }[]>`
+      SELECT pg_try_advisory_lock(hashtextextended(${name}, 0)) AS locked`)[0]?.locked) {
+      if (options.signal?.aborted) throw options.signal.reason ?? new Error("session_advisory_lock_aborted");
+      await new Promise<void>((resolve) => {
+        const wake = setTimeout(done, retryMs);
+        const onAbort = () => { clearTimeout(wake); done(); };
+        function done() { options.signal?.removeEventListener("abort", onAbort); resolve(); }
+        options.signal?.addEventListener("abort", onAbort, { once: true });
+      });
+      if (options.signal?.aborted) throw options.signal.reason ?? new Error("session_advisory_lock_aborted");
+    }
+  } catch (err) {
+    await release();
+    throw err;
+  }
+  timer = setInterval(() => {
+    void sql`SELECT 1`.catch((err) => {
+      if (released) return;
+      released = true;
+      if (timer) clearInterval(timer);
+      void dedicated.$client.end({ timeout: 1 }).catch(() => undefined);
+      options.onLost?.(err);
+    });
+  }, heldCheckMs);
+  timer.unref?.();
+  return { release };
+}
+
 export function createDb(url: string, options?: DatabaseClientOptions) {
   const resolved = resolveDatabaseClientOptions(options ?? databaseClientOptionsFromEnv());
   return createDbClient(url, resolved);
