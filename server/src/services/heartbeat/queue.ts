@@ -1023,6 +1023,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           },
           "claimQueuedRun: withheld queued run at the execution gate",
         );
+        // SCO-940: a withheld stale retry must not leave its seat parked in `error`.
+        if (staleness.outcome === "cancelled") await finalizeAgentStatus(run.agentId, "cancelled");
         return null;
       }
     }

@@ -1354,6 +1354,10 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     // Setup code before adapter.execute threw (e.g. ensureRuntimeState, resolveWorkspaceForRun).
     // The inner catch did not fire, so we must record the failure here.
     const providerFailure = providerFailureFromError(outerErr);
+    // SCO-940: a duplicate dispatch of one reservation generation means the
+    // first dispatch owns the work; the loser must not park the seat in error.
+    const duplicateDispatchConflict = !providerDispatchStarted && outerErr instanceof Error
+      && /Provider dispatch (already admitted this reservation generation|has already reserved this run)/.test(outerErr.message);
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
     const message = redactCurrentUserText(
       identityRedactor.redact(outerErr instanceof Error
@@ -1610,7 +1614,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         // Keep the failed run and its safe provider refusal authoritative,
         // but return the agent to idle so clients do not also announce a
         // misleading agent-wide error for the same rejected chat turn.
-        keepIdleOnFailure: Boolean(nonRetryablePreflightCode) || controllerLeaseLost,
+        keepIdleOnFailure: Boolean(nonRetryablePreflightCode) || controllerLeaseLost || duplicateDispatchConflict,
       }).catch(() => undefined);
     }
   }
