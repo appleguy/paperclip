@@ -1754,11 +1754,13 @@ export function agentRoutes(
     if (!executionRun || (executionRun.status !== "queued" && executionRun.status !== "running")) {
       return {
         status: "skipped" as const,
-        reason: "wakeup_skipped",
-        message: "Wakeup was skipped.",
+        reason: "stale_execution_lock",
+        message: executionRun
+          ? `Wakeup was skipped: the issue still points at run ${executionRun.id} (${executionRun.status}, agent ${executionRun.agentId}) that is no longer active. Reconcile or clear that execution before waking.`
+          : `Wakeup was skipped: the issue points at missing run ${issue.executionRunId}. Reconcile or clear that execution before waking.`,
         issueId,
         executionRunId: issue.executionRunId,
-        executionAgentId: null,
+        executionAgentId: executionRun?.agentId ?? null,
         executionAgentName: null,
       };
     }
