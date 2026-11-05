@@ -22,11 +22,12 @@ import { applyCostCorrectionInTransaction } from "./accounting-corrections.js";
 import { logActivity, type ActivityPublication } from "./activity-log.js";
 import { createCostEventInTransaction } from "./costs.js";
 import { queueBudgetEvaluation } from "./budget-evaluation-work.js";
+import { runUsageMetadataSchema } from "./run-usage.js";
 
 const token = z.number().int().nonnegative().max(2_147_483_647);
 const price = z.number().finite().nonnegative().nullable().optional();
 const usage = z.object({ inputTokens: token, outputTokens: token, cachedInputTokens: token.optional(), cacheWriteTokens: token.optional(), peakContextTokens: token.optional() });
-const checkpointSchema = z.object({
+const checkpointSchema = runUsageMetadataSchema.extend({
   attemptId: z.string().uuid().optional(), usage: usage.optional(),
   usageByModel: z.array(z.object({ model: z.string().min(1).max(250), usage, costUsd: z.number().finite().nonnegative() })).max(500).optional(),
   usageBasis: z.enum(["per_run", "session_cumulative"]).nullable().optional(),
@@ -200,7 +201,7 @@ export async function persistUsageReceiptInTransaction(tx: Db, raw: UsageReceipt
   await tx.update(heartbeatRuns).set({
     costAccountingPending: true,
     accountingLastError: previous.accountingCaptureFailed === true ? "usage_capture_failed" : null,
-    usageJson: { ...previous, ...receipt.usage,
+    usageJson: { ...previous, ...receipt.usage, ...runUsageMetadataSchema.parse(receipt),
       provider: receipt.provider ?? "unknown", biller: receipt.biller ?? receipt.provider ?? "unknown", model: receipt.model ?? "unknown", billingType,
       costUsd: receipt.costUsd ?? null, costUsdExact: receipt.costUsdExact ?? null, cacheAdjustedCostUsd: receipt.cacheAdjustedCostUsd ?? null,
       usageByModel: receipt.usageByModel ?? null, usageSource: receipt.usageBasis ?? "per_run", providerRequestId: receipt.providerRequestId ?? null,
@@ -701,7 +702,7 @@ export async function createRunUsageRecorder(db: Db, input: { companyId: string;
         const finalPrice = final.cacheAdjustedCostUsd ?? final.costUsdExact ?? final.costUsd;
         const previousPrice = previous.cacheAdjustedCostUsd ?? previous.costUsdExact ?? previous.costUsd;
         const moreCost = finalPrice != null && (previousPrice == null || usdToUnits(finalPrice) > usdToUnits(previousPrice));
-        if (!moreTokens && !moreCost) return capture(previous);
+        if (!moreTokens && !moreCost) return capture({ ...previous, ...runUsageMetadataSchema.parse(final) });
       }
       return capture(final);
     }),
@@ -731,6 +732,7 @@ const producerAccountingProjectionFields = [
   "inputTokens", "outputTokens", "cachedInputTokens", "cacheWriteTokens",
   "provider", "biller", "model", "billingType", "usageSource", "providerRequestId", "usageByModel",
   "costUsd", "costUsdExact", "cacheAdjustedCostUsd", "costStatus", "pricingProvenance", "budgetExposure",
+  "quota_pct_before", "quota_pct_after", "window_id", "window_id_before", "window_id_after", "quota_window_rollover", "effort",
 ];
 
 export function preserveAcceptedRunUsageProjectionSql(patch: Record<string, unknown>) {

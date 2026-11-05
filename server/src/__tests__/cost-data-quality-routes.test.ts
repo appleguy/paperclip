@@ -5,7 +5,8 @@ import type { Db } from "@paperclipai/db";
 import { costRoutes } from "../routes/costs.js";
 import { errorHandler } from "../middleware/error-handler.js";
 
-const mocks = vi.hoisted(() => ({ report: vi.fn(), retry: vi.fn(), decide: vi.fn(), canManage: vi.fn() }));
+const mocks = vi.hoisted(() => ({ report: vi.fn(), retry: vi.fn(), decide: vi.fn(), canManage: vi.fn(), runUsage: vi.fn() }));
+vi.mock("../services/run-usage.js", () => ({ listRunUsage: mocks.runUsage }));
 vi.mock("../services/cost-data-quality.js", () => ({ costDataQualityReport: mocks.report }));
 vi.mock("../routes/ai-connections.js", () => ({ canManageAiConnections: mocks.canManage }));
 vi.mock("../services/index.js", () => ({
@@ -30,6 +31,25 @@ beforeEach(() => {
   mocks.report.mockResolvedValue({ events: [], runs: [] }); mocks.retry.mockResolvedValue({ accounted: false });
 });
 describe("cost details and accounting retry authorization", () => {
+  it("returns quota and effort per run using the existing company cost visibility boundary", async () => {
+    const rows = [{ runId, inputTokens: 80, quota_pct_before: 12.5, quota_pct_after: 14, window_id: "1800000000", effort: "xhigh" }];
+    mocks.runUsage.mockResolvedValue(rows);
+    for (const actor of [app(), app("board", "viewer"), app("agent")]) {
+      const response = await request(actor).get(`${path}/by-run?period=all&limit=25`);
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual(rows);
+      expect(mocks.runUsage).toHaveBeenLastCalledWith(expect.anything(), companyId, { allTime: true }, 25);
+    }
+  });
+  it("rejects foreign companies, denied visibility and malformed ranges/limits before reading run usage", async () => {
+    expect((await request(app()).get("/api/companies/other/costs/by-run")).status).toBe(403);
+    for (const query of ["from=invalid", "limit=0", "limit=501", "limit=1.5", "period=all&from=2026-10-01"]) {
+      expect((await request(app()).get(`${path}/by-run?${query}`)).status).toBe(400);
+    }
+    mocks.decide.mockResolvedValue({ allowed: false });
+    expect((await request(app("agent")).get(`${path}/by-run`)).status).toBe(403);
+    expect(mocks.runUsage).not.toHaveBeenCalled();
+  });
   it("allows cost readers, makes viewers read-only, and does not query connection-management permissions", async () => {
     expect((await request(app()).get(`${path}/data-quality?period=all`)).status).toBe(200);
     expect(mocks.report).toHaveBeenLastCalledWith(expect.anything(), companyId, true, { allTime: true });

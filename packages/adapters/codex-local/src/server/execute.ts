@@ -117,6 +117,7 @@ import {
   resolveCodexExecutionEngineForRun,
 } from "./acp.js";
 import { codexShellEnvironmentKeys } from "@paperclipai/adapter-utils/codex-shell-environment";
+import { withCodexRunQuota } from "./run-quota.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const executeCodexAcp = createCodexAcpExecutor();
@@ -580,6 +581,10 @@ export async function ensureCodexSkillsInjected(
 import { codexRemoteControlViolation, codexRcDaemonDownReason } from "./rc-guard.js";
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  return withCodexRunQuota(ctx, executeCodex);
+}
+
+async function executeCodex(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const providerStop = createProviderStoppedBoundary(ctx.onProviderStopped);
   const rcFailure = codexRemoteControlViolation(ctx.config) ?? codexRcDaemonDownReason();
   if (rcFailure) {

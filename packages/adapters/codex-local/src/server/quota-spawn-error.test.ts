@@ -17,7 +17,7 @@ vi.mock("node:child_process", async (importOriginal) => {
   };
 });
 
-import { fetchCodexQuota, fetchCodexRpcQuota, getQuotaWindows } from "./quota.js";
+import { fetchCodexQuota, fetchCodexRateLimits, fetchCodexRpcQuota, getQuotaWindows } from "./quota.js";
 
 function createChildThatErrorsOnMicrotask(err: Error): ChildProcess {
   const child = new EventEmitter() as ChildProcess;
@@ -114,6 +114,29 @@ describe("CodexRpcClient spawn failures", () => {
     expect(stdin.end).toHaveBeenCalledOnce();
     expect(kill).toHaveBeenCalledWith("SIGTERM");
     expect(kill).not.toHaveBeenCalledWith("SIGKILL");
+  });
+
+  it("reads raw reset IDs using the run's executable, home and working directory", async () => {
+    const raw = { rateLimits: { secondary: { usedPercent: 12.5, resetsAt: 1_800_000_000, windowDurationMins: 10_080 } } };
+    const { child, stdin, kill } = createRpcChild(request => ({ id: request.id,
+      result: request.method === "account/rateLimits/read" ? raw : {} }));
+    mockSpawn.mockReturnValue(child);
+    const env = { CODEX_HOME: "/fixture/selected-account" };
+    expect(await fetchCodexRateLimits({ command: "/fixture/codex", env, cwd: "/fixture/workspace", timeoutMs: 100 })).toEqual(raw);
+    expect(mockSpawn).toHaveBeenCalledWith("/fixture/codex", expect.any(Array), { stdio: ["pipe", "pipe", "pipe"], env, cwd: "/fixture/workspace" });
+    expect(stdin.write.mock.calls.map(([line]) => JSON.parse(line).method)).toEqual(["initialize", "initialized", "account/rateLimits/read"]);
+    expect(kill).toHaveBeenCalledWith("SIGTERM");
+  });
+
+  it("bounds a run probe with its configured deadline and closes the subprocess", async () => {
+    vi.useFakeTimers();
+    const { child, kill } = createRpcChild(() => undefined);
+    mockSpawn.mockReturnValue(child);
+    const result = expect(fetchCodexRateLimits({ timeoutMs: 100 })).rejects.toThrow("timed out on initialize");
+    await vi.advanceTimersByTimeAsync(100);
+    await result;
+    expect(kill).toHaveBeenCalledWith("SIGTERM");
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("rejects RPC error envelopes and preserves their authentication classification", async () => {

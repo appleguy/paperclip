@@ -1,0 +1,15 @@
+{
+  "before": { "rateLimits": { "primary": { "usedPercent": 90, "windowDurationMins": 300 }, "secondary": { "usedPercent": 12.5, "resetsAt": 1800000000, "windowDurationMins": 10080 } } },
+  "after": { "rateLimits": { "secondary": { "usedPercent": 14, "resetsAt": 1800000003, "windowDurationMins": 10080 } } },
+  "effort": "xhigh",
+  "usage": { "inputTokens": 80, "cachedInputTokens": 20, "outputTokens": 10 },
+  "expected": {
+    "quota_pct_before": 12.5,
+    "quota_pct_after": 14,
+    "window_id": "1800000000",
+    "window_id_before": "1800000000",
+    "window_id_after": "1800000003",
+    "quota_window_rollover": false,
+    "effort": "xhigh"
+  }
+}

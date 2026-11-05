@@ -471,14 +471,15 @@ type PendingRequest = {
   timer: NodeJS.Timeout;
 };
 
+export interface CodexQuotaProbeOptions {
+  command?: string;
+  env?: NodeJS.ProcessEnv;
+  cwd?: string;
+  timeoutMs?: number;
+}
+
 class CodexRpcClient {
-  private proc = spawn(
-    "codex",
-    // Only account-read RPCs are sent; no agent turn is started. Keep the
-    // read-only sandbox and use the approval policy supported by current CLIs.
-    ["-s", "read-only", "-a", "on-request", "app-server"],
-    { stdio: ["pipe", "pipe", "pipe"], env: process.env },
-  );
+  private proc;
 
   private nextId = 1;
   private buffer = "";
@@ -487,7 +488,11 @@ class CodexRpcClient {
   private failure: Error | null = null;
   private closed = false;
 
-  constructor() {
+  constructor(private options: CodexQuotaProbeOptions = {}) {
+    // Account reads only: this probe never starts a model turn. Run probes
+    // must use the selected credential home, rather than the server's login.
+    this.proc = spawn(options.command ?? "codex", ["-s", "read-only", "-a", "on-request", "app-server"],
+      { stdio: ["pipe", "pipe", "pipe"], env: options.env ?? process.env, ...(options.cwd ? { cwd: options.cwd } : {}) });
     this.proc.stdout.setEncoding("utf8");
     this.proc.stderr.setEncoding("utf8");
     this.proc.stdout.on("data", (chunk: string) => this.onStdout(chunk));
@@ -556,7 +561,7 @@ class CodexRpcClient {
     }
   }
 
-  private request(method: string, params: Record<string, unknown> = {}, timeoutMs = 6_000): Promise<Record<string, unknown>> {
+  private request(method: string, params: Record<string, unknown> = {}, timeoutMs = this.options.timeoutMs ?? 6_000): Promise<Record<string, unknown>> {
     if (this.failure) return Promise.reject(this.failure);
     const id = this.nextId++;
     const payload = JSON.stringify({ id, method, params }) + "\n";
@@ -630,6 +635,17 @@ class CodexRpcClient {
       const timer = setTimeout(done, RPC_SHUTDOWN_GRACE_MS);
       this.proc.once("close", done);
     });
+  }
+}
+
+/** Raw window durations and reset seconds are needed for per-run qcost epochs. */
+export async function fetchCodexRateLimits(options: CodexQuotaProbeOptions = {}): Promise<unknown> {
+  const client = new CodexRpcClient(options);
+  try {
+    await client.initialize();
+    return await client.fetchRateLimits();
+  } finally {
+    await client.shutdown();
   }
 }
 
