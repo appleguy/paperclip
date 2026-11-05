@@ -554,8 +554,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       conversationId = adopted.conversationId ?? null;
       // Does not consult/modify the inbox. Even an emitted-local or pending
       // op is UNKNOWN until a receipt. Never try to re-enqueue on restart.
-      await routeChannelInput((adopted as { op_id?: string }).op_id || adopted.runId, "", true, {
+      const adoptedOpId = (adopted as { op_id?: string }).op_id || adopted.runId;
+      await routeChannelInput(adoptedOpId, "", true, {
         ready: channel.ready, status: channel.status, submit: channel.submit,
+        ...((adopted as { dispatchMode?: string }).dispatchMode === "channel-pending"
+          ? { observe: () => channel.observeInput(adoptedOpId, receiptPath, ctx.signal) } : {}),
         fallback: async () => { throw new Error("adoption may never paste"); },
       });
       ctx.onDispatch?.();
@@ -697,6 +700,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       await ctx.onLog("stdout", `[claude-rc] Dispatching issue ${issueId} via MCP channel ${CHANNEL_NAME}; conversation ${conversationId}; receipt ${receiptPath}\n`);
       const mode = await routeChannelInput(ctx.runId, prompt, false, {
         ready: channel.ready, status: channel.status,
+        observe: () => channel.observeInput(ctx.runId, receiptPath, ctx.signal),
         submit: async (opId, input) => {
           await recordDispatchMode(activePath, active, "channel-pending");
           return channel.submit(opId, input);

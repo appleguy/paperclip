@@ -3,7 +3,7 @@
  * emission, while Paperclip submits through the bridge-ctl stdin control path.
  * A local write is NOT an acknowledgement: only the UserPromptSubmit hook is.
  */
-import { existsSync } from "node:fs";
+import { existsSync, watch, type FSWatcher } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -37,7 +37,64 @@ export type ChannelHost = {
   ready: () => Promise<boolean>;
   status: (opId: string) => Promise<ChannelStatus | null>;
   submit: (opId: string, prompt: string) => Promise<{ ok: boolean; error?: string }>;
+  observeInput: (opId: string, receiptPath: string, signal?: AbortSignal) => Promise<"hook" | "terminal">;
 };
+
+/** A submitted op belongs to the native channel queue, even across a long busy turn.
+ * Observe its existing hook/receipt lifecycle; never turn elapsed time into a new dispatch.
+ * Watch before inspecting so a Stop/receipt arriving during the read cannot be lost.
+ */
+export async function observeChannelInput(
+  dir: string, receiptPath: string, status: () => Promise<ChannelStatus | null>, signal?: AbortSignal,
+): Promise<"hook" | "terminal"> {
+  return new Promise((resolve, reject) => {
+    const watchers: FSWatcher[] = [];
+    let settled = false;
+    let checking = false;
+    let dirty = false;
+    const finish = (error?: unknown, result?: "hook" | "terminal") => {
+      if (settled) return;
+      settled = true;
+      watchers.forEach(watcher => watcher.close());
+      signal?.removeEventListener("abort", abort);
+      if (error) reject(error); else resolve(result!);
+    };
+    const abort = () => finish(new Error("Claude channel observation cancelled; pending op retained, no replay"));
+    const check = async () => {
+      if (settled) return;
+      dirty = true;
+      if (checking) return;
+      checking = true;
+      try {
+        while (dirty && !settled) {
+          dirty = false;
+          const current = await status();
+          if (current?.hook_observed) { finish(undefined, "hook"); break; }
+          // A terminal tool result or receipt is settlement evidence, not hook admission.
+          // The adapter still validates and settles it under the original run identity.
+          if (current?.stage === "terminal" || await fs.stat(receiptPath).then(() => true, error => {
+            if (error.code === "ENOENT") return false;
+            throw error;
+          })) { finish(undefined, "terminal"); break; }
+          if (current?.held_unknown_effect && current.stage !== "inbox_pending")
+            throw new Error("bridge op held in unknown-effect state; operator reconciliation required");
+        }
+      } catch (error) { finish(error); }
+      finally { checking = false; }
+    };
+    try {
+      for (const [folder, name] of [[dir, "ledger.jsonl"], [path.dirname(receiptPath), path.basename(receiptPath)]]) {
+        const watcher = watch(folder!, (_event, file) => {
+          if (file === null || file.toString() === name) void check();
+        });
+        watchers.push(watcher);
+        watcher.on("error", error => finish(error));
+      }
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) abort(); else void check();
+    } catch (error) { finish(error); }
+  });
+}
 
 function quoteShell(s: string): string {
   return "'" + s.replace(/'/g, "'\\''") + "'";
@@ -133,7 +190,7 @@ export async function prepareChannelHost(stateDir: string, installRoot: string):
     child.stdin.end(input ?? "");
   });
 
-  return {
+  const host: ChannelHost = {
     dir, root, mcpConfigPath, hookSettingsPath, control,
     ready: async () => {
       try {
@@ -166,7 +223,9 @@ export async function prepareChannelHost(stateDir: string, installRoot: string):
       }
       return response;
     },
+    observeInput: (opId, receiptPath, signal) => observeChannelInput(dir, receiptPath, () => host.status(opId), signal),
   };
+  return host;
 }
 
 export type ChannelIO = {
@@ -174,6 +233,7 @@ export type ChannelIO = {
   status(opId: string): Promise<ChannelStatus | null>;
   submit(opId: string, prompt: string): Promise<{ ok: boolean }>;
   fallback(): Promise<void>;
+  observe?(): Promise<"hook" | "terminal">;
 };
 
 /**
@@ -184,8 +244,12 @@ export type ChannelIO = {
 export async function routeChannelInput(
   opId: string, prompt: string, adopted: boolean, io: ChannelIO,
   opts: { readyWaitMs?: number; hookWaitMs?: number; pollMs?: number } = {},
-): Promise<"adopted" | "channel" | "tmux-fallback"> {
-  if (adopted) return "adopted";
+): Promise<"adopted" | "channel" | "channel-pending" | "tmux-fallback"> {
+  if (adopted) {
+    // Observation is read-only. Reattach never submits, even for inbox_pending.
+    await io.observe?.();
+    return "adopted";
+  }
   // Also guard against a lost active.json with a durable, already-used op_id.
   if (await io.status(opId)) throw new Error(`bridge op ${opId} already exists; never re-submit`);
   const pollMs = opts.pollMs ?? 250;
@@ -202,6 +266,7 @@ export async function routeChannelInput(
     return "tmux-fallback";
   }
   await io.submit(opId, prompt); // Promise rejection is an UNKNOWN effect; never fallback.
+  if (io.observe) return await io.observe() === "hook" ? "channel" : "channel-pending";
   const deadline = Date.now() + (opts.hookWaitMs ?? 15_000);
   while (true) {
     const status = await io.status(opId);

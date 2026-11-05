@@ -1,7 +1,8 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { createRequire } from "node:module";
 import {
   CHANNEL_NAME, findBridgeRoot, prepareChannelHost, routeChannelInput, type ChannelIO, type ChannelStatus,
 } from "./channel.js";
@@ -16,6 +17,7 @@ async function tmp(): Promise<string> {
 }
 afterEach(async () => {
   await Promise.all(homes.splice(0).map(dir => fs.rm(dir, { recursive: true, force: true })));
+  vi.useRealTimers();
 });
 
 const opId = "d3e466b4-53b7-4d17-ae8d-87dd89ad2be3";
@@ -29,6 +31,89 @@ const state = (stage: ChannelStatus["stage"]): ChannelStatus => ({
 });
 
 describe("claude_rc_local channel dispatch", () => {
+  it("retains one admitted op through a long native turn and delivers once at its hook boundary", async () => {
+    const dir = await tmp();
+    const root = await findBridgeRoot();
+    const host = await prepareChannelHost(dir, root);
+    const { Ledger, processInbox, handleHook } = createRequire(import.meta.url)(path.join(root, "lib/bridge.cjs"));
+    const ledger = new Ledger(host.dir);
+    const receipt = path.join(dir, "receipt.json");
+    const submit = vi.fn(host.submit);
+    const fallback = vi.fn(async () => { throw new Error("must not touch the live pane"); });
+    const io: ChannelIO = {
+      ready: async () => true, status: host.status, submit, fallback,
+      observe: () => host.observeInput(opId, receipt),
+    };
+    let finished = false;
+    const pending = routeChannelInput(opId, "retain this op", false, io).then(result => { finished = true; return result; });
+    await vi.waitFor(async () => expect(await host.status(opId)).toMatchObject({ stage: "inbox_pending" }));
+    const nativeQueue: string[] = [];
+    await processInbox(ledger, async (id: string) => { nativeQueue.push(id); });
+    await vi.waitFor(async () => expect(await host.status(opId)).toMatchObject({ stage: "emitted_local" }));
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(Date.now() + 10 * 60_000);
+    // Stop is a wake hint, not proof that a channel prompt was admitted or a foreign op settled.
+    handleHook(ledger, CHANNEL_NAME, "Stop", { session_id: "original-session" });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(finished).toBe(false);
+    await expect(routeChannelInput(opId, "duplicate wake", false, io)).rejects.toThrow(/already exists/);
+    const adopted = routeChannelInput(opId, "never replay", true, io);
+    handleHook(ledger, CHANNEL_NAME, "UserPromptSubmit", {
+      session_id: "original-session", prompt: `<channel source="${CHANNEL_NAME}" op_id="${opId}">retain this op</channel>`,
+    });
+    await expect(pending).resolves.toBe("channel");
+    await expect(adopted).resolves.toBe("adopted");
+    expect(submit).toHaveBeenCalledOnce();
+    expect(nativeQueue).toEqual([opId]);
+    expect(await processInbox(ledger, async () => { throw new Error("duplicate native delivery"); })).toEqual([]);
+    expect(fallback).not.toHaveBeenCalled();
+    expect(ledger.events().filter((e: { ev: string }) => e.ev === "hook_observed")).toHaveLength(1);
+  });
+
+  it("cancels only the observer and retains the original op for reattach without resubmission", async () => {
+    const dir = await tmp();
+    const host = await prepareChannelHost(dir, await findBridgeRoot());
+    const abort = new AbortController();
+    const submit = vi.fn(host.submit);
+    const io: ChannelIO = { ready: async () => true, status: host.status, submit,
+      observe: () => host.observeInput(opId, path.join(dir, "receipt.json"), abort.signal),
+      fallback: async () => { throw new Error("must not paste"); } };
+    const pending = routeChannelInput(opId, "original work", false, io);
+    const rejected = expect(pending).rejects.toThrow(/pending op retained/);
+    await vi.waitFor(async () => expect(await host.status(opId)).toMatchObject({ stage: "inbox_pending" }));
+    abort.abort();
+    await rejected;
+    expect(await host.status(opId)).toMatchObject({ stage: "inbox_pending" });
+    expect(submit).toHaveBeenCalledOnce();
+    // A receipt wakes observation but does not masquerade as hook admission.
+    const receiptPath = path.join(dir, "receipt.json");
+    const adopted = routeChannelInput(opId, "do not submit", true, {
+      ...io, observe: () => host.observeInput(opId, receiptPath),
+    });
+    await fs.writeFile(receiptPath, "unvalidated receipt: the adapter owns its gate");
+    await expect(adopted).resolves.toBe("adopted");
+    expect(submit).toHaveBeenCalledOnce();
+  });
+
+  it("holds uncertain bridge effects until their original hook arrives without fallback", async () => {
+    const dir = await tmp();
+    const root = await findBridgeRoot();
+    const host = await prepareChannelHost(dir, root);
+    const { Ledger, processInbox, handleHook } = createRequire(import.meta.url)(path.join(root, "lib/bridge.cjs"));
+    const ledger = new Ledger(host.dir);
+    await host.submit(opId, "original work");
+    await processInbox(ledger, async () => {});
+    ledger.recover(); // No hook after bridge restart: uncertainty remains held.
+    await expect(host.observeInput(opId, path.join(dir, "receipt.json"))).rejects.toThrow(/unknown-effect/);
+    expect(ledger.terminal(opId, "block", { reason: "not yet admitted" }).ok).toBe(false);
+    handleHook(ledger, CHANNEL_NAME, "UserPromptSubmit", {
+      prompt: `<channel source="${CHANNEL_NAME}" op_id="${opId}">original work</channel>`,
+    });
+    expect(ledger.terminal(opId, "block", { reason: "original op blocked" }).ok).toBe(true);
+    await expect(host.observeInput(opId, path.join(dir, "receipt.json"))).resolves.toBe("hook");
+    expect(await host.status(opId)).toMatchObject({ stage: "terminal", hook_observed: true });
+  });
+
   it("submits exactly once and accepts only hook observation (not local emission)", async () => {
     let stage: ChannelStatus | null = null;
     let pushes = 0;
