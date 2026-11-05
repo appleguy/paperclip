@@ -26,7 +26,7 @@ import {
 
 const CLAUDE = "/opt/homebrew/bin/claude";
 const MODELS = new Set(["claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5-5"]);
-const EFFORTS = new Set(["low", "medium", "high"]);
+const EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 const ID = /^[a-zA-Z0-9_-]{1,55}$/;
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 

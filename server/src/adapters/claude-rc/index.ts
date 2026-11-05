@@ -58,7 +58,7 @@ The Remote Control name is derived at launch ("<hops below Board> <agent name>",
 any remoteControlName config is ignored.
 Config: cwd, stateDir, tmuxSocket (pc-claude-rc), tmuxSession (claude),
 model (claude-sonnet-5-5|claude-haiku-5-5),
-effort (low|medium|high, default medium), expectedRemoteControlUrl, timeoutSec,
+effort (low|medium|high|xhigh|max, default medium), expectedRemoteControlUrl, timeoutSec,
 channelBridgeRoot (optional repository package directory).
 
 The agent writes a JSON receipt; only the adapter publishes the report and
