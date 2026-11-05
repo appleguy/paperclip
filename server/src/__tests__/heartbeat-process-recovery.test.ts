@@ -4437,12 +4437,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   });
 
   it("re-enters a restart-reattachable legacy run under the same run id", async () => {
-    const { runId } = await seedRunFixture({
+    const { companyId, agentId, runId } = await seedRunFixture({
       adapterType: "claude_rc_local",
       agentStatus: "running",
       processPid: null,
       processGroupId: null,
     });
+    // The previous boot already reserved budget and dispatched provider work.
+    await db.insert(budgetReservations).values({ companyId, runId, agentId, projectId: null, amountCents: "0", providerStartedAt: new Date() });
     await db
       .update(heartbeatRuns)
       .set({ controllerBootId: "00000000-0000-4000-8000-00000000b007", executionStage: "dispatching" })

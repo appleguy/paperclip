@@ -9,6 +9,7 @@ import { budgetServiceInTransaction } from "./budgets.js";
 import { withBudgetSpan } from "./budget-tracing.js";
 import type { ActivityPublication } from "./activity-log.js";
 import { readClaimedNativeStopRecovery } from "./native-runtime/native-cancellation-request.js";
+import { legacyControllerBootId } from "./legacy-controller-lease.js";
 
 /** Native finalization takes its coordinator before issue/run locks. Recovery
  * admission uses the same order after the company accounting lock, so its
@@ -97,6 +98,13 @@ export async function reserveRunBudget(db: Db, companyId: string, runId: string,
           .from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId, companyId),
             eq(nativeRunFinalizations.runId, runId), eq(nativeRunFinalizations.leaseOwner, recoveryLeaseOwner),
             sql`${nativeRunFinalizations.leaseExpiresAt} > clock_timestamp()`)) : [];
+      // A hot restart re-entered this legacy run under the same id (see
+      // supportsRestartReattach): its provider work is already running, so this
+      // controller boot keeps the original hold instead of dispatching again.
+      const restartReattach = run.resultJson?.restartReattach as { newServerPid?: unknown } | undefined;
+      if (run.runtimeMode === "legacy" && existing.state === "held" && existing.projectId === projectId
+        && run.controllerBootId === legacyControllerBootId && restartReattach?.newServerPid === process.pid)
+        return { ...existing, reused: true };
       if (owner) {
         if (stopRecovery) return { ...existing, reused: true };
         // Recovery has already made this run queued/running, so its own pending
