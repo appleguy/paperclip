@@ -75,6 +75,24 @@ async function newestConversation(cwd: string): Promise<string | null> {
   }
   return best?.id ?? null;
 }
+/**
+ * The conversation this seat's own Claude process holds, from Claude Code's
+ * ~/.claude/sessions/<pid>.json (its tmux field names the pane). Seats that
+ * share a cwd make newestConversation pick another seat's file, which failed
+ * the keep check and cleared the Tensor64 Lead (SCO-866).
+ */
+export async function seatConversation(session: string, cwd: string, dir = path.join(os.homedir(), ".claude", "sessions")): Promise<string | null> {
+  const names = (await fs.readdir(dir).catch(() => [] as string[])).filter(n => /^\d+\.json$/.test(n));
+  let best: { id: string; t: number } | null = null;
+  for (const n of names) {
+    const s = await fs.readFile(path.join(dir, n), "utf8").then(t => JSON.parse(t) as Record<string, unknown>).catch(() => null);
+    if (!s || typeof s.sessionId !== "string" || s.cwd !== cwd || typeof s.tmux !== "string" || !s.tmux.startsWith(`${session}:`)) continue;
+    try { process.kill(Number(s.pid), 0); } catch { continue; }
+    const t = Number(s.updatedAt) || 0;
+    if (!best || t > best.t) best = { id: s.sessionId, t };
+  }
+  return best?.id ?? null;
+}
 async function waitIdle(socket: string, session: string, deadline: number): Promise<boolean> {
   while (Date.now() < deadline) {
     try { if (isClaudeIdle(await claudePane(socket, session))) return true; } catch { return false; }
@@ -439,7 +457,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const keepMax = typeof cfg.keepConversationMaxBytes === "number" ? cfg.keepConversationMaxBytes : 400_000;
       const keepState: KeepState | null = keepEnabled
         ? await fs.readFile(keepPath, "utf8").then(t => JSON.parse(t) as KeepState).catch(() => null) : null;
-      const before = await newestConversation(cwd);
+      const before = await seatConversation(session, cwd) ?? await newestConversation(cwd);
       const keepSize = before ? (await fs.stat(path.join(projectDir(cwd), `${before}.jsonl`)).catch(() => null))?.size ?? 0 : 0;
       const reuse = shouldReuseConversation({
         enabled: keepEnabled, state: keepState, newestId: before, projectId, sizeBytes: keepSize, maxBytes: keepMax,
@@ -452,7 +470,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         await sleep(800);
         if (!(await waitIdle(socket, session, Date.now() + 12_000)))
           throw new Error("Claude /clear did not settle to an idle prompt");
-        conversationId = await newestConversation(cwd);
+        conversationId = await seatConversation(session, cwd);
+        for (let i = 0; i < 10 && conversationId === before; i++) { await sleep(500); conversationId = await seatConversation(session, cwd); }
+        if (!conversationId || conversationId === before) conversationId = await newestConversation(cwd);
         if (!conversationId || conversationId === before)
           throw new Error("Claude /clear did not start an isolated conversation");
       }

@@ -112,3 +112,19 @@ describe("SCO-756 managed goal on a kept conversation", () => {
     expect(goalForConversation(undefined, true, state, "i")).toBeUndefined();
   });
 });
+
+describe("seatConversation (SCO-866)", () => {
+  it("picks the live process whose tmux pane is this seat, not the newest file in a shared cwd", async () => {
+    const { seatConversation } = await import("./execute.js");
+    const { mkdtemp, writeFile } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const dir = await mkdtemp(join(process.env.TMPDIR ?? "/tmp", "seatconv-"));
+    const cwd = "/Volumes/NVM/Paperclip/workspaces/claude-rc";
+    const rec = (sessionId: string, tmux: string, updatedAt: number, pid = process.pid) => JSON.stringify({ pid, sessionId, cwd, tmux, updatedAt });
+    await writeFile(join(dir, "1.json"), rec("lead-conv", "tensor64-lead:@5.%5", 1));
+    await writeFile(join(dir, "2.json"), rec("other-conv", "claude-worker:@1.%1", 9));
+    await writeFile(join(dir, "3.json"), rec("dead-conv", "tensor64-lead:@2.%2", 99, 2 ** 22 + 7));
+    expect(await seatConversation("tensor64-lead", cwd, dir)).toBe("lead-conv");
+    expect(await seatConversation("tensor64-lead", "/elsewhere", dir)).toBeNull();
+  });
+});
