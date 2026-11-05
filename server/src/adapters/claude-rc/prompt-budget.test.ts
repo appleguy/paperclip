@@ -1,10 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { assembleDispatchPrompt, fitPromptSections, PROMPT_BUDGET } from "./execute.js";
+import { assembleDispatchPrompt, dispatchInstructionsPrefix, fitPromptSections, PROMPT_BUDGET } from "./execute.js";
 import { routeChannelInput, type ChannelIO } from "./channel.js";
 
 const join = (s: string[]) => s.filter(Boolean).join("\n\n");
 
 describe("claude-rc prompt budget", () => {
+  it("keeps fresh run rules before issue data and omits them on a known conversation", async () => {
+    const prefix = dispatchInstructionsPrefix("AGENT RULES", false);
+    expect(prefix).toContain("never background a tool call");
+    expect(prefix).toContain("Do not write a done receipt on failure");
+    expect(dispatchInstructionsPrefix("AGENT RULES", true)).toBe("");
+    const first = await assembleDispatchPrompt([prefix, "intro", "issue A", "wake A", "", "receipt A"], "test-seat", "claude-haiku-5-5");
+    const second = await assembleDispatchPrompt([prefix, "intro", "issue B", "wake B", "", "receipt B"], "test-seat", "claude-haiku-5-5");
+    expect(first.startsWith(prefix)).toBe(true);
+    expect(second.startsWith(prefix)).toBe(true);
+    expect(first.indexOf("issue A")).toBeGreaterThan(prefix.length);
+  });
   it("leaves a prompt under budget untouched", () => {
     const s = ["rules", "intro", "ctx", "wake", "do it"];
     expect(fitPromptSections(s, [2, 3], join)).toEqual(s);

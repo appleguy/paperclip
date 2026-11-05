@@ -393,6 +393,15 @@ export function goalForConversation(goal: unknown, reuse: boolean, state: KeepSt
   return { ...(goal as Record<string, unknown>), deliveredKey: reuse ? state?.goalKeys?.[issueId] ?? null : null };
 }
 export const PROMPT_BUDGET = 50_000;
+const FRESH_RUN_RULES = [
+  "This is the owner's live Claude Code Remote Control session: messages they send mid-task steer this issue.",
+  "Run every command in the foreground; never background a tool call. Never print secrets or guess Paperclip API credentials.",
+  "Finish the requested issue work, then use your Write tool to create the JSON receipt with status = \"done\", summary = a short factual summary, report = a detailed Markdown result (at least 250 characters).",
+  "Write it only once actual work is complete. The Paperclip adapter publishes the report and closes the issue under the run's scoped identity. Do NOT update the issue yourself. Do not write a done receipt on failure; if blocked, explain the blocker visibly and stop.",
+].join(" ");
+export function dispatchInstructionsPrefix(instructions: string, knownConversation: boolean): string {
+  return knownConversation ? "" : joinPromptSections([instructions, FRESH_RUN_RULES]);
+}
 /** Bound context before the token firewall, including fresh prompts rebuilt after rotation. */
 export async function assembleDispatchPrompt(sections: string[], seat: string, model: string, share?: number): Promise<string> {
   const prompt = joinPromptSections(fitPromptSections(sections, [2, 3], joinPromptSections));
@@ -701,7 +710,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const { taskContextNote, wakePrompt } = selectPaperclipPromptSections(promptContext, { resumedSession: seenIssue });
       const instructionsFilePath = asString(cfg.instructionsFilePath, "");
       const instructionsFull = instructionsFilePath ? await fs.readFile(instructionsFilePath, "utf8") : "";
-      const instructionsPrefix = knownConversation ? "" : instructionsFull;
+      const instructionsPrefix = dispatchInstructionsPrefix(instructionsFull, knownConversation);
       const intro = knownConversation ? "" : renderTemplate(promptBase, {
         agent: ctx.agent, run: { id: ctx.runId }, context: ctx.context, companyId: ctx.agent.companyId,
       });
@@ -715,15 +724,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         `pcrc: PAPERCLIP_RC_RUN_ENV=${promptRunEnvPath}.`,
       ].join(" ") : [
         `Paperclip run ${ctx.runId}, issue ${issueId}. Work on ONLY the assigned issue.`,
-        "This is the owner's live Claude Code Remote Control session: messages they send mid-task steer this issue.",
-        "Run every command in the foreground; never background a tool call. Never print secrets or guess Paperclip API credentials.",
         `To comment or edit this issue (e.g. blockedByIssueIds) prefix the shared api command: PAPERCLIP_RC_RUN_ENV=${promptRunEnvPath} pcrc api POST ./comments '{"body":"..."}' or ... pcrc api PATCH . '{"blockedByIssueIds":[]}'. pcrc supplies the run-scoped credentials; never print them.`,
-        "Finish the requested issue work, then use your Write tool to create the JSON receipt",
-        `${promptReceiptPath} with exactly these keys: runId = ${ctx.runId}, issueId = ${issueId},`,
-        'status = "done", summary = a short factual summary, report = a detailed Markdown result (at least 250 characters).',
-        "Write it only once actual work is complete. The Paperclip adapter publishes the report and closes the issue",
-        "under the run's scoped identity. Do NOT update the issue yourself. Do not write a done receipt on failure;",
-        "if blocked, explain the blocker visibly and stop.",
+        `Done receipt path: ${promptReceiptPath}; exactly these keys: runId = ${ctx.runId}, issueId = ${issueId}, status, summary, report.`,
       ].join(" ");
       // The channel preserves Markdown/newlines; only the tmux fallback flattens.
       const sections = [instructionsPrefix, intro, taskContextNote, wakePrompt,

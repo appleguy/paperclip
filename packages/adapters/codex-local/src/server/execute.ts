@@ -1174,13 +1174,14 @@ async function executeCodex(ctx: AdapterExecutionContext): Promise<AdapterExecut
       : configuredInstructionsPath;
     const instructionsDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
     let instructionsPrefix = "";
+    let instructionsPathNote = "";
     if (instructionsFilePath) {
       try {
         const instructionsContents = await fs.readFile(instructionsFilePath, "utf8");
-        instructionsPrefix =
-          `${instructionsContents}\n\n` +
-          `The above agent instructions were loaded from ${instructionsFilePath}. ` +
-          `Resolve any relative file references from ${instructionsDir}.\n\n`;
+        instructionsPrefix = instructionsContents;
+        instructionsPathNote =
+          `The agent instructions earlier in this prompt were loaded from ${instructionsFilePath}. ` +
+          `Resolve any relative file references from ${instructionsDir}.`;
       } catch (err) {
         const reason = err instanceof Error ? err.message : String(err);
         await onLog(
@@ -1251,7 +1252,7 @@ async function executeCodex(ctx: AdapterExecutionContext): Promise<AdapterExecut
           }
           const notes = [
             `Loaded agent instructions from ${instructionsFilePath}`,
-            `Prepended instructions + path directive to stdin prompt (relative references from ${instructionsDir}).`,
+            `Added instructions and path directive to stdin prompt (relative references from ${instructionsDir}).`,
             repoAgentsNote,
           ];
           if (forceSaferInvocation) {
@@ -1289,6 +1290,7 @@ async function executeCodex(ctx: AdapterExecutionContext): Promise<AdapterExecut
       const prompt = joinPromptSections([
         promptInstructionsPrefix,
         renderedBootstrapPrompt,
+        shouldUseResumeDeltaPrompt ? "" : instructionsPathNote,
         selectInitialCommunicationGuidance(context, { resumedSession: Boolean(resumeSessionId) }),
         wakePrompt,
         codexFallbackHandoffNote,

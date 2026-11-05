@@ -119,6 +119,8 @@ describe("codex remote execution", () => {
       config: {
         engine: "cli",
         command: "codex",
+        instructionsFilePath: path.join(rootDir, "instructions.md"),
+        bootstrapPromptTemplate: "Stable bootstrap.",
         env: {
           CODEX_HOME: codexHomeDir,
         },
@@ -186,8 +188,10 @@ describe("codex remote execution", () => {
 
     expect(runChildProcess).toHaveBeenCalledTimes(1);
     const call = runChildProcess.mock.calls[0] as unknown as
-      | [string, string, string[], { env: Record<string, string>; remoteExecution?: { remoteCwd: string } | null }]
+      | [string, string, string[], { stdin?: string; env: Record<string, string>; remoteExecution?: { remoteCwd: string } | null }]
       | undefined;
+    expect(call?.[3].stdin).toContain("Use the remote workspace.\n\nStable bootstrap.");
+    expect(call?.[3].stdin).toContain(`Resolve any relative file references from ${rootDir}/`);
     expect(call?.[2]).not.toContain("--skip-git-repo-check");
     expect(call?.[3].env.CODEX_HOME).toBe(`${managedRemoteWorkspace}/.paperclip-runtime/codex/home`);
     expect(call?.[3].env.PAPERCLIP_WORKSPACE_CWD).toBe(managedRemoteWorkspace);
