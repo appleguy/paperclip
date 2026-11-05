@@ -35,11 +35,11 @@ describe("standalone subscription quotas", () => {
       calls.push(path);
       expect(opts.credentials).toBe("same-origin");
       expect(opts.cache).toBe("no-store");
-      return { ok: true, json: async () => path === "/api/companies" ? [{ id: "company-123", issuePrefix: "SCO" }] : data };
+      return { ok: true, json: async () => path === "/api/companies" ? [{ id: "company-123", issuePrefix: "SCO" }] : path.endsWith("/history") ? { series: [{ provider: "codex", pool: "weekly", points: [{ t: new Date(Date.now() - 7200000).toISOString(), usedPercent: 10, resetsAt: new Date(Date.now() + 86400000).toISOString() }, { t: new Date(Date.now() - 3600000).toISOString(), usedPercent: 12, resetsAt: new Date(Date.now() + 86400000).toISOString() }] }] } : data };
     }));
     new Function(script!)();
-    await vi.waitFor(() => expect(document.querySelectorAll("#cards section")).toHaveLength(3));
-    expect(calls).toEqual(["/api/companies", "/api/companies/company-123/costs/quota-sentinel"]);
+    await vi.waitFor(() => expect(document.querySelectorAll("#charts section")).toHaveLength(4));
+    expect(calls).toEqual(["/api/companies", "/api/companies/company-123/costs/quota-sentinel", "/api/companies/company-123/costs/quota-sentinel/history"]);
     expect(document.body.textContent).toContain("Third-party · weekly");
     expect(document.body.textContent).toContain("76.8% used");
     expect(document.body.textContent).toContain("recent rate below goal");
@@ -49,6 +49,7 @@ describe("standalone subscription quotas", () => {
     expect(document.body.textContent).toContain("Claude");
     expect(document.body.textContent).toContain("Unknown");
     expect(document.body.textContent).toContain("0.0% used");
+    expect(document.querySelectorAll("#charts svg")).toHaveLength(1);
   });
 
   it("shows sign-in guidance rather than reporting zero usage for an unauthenticated user", async () => {
@@ -57,5 +58,25 @@ describe("standalone subscription quotas", () => {
     await vi.waitFor(() => expect(document.getElementById("status")?.textContent).toContain("Sign in"));
     expect(document.body.textContent).toContain("cannot be displayed");
     expect(document.body.textContent).not.toContain("0.0% used");
+  });
+});
+
+describe("quota projection", () => {
+  const source = script!.slice(script!.indexOf("function resetBetween"), script!.indexOf("function renderCharts"));
+  const project = new Function("isShort", `${source}; return projection`)((item: { pool: string }) => item.pool === "session");
+  const now = Date.parse("2026-11-05T12:00:00Z");
+  const point = (hoursAgo: number, usedPercent: number, resetsAt = "2026-11-06T12:00:00Z") => ({ t: new Date(now - hoursAgo * 3600000).toISOString(), usedPercent, resetsAt });
+  const item = { pool: "weekly", usedPercent: 40, resetsAt: "2026-11-06T12:00:00Z" };
+  it("projects flat and rising usage", () => {
+    expect(project([point(2, 40), point(1, 40)], item, now).projected).toBe(40);
+    expect(project([point(2, 30), point(1, 35)], item, now).projected).toBe(160);
+  });
+  it("reports exhaustion only before reset", () => {
+    expect(project([point(2, 30), point(1, 35)], item, now).exhaustion).toBe(now + 12 * 3600000);
+    expect(project([point(2, 39), point(1, 40)], item, now).exhaustion).toBeNull();
+  });
+  it("excludes earlier reset periods", () => {
+    const points = [point(4, 90, "2026-11-05T09:30:00Z"), point(3, 10), point(2, 12), point(1, 14)];
+    expect(project(points, item, now).rate).toBe(2);
   });
 });

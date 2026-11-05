@@ -11,6 +11,8 @@ import { listRunUsage } from "../services/run-usage.js";
 import { billingReconciliationService } from "../services/billing-reconciliation.js";
 import { adjustCostSchema, importBillingInvoiceSchema, repairAccountingSchema, retryAccountingSchema } from "@paperclipai/shared";
 import { readFile } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { createInterface } from "node:readline";
 import { Router } from "express";
 import { z } from "zod";
 import type { Db } from "@paperclipai/db";
@@ -335,6 +337,52 @@ export function costRoutes(
     if (!(await assertCompanyCostReadAllowed(req, res, companyId))) return;
     const rows = await costs.windowSpend(companyId);
     res.json(rows);
+  });
+
+  router.get("/companies/:companyId/costs/quota-sentinel/history", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    assertBoard(req);
+    if (!(await companies.getById(companyId))) {
+      res.status(404).json({ error: "Company not found" });
+      return;
+    }
+    res.set("Cache-Control", "private, no-store");
+    const requestedDays = req.query.days === undefined ? 14 : Number(req.query.days);
+    if (!Number.isFinite(requestedDays) || requestedDays <= 0) throw badRequest("invalid 'days' value");
+    const cutoff = Date.now() - Math.min(requestedDays, 30) * 86_400_000;
+    const allowed: Record<string, string[]> = {
+      claude: ["session", "weekly"], codex: ["session", "weekly"],
+      antigravity: ["3p:5h", "3p:weekly", "gemini:5h", "gemini:weekly", "gemini-argon-wtu:weekly"],
+    };
+    type Point = { t: string; usedPercent: number; resetsAt: string | null };
+    const series = new Map<string, { provider: string; pool: string; points: Point[]; stride: number; count: number }>();
+    let observedAt: string | null = null;
+    try {
+      const input = createReadStream(process.env.PAPERCLIP_QUOTA_SENTINEL_SAMPLES_PATH
+        ?? "/Volumes/NVM/Paperclip/knowledge/raw/model-routing/quota_pacing_samples.jsonl", { encoding: "utf8" });
+      for await (const line of createInterface({ input, crlfDelay: Infinity })) {
+        let sample: any;
+        try { sample = JSON.parse(line); } catch { continue; }
+        const t = sample?.observed_at;
+        const time = typeof t === "string" ? Date.parse(t) : NaN;
+        if (!Number.isFinite(time) || time < cutoff || time > Date.now()) continue;
+        if (!observedAt || time > Date.parse(observedAt)) observedAt = t;
+        for (const [provider, windows] of Object.entries(allowed)) for (const pool of windows) {
+          const value = sample?.providers?.[provider]?.windows?.[pool];
+          if (typeof value?.used_pct !== "number" || !Number.isFinite(value.used_pct)) continue;
+          const reset = typeof value.reset_at === "string" && Number.isFinite(Date.parse(value.reset_at)) ? value.reset_at : null;
+          const key = `${provider}/${pool}`;
+          let entry = series.get(key);
+          if (!entry) { entry = { provider, pool, points: [], stride: 1, count: 0 }; series.set(key, entry); }
+          if (entry.count++ % entry.stride === 0) entry.points.push({ t, usedPercent: Math.max(0, Math.min(100, value.used_pct)), resetsAt: reset });
+          if (entry.points.length > 2000) { entry.points = entry.points.filter((_point, index) => index % 2 === 0); entry.stride *= 2; }
+        }
+      }
+      res.json({ source: "quota-sentinel", observedAt, series: [...series.values()].map(({ provider, pool, points }) => ({ provider, pool, points })) });
+    } catch {
+      res.status(503).json({ error: "Quota Sentinel history unavailable" });
+    }
   });
 
   // Local process-only Quota Sentinel snapshot. No provider calls or credentials.

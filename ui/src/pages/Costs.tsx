@@ -1106,7 +1106,7 @@ export function Costs({
           <div className="flex flex-wrap items-center justify-between gap-2 text-sm">
             <span className="text-muted-foreground">Quota allowances are separate from Paperclip inference costs.</span>
             <a className="underline underline-offset-4" href="/subscription-quotas.html">
-              Open live subscription-only dashboard
+              Open primary subscription quota dashboard · history and projections
             </a>
           </div>
           <Card data-testid="quota-sentinel-panel">
