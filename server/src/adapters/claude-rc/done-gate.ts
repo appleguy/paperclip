@@ -40,7 +40,8 @@ export function editedPaths(jsonl: string, sinceMs: number): string[] {
     let rec: { timestamp?: string; message?: { content?: unknown } };
     try { rec = JSON.parse(line); } catch { continue; }
     const t = Date.parse(rec.timestamp ?? "");
-    if (Number.isFinite(t) && t < sinceMs) continue;
+    // Compaction replays earlier tool_use records without a timestamp; with a known run start they predate it.
+    if (sinceMs > 0 ? !(t >= sinceMs) : Number.isFinite(t) && t < sinceMs) continue;
     const content = rec.message?.content;
     if (!Array.isArray(content)) continue;
     for (const c of content as Array<{ type?: string; name?: string; input?: Record<string, unknown> }>) {

@@ -31,6 +31,11 @@ describe("editedPaths", () => {
     const jsonl = [line("2026-11-05T01:00:00Z", "Edit", `${M}/old.ts`), line("2026-11-05T02:00:00Z", "Write", `${M}/new.ts`), line("2026-11-05T02:01:00Z", "Read", `${M}/r.ts`)].join("\n");
     expect(editedPaths(jsonl, Date.parse("2026-11-05T01:30:00Z"))).toEqual([`${M}/new.ts`]);
   });
+  it("skips untimestamped records (compaction replay) once the run start is known", () => {
+    const replay = JSON.stringify({ message: { content: [{ type: "tool_use", name: "Edit", input: { file_path: `${M}/replayed.ts` } }] } });
+    expect(editedPaths(replay, Date.parse("2026-11-05T01:30:00Z"))).toEqual([]);
+    expect(editedPaths(replay, 0)).toEqual([`${M}/replayed.ts`]);
+  });
 });
 
 describe("done gate", () => {
