@@ -100,7 +100,21 @@ export async function legacyExecutionNeedsReconciliationWithEvidence(db: Db, run
   if (run.status === "interrupted" && await isInterruptedNativePreparation(db, run)) return false;
   return await hasUnrestoredRemoteWorkspace(db, run) ||
     (legacyExecutionNeedsReconciliation(run) && !(await isPreDispatchReviewWaitVerified(db, run))
-      && !(await isPreDispatchExecutionWaitVerified(db, run)));
+      && !(await isPreDispatchExecutionWaitVerified(db, run))
+      && !(await isOperatorReconciled(db, run)));
+}
+
+/** An operator's resolved reconciliation (provider stopped) settles this run for good, so a
+ * later sweep or backfill must not re-derive the same hold from the run row alone. */
+async function isOperatorReconciled(db: Db, run: Run): Promise<boolean> {
+  if (hasRequiredWorkspaceRecovery(run.resultJson)) return false;
+  const [row] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, run.companyId),
+    eq(issueRecoveryActions.status, "resolved"),
+    sql`${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId' = ${run.id}`,
+    sql`${issueRecoveryActions.evidence}->'executionReconciliation'->>'providerStopped' = 'true'`,
+  )).limit(1);
+  return Boolean(row);
 }
 
 /** Persist the failed legacy run, owned lock release and operator decision together. */
