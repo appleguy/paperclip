@@ -93,10 +93,44 @@ export async function seatConversation(session: string, cwd: string, dir = path.
   }
   return best?.id ?? null;
 }
+/**
+ * SCO-713: the one-time --dangerously-load-development-channels notice (our own local bridge).
+ * It is neither idle nor a permission prompt, so it must be confirmed on any run, not only in the
+ * post-launch window, or the seat sits "waiting on you" with nothing to answer.
+ */
+export function isDevChannelPrompt(screen: string): boolean {
+  return /Loading development channels/i.test(screen) && /I am using this for local development/i.test(screen);
+}
 async function waitIdle(socket: string, session: string, deadline: number): Promise<boolean> {
   while (Date.now() < deadline) {
-    try { if (isClaudeIdle(await claudePane(socket, session))) return true; } catch { return false; }
+    try {
+      const s = await claudePane(socket, session);
+      if (isClaudeIdle(s)) return true;
+      if (isDevChannelPrompt(s)) await tmux(socket, ["send-keys", "-t", session, "Enter"]);
+    } catch { return false; }
     await sleep(900);
+  }
+  return false;
+}
+
+/** SCO-771: the native /goal is a typed slash command; the input line must be empty (NBSP after the prompt glyph). */
+export function isPromptEmpty(screen: string): boolean {
+  const tail = screen.replace(/\r/g, "").trimEnd().split("\n").slice(-18);
+  const line = tail.findLast(l => /^\s*❯/.test(l));
+  return line !== undefined && /^❯[\s\u00a0]*$/.test(line.trimStart());
+}
+/** Type one slash command literally, then Enter; true when the harness echoed `expect`. */
+export async function typeNativeGoal(socket: string, session: string, text: string, expect: RegExp): Promise<boolean> {
+  const screen = await claudePane(socket, session);
+  if (!isClaudeIdle(screen) || !isPromptEmpty(screen)) return false;
+  await tmux(socket, ["send-keys", "-t", session, "-l", text]);
+  await sleep(300);
+  await tmux(socket, ["send-keys", "-t", session, "Enter"]);
+  for (let i = 0; i < 10; i++) {
+    await sleep(500);
+    // The echo line is rendered dim, which claudePane drops; match on the raw screen.
+    const raw = await tmux(socket, ["capture-pane", "-t", session, "-p", "-J", "-e", "-S", "-30"]);
+    if (expect.test(raw.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, ""))) return true;
   }
   return false;
 }
@@ -275,7 +309,7 @@ async function ensureSession(
     const until = Date.now() + 20_000;
     while (Date.now() < until) {
       const s = await claudePane(socket, session).catch(() => "");
-      if (/Loading development channels/i.test(s) && /I am using this for local development/i.test(s)) {
+      if (isDevChannelPrompt(s)) {
         await tmux(socket, ["send-keys", "-t", session, "Enter"]);
         break;
       }
@@ -551,13 +585,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
       // SCO-756: owner-guard's Stop gate maps this seat's conversation to its agent and managed goals.
       const seatPath = path.join(stateDir, "seat.json");
-      const seat = await fs.readFile(seatPath, "utf8").then(t => JSON.parse(t) as { goals?: Record<string, string> }).catch(() => null);
+      const seat = await fs.readFile(seatPath, "utf8").then(t => JSON.parse(t) as { goals?: Record<string, string>; nativeGoalKey?: string | null }).catch(() => null);
       const goals = { ...(seat?.goals ?? {}) };
       const goalState = (goal as { state?: unknown } | undefined)?.state;
       if (typeof goalState === "string") goals[issueId] = goalState; else delete goals[issueId];
       for (const id of Object.keys(goals).slice(0, -200)) delete goals[id];
+      // SCO-771: re-apply the native /goal the managed goal implies; a /clear or restart loses it.
+      let nativeGoalKey = reuse ? seat?.nativeGoalKey ?? null : null;
+      const goalObj = goal as { state?: string; objective?: string | null; key?: string } | undefined;
+      const wantKey = goalObj?.state === "active" && goalObj.objective ? goalObj.key ?? null : null;
+      if (wantKey && wantKey !== nativeGoalKey) {
+        const cond = goalObj!.objective!.replace(/\s+/g, " ").trim().slice(0, 1500);
+        if (await typeNativeGoal(socket, session, `/goal ${cond}`, /Goal set:/)) nativeGoalKey = wantKey;
+        else await ctx.onLog("stderr", `[claude-rc] native /goal not confirmed ("Goal set:" missing or input not empty) for ${issueId}\n`);
+      } else if (!wantKey && nativeGoalKey) {
+        if (await typeNativeGoal(socket, session, "/goal clear", /Goal cleared|No goal|cleared/i)) nativeGoalKey = null;
+        else await ctx.onLog("stderr", `[claude-rc] native /goal clear not confirmed for ${issueId}\n`);
+      }
       await fs.writeFile(seatPath, JSON.stringify({
-        agentId: ctx.agent.id, companyId: ctx.agent.companyId, cwd, conversationId, goals,
+        agentId: ctx.agent.id, companyId: ctx.agent.companyId, cwd, conversationId, goals, nativeGoalKey,
       }), { mode: 0o600 });
       const active: Record<string, unknown> = {
         runId: ctx.runId, issueId, op_id: ctx.runId, receiptPath, rcUrl,

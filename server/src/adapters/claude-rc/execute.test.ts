@@ -113,6 +113,14 @@ describe("SCO-756 managed goal on a kept conversation", () => {
   });
 });
 
+describe("isPromptEmpty (SCO-771)", () => {
+  it("accepts an empty prompt with NBSP and rejects typed input", async () => {
+    const { isPromptEmpty } = await import("./execute.js");
+    expect(isPromptEmpty("x\n❯ \n  bypass permissions on")).toBe(true);
+    expect(isPromptEmpty("❯ hello\n")).toBe(false);
+  });
+});
+
 describe("seatConversation (SCO-866)", () => {
   it("picks the live process whose tmux pane is this seat, not the newest file in a shared cwd", async () => {
     const { seatConversation } = await import("./execute.js");
@@ -135,5 +143,13 @@ describe("paneCwdDiffers (SCO-693)", () => {
     expect(await paneCwdDiffers("/Volumes/NVM/Paperclip/workspaces/claude-rc", "/Volumes/NVM/Paperclip/workspaces/platform-lead")).toBe(true);
     expect(await paneCwdDiffers("/Volumes/NVM/Paperclip/workspaces/platform-lead", "/Volumes/NVM/Paperclip/workspaces/platform-lead/")).toBe(false);
     expect(await paneCwdDiffers("", "/x")).toBe(false);
+  });
+});
+
+describe("isDevChannelPrompt (SCO-713)", () => {
+  it("recognises the development-channels confirm and not an idle TUI", async () => {
+    const { isDevChannelPrompt } = await import("./execute.js");
+    expect(isDevChannelPrompt("WARNING: Loading development channels\n❯ 1. I am using this for local development")).toBe(true);
+    expect(isDevChannelPrompt("❯ \n  bypass permissions on")).toBe(false);
   });
 });
