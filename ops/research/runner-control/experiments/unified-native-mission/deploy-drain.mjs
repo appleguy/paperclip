@@ -455,13 +455,29 @@ export async function pauseOwned(planned, providers, persist = async () => {}) {
 
 async function main() {
   const [action, filename, extra] = process.argv.slice(2);
-  ensure(["verified", "check", "pace", "begin", "wait", "pause", "verify", "release", "finish"].includes(action),
+  ensure(["verified", "codex-live", "check", "pace", "begin", "wait", "pause", "verify", "release", "finish"].includes(action),
     "unknown deploy-drain action");
   const client = await makeClient();
   if (action === "verified") {
     const verified = await isVerified(client, filename);
     console.log("deploy-drain: serving process " + (verified ? "verified" : "unverified"));
     if (!verified) process.exitCode = 10;
+    return;
+  }
+  if (action === "codex-live") {
+    // SCO-817: a deploy that cuts a Codex run wastes burst quota; pc-deploy defers while one runs.
+    const seen = new Set();
+    const live = [];
+    for (const run of await listRunning(client)) {
+      if (!seen.has(run.agentId)) {
+        seen.add(run.agentId);
+        const agent = await client.api("GET", "/api/agents/" + run.agentId);
+        if (agent?.adapterType === "codex_local") live.push(run.agentId);
+      }
+    }
+    const codexRuns = (await listRunning(client)).filter(r => live.includes(r.agentId));
+    console.log("deploy-drain: " + codexRuns.length + " codex_local run(s) live");
+    if (codexRuns.length) process.exitCode = 12;
     return;
   }
   if (action === "check" || action === "pace") {
