@@ -66,6 +66,7 @@ import { markIdleStartupComplete, registerIdleLocalWorkProbe } from "./services/
 import { idleBackupWakeMarker } from "./services/idle-database-backup.js";
 import { createDatabaseBackupOwner } from "./services/database-backup-owner.js";
 import { cloudWarmStandbyServerOptions } from "./middleware/cloud-warm-standby.js";
+import { awaitSchedulerLeadership } from "./services/scheduler-leader.js";
 import { createCloudWarmStandby } from "./services/cloud-warm-standby.js";
 import { chatCompletionDeliveryService } from "./services/chat-completion-delivery.js";
 /// <reference path="./types/express.d.ts" />
@@ -1073,6 +1074,18 @@ async function startServerWithDatabaseTeardown(
   // recovery must never fall back to a configured/public URL if it is absent.
   resolveLocalRuntimeApiUrl();
 
+  // Rolling replacement: serve HTTP now, but leave recovery, run adoption and
+  // every scheduler loop below to the one server that holds the leader lock.
+  // Disabled by default; a lone server never waits.
+  const schedulerLeadership = await awaitSchedulerLeadership(db as any, {
+    enabled: config.schedulerLeaderLockEnabled,
+    log: logger,
+    onLost: (err) => {
+      logger.error({ err }, "scheduler leadership lost; stopping to avoid two schedulers");
+      process.kill(process.pid, "SIGTERM");
+    },
+  });
+
   try {
     const result = await workspaceOperationService(db as any)
       .reconcileStaleRuntimeControlOperations();
@@ -2029,6 +2042,9 @@ async function startServerWithDatabaseTeardown(
     } catch (err) {
       logger.error({ err, signal }, "run-log in-flight mirror flush failed");
     }
+
+    // Runs are drained or detached; let the incoming server take over.
+    await schedulerLeadership?.release();
 
     const appShutdown = (app as { locals?: { paperclipShutdown?: () => Promise<void> } }).locals
       ?.paperclipShutdown;
