@@ -123,7 +123,7 @@ describe("run mutation attribution (SCO-973 / S7 F01)", () => {
   it("returns unknown for shell and unrecognized tool write sets, even with commit prose", async () => {
     for (const name of ["Bash", "mcp__shell", "Agent"]) {
       const record = editedPaths(tool(name, { command: "sed -i '' s/a/b/ ui/page.ts" }), 1);
-      const v = await evaluateDoneGate({ commits: [sha1] }, record, deps());
+      const v = await evaluate({ commits: [sha1] }, record, deps());
       expect(v).toMatchObject({ ok: false, evidence: "unknown" });
     }
   });
@@ -133,7 +133,7 @@ describe("run mutation attribution (SCO-973 / S7 F01)", () => {
     expect(resolved).toEqual({ paths: [`${M}/ui/page.ts`], unknown: [] });
     expect((await evaluateDoneGate({}, resolved, deps())).ok).toBe(false);
     const unresolved = editedPaths(tool("Edit", { file_path: "ui/page.ts" }), 1);
-    expect(await evaluateDoneGate({}, unresolved, deps())).toMatchObject({ ok: false, evidence: "unknown" });
+    expect(await evaluate({}, unresolved, deps())).toMatchObject({ ok: false, evidence: "unknown" });
   });
 
   it("permits normal read-only work and excludes earlier timestamped mutations", async () => {
@@ -144,7 +144,7 @@ describe("run mutation attribution (SCO-973 / S7 F01)", () => {
 
   it("does not interpret malformed or incomplete mutation records as no edits", async () => {
     for (const jsonl of ["", "{", "null", tool("Write", {}), tool("Read", {}) + "\n{"]) {
-      expect(await evaluateDoneGate({}, editedPaths(jsonl, 1), deps())).toMatchObject({ ok: false, evidence: "unknown" });
+      expect(await evaluate({}, editedPaths(jsonl, 1), deps())).toMatchObject({ ok: false, evidence: "unknown" });
     }
   });
 

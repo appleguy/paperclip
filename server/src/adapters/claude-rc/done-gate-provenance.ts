@@ -5,7 +5,7 @@ import type { GateDeps, GateReceipt, GateVerdict } from "./done-gate.js";
 
 export type GateBaseline = {
   runId: string;
-  repos: Array<{ repo: string; head: string }>;
+  repos: Array<{ repo: string; head: string; dirtyPaths?: string[] }>;
 };
 const SHA = /^[0-9a-f]{40}$/i;
 
@@ -15,10 +15,56 @@ export async function captureDoneGateBaseline(runId: string, deps: GateDeps): Pr
   for (const repo of await deps.repos()) {
     const head = await deps.git(repo, ["rev-parse", "--verify", "HEAD^{commit}"]);
     // Missing/unborn repositories remain absent and cannot establish completion.
-    if (head.code === 0 && !head.error && SHA.test(head.out.trim()))
-      repos.push({ repo: await fs.realpath(repo), head: head.out.trim() });
+    if (head.code === 0 && !head.error && SHA.test(head.out.trim())) {
+      const dirty = await deps.git(repo, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+      repos.push({ repo: await fs.realpath(repo), head: head.out.trim(),
+        ...(dirty.code === 0 && !dirty.error ? { dirtyPaths: statusPaths(dirty.out) } : {}) });
+    }
   }
   return { runId, repos };
+}
+
+// --no-renames is not supported by status on all installed Git versions.
+function statusPaths(out: string): string[] {
+  const records = out.split("\0"), paths: string[] = [];
+  for (let i = 0; i < records.length; i++) {
+    const row = records[i];
+    if (row.length < 4) continue;
+    paths.push(row.slice(3));
+    if (/[RC]/.test(row.slice(0, 2)) && records[i + 1]) paths.push(records[++i]);
+  }
+  return paths;
+}
+
+/** Unknown tools are settled against every original dispatch repository, never prose. */
+export async function baselineMutationPaths(receipt: GateReceipt, deps: GateDeps, baseline: GateBaseline): Promise<string[]> {
+  if (!baseline.runId || receipt.runId !== baseline.runId || !Array.isArray(baseline.repos) || !baseline.repos.length)
+    throw new Error("completion receipt does not match a complete dispatch baseline");
+  for (const repo of await deps.repos()) {
+    const canonical = await fs.realpath(repo);
+    if (!baseline.repos.some(start => start.repo === canonical))
+      throw new Error(`dispatch baseline unavailable for repository ${canonical}`);
+  }
+  const paths = new Set<string>();
+  const notMine = new Set(Array.isArray(receipt.notMine) ? receipt.notMine.filter((s): s is string => typeof s === "string") : []);
+  for (const start of baseline.repos) {
+    const git = async (args: string[]) => {
+      const r = await deps.git(start.repo, args);
+      if (r.code !== 0 || r.error) throw new Error(`git ${args[0]} baseline evidence failed in ${start.repo}`);
+      return r.out;
+    };
+    if (!SHA.test(start.head)) throw new Error("invalid dispatch baseline HEAD");
+    await git(["merge-base", "--is-ancestor", start.head, "HEAD"]);
+    const committed = (await git(["diff", "--name-only", "--no-renames", "-z", start.head, "HEAD"])).split("\0").filter(Boolean);
+    const dirty = statusPaths(await git(["status", "--porcelain=v1", "-z", "--untracked-files=all"]));
+    for (const rel of [...committed, ...dirty]) {
+      const absolute = path.join(start.repo, rel);
+      // A legacy baseline without dirt evidence cannot grant an exemption.
+      if (start.dirtyPaths?.includes(rel) && (notMine.has(rel) || notMine.has(absolute))) continue;
+      paths.add(absolute);
+    }
+  }
+  return [...paths];
 }
 
 /** Paths are canonicalized by the gate. Other workers' paths are not inspected. */

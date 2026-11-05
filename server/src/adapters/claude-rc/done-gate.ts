@@ -15,13 +15,14 @@ import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
-import { validateCompletionProvenance, type GateBaseline } from "./done-gate-provenance.js";
+import { baselineMutationPaths, validateCompletionProvenance, type GateBaseline } from "./done-gate-provenance.js";
 
 const run = promisify(execFile);
 
 export const PAPERCLIP_MASTER = "/Volumes/NVM/Paperclip/master";
 export const PAPERCLIP_CURRENT = "/Volumes/NVM/Paperclip/cli/current";
 export const PROJECTS_ROOT = "/Volumes/NVM/AI_Coding_Projects";
+export const WORKSPACES_ROOT = "/Volumes/NVM/Paperclip/workspaces";
 const UI_PREFIXES = ["ui/", "master/ui/"];
 
 export type GateReceipt = { runId?: unknown; commits?: unknown; liveCheck?: unknown; notMine?: unknown };
@@ -43,14 +44,21 @@ const READ_ONLY_TOOLS = new Set(["Read", "Grep", "Glob", "WebFetch", "WebSearch"
 export function editedPaths(jsonl: string, sinceMs: number): MutationRecord {
   const seen = new Set<string>();
   const unknown = new Set<string>();
+  const lines = jsonl.split("\n");
+  // Untimestamped history before the first timestamp in this run is old context.
+  const firstRunRecord = lines.findIndex(line => {
+    try { const t = Date.parse(JSON.parse(line).timestamp ?? ""); return Number.isFinite(t) && t >= sinceMs; }
+    catch { return false; }
+  });
   if (!jsonl.trim()) unknown.add("transcript was read successfully but is empty; no run-owned mutation evidence");
-  for (const line of jsonl.split("\n")) {
+  for (const [index, line] of lines.entries()) {
     if (!line.trim()) continue;
     let rec: { timestamp?: string; cwd?: string; message?: { content?: unknown } };
     try { rec = JSON.parse(line); } catch { unknown.add("transcript contains an unreadable record"); continue; }
     if (!rec || typeof rec !== "object") { unknown.add("transcript contains an invalid record"); continue; }
     const t = Date.parse(rec.timestamp ?? "");
     if (Number.isFinite(t) && t < sinceMs) continue;
+    if (sinceMs > 0 && !Number.isFinite(t) && firstRunRecord >= 0 && index < firstRunRecord) continue;
     const content = rec.message?.content;
     if (!Array.isArray(content)) continue;
     for (const c of content as Array<{ type?: string; name?: string; input?: Record<string, unknown> }>) {
@@ -115,14 +123,19 @@ export async function evaluateDoneGate(receipt: GateReceipt, edited: string[] | 
   const gitFailure = (repo: string, command: string, result: GitEvidence) =>
     unknownEvidence(`Git evidence unknown: git ${command} in ${repo} failed (exit ${result.code}${result.error ? `; ${result.error}` : ""}). Restore Git access and retry; empty output is not proof of a clean checkout.`);
   const record = Array.isArray(edited) ? { paths: edited, unknown: [] } : edited;
-  if (record.unknown.length) return { ok: false, evidence: "unknown", reasons: [`mutation evidence unknown: ${record.unknown.join("; ")}. A complete run-owned mutation record or baseline is required; commit prose cannot establish the write set.`] };
+  if (record.unknown.length && (!baseline || record.unknown.some(reason => reason.startsWith("transcript ")))) return { ok: false, evidence: "unknown", reasons: [`mutation evidence unknown: ${record.unknown.join("; ")}. A complete run-owned mutation record or baseline is required; commit prose cannot establish the write set.`] };
+  let candidates = record.paths;
+  if (record.unknown.length && baseline) {
+    try { candidates = [...new Set([...candidates, ...await baselineMutationPaths(receipt, { ...deps, git }, baseline)])]; }
+    catch (error) { return unknownEvidence(`mutation baseline evidence unknown: ${error instanceof Error ? error.message : "Git evidence unavailable"}`); }
+  }
   const repos = await deps.repos();
   const resolvedRepos = new Map<string, string>();
   try {
     for (const repo of repos) resolvedRepos.set(await canonicalPath(repo), repo);
   } catch { return { ok: false, evidence: "unknown", reasons: ["mutation evidence unknown: checkout alias resolution failed"] }; }
   const touched = new Map<string, string[]>(); // repo -> edited files
-  for (const file of record.paths) {
+  for (const file of candidates) {
     if (!path.isAbsolute(file)) return { ok: false, evidence: "unknown", reasons: ["mutation evidence unknown: relative path has no run cwd"] };
     let f: string;
     try { f = await canonicalPath(file); }
@@ -195,9 +208,11 @@ export function productionDeps(): GateDeps {
   return {
     repos: async () => {
       const out = [PAPERCLIP_MASTER];
-      for (const e of await fs.readdir(PROJECTS_ROOT, { withFileTypes: true }).catch(() => [])) {
-        if (e.isDirectory() && await fs.stat(path.join(PROJECTS_ROOT, e.name, ".git")).then(s => s.isDirectory(), () => false))
-          out.push(path.join(PROJECTS_ROOT, e.name));
+      for (const root of [PROJECTS_ROOT, WORKSPACES_ROOT]) {
+        for (const e of await fs.readdir(root, { withFileTypes: true }).catch(() => [])) {
+          if (e.isDirectory() && await fs.stat(path.join(root, e.name, ".git")).then(s => s.isDirectory() || s.isFile(), () => false))
+            out.push(path.join(root, e.name));
+        }
       }
       return out;
     },
