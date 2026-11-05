@@ -52,7 +52,36 @@ function asString(v: unknown, fallback: string): string {
 }
 /** Pre-dispatch refusals meaning the seat is occupied: the wake waits instead of failing. */
 export function isTargetBusyRefusal(reason: string): boolean {
-  return /previous task unresolved|input guard refused/i.test(reason);
+  return /previous task unresolved|input guard refused|Remote Control seats? busy|single Remote Control session busy/i.test(reason);
+}
+
+/** A released process mutex alone does not prove that its provider run has stopped. */
+export async function checkpointRunState(
+  ctx: AdapterExecutionContext, raw: string,
+): Promise<"empty" | "self" | "live" | "terminal" | "unknown"> {
+  if (!raw) return "empty";
+  let active: Partial<ActiveDispatch>;
+  try { active = JSON.parse(raw); } catch { return "unknown"; }
+  if (!active || typeof active.runId !== "string" || !/^[0-9a-f-]{36}$/i.test(active.runId)
+      || typeof active.issueId !== "string") return "unknown";
+  if (active.runId === ctx.runId) return "self";
+  if (!ctx.authToken) return "unknown";
+  const port = Number(process.env.PAPERCLIP_LISTEN_PORT ?? process.env.PORT ?? "3100");
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return "unknown";
+  try {
+    // At most one bounded read per checkpointed seat in this claim. No idle polling.
+    const response = await fetch(`http://127.0.0.1:${port}/api/heartbeat-runs/${encodeURIComponent(active.runId)}`, {
+      redirect: "manual", signal: ctx.signal
+        ? AbortSignal.any([ctx.signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000),
+      headers: { Authorization: `Bearer ${ctx.authToken}` },
+    });
+    if (!response.ok) return "unknown";
+    const run = await response.json() as { id?: unknown; agentId?: unknown; companyId?: unknown; status?: unknown; contextSnapshot?: { issueId?: unknown; taskId?: unknown } };
+    if (run?.id !== active.runId || run.agentId !== ctx.agent.id || run.companyId !== ctx.agent.companyId
+        || (run.contextSnapshot?.issueId ?? run.contextSnapshot?.taskId) !== active.issueId) return "unknown";
+    if (run.status === "queued" || run.status === "running") return "live";
+    return ["succeeded", "failed", "cancelled", "timed_out", "interrupted"].includes(String(run.status)) ? "terminal" : "unknown";
+  } catch { return "unknown"; }
 }
 
 export function normalizeOneLine(value: string): string {
@@ -309,14 +338,18 @@ export function agySlot(index: number, socket: string, session: string, stateDir
 }
 
 /**
- * Pick and lock one seat: the seat already holding this issue's checkpoint (adoption, waits for its mutex),
+ * Pick and lock one seat: the seat already holding this issue's checkpoint (adoption),
  * else the first free seat without an unresolved checkpoint. Finished foreign receipts are settled on the way.
  */
-async function claimSlot(
+export async function claimSlot(
   ctx: AdapterExecutionContext, slots: AgySlot[], issueId: string, deadline: number,
 ): Promise<{ slot: AgySlot; unlock: () => Promise<void> }> {
+  if (ctx.signal?.aborted) throw new Error("agy run cancelled; shared TUI left intact, active checkpoint preserved");
   for (const slot of slots) await fs.mkdir(slot.stateDir, { recursive: true, mode: 0o700 });
-  const activeOf = (slot: AgySlot) => fs.readFile(path.join(slot.stateDir, "active.json"), "utf8").catch(() => "");
+  const activeOf = (slot: AgySlot) => fs.readFile(path.join(slot.stateDir, "active.json"), "utf8").catch(error => {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  });
   const owner = await (async () => {
     for (const slot of slots) {
       const raw = await activeOf(slot);
@@ -338,31 +371,27 @@ async function claimSlot(
       throw error;
     }
   }
-  if (owner) return { slot: owner, unlock: await acquire(owner.stateDir, deadline) };
-  while (Date.now() < deadline) {
-    let lastError = "";
-    let held = false;
-    for (const slot of slots) {
-      const unlock = await tryAcquire(slot.stateDir);
-      if (!unlock) { held = true; continue; }
+  // A duplicate wake must not wait inside an adapter until the seat times out.
+  // Preserve issue affinity: an occupied owner seat cannot spill into another seat.
+  for (const slot of owner ? [owner] : slots) {
+    const unlock = await tryAcquire(slot.stateDir);
+    if (!unlock) continue;
+    try {
       let raw = await activeOf(slot);
-      if (raw) {
+      const state = await checkpointRunState(ctx, raw);
+      if (state === "live" || state === "unknown") { await unlock(); continue; }
+      if (raw && state === "terminal") {
         await settleForeignCheckpoint(ctx, raw, issueId, slot.stateDir, path.join(slot.stateDir, "active.json"));
         raw = await activeOf(slot);
       }
-      try {
-        adoptableActive(raw, issueId, slot.stateDir);
-        return { slot, unlock };
-      } catch (e) {
-        lastError = e instanceof Error ? e.message : String(e);
-        await unlock();
-      }
+      adoptableActive(raw, issueId, slot.stateDir);
+      return { slot, unlock };
+    } catch (error) {
+      await unlock();
+      if (!isTargetBusyRefusal(error instanceof Error ? error.message : String(error))) throw error;
     }
-    // No seat is running and every one holds an unresolved checkpoint: same target_busy refusal as one seat.
-    if (lastError && !held) throw new Error(lastError);
-    await sleep(1000);
   }
-  throw new Error("agy Remote Control seats busy: serialization timeout");
+  throw new Error("agy previous task unresolved; Remote Control seat busy; wake coalesced without dispatch");
 }
 
 export type DeliveryDisposition = { status: "done" | "in_review"; reportRevisionId: string };

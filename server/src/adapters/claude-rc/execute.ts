@@ -16,7 +16,7 @@ import {
   joinPromptSections, renderTemplate, selectPaperclipPromptSections,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
-  acquire, adoptableActive, isTargetBusyRefusal, normalizeOneLine, parseReceipt, receiptFilePath, target, tmux, tryAcquire,
+  acquire, adoptableActive, checkpointRunState, isTargetBusyRefusal, normalizeOneLine, parseReceipt, receiptFilePath, target, tmux, tryAcquire,
   type Receipt,
 } from "../agy/execute.js";
 import { deriveRcName, reportsToDepth, sanitizeRcName, slotRcName, type RcAgentNode } from "./rc-name.js";
@@ -51,26 +51,44 @@ export function rcSlot(index: number, session: string, stateDir: string): RcSlot
 export async function claimSlot(
   ctx: AdapterExecutionContext, slots: RcSlot[], issueId: string, deadline: number,
 ): Promise<{ slot: RcSlot; unlock: () => Promise<void> }> {
-  if (slots.length === 1) return { slot: slots[0]!, unlock: await acquire(slots[0]!.stateDir, deadline) };
+  if (ctx.signal?.aborted) throw new Error("Claude run cancelled; shared TUI left intact, active checkpoint preserved");
   for (const slot of slots) await fs.mkdir(slot.stateDir, { recursive: true, mode: 0o700 });
-  const activeOf = (slot: RcSlot) => fs.readFile(path.join(slot.stateDir, "active.json"), "utf8").catch(() => "");
+  const activeOf = (slot: RcSlot) => fs.readFile(path.join(slot.stateDir, "active.json"), "utf8").catch(error => {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  });
+  let owner: RcSlot | undefined;
   for (const slot of slots) {
-    try { if ((JSON.parse(await activeOf(slot)) as { issueId?: unknown }).issueId === issueId)
-      return { slot, unlock: await acquire(slot.stateDir, deadline) }; } catch { /* no checkpoint */ }
+    try {
+      if ((JSON.parse(await activeOf(slot)) as { issueId?: unknown }).issueId === issueId) { owner = slot; break; }
+    } catch { /* unreadable checkpoints are retained below */ }
   }
-  while (Date.now() < deadline) {
-    let held = false;
-    for (const slot of slots) {
-      const unlock = await tryAcquire(slot.stateDir);
-      if (!unlock) { held = true; continue; }
-      await reconcileForeignSettlement(ctx, slot.stateDir, path.join(slot.stateDir, "active.json")).catch(() => {});
-      if (!(await activeOf(slot))) return { slot, unlock };
+  if (ctx.context.paperclipRestartReattach === true) {
+    if (!owner) throw new Error("claude_rc_local restart checkpoint missing; provider ownership requires reconciliation");
+    const unlock = await acquire(owner.stateDir, deadline);
+    try {
+      const active = adoptableActive(await activeOf(owner), issueId, owner.stateDir, "claude_rc_local");
+      if (!active || active.runId !== ctx.runId) throw new Error("claude_rc_local restart checkpoint run mismatch; provider ownership requires reconciliation");
+      return { slot: owner, unlock };
+    } catch (error) { await unlock(); throw error; }
+  }
+  for (const slot of owner ? [owner] : slots) {
+    const unlock = await tryAcquire(slot.stateDir);
+    if (!unlock) continue;
+    try {
+      const raw = await activeOf(slot);
+      const state = await checkpointRunState(ctx, raw);
+      if (state === "live" || state === "unknown") { await unlock(); continue; }
+      await reconcileForeignSettlement(ctx, slot.stateDir, path.join(slot.stateDir, "active.json"));
+      // Same-issue adoption observes the original operation; it never submits a second one.
+      adoptableActive(await activeOf(slot), issueId, slot.stateDir, "claude_rc_local");
+      return { slot, unlock };
+    } catch (error) {
       await unlock();
+      if (!isTargetBusyRefusal(error instanceof Error ? error.message : String(error))) throw error;
     }
-    if (!held) throw new Error("claude_rc_local previous task unresolved; inspect active.json and its receipt before dispatch. Never replay actions");
-    await sleep(1000);
   }
-  throw new Error("claude_rc_local Remote Control seats busy: serialization timeout");
+  throw new Error("claude_rc_local previous task unresolved; Remote Control seat busy; wake coalesced without dispatch");
 }
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
