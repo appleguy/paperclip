@@ -358,6 +358,7 @@ import { buildExecutionWorkspaceAdapterConfig, parseProjectExecutionWorkspacePol
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import {
   buildPromotedSourceTrust,
+  commentAuthoringSourceForActor,
   isLowTrustQuarantined,
   redactQuarantinedBodyForHigherTrust,
   resolveActorSourceTrustForIssue,
@@ -15114,6 +15115,10 @@ export function issueRoutes(
                   mirrorToSlack: actor.actorType === "user",
                   authorizationReason: issueMutationAuthorizationReason,
                   sourceTrust: transactionalCommentSourceTrust,
+                  commentAuthoringSource: commentAuthoringSourceForActor({
+                    actorType: req.actor.type,
+                    actorSource: req.actor.source,
+                  }),
                 },
                 tx,
               );
@@ -15726,6 +15731,10 @@ export function issueRoutes(
             clientRequestId: actor.actorType === "user" ? commentClientRequestId : undefined,
             mirrorToSlack: actor.actorType === "user",
             sourceTrust: await sourceTrustForActorWrite(issue, actor),
+            commentAuthoringSource: commentAuthoringSourceForActor({
+              actorType: req.actor.type,
+              actorSource: req.actor.source,
+            }),
           },
           tx as unknown as Db,
         );
@@ -17733,6 +17742,7 @@ export function issueRoutes(
                 issue.id,
                 `Secret binding execution failed\n\n- Config path: \`${configPath}\`\n- Error code: \`${errorCode}\`\n- Binding created: **no**`,
                 { userId: resolvedByUserId },
+                { commentAuthoringSource: "system" },
               );
             } catch (commentError) {
               logger.warn(
@@ -18851,6 +18861,7 @@ export function issueRoutes(
           ));
           const saved = await svc.addComment(issue.id, req.body.body, { userId }, {
             clientRequestId: req.body.clientRequestId, authorType: "user", attachmentIds: req.body.attachmentIds,
+            commentAuthoringSource: commentAuthoringSourceForActor({ actorType: req.actor.type, actorSource: req.actor.source }),
           }, tx);
           if (!existing) await logActivity(tx as unknown as Db, {
             companyId: issue.companyId, actorType: actor.actorType, actorId: actor.actorId,
@@ -18909,6 +18920,7 @@ export function issueRoutes(
           const receipt = await svc.addComment(issue.id, req.body.body, { userId: req.actor.userId }, {
             clientRequestId: req.body.clientRequestId, attachmentIds: req.body.attachmentIds,
             authorType: "user",
+            commentAuthoringSource: commentAuthoringSourceForActor({ actorType: req.actor.type, actorSource: req.actor.source }),
           });
           const userId = req.actor.userId;
           await completeIssueCommentReceipt(db, issueReferencesSvc, {
@@ -18940,6 +18952,10 @@ export function issueRoutes(
         await getClosedIssueExecutionWorkspace(issue);
 
       const actor = getActorInfo(req);
+      const commentAuthoringSource = commentAuthoringSourceForActor({
+        actorType: req.actor.type,
+        actorSource: req.actor.source,
+      });
       const commentPresentation =
         req.body.presentation ??
         (await deriveRecoveryCommentPresentation(
@@ -19224,6 +19240,7 @@ export function issueRoutes(
         currentIssue.executionPolicy ?? null,
       );
       const shouldAutoApproveReviewComment =
+        commentAuthoringSource !== "via_chatgpt" &&
         currentIssue.status === "in_review" &&
         currentExecutionState?.status === "pending" &&
         actorMatchesExecutionParticipant(
@@ -19286,6 +19303,7 @@ export function issueRoutes(
           clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
           mirrorToSlack: actor.actorType === "user",
           sourceTrust,
+          commentAuthoringSource,
         };
         let txResult: {
           comment: Awaited<ReturnType<typeof svc.addComment>>;
@@ -19400,6 +19418,7 @@ export function issueRoutes(
           mirrorToSlack: actor.actorType === "user",
           authorizationReason: commentAuthorizationReason,
           sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),
+          commentAuthoringSource,
         };
         const add = (dbOrTx: Db = db) =>
           svc.addComment(

@@ -3,6 +3,7 @@ import {
   LOW_TRUST_REVIEW_PRESET,
   LOW_TRUST_REVIEW_PRESET_VERSION,
   LOW_TRUST_REVIEW_RAW_OUTPUT_DISPOSITION,
+  COMMENT_AUTHORING_SOURCES,
   TRUST_PRESETS,
 } from "../trust-policy.js";
 
@@ -56,8 +57,9 @@ export const trustAuthorizationPolicySchema = z.object({
 export const sourceTrustArtifactKindSchema = z.enum(["issue", "comment", "document", "work_product"]);
 
 export const sourceTrustMetadataSchema = z.object({
-  preset: trustPresetSchema,
-  disposition: z.enum(["quarantined", "promoted"]),
+  commentAuthoringSource: z.enum(COMMENT_AUTHORING_SOURCES).optional(),
+  preset: trustPresetSchema.optional(),
+  disposition: z.enum(["quarantined", "promoted"]).optional(),
   sourceIssueId: z.string().guid().nullable().optional(),
   sourceRunId: z.string().guid().nullable().optional(),
   sourceAgentId: z.string().guid().nullable().optional(),
@@ -69,7 +71,16 @@ export const sourceTrustMetadataSchema = z.object({
   promotedByActorType: z.enum(["agent", "user", "system"]).nullable().optional(),
   promotedByActorId: z.string().trim().min(1).nullable().optional(),
   promotedAt: z.string().datetime({ offset: true }).nullable().optional(),
-}).strict();
+}).strict().superRefine((value, context) => {
+  const hasPreset = value.preset !== undefined;
+  const hasDisposition = value.disposition !== undefined;
+  if (hasPreset !== hasDisposition) {
+    context.addIssue({ code: "custom", message: "preset and disposition must be provided together" });
+  }
+  if (!hasPreset && !value.commentAuthoringSource) {
+    context.addIssue({ code: "custom", message: "source-trust metadata needs a trust disposition or comment authoring source" });
+  }
+});
 
 export type TrustPresetInput = z.infer<typeof trustPresetSchema>;
 export type LowTrustBoundaryInput = z.infer<typeof lowTrustBoundarySchema>;

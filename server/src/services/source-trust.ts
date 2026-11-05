@@ -2,6 +2,8 @@ import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, heartbeatRuns, projects } from "@paperclipai/db";
 import {
+  type CommentAuthoringSource,
+  type IssueCommentAuthorType,
   LOW_TRUST_REVIEW_PRESET,
   type SourceTrustMetadata,
 } from "@paperclipai/shared";
@@ -11,6 +13,30 @@ import { resolveCoreTrustPreset } from "./trust-preset-resolver.js";
 
 export const LOW_TRUST_QUARANTINED_BODY =
   "[Quarantined low-trust output omitted from higher-trust agent context. A trusted reviewer can inspect and promote a sanitized artifact.]";
+
+export function commentAuthoringSourceForActor(input: {
+  actorType: "board" | "agent" | "none";
+  actorSource?: string | null;
+}): CommentAuthoringSource {
+  if (input.actorType === "agent") return "agent";
+  if (input.actorType === "none") return "system";
+  return input.actorSource === "mcp_oauth" ? "via_chatgpt" : "you";
+}
+
+export function commentAuthoringSourceForAuthorType(
+  authorType: IssueCommentAuthorType | null | undefined,
+): CommentAuthoringSource {
+  if (authorType === "agent") return "agent";
+  if (authorType === "system") return "system";
+  return "you";
+}
+
+export function withCommentAuthoringSource(
+  sourceTrust: SourceTrustMetadata | null | undefined,
+  commentAuthoringSource: CommentAuthoringSource,
+): SourceTrustMetadata {
+  return { ...(sourceTrust ?? {}), commentAuthoringSource };
+}
 
 export type SourceTrustActor = {
   actorType: "agent" | "user";

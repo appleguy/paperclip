@@ -136,6 +136,7 @@ import {
 } from "@paperclipai/db";
 import type {
   AcceptedPlanDecomposition,
+  CommentAuthoringSource,
   IssueComment,
   IssueCommentAuthorType,
   IssueCommentDerivedAuthorSource,
@@ -13056,6 +13057,7 @@ export function issueService(db: Db) {
         proactiveChatMessage?: { sourceTaskId: string; userId: string };
         /** Server-only: authenticated Paperclip messages also belong in the Slack thread. */
         mirrorToSlack?: boolean;
+        commentAuthoringSource?: CommentAuthoringSource;
       },
       dbOrTx: any = db,
     ): Promise<IssueComment> {
@@ -13386,6 +13388,7 @@ export function issueService(db: Db) {
           presentation,
           metadata,
           sourceTrust: options?.sourceTrust ?? null,
+          commentAuthoringSource: options?.commentAuthoringSource,
           createdAt: validCreatedAt ?? currentInsertTimestamp!,
           ...(currentInsertTimestamp
             ? { updatedAt: currentInsertTimestamp }

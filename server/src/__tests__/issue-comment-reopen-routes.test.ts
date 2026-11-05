@@ -619,6 +619,9 @@ describe("issue comment reopen routes", () => {
       : await app.patch(`/api/issues/${issue.id}`).send({ comment: "New regression evidence", resume: true });
 
     expect(response.status, JSON.stringify(response.body)).toBe(operation === "comment" ? 201 : 200);
+    expect(mockIssueService.addComment.mock.calls[0]?.[3]).toMatchObject({
+      commentAuthoringSource: "agent",
+    });
     expect(mockIssueService.update.mock.calls[0]?.slice(0, 2))
       .toEqual([issue.id, expect.objectContaining({ status: "todo" })]);
     expect(mockExecutionWorkspaceService.reopenClosedIsolatedExecutionWorkspaceForIssue).not.toHaveBeenCalled();
@@ -722,6 +725,9 @@ describe("issue comment reopen routes", () => {
       expect.objectContaining({ attachmentIds: [id], clientRequestId: "77777777-7777-4777-8777-777777777777" }),
       mockTx,
     );
+    expect(mockIssueService.addComment.mock.calls[0]?.[3]).toMatchObject({
+      commentAuthoringSource: "you",
+    });
   });
 
   it("rejects attachment IDs without a PATCH comment before updating or waking", async () => {
@@ -1608,6 +1614,7 @@ describe("issue comment reopen routes", () => {
         authorType: "user",
         authorizationReason: "allow_board_actor",
         clientRequestId: undefined,
+        commentAuthoringSource: "you",
         mirrorToSlack: true,
         presentation: {
           kind: "system_notice",
@@ -3411,6 +3418,112 @@ describe("issue comment reopen routes", () => {
       expect.any(String),
       expect.objectContaining({ reason: "issue_blockers_resolved" }),
     );
+  });
+
+  it("does not auto-approve a Via ChatGPT comment that matches a user review participant", async () => {
+    const policy = await normalizePolicy({
+      stages: [{
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        type: "review",
+        participants: [{ type: "user", userId: "local-board" }],
+      }],
+    });
+    const issue = {
+      ...makeIssue("todo"),
+      status: "in_review",
+      assigneeAgentId: null,
+      assigneeUserId: "local-board",
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: policy.stages[0].id,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "user", userId: "local-board" },
+        returnAssignee: {
+          type: "agent",
+          agentId: "22222222-2222-4222-8222-222222222222",
+        },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+    const reviewBody = "## Review: PAP-580 - APPROVED";
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-via-chatgpt-review",
+      issueId: issue.id,
+      companyId: issue.companyId,
+      body: reviewBody,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      authorAgentId: null,
+      authorUserId: "local-board",
+    });
+
+    const res = await request(await installActor(createApp(), {
+      type: "board",
+      userId: "local-board",
+      companyId: "company-1",
+      companyIds: ["company-1"],
+      source: "mcp_oauth",
+    }))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: reviewBody });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.addComment.mock.calls[0]?.[3]).toMatchObject({
+      commentAuthoringSource: "via_chatgpt",
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("rejects Via ChatGPT issue updates that submit a review approval", async () => {
+    const policy = await normalizePolicy({
+      stages: [{
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        type: "review",
+        participants: [{ type: "user", userId: "local-board" }],
+      }],
+    });
+    const issue = {
+      ...makeIssue("todo"),
+      status: "in_review",
+      assigneeAgentId: null,
+      assigneeUserId: "local-board",
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: policy.stages[0].id,
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "user", userId: "local-board" },
+        returnAssignee: {
+          type: "agent",
+          agentId: "22222222-2222-4222-8222-222222222222",
+        },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(await installActor(createApp(), {
+      type: "board",
+      userId: "local-board",
+      companyId: "company-1",
+      companyIds: ["company-1"],
+      source: "mcp_oauth",
+    }))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ status: "done", comment: "## Review: PAP-580 - APPROVED" });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toBe("Review decisions must be made in Paperclip");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+    expect(mockIssueService.addComment).not.toHaveBeenCalled();
   });
 
   it("does not auto-approve when actor kind disagrees with the participant kind", async () => {

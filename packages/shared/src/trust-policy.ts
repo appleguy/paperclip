@@ -66,6 +66,9 @@ export type SourceTrustArtifactKind = "issue" | "comment" | "document" | "work_p
 
 export type SourceTrustDisposition = "quarantined" | "promoted";
 
+export const COMMENT_AUTHORING_SOURCES = ["you", "via_chatgpt", "agent", "system"] as const;
+export type CommentAuthoringSource = (typeof COMMENT_AUTHORING_SOURCES)[number];
+
 export interface SourceTrustPromotionSource {
   artifactKind: SourceTrustArtifactKind;
   artifactId: string;
@@ -73,8 +76,10 @@ export interface SourceTrustPromotionSource {
 }
 
 export interface SourceTrustMetadata {
-  preset: TrustPreset;
-  disposition: SourceTrustDisposition;
+  /** Durable source of an issue comment; absent on historical comments and non-comment artifacts. */
+  commentAuthoringSource?: CommentAuthoringSource;
+  preset?: TrustPreset;
+  disposition?: SourceTrustDisposition;
   sourceIssueId?: string | null;
   sourceRunId?: string | null;
   sourceAgentId?: string | null;

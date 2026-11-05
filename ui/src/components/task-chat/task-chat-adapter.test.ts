@@ -52,6 +52,27 @@ describe("commentsToTaskChatItems", () => {
       author: "human", sourceChannel: "imessage-photon", text: "From my phone",
     }]);
   });
+  it("carries the persisted authoring source into every comment bubble", () => {
+    const sources = [
+      ["you", "user"],
+      ["via_chatgpt", "user"],
+      ["agent", "agent"],
+      ["system", "system"],
+    ] as const;
+    const items = commentsToTaskChatItems(sources.map(([commentAuthoringSource, authorType]) => ({
+      id: `comment-${commentAuthoringSource}`,
+      body: "A comment",
+      authorType,
+      authorUserId: authorType === "user" ? "owner" : null,
+      authorAgentId: authorType === "agent" ? "agent-1" : null,
+      sourceTrust: { commentAuthoringSource },
+      createdAt: "2026-10-09T20:42:00Z",
+    } as unknown as IssueChatComment)));
+
+    expect(items.map(item => item.kind === "message" ? item.commentAuthoringSource : undefined)).toEqual(
+      sources.map(([commentAuthoringSource]) => commentAuthoringSource),
+    );
+  });
   it("classifies a recovered local-board comment as an agent bubble", () => {
     const items = commentsToTaskChatItems([{
       id: "c-recovered",

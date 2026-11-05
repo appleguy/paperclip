@@ -268,6 +268,7 @@ export {
   type SourceTrustDisposition,
   type SourceTrustPromotionSource,
   type SourceTrustMetadata,
+  type CommentAuthoringSource,
 } from "./trust-policy.js";
 export {
   APP_STORE_DEFINITIONS,

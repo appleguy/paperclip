@@ -24,6 +24,7 @@ import type {
   DecisionHistoryItem,
   ConversationTaskHandoff,
   AttentionItem,
+  CommentAuthoringSource,
 } from "@paperclipai/shared";
 import type {
   PaperclipQuestionResponse,
@@ -121,6 +122,8 @@ export interface TaskChatMessageItem {
   channel?: "progress" | "final" | "unknown";
   /** Transport attribution for an inbound human comment. */
   sourceChannel?: IssueCommentMetadata["sourceChannel"];
+  /** Server-authenticated source from the comment's source-trust metadata. */
+  commentAuthoringSource?: CommentAuthoringSource;
   timestamp?: string;
   /** Show a streaming cursor and suppress collapse while true. */
   streaming?: boolean;

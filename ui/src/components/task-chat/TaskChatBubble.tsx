@@ -14,6 +14,7 @@ import { paperclipHumanAvatarUrl } from "@/lib/issue-chat-human-author";
 import { useCallback, useContext, useState, type ReactNode } from "react";
 import { useEmailComment } from "@/components/EmailMessageCard";
 import type { IssueAttachment } from "@paperclipai/shared";
+import type { CommentAuthoringSource } from "@paperclipai/shared";
 import { IssueGalleryContext } from "@/context/IssueGalleryContext";
 import { cn } from "@/lib/utils";
 import { agentDetailHref } from "@/pages/agent-detail-navigation";
@@ -81,6 +82,21 @@ function initialsForName(name: string) {
     return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
   }
   return name.slice(0, 2).toUpperCase();
+}
+
+const COMMENT_AUTHORING_SOURCE_LABELS: Record<CommentAuthoringSource, string> = {
+  you: "You",
+  via_chatgpt: "Via ChatGPT",
+  agent: "Agent",
+  system: "System",
+};
+
+function commentAuthoringSourceLabel(item: TaskChatMessageItem) {
+  if (item.commentAuthoringSource) {
+    return COMMENT_AUTHORING_SOURCE_LABELS[item.commentAuthoringSource];
+  }
+  if (item.author === "human") return "You";
+  return item.author === "agent" ? "Agent" : "System";
 }
 
 export function TaskChatAgentIdentity({
@@ -188,11 +204,19 @@ function TaskChatBubbleContent({
   if (item.author === "system") {
     // Collapsed humanized one-liner, expandable to the full detail (PAP-443).
     return (
-      <TaskChatSystemNotice
-        item={item}
-        onTryAgainNoLiveExecutionPath={onTryAgainNoLiveExecutionPath}
-        tryAgainNoLiveExecutionPathPending={tryAgainNoLiveExecutionPathPending}
-      />
+      <div className="flex w-full flex-col items-center gap-1">
+        <span
+          className="px-1 text-(length:--text-micro) text-muted-foreground"
+          data-testid="task-chat-comment-source"
+        >
+          {commentAuthoringSourceLabel(item)}
+        </span>
+        <TaskChatSystemNotice
+          item={item}
+          onTryAgainNoLiveExecutionPath={onTryAgainNoLiveExecutionPath}
+          tryAgainNoLiveExecutionPathPending={tryAgainNoLiveExecutionPathPending}
+        />
+      </div>
     );
   }
 
@@ -252,6 +276,12 @@ function TaskChatBubbleContent({
       )}
     >
       {beforeTurn ? <div className="w-full pb-1">{beforeTurn}</div> : null}
+      <span
+        className="px-1 text-(length:--text-micro) text-muted-foreground"
+        data-testid="task-chat-comment-source"
+      >
+        {commentAuthoringSourceLabel(item)}
+      </span>
       {item.chatMessage && <Link to={`/issues/${item.chatMessage.sourceTaskIdentifier}`} className="px-1 text-xs text-muted-foreground underline underline-offset-4">
         From {item.chatMessage.sourceTaskIdentifier}
       </Link>}

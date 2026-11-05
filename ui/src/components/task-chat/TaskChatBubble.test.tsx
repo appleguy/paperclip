@@ -91,6 +91,27 @@ describe("TaskChatBubble attachment chips", () => {
     );
   }
 
+  it.each([
+    ["you", "human", "You"],
+    ["via_chatgpt", "human", "Via ChatGPT"],
+    ["agent", "agent", "Agent"],
+    ["system", "system", "System"],
+  ] as const)("shows the %s comment source label", (commentAuthoringSource, author, label) => {
+    flushSync(() => root!.render(
+      <ThemeProvider>
+        <TaskChatBubble item={{
+          id: `source-${commentAuthoringSource}`,
+          kind: "message",
+          author,
+          text: "Comment body",
+          commentAuthoringSource,
+        }} />
+      </ThemeProvider>,
+    ));
+
+    expect(container.querySelector('[data-testid="task-chat-comment-source"]')?.textContent).toBe(label);
+  });
+
   it("renders another human on the left like an agent, and moves them right when they become the viewer", () => {
     const item: TaskChatMessageItem = {
       id: "sam-comment", kind: "message", author: "human", text: "I still see the old task title.",

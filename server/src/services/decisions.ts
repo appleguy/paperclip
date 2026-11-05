@@ -486,7 +486,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
         const values = decision.inputValues ?? {};
         let result: Record<string, unknown>;
         if (effect.type === "comment_on_issue") {
-          const comment = await svc.addComment(target.id, interpolate(effect.bodyMarkdown, values), { userId: decidedByUserId }, undefined, tx);
+          const comment = await svc.addComment(target.id, interpolate(effect.bodyMarkdown, values), { userId: decidedByUserId }, { commentAuthoringSource: "system" }, tx);
           result = { commentId: comment.id };
         } else if (effect.type === "update_issue_status") {
           const updated = await svc.update(
@@ -496,7 +496,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
             postCommitActivityPublications,
             postCommitIssueActions,
           );
-          if (effect.comment) await svc.addComment(target.id, interpolate(effect.comment, values), { userId: decidedByUserId }, undefined, tx);
+          if (effect.comment) await svc.addComment(target.id, interpolate(effect.comment, values), { userId: decidedByUserId }, { commentAuthoringSource: "system" }, tx);
           result = { issueId: updated?.id, status: updated?.status };
         } else if (effect.type === "assign_issue") {
           const updated = await svc.update(
@@ -510,7 +510,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
             postCommitActivityPublications,
             postCommitIssueActions,
           );
-          if (effect.comment) await svc.addComment(target.id, interpolate(effect.comment, values), { userId: decidedByUserId }, undefined, tx);
+          if (effect.comment) await svc.addComment(target.id, interpolate(effect.comment, values), { userId: decidedByUserId }, { commentAuthoringSource: "system" }, tx);
           result = { issueId: updated?.id };
         } else if (effect.type === "resolve_blocker") {
           const current = await tx.select({ id: issueRelations.issueId }).from(issueRelations).where(and(eq(issueRelations.companyId, decision.companyId), eq(issueRelations.relatedIssueId, target.id), eq(issueRelations.type, "blocks")));
@@ -543,7 +543,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
               postCommitIssueActions,
             );
           }
-          await svc.addComment(target.id, interpolate(effect.reasonComment, values), { userId: decidedByUserId }, undefined, tx);
+          await svc.addComment(target.id, interpolate(effect.reasonComment, values), { userId: decidedByUserId }, { commentAuthoringSource: "system" }, tx);
           result = { cancelledIssueIds: cancelled };
         }
         const activity = await effectAudit(tx as unknown as Db, decision, execution.id, effect, "executed", decidedByUserId, originResponsibleUserId, result);

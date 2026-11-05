@@ -212,6 +212,7 @@ import {
   systemNoticeLabelForTone,
 } from "../lib/system-notice-comment";
 import type {
+  CommentAuthoringSource,
   IssueCommentMetadata,
   IssueCommentPresentation,
   SourceTrustMetadata,
@@ -2096,6 +2097,9 @@ function IssueChatUserMessage({
         <span className="text-sm font-medium text-foreground">
           {resolvedAuthorName}
         </span>
+        <CommentAuthoringSourceBadge
+          source={commentAuthoringSourceFromCustom(custom)}
+        />
         <SourceTrustBadge sourceTrust={sourceTrust} artifactLabel="comment" />
         {followUpRequested ? (
           <Badge
@@ -2580,6 +2584,9 @@ function IssueChatAssistantMessage({
             <span className="text-sm font-medium text-foreground">
               {authorName}
             </span>
+            <CommentAuthoringSourceBadge
+              source={commentAuthoringSourceFromCustom(custom)}
+            />
             {/* Reads as "Fable · for Dotta" beside the author name (the open cross-task write design (attribution)). */}
             {attribution ? (
               <CommentAttributionChip
@@ -3135,8 +3142,50 @@ function isSourceTrustMetadata(value: unknown): value is SourceTrustMetadata {
   if (!value || typeof value !== "object") return false;
   const v = value as Record<string, unknown>;
   return (
-    v.preset === "low_trust_review" &&
-    (v.disposition === "quarantined" || v.disposition === "promoted")
+    isCommentAuthoringSource(v.commentAuthoringSource) ||
+    (v.preset === "low_trust_review" &&
+      (v.disposition === "quarantined" || v.disposition === "promoted"))
+  );
+}
+
+const COMMENT_AUTHORING_SOURCE_LABELS: Record<CommentAuthoringSource, string> = {
+  you: "You",
+  via_chatgpt: "Via ChatGPT",
+  agent: "Agent",
+  system: "System",
+};
+
+function isCommentAuthoringSource(value: unknown): value is CommentAuthoringSource {
+  return value === "you" || value === "via_chatgpt" || value === "agent" || value === "system";
+}
+
+function commentAuthoringSourceFromCustom(
+  custom: Record<string, unknown>,
+): CommentAuthoringSource {
+  const sourceTrust = isSourceTrustMetadata(custom.sourceTrust)
+    ? custom.sourceTrust
+    : null;
+  if (sourceTrust && isCommentAuthoringSource(sourceTrust.commentAuthoringSource)) {
+    return sourceTrust.commentAuthoringSource;
+  }
+  if (custom.authorType === "user") return "you";
+  if (custom.authorType === "agent") return "agent";
+  return "system";
+}
+
+function CommentAuthoringSourceBadge({
+  source,
+}: {
+  source: CommentAuthoringSource;
+}) {
+  return (
+    <Badge
+      variant="outline"
+      className="text-(length:--text-nano) uppercase tracking-(--tracking-eyebrow)"
+      data-testid={`comment-authoring-source-${source}`}
+    >
+      {COMMENT_AUTHORING_SOURCE_LABELS[source]}
+    </Badge>
   );
 }
 
@@ -3427,6 +3476,7 @@ function CompactSystemNoticeRow({
   tone,
   title,
   source,
+  commentAuthoringSource,
   noticeProps,
   defaultOpen = false,
 }: {
@@ -3435,6 +3485,7 @@ function CompactSystemNoticeRow({
   tone: SystemNoticeTone;
   title: string;
   source?: SystemNoticeProps["source"];
+  commentAuthoringSource: CommentAuthoringSource;
   noticeProps: SystemNoticeProps;
   defaultOpen?: boolean;
 }) {
@@ -3468,6 +3519,7 @@ function CompactSystemNoticeRow({
                 · {source.label}
               </span>
             ) : null}
+            <CommentAuthoringSourceBadge source={commentAuthoringSource} />
             {/* Trailing meta never shrinks — keeps the timestamp on one line so the
                 collapsed row stays a single quiet line on narrow / mobile widths. */}
             <span className="ml-auto flex shrink-0 items-center gap-1.5">
@@ -3528,6 +3580,7 @@ function SystemNoticeCommentContent({
     typeof custom.authorType === "string" ? custom.authorType : null;
   const authorName =
     typeof custom.authorName === "string" ? custom.authorName : null;
+  const commentAuthoringSource = commentAuthoringSourceFromCustom(custom);
   const bodyText = message.content
     .filter((p): p is { type: "text"; text: string } => p.type === "text")
     .map((p) => p.text)
@@ -3618,20 +3671,23 @@ function SystemNoticeCommentContent({
   };
 
   if (authorType === "system" && workspaceRetry) return null;
-  if (authorType === "system" && branchRecovery) return <div id={anchorId}><WorkspaceBaseRefRecoveryNotice key={`${branchRecovery.actionId}:${branchRecovery.runId}`} {...branchRecovery.props} /></div>;
+  if (authorType === "system" && branchRecovery) return <div id={anchorId}><div className="mb-1 px-1"><CommentAuthoringSourceBadge source={commentAuthoringSource} /></div><WorkspaceBaseRefRecoveryNotice key={`${branchRecovery.actionId}:${branchRecovery.runId}`} {...branchRecovery.props} /></div>;
 
   if (authorType === "system" && recoverySnapshot) {
-    return <div id={anchorId}><DispositionRecoveryNotice snapshot={recoverySnapshot} createdAt={toValidIsoString(message.createdAt)} defaultExpanded={presentation?.detailsDefaultOpen} /></div>;
+    return <div id={anchorId}><div className="mb-1 px-1"><CommentAuthoringSourceBadge source={commentAuthoringSource} /></div><DispositionRecoveryNotice snapshot={recoverySnapshot} createdAt={toValidIsoString(message.createdAt)} defaultExpanded={presentation?.detailsDefaultOpen} /></div>;
   }
 
   if (staleSuccessfulRunHandoffNotice) {
     return (
-      <StaleDispositionWarningRow
-        anchorId={anchorId}
-        message={message}
-        metadata={commentMetadata}
-        runAgentId={runAgentId}
-      />
+      <div>
+        <div className="mb-1 px-1"><CommentAuthoringSourceBadge source={commentAuthoringSource} /></div>
+        <StaleDispositionWarningRow
+          anchorId={anchorId}
+          message={message}
+          metadata={commentMetadata}
+          runAgentId={runAgentId}
+        />
+      </div>
     );
   }
 
@@ -3647,6 +3703,7 @@ function SystemNoticeCommentContent({
         tone={tone}
         title={title}
         source={source}
+        commentAuthoringSource={commentAuthoringSource}
         noticeProps={props}
         defaultOpen={Boolean(presentation.detailsDefaultOpen)}
       />
@@ -3656,6 +3713,7 @@ function SystemNoticeCommentContent({
   return (
     <div id={anchorId} className="group">
       <div className="py-1">
+        <div className="mb-1 px-1"><CommentAuthoringSourceBadge source={commentAuthoringSource} /></div>
         <SystemNotice {...props} />
         <div className="mt-1 flex items-center justify-end gap-1.5 px-1 opacity-0 transition-opacity group-hover:opacity-100">
           <Tooltip>
