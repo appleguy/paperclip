@@ -827,7 +827,10 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       if (run.runtimeMode === "legacy" && supportsRestartReattach(adapterType, current.adapterConfig)) {
         const prior = parseObject(parseObject(run.resultJson).restartReattach);
         const count = typeof prior.count === "number" ? prior.count : 0;
-        if (count >= MAX_RESTART_REATTACHES) {
+        // agy restart re-entry is fenced to the original run's checkpoint and
+        // fails closed if it is missing or foreign. A long turn can span more
+        // than five deployments; exhausting an arbitrary count would orphan it.
+        if (count >= MAX_RESTART_REATTACHES && adapterType !== "agy_local") {
           classify(candidate, "skipped", "restart_reattach_budget_exhausted", patch);
           continue;
         }

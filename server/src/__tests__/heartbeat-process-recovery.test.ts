@@ -4522,6 +4522,27 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("continues reattaching an agy run after five restarts", async () => {
+    const { runId } = await seedRunFixture({
+      adapterType: "agy_local", agentStatus: "running", processPid: null, processGroupId: null,
+    });
+    await db.update(heartbeatRuns)
+      .set({ controllerBootId: "00000000-0000-4000-8000-00000000b007", resultJson: { restartReattach: { count: 5 } } })
+      .where(eq(heartbeatRuns.id, runId));
+
+    await withTempPaperclipHome(async () => {
+      await writeHotRestartIntent({ previousServerPid: process.pid, previousServerVersion: "reattach-version",
+        requestedAt: new Date("2026-08-01T00:05:00.000Z") });
+      await heartbeatService(db).prepareHotRestartShutdown("SIGTERM", new Date("2026-08-01T00:06:00.000Z"));
+      const restarted = heartbeatService(db);
+      const adoption = await restarted.reconcileHotRestartAdoption(new Date("2026-08-01T00:07:00.000Z"));
+      expect(adoption).toMatchObject({ mode: "reported", adoptedRunIds: [runId], skippedRunIds: [] });
+      await vi.waitFor(() => expect(mockAdapterExecute).toHaveBeenCalledOnce(), { timeout: 10_000 });
+      expect(mockAdapterExecute.mock.calls[0]?.[0]).toMatchObject({ runId, context: { paperclipRestartReattach: true } });
+      await restarted.drainActiveRunExecutions();
+    });
+  });
+
   it("reports preflight live runs as lost when the shutdown snapshot is missing", async () => {
     const { runId } = await seedRunFixture({
       agentStatus: "running",
