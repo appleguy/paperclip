@@ -1,0 +1,150 @@
+/** F07: a receipt is an intent; only verified, durably recorded delivery frees a seat. */
+import fs from "node:fs/promises";
+import path from "node:path";
+import { createHash } from "node:crypto";
+import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
+import { adoptableActive, parseReceipt, type Receipt } from "../agy/execute.js";
+
+type Outcome = { kind: "done"; receipt: Receipt } | { kind: "block"; reason: string };
+type Settlement = {
+  version: 1; agentId: string; runId: string; issueId: string; outcome: Outcome; fingerprint: string;
+  status: "done" | "blocked"; reportRevisionId: string | null;
+};
+const fingerprint = (outcome: Outcome) => createHash("sha256").update(JSON.stringify(outcome)).digest("hex");
+const markerPath = (stateDir: string, runId: string) => path.join(stateDir, `settled-${runId}.json`);
+
+async function durableWrite(file: string, value: unknown): Promise<void> {
+  const temp = `${file}.${process.pid}.tmp`;
+  const handle = await fs.open(temp, "w", 0o600);
+  try { await handle.writeFile(JSON.stringify(value)); await handle.sync(); }
+  finally { await handle.close(); }
+  await fs.rename(temp, file);
+  const dir = await fs.open(path.dirname(file), "r");
+  try { await dir.sync(); } finally { await dir.close(); }
+}
+
+async function readSettlement(stateDir: string, runId: string, issueId: string, agentId: string): Promise<Settlement | null> {
+  try {
+    const s = JSON.parse(await fs.readFile(markerPath(stateDir, runId), "utf8")) as Settlement;
+    if (s.version !== 1 || s.agentId !== agentId || s.runId !== runId || s.issueId !== issueId || !s.outcome) return null;
+    if (s.outcome.kind === "done") {
+      const receipt = parseReceipt(JSON.stringify(s.outcome.receipt), runId, issueId);
+      // Normalize to the exact validated receipt fields when comparing persisted evidence.
+      if (s.status !== "done" || typeof s.reportRevisionId !== "string" || !s.reportRevisionId || !receipt) return null;
+    } else if (s.outcome.kind !== "block" || s.status !== "blocked"
+      || typeof s.outcome.reason !== "string" || !s.outcome.reason.trim()) return null;
+    return s.fingerprint === fingerprint(s.outcome) ? s : null;
+  } catch { return null; }
+}
+
+function localApi(ctx: AdapterExecutionContext) {
+  if (!ctx.authToken) throw new Error("missing scoped token for Claude RC settlement");
+  const port = Number(process.env.PAPERCLIP_LISTEN_PORT ?? process.env.PORT ?? "3100");
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("invalid local Paperclip listen port");
+  return async (method: string, route: string, body?: unknown): Promise<unknown> => {
+    const response = await fetch(`http://127.0.0.1:${port}/api/${route}`, {
+      method, redirect: "manual", signal: AbortSignal.timeout(15_000),
+      headers: { Authorization: `Bearer ${ctx.authToken}`, "X-Paperclip-Run-Id": ctx.runId, "Content-Type": "application/json" },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+    if (method === "GET" && response.status === 404) return null;
+    if (!response.ok) throw new Error(`Claude RC settlement ${method} returned HTTP ${response.status}`);
+    return response.json(); // Missing or malformed acknowledgement is not settlement.
+  };
+}
+
+/** Called only after the done gate; every write is under a fresh run for this issue. */
+export async function settleOutcome(
+  ctx: AdapterExecutionContext, stateDir: string, sourceRunId: string, issueId: string, outcome: Outcome,
+): Promise<void> {
+  const scopedIssue = ctx.context.issueId ?? ctx.context.taskId;
+  if (scopedIssue !== issueId) throw new Error("Claude RC settlement requires the original issue scope");
+  if (!/^[A-Za-z0-9_-]{1,80}$/.test(sourceRunId)) throw new Error("invalid settlement source run");
+  if (outcome.kind === "done") parseReceipt(JSON.stringify(outcome.receipt), sourceRunId, issueId);
+  else if (!outcome.reason.trim()) throw new Error("empty blocker settlement");
+  const prior = await readSettlement(stateDir, sourceRunId, issueId, ctx.agent.id);
+  if (prior?.fingerprint === fingerprint(outcome)) return;
+  if (prior) throw new Error("Claude RC source operation already settled with a different outcome");
+  const invoke = localApi(ctx);
+  const route = `issues/${encodeURIComponent(issueId)}`;
+  let reportRevisionId: string | null = null;
+  if (outcome.kind === "done") {
+    const existing = await invoke("GET", `${route}/documents/report`) as { body?: unknown; latestRevisionId?: unknown } | null;
+    if (existing?.body !== outcome.receipt.report) {
+      await invoke("PUT", `${route}/documents/report`, {
+        title: "Claude Code execution report", format: "markdown", body: outcome.receipt.report,
+        changeSummary: `Claude Remote Control source run ${sourceRunId}`,
+        baseRevisionId: typeof existing?.latestRevisionId === "string" ? existing.latestRevisionId : null,
+      });
+    }
+    const report = await invoke("GET", `${route}/documents/report`) as { body?: unknown; latestRevisionId?: unknown } | null;
+    if (report?.body !== outcome.receipt.report || typeof report.latestRevisionId !== "string" || !report.latestRevisionId)
+      throw new Error("Claude RC report readback did not verify the receipt");
+    reportRevisionId = report.latestRevisionId;
+  }
+  const status = outcome.kind === "done" ? "done" : "blocked";
+  let issue = await invoke("GET", route) as { status?: unknown } | null;
+  if (issue?.status !== status) {
+    const intentPath = path.join(stateDir, `settling-${sourceRunId}.json`);
+    const intent = await fs.readFile(intentPath, "utf8").catch(error => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    // A PATCH may have advanced a review stage even when it did not produce the
+    // requested status. Never repeat an uncertain transition as another approval.
+    if (intent !== null) throw new Error("Claude RC status transition already attempted; scoped reconciliation required");
+    await durableWrite(intentPath, { version: 1, runId: sourceRunId, issueId, fingerprint: fingerprint(outcome), status });
+    // The blocker comment and transition share one issue update, avoiding duplicate comments on recovery.
+    await invoke("PATCH", route, { status, ...(outcome.kind === "block" ? {
+      comment: `Claude Remote Control blocked: ${outcome.reason}`,
+      unblockDescriptor: { owner: { agentId: ctx.agent.id }, action: `Resolve the worker-reported blocker, then reassign or reopen:\n${outcome.reason}`.slice(0, 2000) },
+    } : {}) });
+    issue = await invoke("GET", route) as { status?: unknown } | null;
+  }
+  if (issue?.status !== status) throw new Error(`Claude RC outcome remains ${String(issue?.status)}; checkpoint retained`);
+  await durableWrite(markerPath(stateDir, sourceRunId), {
+    version: 1, agentId: ctx.agent.id, runId: sourceRunId, issueId, outcome, fingerprint: fingerprint(outcome), status, reportRevisionId,
+  } satisfies Settlement);
+}
+
+/** A foreign run cannot deliver this outcome. Queue a scoped adoption, retaining the original checkpoint. */
+export async function reconcileForeignSettlement(
+  ctx: AdapterExecutionContext, stateDir: string, activePath: string,
+): Promise<void> {
+  const raw = await fs.readFile(activePath, "utf8").catch(error => {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  });
+  if (!raw) return;
+  let owner: { issueId?: unknown };
+  try { owner = JSON.parse(raw); } catch { return; } // Existing adoption rejects unreadable ownership.
+  const currentIssue = ctx.context.issueId ?? ctx.context.taskId;
+  if (!owner || typeof owner.issueId !== "string" || owner.issueId === currentIssue) return;
+  const active = adoptableActive(raw, owner.issueId, stateDir, "claude_rc_local");
+  if (!active) return;
+  const settled = await readSettlement(stateDir, active.runId, active.issueId, ctx.agent.id);
+  let receiptMatches = false;
+  if (settled?.outcome.kind === "done") {
+    try {
+      const receipt = parseReceipt(await fs.readFile(active.receiptPath, "utf8"), active.runId, active.issueId);
+      receiptMatches = fingerprint({ kind: "done", receipt }) === settled.fingerprint;
+    } catch { /* Torn or replaced receipt is never proof of delivery. */ }
+  }
+  if (settled && (settled.outcome.kind === "block" || receiptMatches)) {
+    await fs.rename(activePath, path.join(stateDir, `active.settled-${active.runId}.json`));
+    const dir = await fs.open(stateDir, "r");
+    try { await dir.sync(); } finally { await dir.close(); }
+    await ctx.onLog("stdout", `[claude-rc] Archived verified settlement for original issue ${active.issueId}\n`);
+    return;
+  }
+  try {
+    await localApi(ctx)("POST", `agents/${encodeURIComponent(ctx.agent.id)}/wakeup`, {
+      source: "on_demand", triggerDetail: "system", reason: "claude_rc_checkpoint_recovery",
+      payload: { issueId: active.issueId }, idempotencyKey: `claude-rc-settlement:${active.runId}`,
+    });
+    await ctx.onLog("stdout", `[claude-rc] Requested scoped recovery for original issue ${active.issueId}; checkpoint retained\n`);
+  } catch (error) {
+    await ctx.onLog("stderr", `[claude-rc] Scoped recovery request failed; checkpoint retained: ${error instanceof Error ? error.message : String(error)}\n`);
+  }
+  throw new Error(`claude_rc_local previous task unresolved; original issue ${active.issueId} requires scoped settlement; never replay actions`);
+}

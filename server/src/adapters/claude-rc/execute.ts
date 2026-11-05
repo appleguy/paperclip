@@ -16,12 +16,13 @@ import {
   joinPromptSections, renderTemplate, selectPaperclipPromptSections,
 } from "@paperclipai/adapter-utils/server-utils";
 import {
-  acquire, adoptableActive, isTargetBusyRefusal, deliver, normalizeOneLine, parseReceipt, receiptFilePath, tmux,
+  acquire, adoptableActive, isTargetBusyRefusal, normalizeOneLine, parseReceipt, receiptFilePath, tmux,
   type Receipt,
 } from "../agy/execute.js";
 import { deriveRcName, reportsToDepth, sanitizeRcName, type RcAgentNode } from "./rc-name.js";
 import { gateReceiptRaw, refusalMessage, productionDeps } from "./done-gate.js";
 import { captureDoneGateBaseline, type GateBaseline } from "./done-gate-provenance.js";
+import { reconcileForeignSettlement, settleOutcome } from "./settlement.js";
 import {
   CHANNEL_NAME, findBridgeRoot, prepareChannelHost, routeChannelInput, type ChannelHost,
   type ChannelStatus,
@@ -343,24 +344,8 @@ async function readBlockTerminal(stateDir: string, opId: string): Promise<string
 }
 
 /** Post the worker's blocker as a comment and mark the issue blocked, under the run-scoped token. */
-async function deliverBlock(ctx: AdapterExecutionContext, issueId: string, reason: string): Promise<void> {
-  if (!ctx.authToken) throw new Error("missing scoped agent token for blocker delivery");
-  const port = Number(process.env.PAPERCLIP_LISTEN_PORT ?? process.env.PORT ?? "3100");
-  const issue = encodeURIComponent(issueId);
-  for (const [method, suffix, body] of [
-    ["POST", "/comments", { body: `Claude RC worker reported a blocker:\n\n${reason}` }],
-    ["PATCH", "", { status: "blocked", unblockDescriptor: {
-      owner: { agentId: ctx.agent.id }, action: `Resolve the worker-reported blocker, then reassign or reopen:\n${reason}`.slice(0, 2000) } }],
-  ] as const) {
-    const res = await fetch(new URL(`/api/issues/${issue}${suffix}`, `http://127.0.0.1:${port}`), {
-      method, redirect: "manual", body: JSON.stringify(body), signal: AbortSignal.timeout(15_000),
-      headers: { Authorization: `Bearer ${ctx.authToken}`, "X-Paperclip-Run-Id": ctx.runId, "Content-Type": "application/json" },
-    });
-    if (!res.ok) {
-      const detail = (await res.text().catch(() => "")).slice(0, 300);
-      throw new Error(`Paperclip ${method} ${suffix || "issue"} returned HTTP ${res.status}: ${detail}`);
-    }
-  }
+async function deliverBlock(ctx: AdapterExecutionContext, issueId: string, reason: string, stateDir: string, sourceRunId: string): Promise<void> {
+  await settleOutcome(ctx, stateDir, sourceRunId, issueId, { kind: "block", reason });
 }
 
 async function postComment(ctx: AdapterExecutionContext, issueId: string, body: string): Promise<void> {
@@ -430,6 +415,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     await fs.mkdir(stateDir, { recursive: true, mode: 0o700 });
     await fs.chmod(stateDir, 0o700);
     unlock = await acquire(stateDir, Date.now() + timeoutMs);
+    const activePath = path.join(stateDir, "active.json");
+    // F07: do not replace the original run's environment or touch its transport
+    // until a foreign checkpoint is durably settled under its own issue scope.
+    await reconcileForeignSettlement(ctx, stateDir, activePath);
     // SCO-653: run-scoped write path for the pane. 0600 file read only by bin/pcrc; never printed.
     const port = Number(process.env.PAPERCLIP_LISTEN_PORT ?? process.env.PORT ?? "3100");
     const sq = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
@@ -440,22 +429,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       `export PAPERCLIP_RUN_ID=${sq(ctx.runId)}`,
       `export PAPERCLIP_TASK_ID=${sq(issueId)}`, ""].join("\n"), { mode: 0o600 });
     await fs.chmod(runEnvPath, 0o600);
-    const activePath = path.join(stateDir, "active.json");
     const bridgeRoot = await findBridgeRoot(asString(cfg.channelBridgeRoot, "") || undefined);
     const channel = await prepareChannelHost(stateDir, bridgeRoot);
-    // A checkpoint retained by an earlier run whose op already reached a terminal state
-    // (block ledger entry or receipt file) would otherwise fail every later dispatch.
-    try {
-      const prevRaw = await fs.readFile(activePath, "utf8");
-      const prev = JSON.parse(prevRaw) as { op_id?: string; runId?: string; receiptPath?: string };
-      const prevOp = asString(prev.op_id, asString(prev.runId, ""));
-      if (prevOp && prevOp !== ctx.runId && !(() => { try { return adoptableActive(prevRaw, issueId, stateDir, "claude_rc_local"); } catch { return null; } })()
-        && (await readBlockTerminal(stateDir, prevOp) !== null
-          || (prev.receiptPath && await fs.stat(prev.receiptPath).then(() => true, () => false)))) {
-        await fs.rename(activePath, path.join(stateDir, `active.stale-${prevOp}.json`));
-        await ctx.onLog("stdout", `[claude-rc] Archived terminal checkpoint for finished op ${prevOp}\n`);
-      }
-    } catch { /* no checkpoint or unreadable: existing handling applies */ }
     // SCO-980: inspect delivery evidence before permitting a new operation ID.
     await reconcileOrphanActive({
       stateDir, activePath, issueId, runId: ctx.runId,
@@ -696,7 +671,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           await ctx.onLog("stdout", `[claude-rc] Done gate refused receipt ${gateRefusals}/3 for ${issueId}: ${gate.reasons.join(" | ").slice(0, 600)}\n`);
           if (gateRefusals >= 3) {
             blockedReason = `done gate refused 3 receipts: ${gate.reasons.join(" | ").slice(0, 1500)}`;
-            await deliverBlock(ctx, issueId, blockedReason);
+            await deliverBlock(ctx, issueId, blockedReason, stateDir, receiptRunId);
             await fs.rm(activePath, { force: true });
             break;
           }
@@ -707,7 +682,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         break;
       } else if (await readBlockTerminal(stateDir, receiptRunId).then(async reason => {
         if (reason === null) return false;
-        await deliverBlock(ctx, issueId, reason);
+        await deliverBlock(ctx, issueId, reason, stateDir, receiptRunId);
         await ctx.onLog("stdout", `[claude-rc] Worker blocked ${issueId}: ${reason.slice(0, 200)}\n`);
         await fs.rm(activePath, { force: true });
         blockedReason = reason;
@@ -734,7 +709,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
     if (!receipt)
       return failure("Claude did not produce a validated completion receipt; checkpoint retained", true);
-    await deliver(ctx, receipt, "Claude Code execution report", "Claude Remote Control");
+    await settleOutcome(ctx, stateDir, receiptRunId, issueId, { kind: "done", receipt });
     await ctx.onLog("stdout", `[claude-rc] Done ${issueId}: ${receipt.summary}; conversation=${conversationId ?? "unknown"}\n`);
     await fs.rm(activePath);
     return {

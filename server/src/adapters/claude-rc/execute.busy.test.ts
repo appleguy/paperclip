@@ -8,7 +8,10 @@ import type { ChannelIO } from "./channel.js";
 const deps = vi.hoisted(() => ({ tmux: vi.fn(), deliver: vi.fn(), route: vi.fn(), gate: vi.fn(), submit: vi.fn() }));
 vi.mock("../agy/execute.js", async importOriginal => ({
   ...await importOriginal<typeof import("../agy/execute.js")>(),
-  tmux: deps.tmux, deliver: deps.deliver,
+  tmux: deps.tmux,
+}));
+vi.mock("./settlement.js", async importOriginal => ({
+  ...await importOriginal<typeof import("./settlement.js")>(), settleOutcome: deps.deliver,
 }));
 vi.mock("./channel.js", async importOriginal => ({
   ...await importOriginal<typeof import("./channel.js")>(),
@@ -72,6 +75,46 @@ afterEach(async () => {
 });
 
 describe("SCO-947 busy delivery and completion", () => {
+  it.each(["{", "valid"])("retains foreign %s receipt before touching the transport or run environment", async value => {
+    const oldRun = "11111111-1111-4111-8111-111111111111";
+    const oldReceiptPath = receiptFilePath(stateDir, oldRun);
+    const checkpoint = JSON.stringify({ runId: oldRun, issueId: "original-issue", receiptPath: oldReceiptPath, rcUrl });
+    await fs.writeFile(path.join(stateDir, "active.json"), checkpoint);
+    await fs.writeFile(path.join(stateDir, "run-env.sh"), "original scoped environment");
+    await fs.writeFile(oldReceiptPath, value === "valid" ? JSON.stringify({
+      runId: oldRun, issueId: "original-issue", status: "done", summary: "Original work completed",
+      report: "Original completed work and its supporting evidence. ".repeat(8),
+    }) : value);
+    const result = await execute(ctx);
+    expect(result.errorFamily).toBe("target_busy");
+    expect(await fs.readFile(path.join(stateDir, "active.json"), "utf8")).toBe(checkpoint);
+    expect(await fs.readFile(path.join(stateDir, "run-env.sh"), "utf8")).toBe("original scoped environment");
+    expect(deps.tmux).not.toHaveBeenCalled();
+    expect(deps.route).not.toHaveBeenCalled();
+    expect(deps.deliver).not.toHaveBeenCalled();
+    const requests = vi.mocked(fetch).mock.calls.filter(([, init]) => init?.method === "POST");
+    expect(requests).toHaveLength(1);
+    expect(String(requests[0][0])).toContain("/agents/agent/wakeup");
+    expect(JSON.parse(requests[0][1]!.body as string).payload.issueId).toBe("original-issue");
+  });
+
+  it("adopts the original same-issue receipt without submitting a new operation", async () => {
+    const oldRun = "11111111-1111-4111-8111-111111111111";
+    const oldReceiptPath = receiptFilePath(stateDir, oldRun);
+    await fs.writeFile(path.join(stateDir, "active.json"), JSON.stringify({
+      runId: oldRun, issueId: "issue-busy", receiptPath: oldReceiptPath, rcUrl, cwd, conversationId: "conversation-busy",
+    }));
+    const oldReceipt = { runId: oldRun, issueId: "issue-busy", status: "done", summary: "Original work completed",
+      report: "Original completed work and its supporting evidence. ".repeat(8) };
+    await fs.writeFile(oldReceiptPath, JSON.stringify(oldReceipt));
+    deps.route.mockResolvedValue("adopted");
+    const result = await execute(ctx);
+    expect(result.exitCode).toBe(0);
+    expect(deps.route.mock.calls[0].slice(0, 3)).toEqual([oldRun, "", true]);
+    expect(deps.deliver).toHaveBeenCalledWith(ctx, stateDir, oldRun, "issue-busy", { kind: "done", receipt: oldReceipt });
+    expect(deps.submit).not.toHaveBeenCalled();
+  });
+
   it("journals possible channel effects before submit and retains intent after a crash", async () => {
     deps.route.mockImplementation(async (op: string, prompt: string, _adopted: boolean, io: ChannelIO) => {
       expect(JSON.parse(await fs.readFile(path.join(stateDir, "active.json"), "utf8")).dispatchMode).toBe("prepared");
@@ -167,7 +210,7 @@ describe("SCO-947 busy delivery and completion", () => {
     const result = await execute(ctx);
     expect(result.exitCode).toBe(0);
     expect(result.resultJson).toMatchObject({ blocked: true });
-    expect(deps.deliver).not.toHaveBeenCalled();
+    expect(deps.deliver).toHaveBeenCalledWith(ctx, stateDir, ctx.runId, "issue-busy", { kind: "block", reason: "Required input unavailable" });
   });
 
   it("re-sends a refused receipt while busy, then completes on the corrected receipt", async () => {
