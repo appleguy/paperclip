@@ -137,13 +137,13 @@ import {
   readChatControlRecoveryStop,
 } from "../chat-control-recovery-stop.js";
 import {
-  ISSUE_NEW_INPUT_ACTIVITY_ACTIONS,
   ISSUE_PROGRESS_ACTIVITY_ACTIONS,
   ISSUE_REWAKE_LOOKBACK_MS,
   ISSUE_REWAKE_RUN_SAMPLE_LIMIT,
+  ISSUE_WAKE_DELTA_KEY,
   evaluateIssueRewakeThrottle,
-  isThrottleCandidateIssueRewake,
 } from "../issue-rewake-throttle.js";
+import { meaningfulIssueActivity, readIssueWakeDelta } from "../issue-rewake-throttle-db.js";
 import { logActivity } from "../activity-log.js";
 import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "../issue-dependency-wakeups.js";
 import {
@@ -2199,6 +2199,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       delete payload.queuedCommentInterrupt;
       delete payload.manualUserWake;
       delete payload.taskRetry;
+      delete payload[ISSUE_WAKE_DELTA_KEY];
     }
     if (opts.manualUserWake) {
       if (opts.requestedByActorType !== "user" || !opts.requestedByActorId || opts.failedRunId) {
@@ -3148,6 +3149,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               conversationState: issues.conversationState,
               status: issues.status,
               statusVersion: issues.statusVersion,
+              title: issues.title,
+              description: issues.description,
+              priority: issues.priority,
+              parentId: issues.parentId,
+              workMode: issues.workMode,
+              unblockDescriptor: issues.unblockDescriptor,
               projectId: issues.projectId,
               projectWorkspaceId: issues.projectWorkspaceId,
               executionWorkspaceId: issues.executionWorkspaceId,
@@ -3985,6 +3992,35 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             }
           }
 
+          // One server-derived delta per agent/issue, including wakes offered
+          // to a live run. Checking before coalescing also prevents a duplicate
+          // monitor/retry from surviving as a deferred follow-up after release.
+          const issueWakeDelta = !caseRequest && !receiptRequest && !reconciledSourceRunId && !executionWaitRequestId
+            ? await readIssueWakeDelta(tx, {
+                companyId: agent.companyId, agentId, issue,
+                candidate: {
+                  reason, wakeCommentId: wakeCommentId ?? null,
+                  requestedByActorType: opts.requestedByActorType ?? null,
+                  forceFreshSession: enrichedContextSnapshot.forceFreshSession === true,
+                  hasExplicitResume: Boolean(explicitResumeSession),
+                },
+                agentConfig: { adapterType: agent.adapterType, adapterConfig: agent.adapterConfig, runtimeConfig: agent.runtimeConfig },
+              }) : null;
+          if (issueWakeDelta?.blocked) {
+            await tx.insert(agentWakeupRequests).values({
+              ...durableReceiptFields, companyId: agent.companyId, agentId, source, triggerDetail,
+              reason: "issue_rewake_no_meaningful_delta",
+              payload: { ...(payload ?? {}), issueId, heartbeatSkip: {
+                reason: "issue_rewake_no_meaningful_delta", requestedReason: reason,
+              } },
+              status: "skipped", requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null, finishedAt: new Date(),
+            });
+            return { kind: "skipped" as const };
+          }
+          if (issueWakeDelta) payload = { ...(payload ?? {}), issueId, [ISSUE_WAKE_DELTA_KEY]: issueWakeDelta.fingerprint };
+
           if (activeExecutionRun) {
             // The case ledger owns retry. Do not place its exact receipt in a
             // generic deferred queue that cannot retain handoff authority.
@@ -4115,21 +4151,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // this gate. A verified durable case receipt carries a new phase;
           // its agent-authored instruction comment is not an event-free wake.
           if (
-            !caseRequest &&
-            isThrottleCandidateIssueRewake({
-              reason,
-              wakeCommentId: wakeCommentId ?? null,
-              requestedByActorType: opts.requestedByActorType ?? null,
-              forceFreshSession:
-                enrichedContextSnapshot.forceFreshSession === true,
-              hasExplicitResume: Boolean(explicitResumeSession),
-            })
+            issueWakeDelta?.candidate
           ) {
             const throttleNow = new Date();
             const recentTerminalRuns = await tx
               .select({
                 id: heartbeatRuns.id,
                 status: heartbeatRuns.status,
+                errorCode: heartbeatRuns.errorCode,
+                error: heartbeatRuns.error,
+                exitCode: heartbeatRuns.exitCode,
+                signal: heartbeatRuns.signal,
                 finishedAt: heartbeatRuns.finishedAt,
               })
               .from(heartbeatRuns)
@@ -4165,6 +4197,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                       activityLog.action,
                       ISSUE_PROGRESS_ACTIVITY_ACTIONS,
                     ),
+                    meaningfulIssueActivity(agentId),
                   ),
                 );
               const lastRunFinishedAt =
@@ -4179,14 +4212,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                         eq(activityLog.entityType, "issue"),
                         eq(activityLog.entityId, issue.id),
                         gt(activityLog.createdAt, lastRunFinishedAt),
-                        sql`coalesce(${activityLog.details}->>'origin', '') <> 'fast_response'`,
-                        inArray(
-                          activityLog.action,
-                          ISSUE_NEW_INPUT_ACTIVITY_ACTIONS,
-                        ),
-                        wakeCommentId && opts.requestedByActorType === "agent"
-                          ? ne(activityLog.actorType, "agent")
-                          : undefined,
+                        meaningfulIssueActivity(agentId),
                       ),
                     )
                     .limit(1)
@@ -4200,11 +4226,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                     .map((row) => row.runId)
                     .filter((runId): runId is string => Boolean(runId)),
                 ),
-                // For an agent comment wake, the query excludes agent-authored
-                // activity while preserving genuinely new user/system input.
-                // Presentation/author metadata therefore cannot smuggle human
-                // wake privilege, nor can it mask an actual human response.
-                hasNewIssueInputSinceLastRun: newInputRows.length > 0,
+                hasNewIssueInputSinceLastRun: newInputRows.length > 0 || issueWakeDelta.hasNewDelta,
               });
 
               if (throttleDecision.blocked) {

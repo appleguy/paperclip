@@ -6,6 +6,7 @@ import {
   computeIssueRewakeCooldownMs,
   evaluateIssueRewakeThrottle,
   isThrottleCandidateIssueRewake,
+  shouldSuppressIssueWakeDelta,
 } from "../services/issue-rewake-throttle.ts";
 
 const NOW = new Date("2026-07-12T18:14:00.000Z");
@@ -24,28 +25,30 @@ function runSample(input: {
 
 describe("isThrottleCandidateIssueRewake", () => {
   const base = {
-    reason: "issue_assigned",
+    reason: "issue_queue_drive",
     wakeCommentId: null,
     requestedByActorType: "system" as const,
     forceFreshSession: false,
     hasExplicitResume: false,
   };
 
-  it("throttles state-poll reasons and reason-less invokes", () => {
+  it("throttles state-poll reasons and keeps unattributed invokes", () => {
     expect(isThrottleCandidateIssueRewake(base)).toBe(true);
     expect(isThrottleCandidateIssueRewake({ ...base, reason: "issue_queue_drive" })).toBe(true);
-    expect(isThrottleCandidateIssueRewake({ ...base, reason: null })).toBe(true);
+    expect(isThrottleCandidateIssueRewake({ ...base, reason: null })).toBe(false);
     expect(isThrottleCandidateIssueRewake({ ...base, reason: "issue_continuation_needed" })).toBe(true);
     expect(isThrottleCandidateIssueRewake({ ...base, reason: "issue_assignment_recovery" })).toBe(true);
     expect(isThrottleCandidateIssueRewake({ ...base, reason: "issue_graph_liveness_backstop" })).toBe(true);
   });
 
-  it("keeps agent comments throttle-eligible without granting human comment privileges", () => {
+  it("throttles only a stored own comment; another or unknown author always passes", () => {
     expect(isThrottleCandidateIssueRewake({
       ...base,
       reason: "issue_commented",
       wakeCommentId: "comment-1",
       requestedByActorType: "agent",
+      agentId: "agent-a",
+      commentAuthorAgentId: "agent-a",
     })).toBe(true);
     expect(isThrottleCandidateIssueRewake({
       ...base,
@@ -53,6 +56,10 @@ describe("isThrottleCandidateIssueRewake", () => {
       wakeCommentId: "comment-1",
       requestedByActorType: "user",
     })).toBe(false);
+    expect(isThrottleCandidateIssueRewake({ ...base, wakeCommentId: "comment-1",
+      agentId: "agent-a", commentAuthorAgentId: "agent-b", requestedByActorType: "agent" })).toBe(false);
+    expect(isThrottleCandidateIssueRewake({ ...base, wakeCommentId: "comment-1",
+      agentId: "agent-a", requestedByActorType: "agent" })).toBe(false);
   });
 
   it("never throttles trusted explicit escalation wakes", () => {
@@ -67,6 +74,8 @@ describe("isThrottleCandidateIssueRewake", () => {
       wakeCommentId: "comment-1",
       requestedByActorType: "agent",
       hasExplicitResume: true,
+      agentId: "agent-a",
+      commentAuthorAgentId: "agent-a",
     })).toBe(true);
   });
 
@@ -76,12 +85,29 @@ describe("isThrottleCandidateIssueRewake", () => {
       "issue_comment_mentioned",
       "issue_blockers_resolved",
       "issue_children_completed",
-      "issue_monitor_due",
-      "process_lost_retry",
-      "run_liveness_continuation",
+      "issue_assigned",
     ]) {
       expect(isThrottleCandidateIssueRewake({ ...base, reason })).toBe(false);
     }
+    for (const reason of ["issue_assigned", "issue_blockers_resolved", "issue_children_completed"]) {
+      expect(isThrottleCandidateIssueRewake({ ...base, reason, wakeCommentId: "earlier-own-comment",
+        agentId: "agent-a", commentAuthorAgentId: "agent-a", requestedByActorType: "agent" })).toBe(false);
+    }
+  });
+
+  it("throttles monitor and retry wakes without new information", () => {
+    for (const reason of ["issue_monitor_due", "heartbeat_timer", "process_lost_retry", "target_busy_retry", "transient_failure_retry"]) {
+      expect(isThrottleCandidateIssueRewake({ ...base, reason })).toBe(true);
+    }
+  });
+});
+
+describe("meaningful issue wake fingerprints", () => {
+  it("consumes each delta once and preserves protected or uncertain wakes", () => {
+    expect(shouldSuppressIssueWakeDelta({ candidate: true, fingerprint: "state-a", consumedFingerprint: null })).toBe(false);
+    expect(shouldSuppressIssueWakeDelta({ candidate: true, fingerprint: "state-a", consumedFingerprint: "state-a" })).toBe(true);
+    expect(shouldSuppressIssueWakeDelta({ candidate: true, fingerprint: "state-b", consumedFingerprint: "state-a" })).toBe(false);
+    expect(shouldSuppressIssueWakeDelta({ candidate: false, fingerprint: "state-a", consumedFingerprint: "state-a" })).toBe(false);
   });
 });
 
@@ -193,6 +219,18 @@ describe("evaluateIssueRewakeThrottle", () => {
       hasNewIssueInputSinceLastRun: false,
     });
     expect(decision).toEqual({ blocked: false, noProgressStreak: 0 });
+  });
+
+  it("backs off identical failure repeats, but permits a changed failure", () => {
+    const runs = [10, 40, 70].map((finishedSecondsAgo, index) => ({
+      ...runSample({ id: `failure-${index}`, status: "failed", finishedSecondsAgo }), errorCode: "same-fault",
+    }));
+    const input = { now: NOW, recentTerminalRuns: runs, runIdsWithIssueProgress: new Set<string>(), hasNewIssueInputSinceLastRun: false };
+    expect(evaluateIssueRewakeThrottle(input).blocked).toBe(true);
+    expect(evaluateIssueRewakeThrottle({ ...input, recentTerminalRuns: [{ ...runs[0], errorCode: "new-fault" }, ...runs.slice(1)] }).blocked).toBe(false);
+    expect(evaluateIssueRewakeThrottle({ ...input, recentTerminalRuns: [{ ...runs[0], error: "different failure" }, ...runs.slice(1)] }).blocked).toBe(false);
+    expect(evaluateIssueRewakeThrottle({ ...input,
+      recentTerminalRuns: runs.map(run => ({ ...run, status: "cancelled" })) })).toEqual({ blocked: false, noProgressStreak: 0 });
   });
 
   it("allows when new issue input landed after the last run", () => {
