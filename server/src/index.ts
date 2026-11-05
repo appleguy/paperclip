@@ -66,7 +66,7 @@ import { markIdleStartupComplete, registerIdleLocalWorkProbe } from "./services/
 import { idleBackupWakeMarker } from "./services/idle-database-backup.js";
 import { createDatabaseBackupOwner } from "./services/database-backup-owner.js";
 import { cloudWarmStandbyServerOptions } from "./middleware/cloud-warm-standby.js";
-import { awaitSchedulerLeadership } from "./services/scheduler-leader.js";
+import { awaitSchedulerLeadership, createSchedulerHandoff } from "./services/scheduler-leader.js";
 import { createCloudWarmStandby } from "./services/cloud-warm-standby.js";
 import { chatCompletionDeliveryService } from "./services/chat-completion-delivery.js";
 /// <reference path="./types/express.d.ts" />
@@ -1957,18 +1957,10 @@ async function startServerWithDatabaseTeardown(
     );
   }
   
-  const performShutdown = async (
-    signal: "SIGINT" | "SIGTERM",
-    exitProcess: boolean,
-  ) => {
-    setStartupRecoveryPhase("draining");
-    for (const client of liveEventsWebSocketServer.clients) client.close(1012, "Server restarting");
-    liveEventsWebSocketServer.close();
-    // Finish admitted HTTP requests while their services, workers and database
-    // are still available. Railway must switch routing before signaling A.
-    await closeHttpListenerForShutdown({ server, signal, timeoutMs: 30_000, log: logger,
-      drainRequests: abort => drainHttpRequestWork(app, abort) });
-    await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
+  // Both a staged handoff and final shutdown quiesce exactly once. During a
+  // handoff HTTP stays open: callbacks can reach the shared database while the
+  // incoming server acquires leadership and completes startup adoption.
+  const quiesceSchedulerOnce = async (signal: "SIGINT" | "SIGTERM") => {
     heartbeatSchedulerStopped = true;
     skillVersionRetentionWorker?.unsubscribe();
     await taskDrainExpiryWork.stop();
@@ -1991,11 +1983,50 @@ async function startServerWithDatabaseTeardown(
     unregisterTerminalWorkspaceProbe?.();
     unsubscribeNativeWorkspaceSyncRetention?.();
 
-    const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({
+    return coordinateHeartbeatSchedulerShutdown({
       signal,
       prepareHotRestartShutdown,
       waitForHeartbeatSchedulerIdle,
     });
+  };
+  let quiescence: ReturnType<typeof quiesceSchedulerOnce> | undefined;
+  const quiesceScheduler = (signal: "SIGINT" | "SIGTERM") => quiescence ??= quiesceSchedulerOnce(signal);
+
+  const handoffScheduler = createSchedulerHandoff({
+    prepare: async () => {
+      const prepared = await quiesceScheduler("SIGTERM");
+      if (prepared.preparationError || prepared.hotRestart?.skipDrain !== true) {
+        throw new Error("scheduler handoff requires a successful hot-restart snapshot", {
+          cause: prepared.preparationError,
+        });
+      }
+      await flushInFlightRunLogMirrors();
+    },
+    release: async () => { await schedulerLeadership?.release(); },
+  });
+  const onSchedulerHandoff = () => {
+    void handoffScheduler().catch((err) => {
+      // Keep the lock on preparation failure. The deployer can still use the
+      // normal shutdown path, but the waiter must never adopt undetached runs.
+      logger.error({ err }, "scheduler handoff failed; retaining leadership");
+    });
+  };
+  if (schedulerLeadership) process.on("SIGUSR2", onSchedulerHandoff);
+
+  const performShutdown = async (
+    signal: "SIGINT" | "SIGTERM",
+    exitProcess: boolean,
+  ) => {
+    process.off("SIGUSR2", onSchedulerHandoff);
+    setStartupRecoveryPhase("draining");
+    for (const client of liveEventsWebSocketServer.clients) client.close(1012, "Server restarting");
+    liveEventsWebSocketServer.close();
+    // Finish admitted HTTP requests while their services and database are
+    // available. A rolling deploy signals this only after the successor is ready.
+    await closeHttpListenerForShutdown({ server, signal, timeoutMs: 30_000, log: logger,
+      drainRequests: abort => drainHttpRequestWork(app, abort) });
+    await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
+    const heartbeatShutdown = await quiesceScheduler(signal);
     const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
     const selectiveDrainRunIds = heartbeatShutdown.hotRestart?.drainRunIds ?? null;
     if (skipHeartbeatDrain) {

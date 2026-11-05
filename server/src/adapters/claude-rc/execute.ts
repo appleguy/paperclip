@@ -534,10 +534,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     await reconcileForeignSettlement(ctx, stateDir, activePath);
     // SCO-653: run-scoped write path for the pane. 0600 file read only by bin/pcrc; never printed.
     const port = Number(process.env.PAPERCLIP_LISTEN_PORT ?? process.env.PORT ?? "3100");
+    const callbackUrl = asString(process.env.PAPERCLIP_PUBLIC_URL,
+      asString(process.env.PAPERCLIP_API_URL, `http://127.0.0.1:${port}`));
     const sq = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
     runEnvPath = path.join(stateDir, "run-env.sh");
     await fs.writeFile(runEnvPath, [
-      `export PAPERCLIP_API_URL=${sq(`http://127.0.0.1:${port}`)}`,
+      `export PAPERCLIP_API_URL=${sq(callbackUrl)}`,
       `export PAPERCLIP_API_KEY=${sq(ctx.authToken)}`,
       `export PAPERCLIP_RUN_ID=${sq(ctx.runId)}`,
       `export PAPERCLIP_TASK_ID=${sq(issueId)}`, ""].join("\n"), { mode: 0o600 });
