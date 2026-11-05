@@ -18,16 +18,20 @@ it("separates concurrent commits, unchanged dirt, changed baseline dirt and omit
       return { code: 0, out: stdout };
     } catch (error) { return { code: Number((error as { code: number }).code) || 1, out: "" }; }
   };
-  const commit = async (file: string, content: string) => {
-    await fs.writeFile(path.join(repo, file), content);
-    expect((await git(repo, ["add", "--", file])).code).toBe(0);
-    expect((await git(repo, ["-c", "core.hooksPath=/dev/null", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture"])).code).toBe(0);
-    return (await git(repo, ["rev-parse", "HEAD"])).out.trim();
+  const commit = async (file: string, content: string, root = repo) => {
+    await fs.writeFile(path.join(root, file), content);
+    expect((await git(root, ["add", "--", file])).code).toBe(0);
+    expect((await git(root, ["-c", "core.hooksPath=/dev/null", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "fixture"])).code).toBe(0);
+    return (await git(root, ["rev-parse", "HEAD"])).out.trim();
   };
   expect((await git(repo, ["init", "-q"])).code).toBe(0);
   await commit("own.ts", "initial\n");
   await commit("peer.ts", "initial\n");
   await fs.writeFile(path.join(repo, "old-dirt"), "original\n");
+  const nested = path.join(repo, "nested");
+  await fs.mkdir(nested);
+  await git(nested, ["init", "-q"]);
+  await commit("file.ts", "nested original\n", nested);
   const deps: GateDeps = { repos: async () => [repo], git, liveSha: async () => null };
   const baseline = await captureDoneGateBaseline("run", deps);
   const own = await commit("own.ts", "own committed change\n");
@@ -41,6 +45,10 @@ it("separates concurrent commits, unchanged dirt, changed baseline dirt and omit
   expect(editedPaths(transcript.replace("git commit -m fixture", "git commit -qm fixture && git log --oneline -1")
     .replace(`[main ${own.slice(0, 7)}] fixture`, `${own.slice(0, 7)} fixture`), 1).observedCommits).toEqual([own.slice(0, 7)]);
   const check = (commits = [own], notMine: string[] = []) => evaluateDoneGate({ runId: "run", commits, notMine }, record, deps, baseline);
+  expect(await check()).toMatchObject({ ok: true });
+  await fs.writeFile(path.join(nested, "file.ts"), "changed nested content\n");
+  expect(await check()).toMatchObject({ ok: false });
+  await fs.writeFile(path.join(nested, "file.ts"), "nested original\n");
   expect(await check()).toMatchObject({ ok: true });
   expect(await check([])).toMatchObject({ ok: false });
   // Changed existing dirt cannot be exempted with notMine in a new snapshot.

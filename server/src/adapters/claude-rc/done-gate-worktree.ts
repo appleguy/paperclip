@@ -20,7 +20,7 @@ export function statusPaths(out: string): string[] {
  * Missing/unreadable/racing files have no exemption. Index + mode are included
  * so staging a different blob cannot masquerade as unchanged worktree dirt.
  */
-export async function dirtyFingerprints(repo: string, paths: string[], deps: GateDeps): Promise<Record<string, string>> {
+export async function dirtyFingerprints(repo: string, paths: string[], deps: GateDeps, depth = 0): Promise<Record<string, string>> {
   const index = await deps.git(repo, ["ls-files", "--stage", "-z"]);
   if (index.code !== 0 || index.error) return {};
   const entries = new Map<string, string[]>();
@@ -46,7 +46,19 @@ export async function dirtyFingerprints(repo: string, paths: string[], deps: Gat
         hash.update(String(before.mode));
         if (before.isSymbolicLink()) hash.update(await fs.readlink(file));
         else if (before.isFile()) for await (const chunk of createReadStream(file)) hash.update(chunk);
-        else continue; // submodule/directory content is not proven by its inode
+        else if (before.isDirectory() && depth < 8) {
+          // Git collapses untracked nested repositories to a directory even
+          // with --untracked-files=all. An inode/mtime cannot prove its tree.
+          const root = await deps.git(file, ["rev-parse", "--show-toplevel"]);
+          if (root.code !== 0 || root.error || await fs.realpath(root.out.trim()) !== await fs.realpath(file)) continue;
+          const head = await deps.git(file, ["rev-parse", "--verify", "HEAD^{commit}"]);
+          const status = await deps.git(file, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
+          if (head.code !== 0 || head.error || status.code !== 0 || status.error) continue;
+          const nestedPaths = statusPaths(status.out);
+          const nested = await dirtyFingerprints(file, nestedPaths, deps, depth + 1);
+          if (nestedPaths.some(p => !nested[p])) continue;
+          hash.update(head.out.trim()).update(status.out).update(JSON.stringify(Object.entries(nested).sort(([a], [b]) => a.localeCompare(b))));
+        } else continue;
         const after = await fs.lstat(file, { bigint: true });
         if (before.ino === after.ino && before.size === after.size && before.ctimeNs === after.ctimeNs)
           result[rel] = hash.digest("hex");
