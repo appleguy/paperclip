@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const html = readFileSync(resolve(process.cwd(), "ui/public/subscription-quotas.html"), "utf8");
+const html = readFileSync(resolve(process.cwd(), existsSync("ui/public/subscription-quotas.html") ? "ui/public/subscription-quotas.html" : "public/subscription-quotas.html"), "utf8");
 const script = html.split("<script>")[1]?.split("</script>")[0];
 const body = html.split("<body>")[1]?.split("<script>")[0];
 
@@ -29,16 +29,17 @@ describe("standalone subscription quotas", () => {
         { provider: "codex", pool: "weekly", usedPercent: 18, resetsAt: "2026-11-05T10:04:17Z", state: "behind_pace" },
         { provider: "claude", pool: "weekly", usedPercent: 0, resetsAt: "2026-11-06T11:00:00Z", state: "need_trend" },
         { provider: "claude", pool: "session", usedPercent: null, resetsAt: null, state: "unknown" },
+        { provider: "chatgpt-web", pool: "pro:weekly", usedPercent: 4, resetsAt: new Date(Date.now() + 86400000).toISOString(), state: "ok" },
       ],
     };
     vi.stubGlobal("fetch", vi.fn(async (path: string, opts: RequestInit) => {
       calls.push(path);
       expect(opts.credentials).toBe("same-origin");
       expect(opts.cache).toBe("no-store");
-      return { ok: true, json: async () => path === "/api/companies" ? [{ id: "company-123", issuePrefix: "SCO" }] : path.endsWith("/history") ? { series: [{ provider: "codex", pool: "weekly", points: [{ t: new Date(Date.now() - 7200000).toISOString(), usedPercent: 10, resetsAt: new Date(Date.now() + 86400000).toISOString() }, { t: new Date(Date.now() - 3600000).toISOString(), usedPercent: 12, resetsAt: new Date(Date.now() + 86400000).toISOString() }] }] } : data };
+      return { ok: true, json: async () => path === "/api/companies" ? [{ id: "company-123", issuePrefix: "SCO" }] : path.endsWith("/history") ? { series: ["codex", "chatgpt-web"].map((provider) => ({ provider, pool: provider === "codex" ? "weekly" : "pro:weekly", points: [{ t: new Date(Date.now() - 7200000).toISOString(), usedPercent: 2, resetsAt: new Date(Date.now() + 86400000).toISOString() }, { t: new Date(Date.now() - 3600000).toISOString(), usedPercent: 4, resetsAt: new Date(Date.now() + 86400000).toISOString() }] })) } : data };
     }));
     new Function(script!)();
-    await vi.waitFor(() => expect(document.querySelectorAll("#charts section")).toHaveLength(4));
+    await vi.waitFor(() => expect(document.querySelectorAll("#charts section")).toHaveLength(5));
     expect(calls).toEqual(["/api/companies", "/api/companies/company-123/costs/quota-sentinel", "/api/companies/company-123/costs/quota-sentinel/history"]);
     expect(document.body.textContent).toContain("Third-party · weekly");
     expect(document.body.textContent).toContain("76.8% used");
@@ -49,7 +50,9 @@ describe("standalone subscription quotas", () => {
     expect(document.body.textContent).toContain("Claude");
     expect(document.body.textContent).toContain("Unknown");
     expect(document.body.textContent).toContain("0.0% used");
-    expect(document.querySelectorAll("#charts svg")).toHaveLength(1);
+    expect(document.querySelectorAll("#charts svg")).toHaveLength(2);
+    const webChart = [...document.querySelectorAll("#charts section")].find((section) => section.textContent?.includes("ChatGPT Web · Pro power"));
+    expect(webChart?.querySelector(".chart-trend")).toBeTruthy();
   });
 
   it("shows sign-in guidance rather than reporting zero usage for an unauthenticated user", async () => {
@@ -78,5 +81,9 @@ describe("quota projection", () => {
   it("excludes earlier reset periods", () => {
     const points = [point(4, 90, "2026-11-05T09:30:00Z"), point(3, 10), point(2, 12), point(1, 14)];
     expect(project(points, item, now).rate).toBe(2);
+  });
+  it("projects integer send counts converted to percentages across a weekly reset", () => {
+    const points = [point(4, 4, "2026-11-05T09:30:00Z"), point(3, 0), point(2, 2), point(1, 4)];
+    expect(project(points, { ...item, pool: "pro:weekly", usedPercent: 4 }, now).rate).toBe(2);
   });
 });

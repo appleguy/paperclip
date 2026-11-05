@@ -358,6 +358,21 @@ export function costRoutes(
     type Point = { t: string; usedPercent: number; resetsAt: string | null };
     const series = new Map<string, { provider: string; pool: string; points: Point[]; stride: number; count: number }>();
     let observedAt: string | null = null;
+    const addPoint = (provider: string, pool: string, t: string, value: any) => {
+      if (typeof value?.used_pct !== "number" || !Number.isFinite(value.used_pct)) return;
+      const reset = typeof value.reset_at === "string" && Number.isFinite(Date.parse(value.reset_at)) ? value.reset_at : null;
+      const key = `${provider}/${pool}`;
+      let entry = series.get(key);
+      if (!entry) { entry = { provider, pool, points: [], stride: 1, count: 0 }; series.set(key, entry); }
+      if (entry.count++ % entry.stride === 0) entry.points.push({ t, usedPercent: Math.max(0, Math.min(100, value.used_pct)), resetsAt: reset });
+      if (entry.points.length > 2000) { entry.points = entry.points.filter((_point, index) => index % 2 === 0); entry.stride *= 2; }
+    };
+    const validTime = (t: unknown) => {
+      const time = typeof t === "string" ? Date.parse(t) : NaN;
+      if (!Number.isFinite(time) || time < cutoff || time > Date.now()) return false;
+      if (!observedAt || time > Date.parse(observedAt)) observedAt = t as string;
+      return true;
+    };
     try {
       const input = createReadStream(process.env.PAPERCLIP_QUOTA_SENTINEL_SAMPLES_PATH
         ?? "/Volumes/NVM/Paperclip/knowledge/raw/model-routing/quota_pacing_samples.jsonl", { encoding: "utf8" });
@@ -365,19 +380,21 @@ export function costRoutes(
         let sample: any;
         try { sample = JSON.parse(line); } catch { continue; }
         const t = sample?.observed_at;
-        const time = typeof t === "string" ? Date.parse(t) : NaN;
-        if (!Number.isFinite(time) || time < cutoff || time > Date.now()) continue;
-        if (!observedAt || time > Date.parse(observedAt)) observedAt = t;
+        if (!validTime(t)) continue;
         for (const [provider, windows] of Object.entries(allowed)) for (const pool of windows) {
-          const value = sample?.providers?.[provider]?.windows?.[pool];
-          if (typeof value?.used_pct !== "number" || !Number.isFinite(value.used_pct)) continue;
-          const reset = typeof value.reset_at === "string" && Number.isFinite(Date.parse(value.reset_at)) ? value.reset_at : null;
-          const key = `${provider}/${pool}`;
-          let entry = series.get(key);
-          if (!entry) { entry = { provider, pool, points: [], stride: 1, count: 0 }; series.set(key, entry); }
-          if (entry.count++ % entry.stride === 0) entry.points.push({ t, usedPercent: Math.max(0, Math.min(100, value.used_pct)), resetsAt: reset });
-          if (entry.points.length > 2000) { entry.points = entry.points.filter((_point, index) => index % 2 === 0); entry.stride *= 2; }
+          addPoint(provider, pool, t, sample?.providers?.[provider]?.windows?.[pool]);
         }
+      }
+      try {
+        const webInput = createReadStream(process.env.PAPERCLIP_CHATGPT_WEB_QUOTA_SAMPLES_PATH
+          ?? "/Volumes/NVM/Paperclip/knowledge/raw/model-routing/chatgpt_web_quota_samples.jsonl", { encoding: "utf8" });
+        for await (const line of createInterface({ input: webInput, crlfDelay: Infinity })) {
+          let sample: any;
+          try { sample = JSON.parse(line); } catch { continue; }
+          if (validTime(sample?.observed_at)) addPoint("chatgpt-web", "pro:weekly", sample.observed_at, sample);
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
       }
       res.json({ source: "quota-sentinel", observedAt, series: [...series.values()].map(({ provider, pool, points }) => ({ provider, pool, points })) });
     } catch {

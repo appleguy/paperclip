@@ -15,7 +15,7 @@ vi.mock("../services/index.js", () => ({
 const companyId = "11111111-1111-4111-8111-111111111111";
 const path = `/api/companies/${companyId}/costs/quota-sentinel/history`;
 let directory = "";
-afterEach(async () => { delete process.env.PAPERCLIP_QUOTA_SENTINEL_SAMPLES_PATH; if (directory) await rm(directory, { recursive: true, force: true }); });
+afterEach(async () => { delete process.env.PAPERCLIP_QUOTA_SENTINEL_SAMPLES_PATH; delete process.env.PAPERCLIP_CHATGPT_WEB_QUOTA_SAMPLES_PATH; if (directory) await rm(directory, { recursive: true, force: true }); });
 function app(agent = false) {
   const instance = express();
   instance.use((req, _res, next) => { req.actor = agent ? { type: "agent", agentId: "agent", companyId } as typeof req.actor : { type: "board", source: "session", userId: "alice", companyIds: [companyId] } as typeof req.actor; next(); });
@@ -26,6 +26,7 @@ describe("quota history", () => {
     directory = await mkdtemp(join(tmpdir(), "quota-history-"));
     const file = join(directory, "samples.jsonl");
     process.env.PAPERCLIP_QUOTA_SENTINEL_SAMPLES_PATH = file;
+    process.env.PAPERCLIP_CHATGPT_WEB_QUOTA_SAMPLES_PATH = join(directory, "missing.jsonl");
     const sample = (days: number) => JSON.stringify({ observed_at: new Date(Date.now() - days * 86400000).toISOString(), secret: "private", providers: { claude: { windows: { weekly: { used_pct: 25, reset_at: "2027-01-01T00:00:00Z", account: "private" }, secret: { used_pct: 50 } } }, secret: { windows: { weekly: { used_pct: 50 } } } } });
     await writeFile(file, ["{bad", sample(1), sample(20), sample(31)].join("\n"));
     const response = await request(app()).get(path);
@@ -37,5 +38,26 @@ describe("quota history", () => {
     expect((await request(app()).get(`${path}?days=bad`)).status).toBe(400);
     expect((await request(app(true)).get(path)).status).toBe(403);
     expect((await request(app()).get("/api/companies/other/costs/quota-sentinel/history")).status).toBe(403);
+  });
+  it("streams and bounds Pro samples, tolerating a missing file and rejecting other read errors", async () => {
+    directory = await mkdtemp(join(tmpdir(), "quota-history-"));
+    const base = join(directory, "base.jsonl"), web = join(directory, "web.jsonl");
+    process.env.PAPERCLIP_QUOTA_SENTINEL_SAMPLES_PATH = base;
+    process.env.PAPERCLIP_CHATGPT_WEB_QUOTA_SAMPLES_PATH = web;
+    await writeFile(base, "");
+    expect((await request(app()).get(path)).body.series).toEqual([]);
+    const t = new Date(Date.now() - 3600000).toISOString();
+    const sample = JSON.stringify({ observed_at: t, used_pct: 2.5, reset_at: "2027-01-01T00:00:00Z", secret: "private" });
+    await writeFile(web, ["{bad", JSON.stringify({ observed_at: new Date(Date.now() - 31 * 86400000).toISOString(), used_pct: 50 }), ...Array(4001).fill(sample)].join("\n"));
+    const response = await request(app()).get(path);
+    expect(response.status).toBe(200);
+    expect(response.body.observedAt).toBe(t);
+    expect(response.body.series).toHaveLength(1);
+    expect(response.body.series[0]).toMatchObject({ provider: "chatgpt-web", pool: "pro:weekly" });
+    expect(response.body.series[0].points.length).toBeLessThanOrEqual(2000);
+    expect(response.body.series[0].points[0]).toEqual({ t, usedPercent: 2.5, resetsAt: "2027-01-01T00:00:00Z" });
+    expect(JSON.stringify(response.body)).not.toContain("private");
+    process.env.PAPERCLIP_CHATGPT_WEB_QUOTA_SAMPLES_PATH = directory;
+    expect((await request(app()).get(path)).status).toBe(503);
   });
 });
