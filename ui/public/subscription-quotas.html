@@ -166,8 +166,10 @@ function renderCharts(data,history){
  var target=document.getElementById("charts");target.replaceChildren();
  data.pools.forEach(function(item){
   var series=history&&Array.isArray(history.series)?history.series.find(function(s){return s.provider===item.provider&&s.pool===item.pool}):null;
-  var points=series&&Array.isArray(series.points)?series.points.slice().sort(function(a,b){return Date.parse(a.t)-Date.parse(b.t)}):[];
-  var now=Date.now(),forecast=projection(points,item,now),card=el("section","chart-card"),name=(labels[item.provider]||item.provider)+" · "+(pools[item.pool]||item.pool);
+  // Short windows show the last day; weekly windows the full history.
+  var now=Date.now(),from=now-(isShort(item)?24:336)*3600000;
+  var points=series&&Array.isArray(series.points)?series.points.filter(function(p){return Date.parse(p.t)>=from}).sort(function(a,b){return Date.parse(a.t)-Date.parse(b.t)}):[];
+  var forecast=projection(points,item,now),card=el("section","chart-card"),name=(labels[item.provider]||item.provider)+" · "+(pools[item.pool]||item.pool);
   card.append(el("h3",null,name),el("p",null,"Current: "+usedPct(item.usedPercent)+" used · resets "+when(item.resetsAt)));
   card.append(el("p",null,forecast?"Projected at reset: "+forecast.projected.toFixed(1)+"% · "+forecast.rate.toFixed(2)+" pts/h"+(forecast.exhaustion?" · exhausts at "+when(new Date(forecast.exhaustion).toISOString()):""):"Projection unavailable: not enough current-period history."));
   if(!points.length){card.append(el("p",null,"No history available for this pool."));target.append(card);return}
@@ -178,7 +180,7 @@ function renderCharts(data,history){
   [0,50,100].forEach(function(v){line(30,y(v),390,y(v),"chart-grid");var label=document.createElementNS(ns,"text");label.setAttribute("x","0");label.setAttribute("y",y(v)+3);label.setAttribute("class","chart-label");label.textContent=v+"%";svg.append(label)});
   var segments=[],segment=[];points.forEach(function(p,i){if(i&&resetBetween(points[i-1],p)){segments.push(segment);segment=[];line(x(Date.parse(p.t)),20,x(Date.parse(p.t)),125,"chart-reset")}segment.push(x(Date.parse(p.t))+","+y(p.usedPercent))});segments.push(segment);
   segments.forEach(function(s){var n=document.createElementNS(ns,"polyline");n.setAttribute("points",s.join(" "));n.setAttribute("class","chart-line");svg.append(n)});
-  if(Number.isFinite(reset)&&reset>now){line(x(reset),20,x(reset),125,"chart-reset");if(forecast)line(x(now),y(item.usedPercent),x(forecast.exhaustion||reset),y(forecast.exhaustion?100:forecast.projected),"chart-trend")}
+  if(Number.isFinite(reset)&&reset>now){line(x(reset),20,x(reset),125,"chart-reset");if(forecast){var tx=x(forecast.exhaustion||reset),ty=y(forecast.exhaustion?100:forecast.projected),tag=document.createElementNS(ns,"text");line(x(now),y(item.usedPercent),tx,ty,"chart-trend");tag.setAttribute("x",tx-3);tag.setAttribute("y",Math.max(12,ty-5));tag.setAttribute("text-anchor","end");tag.setAttribute("class","chart-label");tag.textContent=forecast.exhaustion?"100% before reset":Math.min(100,forecast.projected).toFixed(0)+"% at reset";svg.append(tag)}}
   var firstLabel=document.createElementNS(ns,"text");firstLabel.setAttribute("x","30");firstLabel.setAttribute("y","145");firstLabel.setAttribute("class","chart-label");firstLabel.textContent=new Date(start).toLocaleDateString();svg.append(firstLabel);
   var endLabel=document.createElementNS(ns,"text");endLabel.setAttribute("x","390");endLabel.setAttribute("y","145");endLabel.setAttribute("text-anchor","end");endLabel.setAttribute("class","chart-label");endLabel.textContent=Number.isFinite(reset)&&reset>now?"Reset":"Now";svg.append(endLabel);
   card.append(svg,el("p",null,"Blue: usage · purple dashed: projection · gold: reset"));target.append(card);
