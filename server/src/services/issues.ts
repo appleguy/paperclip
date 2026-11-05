@@ -120,6 +120,7 @@ import {
   issueDocuments,
   issueQuestionResponseDeliveries,
   issueWorkProducts,
+  issueIdentifierAliases,
   issueReadStates,
   issueThreadInteractions,
   toolActionRequests,
@@ -6884,6 +6885,54 @@ async function lockIssueForCommentMutation(tx: DbTransaction, commentId: string)
   return Boolean(issue);
 }
 
+/**
+ * Reserve `count` consecutive identifiers. A project with its own issue prefix
+ * allocates from the project counter (A-1, A-2, ...); everything else uses the
+ * company counter. Must run inside the issue-creating transaction.
+ */
+async function reserveIssueIdentifiers(
+  tx: any,
+  companyId: string,
+  projectId: string | null | undefined,
+  count: number,
+): Promise<{ prefix: string; first: number }> {
+  if (projectId) {
+    const [project] = await tx
+      .select({ issuePrefix: projects.issuePrefix })
+      .from(projects)
+      .where(and(eq(projects.id, projectId), eq(projects.companyId, companyId)));
+    if (project?.issuePrefix) {
+      const [maxRow] = await tx
+        .select({ maxNum: sql<number>`coalesce(max(${issues.issueNumber}), 0)` })
+        .from(issues)
+        .where(and(eq(issues.companyId, companyId), sql`split_part(${issues.identifier}, '-', 1) = ${project.issuePrefix}`));
+      const [row] = await tx
+        .update(projects)
+        .set({ issueCounter: sql`greatest(${projects.issueCounter}, ${maxRow?.maxNum ?? 0}) + ${count}` })
+        .where(eq(projects.id, projectId))
+        .returning({ issueCounter: projects.issueCounter });
+      return { prefix: project.issuePrefix, first: row.issueCounter - count + 1 };
+    }
+  }
+  // Self-correcting counter: use MAX(issue_number) + 1 if the counter has
+  // drifted below the actual max. Project-prefixed issues have their own
+  // number space and are excluded.
+  const [maxRow] = await tx
+    .select({ maxNum: sql<number>`coalesce(max(${issues.issueNumber}), 0)` })
+    .from(issues)
+    .where(and(
+      eq(issues.companyId, companyId),
+      sql`(${issues.identifier} is null or split_part(${issues.identifier}, '-', 1) = (select ${companies.issuePrefix} from ${companies} where ${companies.id} = ${companyId}))`,
+    ));
+  const [company] = await tx
+    .update(companies)
+    .set({ issueCounter: sql`greatest(${companies.issueCounter}, ${maxRow?.maxNum ?? 0}) + ${count}` })
+    .where(eq(companies.id, companyId))
+    .returning({ issueCounter: companies.issueCounter, issuePrefix: companies.issuePrefix });
+  if (!company) throw notFound("Target company not found");
+  return { prefix: company.issuePrefix, first: company.issueCounter - count + 1 };
+}
+
 export function issueService(db: Db) {
   const instanceSettings = instanceSettingsService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -6938,10 +6987,17 @@ export function issueService(db: Db) {
   }
 
   async function getIssueByIdentifier(identifier: string) {
+    const normalized = identifier.toUpperCase();
     const row = await retryIdempotentDatabaseOperation(() => db
       .select({ ...getTableColumns(issues), displayStatus: issueDisplayStatusSql(), externalConversationState: externalConversationStateSql() })
       .from(issues)
-      .where(eq(issues.identifier, identifier.toUpperCase()))
+      .where(or(
+        eq(issues.identifier, normalized),
+        // Former identifiers (re-keyed issues) keep resolving.
+        inArray(issues.id, db.select({ id: issueIdentifierAliases.issueId }).from(issueIdentifierAliases).where(eq(issueIdentifierAliases.identifier, normalized))),
+      ))
+      .orderBy(sql`(${issues.identifier} = ${normalized}) desc`)
+      .limit(1)
       .then((rows) => rows[0] ?? null));
     if (!row) return null;
     const [enriched] = await withIssueLabels(db, [row]);
@@ -8070,8 +8126,7 @@ export function issueService(db: Db) {
     );
 
     const childIdentifier = child.identifier?.trim() || child.id;
-    const childPrefix = childIdentifier.split("-")[0] || "PAP";
-    const body = `System relay: [${childIdentifier}](/${childPrefix}/issues/${childIdentifier}) transitioned to \`${child.status}\`.`;
+    const body = `System relay: [${childIdentifier}](/issues/${childIdentifier}) transitioned to \`${child.status}\`.`;
     const existingRelay = await dbOrTx
       .select({ id: issueComments.id })
       .from(issueComments)
@@ -10584,29 +10639,9 @@ export function issueService(db: Db) {
             executionWorkspaceSettings: issueData.executionWorkspaceSettings,
           });
         }
-        // Self-correcting counter: use MAX(issue_number) + 1 if the counter
-        // has drifted below the actual max, preventing identifier collisions.
-        const [maxRow] = await tx
-          .select({
-            maxNum: sql<number>`coalesce(max(${issues.issueNumber}), 0)`,
-          })
-          .from(issues)
-          .where(eq(issues.companyId, companyId));
-        const currentMax = maxRow?.maxNum ?? 0;
-
-        const [company] = await tx
-          .update(companies)
-          .set({
-            issueCounter: sql`greatest(${companies.issueCounter}, ${currentMax}) + 1`,
-          })
-          .where(eq(companies.id, companyId))
-          .returning({
-            issueCounter: companies.issueCounter,
-            issuePrefix: companies.issuePrefix,
-          });
-
-        const issueNumber = company.issueCounter;
-        const identifier = `${company.issuePrefix}-${issueNumber}`;
+        const reserved = await reserveIssueIdentifiers(tx, companyId, issueData.projectId, 1);
+        const issueNumber = reserved.first;
+        const identifier = `${reserved.prefix}-${issueNumber}`;
         const responsibleUserId = await resolveResponsibleUserIdForIssueCreate(
           tx,
           companyId,
@@ -10835,30 +10870,6 @@ export function issueService(db: Db) {
         await instanceSettings.getExperimental()
       ).enableIsolatedWorkspaces;
       await db.transaction(async (tx) => {
-        // Self-correcting counter: seed from max(issue_number) so a drifted
-        // company counter cannot mint colliding identifiers, then reserve the
-        // whole range in one bump instead of one-per-issue.
-        const [maxRow] = await tx
-          .select({
-            maxNum: sql<number>`coalesce(max(${issues.issueNumber}), 0)`,
-          })
-          .from(issues)
-          .where(eq(issues.companyId, companyId));
-        const currentMax = maxRow?.maxNum ?? 0;
-        const [company] = await tx
-          .select({
-            issueCounter: companies.issueCounter,
-            issuePrefix: companies.issuePrefix,
-          })
-          .from(companies)
-          .where(eq(companies.id, companyId));
-        if (!company) throw notFound("Target company not found");
-        const base = Math.max(company.issueCounter ?? 0, currentMax);
-        await tx
-          .update(companies)
-          .set({ issueCounter: base + rows.length })
-          .where(eq(companies.id, companyId));
-
         const defaultCompanyGoal = await getDefaultCompanyGoal(tx, companyId);
         const defaultGoalId = defaultCompanyGoal?.id ?? null;
 
@@ -10919,12 +10930,11 @@ export function issueService(db: Db) {
           companyId: string;
         }> = [];
 
-        let counter = base;
         for (const row of rows) {
           await assertExecutionTaskParent(tx as unknown as Db, companyId, row.parentId);
-          counter += 1;
-          const issueNumber = counter;
-          const identifier = `${company.issuePrefix}-${issueNumber}`;
+          const reserved = await reserveIssueIdentifiers(tx, companyId, row.projectId, 1);
+          const issueNumber = reserved.first;
+          const identifier = `${reserved.prefix}-${issueNumber}`;
 
           if (row.assigneeAgentId) {
             if (!validatedAgentIds.has(row.assigneeAgentId)) {

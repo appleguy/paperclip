@@ -1639,8 +1639,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     issue: Pick<typeof issues.$inferSelect, "id" | "identifier">,
   ) {
     const label = issue.identifier ?? issue.id;
-    const prefix = issue.identifier?.split("-")[0] || "PAP";
-    return `[${label}](/${prefix}/issues/${label})`;
+    return `[${label}](/issues/${label})`;
   }
 
   function hasUnmanagedBackgroundTaskEvidence(

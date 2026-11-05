@@ -873,8 +873,7 @@ function formatIssueLinksForComment(
   return identifiers
     .slice(0, 5)
     .map((identifier) => {
-      const prefix = identifier.split("-")[0] || "PAP";
-      return `[${identifier}](/${prefix}/issues/${identifier})`;
+      return `[${identifier}](/issues/${identifier})`;
     })
     .join(", ");
 }

@@ -826,7 +826,7 @@ function MarkdownBodyImpl({
   // Stable identity so it can feed the memoized remark plugins without
   // re-creating them (and forcing a full markdown re-parse) every render.
   const knownPrefixes = useMemo(
-    () => (companies?.length ? companies.map((c) => c.issuePrefix) : undefined),
+    () => (companies?.length ? companies.flatMap((c) => [c.issuePrefix, ...(c.projectIssuePrefixes ?? [])]) : undefined),
     [companies],
   );
   const externalReferenceLookup = useMemo<MarkdownExternalReferenceMap | null>(() => {

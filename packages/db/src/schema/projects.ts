@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { pgTable, uuid, text, timestamp, date, index, jsonb, check, uniqueIndex } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, date, index, jsonb, check, uniqueIndex, integer } from "drizzle-orm/pg-core";
 import type { AgentEnvConfig } from "@paperclipai/shared";
 import { companies } from "./companies.js";
 import { goals } from "./goals.js";
@@ -18,6 +18,8 @@ export const projects = pgTable(
     privacyOwnerUserId: text("privacy_owner_user_id"),
     personalOwnerUserId: text("personal_owner_user_id"),
     status: text("status").notNull().default("backlog"),
+    issuePrefix: text("issue_prefix"),
+    issueCounter: integer("issue_counter").notNull().default(0),
     leadAgentId: uuid("lead_agent_id").references(() => agents.id),
     targetDate: date("target_date"),
     color: text("color"),
@@ -36,6 +38,9 @@ export const projects = pgTable(
     companyIdUq: uniqueIndex("projects_company_id_uq").on(table.companyId, table.id),
     companyIdx: index("projects_company_idx").on(table.companyId),
     visibilityCheck: check("projects_visibility_check", sql`${table.visibility} in ('open', 'private')`),
+    issuePrefixUq: uniqueIndex("projects_company_issue_prefix_uq")
+      .on(table.companyId, table.issuePrefix)
+      .where(sql`${table.issuePrefix} is not null`),
     personalOwnerUq: uniqueIndex("projects_company_personal_owner_uq")
       .on(table.companyId, table.personalOwnerUserId)
       .where(sql`${table.personalOwnerUserId} is not null`),

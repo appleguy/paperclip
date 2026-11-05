@@ -169,9 +169,7 @@ function normalizeInstanceGeneralSettings(raw: unknown) {
 
 function buildIssuePath(identifier: string | null) {
   if (!identifier) return null;
-  const prefix = identifier.split("-")[0]?.trim();
-  if (!prefix) return null;
-  return `/${prefix}/issues/${identifier}`;
+  return `/issues/${identifier}`;
 }
 
 function buildTargetSummary(input: {

@@ -11,13 +11,14 @@ import { deleteCompany } from "./company-deletion.js";
 import { fenceActiveCompanyAgentStopsInTransaction } from "./agent-lifecycle.js";
 import { publishAccountingActivities } from "./accounting-transaction.js";
 import { budgetServiceInTransaction, type BudgetServiceHooks } from "./budgets.js";
-import { and, count, eq, gte, inArray, isNull, lt, notInArray, sql } from "drizzle-orm";
+import { and, count, eq, gte, inArray, isNotNull, isNull, lt, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   companies,
   companyLogos,
   assets,
   agents,
+  projects,
   agentWakeupRequests,
   issues,
   heartbeatRuns,
@@ -272,11 +273,26 @@ export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
     throw new Error("Unable to allocate unique issue prefix");
   }
 
+  async function loadProjectIssuePrefixes(companyIds: string[]) {
+    const byCompany = new Map<string, string[]>();
+    if (companyIds.length === 0) return byCompany;
+    const rows = await db
+      .select({ companyId: projects.companyId, issuePrefix: projects.issuePrefix })
+      .from(projects)
+      .where(and(inArray(projects.companyId, companyIds), isNotNull(projects.issuePrefix)));
+    for (const row of rows) {
+      if (!row.issuePrefix) continue;
+      byCompany.set(row.companyId, [...(byCompany.get(row.companyId) ?? []), row.issuePrefix]);
+    }
+    return byCompany;
+  }
+
   return {
     list: async () => {
       const rows = await getCompanyQuery(db);
       const hydrated = await hydrateCompanySpend(rows);
-      return hydrated.map((row) => enrichCompany(row));
+      const projectPrefixes = await loadProjectIssuePrefixes(hydrated.map((row) => row.id));
+      return hydrated.map((row) => ({ ...enrichCompany(row), projectIssuePrefixes: projectPrefixes.get(row.id) ?? [] }));
     },
 
     getById: async (id: string) => {
@@ -290,7 +306,8 @@ export function companyService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
         .then((rows) => rows[0] ?? null);
       if (!row) return null;
       const [hydrated] = await hydrateCompanySpend([row], db);
-      return enrichCompany(hydrated);
+      const projectPrefixes = await loadProjectIssuePrefixes([hydrated.id]);
+      return { ...enrichCompany(hydrated), projectIssuePrefixes: projectPrefixes.get(hydrated.id) ?? [] };
     },
 
     create: async (data: typeof companies.$inferInsert) => {

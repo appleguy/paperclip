@@ -22,6 +22,8 @@ export interface Company {
   pauseReason: PauseReason | null;
   pausedAt: Date | null;
   issuePrefix: string;
+  /** Per-project issue prefixes in use (e.g. "T", "A"); issue identifiers may start with these. */
+  projectIssuePrefixes?: string[];
   issueCounter: number;
   budgetMonthlyCents: number;
   spentMonthlyCents: number;

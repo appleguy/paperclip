@@ -114,6 +114,8 @@ const projectFields = {
   description: z.string().optional().nullable(),
   visibility: z.enum(["open", "private"]).optional().default("open"),
   status: z.enum(PROJECT_STATUSES).optional().default("backlog"),
+  /** Per-project issue identifier prefix (e.g. "T" -> T-1). Null/omitted keeps the company prefix. */
+  issuePrefix: z.string().trim().toUpperCase().regex(/^[A-Z][A-Z0-9]{0,9}$/).optional().nullable(),
   leadAgentId: z.string().guid().optional().nullable(),
   targetDate: z.string().optional().nullable(),
   color: z.string().optional().nullable(),

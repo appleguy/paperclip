@@ -118,9 +118,8 @@ export function formatIssueIdentifierLink(
   fallback: string,
 ) {
   if (!identifier) return fallback;
-  const prefix = identifier.split("-")[0];
-  if (!prefix || !/^[A-Z][A-Z0-9]*-\d+$/.test(identifier)) return identifier;
-  return `[${identifier}](/${prefix}/issues/${identifier})`;
+  if (!/^[A-Z][A-Z0-9]*-\d+$/.test(identifier)) return identifier;
+  return `[${identifier}](/issues/${identifier})`;
 }
 
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_RETRY_REASON =

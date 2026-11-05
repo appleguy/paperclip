@@ -133,6 +133,8 @@ export interface Project {
   /** Only this user and administrators may change the project audience. */
   privacyOwnerUserId?: string | null;
   status: ProjectStatus;
+  /** Per-project issue prefix (e.g. "T"); null/omitted means issues use the company prefix. */
+  issuePrefix?: string | null;
   leadAgentId: string | null;
   targetDate: string | null;
   color: string | null;

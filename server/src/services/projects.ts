@@ -7,6 +7,7 @@ import { enqueueProjectSkillSource, detachProjectSkillSource } from "./project-s
 import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  companies,
   projects,
   executionWorkspaces,
   projectAccessMembers,
@@ -89,6 +90,26 @@ export async function ensureProjectAccessMember(
       .then(rows => rows[0] ?? null);
   });
 }
+
+/**
+ * A project issue prefix must not equal any company prefix (it would make
+ * identifiers ambiguous with company routes). Per-company uniqueness among
+ * projects is enforced by projects_company_issue_prefix_uq.
+ */
+async function assertProjectIssuePrefixAvailable(
+  dbOrTx: any,
+  prefix: string | null | undefined,
+) {
+  if (!prefix) return;
+  const clash = await dbOrTx
+    .select({ id: companies.id })
+    .from(companies)
+    .where(eq(companies.issuePrefix, prefix))
+    .limit(1)
+    .then((rows: Array<{ id: string }>) => rows[0] ?? null);
+  if (clash) throw conflict(`Issue prefix "${prefix}" is already used by a company`);
+}
+
 
 /**
  * Concurrency-safe lazy creation for the per-user private parking project.
@@ -657,6 +678,7 @@ export function projectService(db: Db, options: { captureWorkspaceUpdates?: bool
     const { goalIds: inputGoalIds, ...projectData } = data;
     const ids = resolveGoalIds({ goalIds: inputGoalIds, goalId: projectData.goalId });
     if (ids && ids.length > 0) await assertGoalsBelongToCompany(db, companyId, ids);
+    await assertProjectIssuePrefixAvailable(db, projectData.issuePrefix);
 
     // Note: color is intentionally NOT auto-assigned. New projects default to
     // `color = null` (neutral gray) unless an explicit color is supplied. See PAP-68.
@@ -989,6 +1011,7 @@ export function projectService(db: Db, options: { captureWorkspaceUpdates?: bool
       if (ids && ids.length > 0) {
         await assertGoalsBelongToCompany(db, existingProject.companyId, ids);
       }
+      await assertProjectIssuePrefixAvailable(db, projectData.issuePrefix);
 
       if (projectData.name !== undefined) {
         const existingShortname = normalizeProjectUrlKey(existingProject.name);

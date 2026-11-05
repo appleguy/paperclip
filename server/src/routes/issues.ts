@@ -6643,8 +6643,9 @@ export function issueRoutes(
   }) {
     const identifier = issue.identifier?.trim();
     if (!identifier) return `\`${issue.id}\``;
-    const prefix = identifier.split("-")[0] || "PAP";
-    return `[${identifier}](/${prefix}/issues/${identifier})`;
+    // Unprefixed issue paths redirect to the company route; the identifier
+    // prefix may be a project prefix, not the company prefix.
+    return `[${identifier}](/issues/${identifier})`;
   }
 
   function appendWatchdogDiscoveryContext(input: {

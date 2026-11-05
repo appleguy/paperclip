@@ -7,6 +7,7 @@ import {
   issueDocuments,
   issueReferenceMentions,
   issues,
+  issueIdentifierAliases,
 } from "@paperclipai/db";
 import type {
   IssueReferenceSource,
@@ -141,11 +142,18 @@ export function issueReferenceService(db: Db) {
         .from(issues)
         .where(and(eq(issues.companyId, input.companyId), inArray(issues.identifier, identifiers)))
       : [];
-    const targetByIdentifier = new Map<string, string>(
-      resolvedTargets
+    const aliasTargets: Array<{ id: string; identifier: string }> = identifiers.length > 0
+      ? await dbOrTx
+        .select({ id: issueIdentifierAliases.issueId, identifier: issueIdentifierAliases.identifier })
+        .from(issueIdentifierAliases)
+        .where(and(eq(issueIdentifierAliases.companyId, input.companyId), inArray(issueIdentifierAliases.identifier, identifiers)))
+      : [];
+    const targetByIdentifier = new Map<string, string>([
+      ...aliasTargets.map((row): [string, string] => [row.identifier, row.id]),
+      ...resolvedTargets
         .filter((row): row is ResolvedTargetRow & { identifier: string } => typeof row.identifier === "string")
-        .map((row) => [row.identifier, row.id]),
-    );
+        .map((row): [string, string] => [row.identifier, row.id]),
+    ]);
 
     await dbOrTx.delete(issueReferenceMentions).where(sourceWhere(input));
 
