@@ -22,7 +22,7 @@ vi.mock("./channel.js", async importOriginal => ({
 vi.mock("./done-gate.js", async importOriginal => ({
   ...await importOriginal<typeof import("./done-gate.js")>(), gateReceiptRaw: deps.gate,
 }));
-import { execute, projectDir, typeNativeGoal } from "./execute.js";
+import { execute, isClaudeIdle, projectDir, reconcileIdleAdoption, typeNativeGoal } from "./execute.js";
 import { receiptFilePath } from "../agy/execute.js";
 
 const rcUrl = "https://claude.ai/code/session_busy";
@@ -75,6 +75,61 @@ afterEach(async () => {
 });
 
 describe("SCO-947 busy delivery and completion", () => {
+  it.each(["refused", "missing", "malformed"])("SCO-1018 archives an idle %s receipt checkpoint and completes a fresh dispatch", async kind => {
+    const oldRun = "11111111-1111-4111-8111-111111111111";
+    const oldReceiptPath = receiptFilePath(stateDir, oldRun);
+    const checkpoint = JSON.stringify({ runId: oldRun, op_id: oldRun, issueId: "issue-busy",
+      receiptPath: oldReceiptPath, rcUrl, cwd, conversationId: "conversation-busy",
+      dispatchMode: "channel-pending",
+      ...(kind === "refused" ? {} : { startedAt: new Date(Date.now() - 1000).toISOString() }),
+      doneGateBaseline: { old: "unprovable baseline" },
+    });
+    await fs.writeFile(path.join(stateDir, "active.json"), checkpoint);
+    if (kind === "refused") await fs.writeFile(`${oldReceiptPath}.refused-1`, "refused evidence");
+    if (kind === "malformed") await fs.writeFile(oldReceiptPath, "{");
+    screen = `${rcUrl}\n❯ \n  bypass permissions on`;
+    ctx.config.keepConversation = true;
+    await fs.writeFile(path.join(stateDir, "keep-conversation.json"), JSON.stringify({
+      conversationId: "conversation-busy", projectId: "", issueIds: ["issue-busy"],
+    }));
+    const result = await execute(ctx);
+    expect(result.exitCode).toBe(0);
+    const archives = (await fs.readdir(stateDir)).filter(n => n.startsWith(`active.unverified-${oldRun}-`));
+    expect(archives).toHaveLength(1);
+    expect(await fs.readFile(path.join(stateDir, archives[0]!), "utf8")).toBe(checkpoint);
+    expect(deps.route).toHaveBeenCalledOnce();
+    expect(deps.route.mock.calls[0][0]).toBe(ctx.runId);
+    expect(deps.route.mock.calls[0][2]).toBe(false);
+    expect(deps.deliver).toHaveBeenCalledWith(ctx, stateDir, ctx.runId, "issue-busy", expect.objectContaining({ kind: "done" }));
+    await expect(fs.stat(path.join(stateDir, "active.json"))).rejects.toThrow();
+    if (kind === "refused") expect(await fs.readFile(`${oldReceiptPath}.refused-1`, "utf8")).toBe("refused evidence");
+  });
+
+  it.each(["busy", "synthesizing", "same-run", "not-older", "unknown-age", "receipt", "block"])("SCO-1018 preserves %s adoption evidence", async kind => {
+    const oldRun = "11111111-1111-4111-8111-111111111111";
+    const oldReceiptPath = receiptFilePath(stateDir, oldRun);
+    const checkpoint = JSON.stringify({ runId: oldRun, issueId: "issue-busy", receiptPath: oldReceiptPath, rcUrl,
+      ...(kind === "unknown-age" ? {} : { startedAt: new Date(1000).toISOString() }) });
+    const activePath = path.join(stateDir, "active.json");
+    await fs.writeFile(activePath, checkpoint);
+    if (kind === "synthesizing") await fs.writeFile(`${oldReceiptPath}.refused-1`, "prior refusal");
+    if (kind === "receipt") await fs.writeFile(oldReceiptPath, JSON.stringify({
+      runId: oldRun, issueId: "issue-busy", status: "done", summary: "Valid original receipt", report: "evidence ".repeat(40),
+    }));
+    if (kind === "block") {
+      await fs.mkdir(path.join(stateDir, "channel-bridge"));
+      await fs.writeFile(path.join(stateDir, "channel-bridge/ledger.jsonl"), JSON.stringify({
+        ev: "terminal", op_id: oldRun, kind: "block", reason: "Required input unavailable",
+      }) + "\n");
+    }
+    expect(await reconcileIdleAdoption({ stateDir, activePath, issueId: "issue-busy",
+      runId: kind === "same-run" ? oldRun : ctx.runId, wakeStartedAt: kind === "not-older" ? 1000 : 2000,
+      paneIdle: async () => kind === "synthesizing"
+        ? isClaudeIdle("✻ Synthesizing… 9m\n❯ \n  bypass permissions on") : kind !== "busy", log: () => {},
+    })).toBe(false);
+    expect(await fs.readFile(activePath, "utf8")).toBe(checkpoint);
+  });
+
   it.each(["{", "valid"])("retains foreign %s receipt before touching the transport or run environment", async value => {
     const oldRun = "11111111-1111-4111-8111-111111111111";
     const oldReceiptPath = receiptFilePath(stateDir, oldRun);

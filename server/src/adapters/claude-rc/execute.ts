@@ -96,7 +96,7 @@ export function isClaudeIdle(screen: string): boolean {
   // Spinner tokens are capitalized and end in an ellipsis; plain prose such as
   // "one pane per generating session" in the last answer must not read as busy.
   const text = tail.join("\n");
-  return !/esc to interrupt|Do you want to|❯ 1\./i.test(text) && !/(Generating|Thinking|Working)…/.test(text);
+  return !/esc to\b|Do you want to|❯ 1\./i.test(text) && !/^\s*\S+ [A-Z][a-z]+…/m.test(text);
 }
 export function parseClaudeRcUrl(screen: string): string | null {
   return screen.match(/https:\/\/claude\.ai\/code\/session_[A-Za-z0-9]+/)?.[0] ?? null;
@@ -252,6 +252,40 @@ export async function reconcileOrphanActive(o: {
   await fs.rename(o.activePath, dest);
   await o.log(`[claude-rc] Archived never-submitted op ${op} at ${dest}; seat freed\n`);
   return "archived";
+}
+
+/** A fresh same-issue wake may replace an idle, unverified dispatch, never replay its op. */
+export async function reconcileIdleAdoption(o: {
+  stateDir: string; activePath: string; issueId: string; runId: string; wakeStartedAt: number;
+  paneIdle: () => Promise<boolean>; log: (m: string) => Promise<void> | void;
+}): Promise<boolean> {
+  const raw = await fs.readFile(o.activePath, "utf8").catch(error => {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  });
+  const active = adoptableActive(raw, o.issueId, o.stateDir, "claude_rc_local");
+  if (!active || active.runId === o.runId) return false;
+  const started = Date.parse(asString((active as { startedAt?: unknown }).startedAt, ""));
+  const olderWake = Number.isFinite(started) && started < o.wakeStartedAt;
+  const receiptName = path.basename(active.receiptPath);
+  const refused = (await fs.readdir(o.stateDir)).some(name =>
+    name.startsWith(`${receiptName}.refused-`) && /^\d+$/.test(name.slice(`${receiptName}.refused-`.length)));
+  if ((!olderWake && !refused) || !(await o.paneIdle())) return false;
+  const receipt = await fs.readFile(active.receiptPath, "utf8").catch(error => {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  });
+  try {
+    parseReceipt(receipt, active.runId, o.issueId);
+    return false; // Keep an available receipt for the normal done gate and settlement.
+  } catch { /* Missing or malformed receipt cannot settle this dispatch. */ }
+  if (await readBlockTerminal(o.stateDir, active.runId) !== null) return false;
+  const dest = path.join(o.stateDir, `active.unverified-${active.runId}-${Date.now()}.json`);
+  await fs.rename(o.activePath, dest);
+  const dir = await fs.open(o.stateDir, "r");
+  try { await dir.sync(); } finally { await dir.close(); }
+  await o.log(`[claude-rc] Archived idle unverified run ${active.runId} at ${dest}; dispatching fresh without replaying the old op\n`);
+  return true;
 }
 
 const AGENT_TMP_ROOT = "/Volumes/NVM/AI_Agent_Runtime/tmp";
@@ -420,6 +454,7 @@ async function derivedRcName(ctx: AdapterExecutionContext): Promise<string> {
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  const wakeStartedAt = Date.now();
   const cfg = ctx.config;
   const baseSession = asString(cfg.tmuxSession, "claude");
   let session = baseSession;
@@ -493,6 +528,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         const st = await fs.stat(path.join(projectDir(cwd), `${conv}.jsonl`)).catch(() => null);
         return Boolean(st) && Date.now() - st!.mtimeMs < (Number(cfg.liveWindowSec) || 600) * 1000;
       },
+      paneIdle: async () => isClaudeIdle(await claudePane(socket, session)),
+      log: (m) => ctx.onLog("stdout", m),
+    });
+    await reconcileIdleAdoption({
+      stateDir, activePath, issueId, runId: ctx.runId, wakeStartedAt,
       paneIdle: async () => isClaudeIdle(await claudePane(socket, session)),
       log: (m) => ctx.onLog("stdout", m),
     });

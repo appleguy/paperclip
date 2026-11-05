@@ -19,6 +19,11 @@ describe("claude_rc_local screen parsing", () => {
     expect(isClaudeIdle(["Do you want to proceed?", "❯ 1. Yes", "  2. No", footer].join("\n"))).toBe(false);
     expect(isClaudeIdle("starting…")).toBe(false);
   });
+  it.each(["Synthesizing", "Pondering"])("keeps a narrow %s pane busy with a truncated interrupt hint", verb => {
+    expect(isClaudeIdle([`✻ ${verb}… 9m`, rule, "❯ ", footer, "  esc to …"].join("\n"))).toBe(false);
+    expect(isClaudeIdle([`✻ ${verb}… 9m`, rule, "❯ ", footer].join("\n"))).toBe(false);
+    expect(isClaudeIdle(["  esc to …", rule, "❯ ", footer].join("\n"))).toBe(false);
+  });
   it("parses the RC session URL and the transcript directory", () => {
     expect(parseClaudeRcUrl("Continue at https://claude.ai/code/session_01QMN4waqy2eh24tbzSQhQWV now"))
       .toBe("https://claude.ai/code/session_01QMN4waqy2eh24tbzSQhQWV");
