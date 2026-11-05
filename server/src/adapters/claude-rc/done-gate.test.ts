@@ -5,6 +5,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { editedPaths, evaluateDoneGate as evaluate, gateReceiptRaw, productionDeps, repoOf, type GateDeps, type GateReceipt, type MutationRecord } from "./done-gate.js";
 import { captureDoneGateBaseline } from "./done-gate-provenance.js";
+import { statusPaths } from "./done-gate-worktree.js";
 
 const M = "/Volumes/NVM/Paperclip/master";
 const Z = "/Volumes/NVM/AI_Coding_Projects/zagent";
@@ -115,6 +116,31 @@ describe("editedPaths", () => {
     expect(editedPaths(replay, Date.parse("2026-11-05T01:30:00Z")).unknown).toContain("tool record has no run timestamp");
     expect(editedPaths(replay, 0)).toEqual({ paths: [`${M}/replayed.ts`], unknown: [] });
   });
+
+  it("preserves NotebookEdit and MultiEdit targets with spaces and non-ASCII characters", () => {
+    const notebook = `${M}/notebooks/研究 notes/café.ipynb`;
+    const multiEdit = `${M}/server/naïve path/page.ts`;
+    const jsonl = [
+      JSON.stringify({ timestamp: "2026-11-05T02:00:00Z", message: { content: [{ type: "tool_use", name: "NotebookEdit", input: { notebook_path: notebook } }] } }),
+      JSON.stringify({ timestamp: "2026-11-05T02:01:00Z", message: { content: [{ type: "tool_use", name: "MultiEdit", input: { file_path: multiEdit, edits: [] } }] } }),
+    ].join("\n");
+    expect(editedPaths(jsonl, Date.parse("2026-11-05T01:30:00Z"))).toEqual({ paths: [notebook, multiEdit], unknown: [] });
+  });
+
+  it("keeps mixed timestamped and untimestamped records on the right side of run start", () => {
+    const untimestamped = (p: string) => JSON.stringify({ message: { content: [{ type: "tool_use", name: "Edit", input: { file_path: p } }] } });
+    const timestamped = (ts: string, p: string) => JSON.stringify({ timestamp: ts, message: { content: [{ type: "tool_use", name: "Edit", input: { file_path: p } }] } });
+    const jsonl = [
+      untimestamped(`${M}/replayed.ts`),
+      timestamped("2026-11-05T01:00:00Z", `${M}/before.ts`),
+      timestamped("2026-11-05T02:00:00Z", `${M}/during.ts`),
+      untimestamped(`${M}/ambiguous.ts`),
+    ].join("\n");
+    expect(editedPaths(jsonl, Date.parse("2026-11-05T01:30:00Z"))).toEqual({
+      paths: [`${M}/during.ts`],
+      unknown: ["tool record has no run timestamp"],
+    });
+  });
 });
 
 describe("run mutation attribution (SCO-973 / S7 F01)", () => {
@@ -204,6 +230,12 @@ describe("done gate", () => {
     const v = await evaluateDoneGate({ commits: [sha1] }, [`${M}/server/a.ts`], deps({ dirty: " M server/a.ts\0" }));
     expect(!v.ok && v.reasons[0]).toContain("uncommitted edits of this run");
   });
+  it("keeps both unquoted paths from a porcelain-v1 rename record", () => {
+    expect(statusPaths("R  server/new name/新.ts\0server/old name/旧.ts\0")).toEqual([
+      "server/new name/新.ts",
+      "server/old name/旧.ts",
+    ]);
+  });
   it("rejects notMine for a path independently recorded as this run's mutation", async () => {
     const v = await evaluateDoneGate({ commits: [sha1], notMine: ["server/a.ts"] }, [`${M}/server/a.ts`], deps({ dirty: " M server/a.ts\0" }));
     expect(v.ok).toBe(false);
@@ -215,6 +247,11 @@ describe("done gate", () => {
   it("accepts a Paperclip SHA that is queued, noting it", async () => {
     const v = await evaluateDoneGate({ commits: [sha1] }, [`${M}/server/a.ts`], deps());
     expect(v.ok && v.notes.join()).toContain("queued for autodeploy");
+  });
+  it("accepts a seven-character uppercase commit SHA", async () => {
+    const shortUpper = sha1.slice(0, 7).toUpperCase();
+    const v = await evaluateDoneGate({ commits: [shortUpper] }, [`${M}/server/a.ts`], deps({ onHead: new Set([shortUpper]) }));
+    expect(v.ok).toBe(true);
   });
   it("owner-visible UI must be live and carry a liveCheck", async () => {
     const ui = { uiFiles: "ui/public/subscription-quotas.html" };
@@ -228,6 +265,23 @@ describe("done gate", () => {
   it("accepts a non-Paperclip SHA on its checkout", async () => {
     const v = await evaluateDoneGate({ commits: [sha1] }, [`${Z}/go/a.go`], deps({ known: { [sha1]: Z } }));
     expect(v.ok).toBe(true);
+  });
+  it("uses the first checkout when a SHA exists in more than one repo", async () => {
+    const base = deps();
+    const both = {
+      ...base,
+      git: async (repo: string, args: string[]) => {
+        if (args[0] === "cat-file") return { code: 0, out: "" };
+        if (args[0] === "merge-base") return { code: args[2] === sha1 && args[3] === BASE ? 1 : 0, out: "" };
+        if (args[0] === "diff") return { code: 0, out: args.includes(BASE) ? "go/a.go\0" : "" };
+        if (args[0] === "diff-tree") return { code: 0, out: "go/a.go\0" };
+        return base.git(repo, args);
+      },
+    } satisfies GateDeps;
+    const v = await evaluateDoneGate({ commits: [sha1] }, [`${Z}/go/a.go`], both);
+    expect(v.ok).toBe(true);
+    expect(v.notes.join()).toContain("live");
+    expect(v.notes.join()).not.toContain(`on ${Z}`);
   });
   it("maps a file to its deepest repo", () => {
     expect(repoOf(`${Z}/go/a.go`, [M, Z])).toBe(Z);
