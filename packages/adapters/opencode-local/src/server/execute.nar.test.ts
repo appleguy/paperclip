@@ -183,6 +183,18 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect(promptPosts).toBe(0);
   });
 
+  it("rotates an idle NAR conversation after checking the assembled prompt", async () => {
+    const first = await execute(context("run-peak-1", { nativeRuntime: "nar" }) as never);
+    const ctx = context("run-peak-2", { nativeRuntime: "nar" }, "issue-one", first.sessionId!);
+    const gate = vi.fn(async () => ({ rotate: true, reason: "peak plus prompt exceeds limit", handoffMarkdown: "Unfinished handoff marker" }));
+    const rotated = await execute({ ...ctx, evaluateSessionPrompt: gate } as never);
+    expect(gate).toHaveBeenCalledOnce();
+    expect(rotated).toMatchObject({ exitCode: 0, sessionId: sessionIdFor(scope, 1) });
+    expect(sessions.get(sessionIdFor(scope, 1))?.msgs[0]?.text).toContain("Unfinished handoff marker");
+    expect(sessions.get(sessionIdFor(scope))?.msgs).toHaveLength(2);
+    expect(promptPosts).toBe(2);
+  });
+
   it("records a llama-swap 429 concurrency_limit as a capacity refusal, not an adapter failure", async () => {
     assistantError = { name: "provider.rate-limit", data: { statusCode: 429, code: "concurrency_limit", retryAfterMs: 1000 } };
     const result = await execute(context("run-429", { nativeRuntime: "nar" }) as never);
@@ -258,9 +270,11 @@ describe("OpenCode adapter nativeRuntime nar", () => {
       s.info.outcome = "succeeded";
       active.delete(sid);
     }, 60);
-    const retry = await execute(context("run-1-retry", { nativeRuntime: "nar", model: "openai/qwen", tokenPreflightShare: 0.000001 }) as never); // one 5s poll
+    const gate = vi.fn(async () => { throw new Error("must never rotate an in-flight rejoin"); });
+    const retry = await execute({ ...context("run-1-retry", { nativeRuntime: "nar", model: "openai/qwen", tokenPreflightShare: 0.000001 }), evaluateSessionPrompt: gate } as never); // one 5s poll
     clearTimeout(finish);
     expect(promptPosts).toBe(0);
+    expect(gate).not.toHaveBeenCalled();
     expect(userMsgs().map((m) => m.id)).toEqual([orphan]);
     expect(retry).toMatchObject({ exitCode: 0, summary: "orphan finished", sessionId: sid, costUsd: 0.25 });
   }, 15_000);

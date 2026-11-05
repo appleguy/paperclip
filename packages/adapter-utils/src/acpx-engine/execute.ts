@@ -1,6 +1,6 @@
 import { isOpenRouterUrl, openRouterClaudeHeaders } from "@paperclipai/shared/openrouter-attribution";
 import { prepareAcpxCodexObservabilityHome } from "../codex-observability-home.js";
-import { assertPromptTokenShare } from "../token-preflight.js";
+import { assertAssembledPrompt, preflightSessionPrompt, applyPromptRotation } from "../token-preflight.js";
 import { readableRuntimePath } from "../readable-runtime-paths.js";
 import { codexShellEnvironmentKeys } from "../codex-shell-environment.js";
 import { applyObservabilityEnvironment } from "../agent-observability.js";
@@ -482,6 +482,7 @@ interface AcpxPreparedRuntime {
   timeoutSec: number;
   timeoutResolution: AdapterExecutionTargetTimeoutResolution;
   sessionKey: string;
+  tokenSessionGeneration: string;
   fingerprint: string;
   agentCommand: string | null;
   agentRegistry: AcpAgentRegistry;
@@ -1614,6 +1615,7 @@ function buildSessionParams(input: {
   const { prepared, handle } = input;
   return {
     sessionKey: prepared.sessionKey,
+    tokenSessionGeneration: prepared.tokenSessionGeneration,
     runtimeSessionName: handle.runtimeSessionName,
     acpxRecordId: handle.acpxRecordId,
     acpSessionId: handle.backendSessionId,
@@ -2224,6 +2226,25 @@ async function buildRuntime(input: {
     }
   }
 
+  // Decide before fingerprinting, staging, borrowing a warm handle, or opening
+  // acpx's persistent record. A different generation must own different caches.
+  let tokenSessionGeneration = asString(input.ctx.runtime.sessionParams?.tokenSessionGeneration, "");
+  if (input.ctx.evaluateSessionPrompt) {
+    const assembled = await buildPrompt(input.ctx, Boolean(input.ctx.runtime.sessionId || input.ctx.runtime.sessionParams), env);
+    const gate = await preflightSessionPrompt(input.ctx, requestedModel,
+      joinPromptSections([skillPromptInstructions, assembled.prompt]),
+      input.ctx.runtime.sessionDisplayId ?? input.ctx.runtime.sessionId ?? null);
+    if (gate.rotate) {
+      applyPromptRotation(input.ctx, gate);
+      tokenSessionGeneration = `rotation-${shortHash(runId)}`;
+      const fresh = await buildPrompt(input.ctx, false, env);
+      await assertAssembledPrompt({ seat: agent.name, model: requestedModel,
+        prompt: joinPromptSections([skillPromptInstructions, fresh.prompt]),
+        share: config.tokenPreflightShare === undefined ? undefined : Number(config.tokenPreflightShare) });
+      await input.ctx.onLog("stderr", `[paperclip] Starting fresh: ${gate.reason}\n`);
+    }
+  }
+
   const configuredCommand = asString(config.agentCommand, "").trim();
   const builtInCommand = await resolveBuiltInAgentCommand({
     agent: acpxAgent,
@@ -2339,7 +2360,7 @@ async function buildRuntime(input: {
     agentId: agent.id,
     taskKey,
   };
-  const sessionKey = buildSessionKey(keyIdentity, fingerprint);
+  const sessionKey = buildSessionKey(keyIdentity, fingerprint) + (tokenSessionGeneration ? `:${tokenSessionGeneration}` : "");
 
   // Ship the workspace into the sandbox and capture `{ workspaceRemoteDir,
   // runtimeRootDir, assetDirs, restoreWorkspace }`. Done once here, before the
@@ -2704,6 +2725,7 @@ async function buildRuntime(input: {
     timeoutResolution,
     sessionKey,
     fingerprint,
+    tokenSessionGeneration,
     agentCommand,
     agentRegistry,
     processSessionBridge,
@@ -5035,7 +5057,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         preparePhaseStart = now();
         const { prompt, promptMetrics, commandNotes } = await buildPrompt(ctx, resumedSession, prepared.env);
         runPrompt = joinPromptSections([prepared.skillPromptInstructions, prompt]);
-        assertPromptTokenShare({
+        await assertAssembledPrompt({
           seat: ctx.agent.name,
           model: prepared.requestedModel,
           prompt: runPrompt,

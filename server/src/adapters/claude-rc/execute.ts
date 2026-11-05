@@ -10,7 +10,7 @@ import os from "node:os";
 import path from "node:path";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { readableRuntimePath } from "@paperclipai/adapter-utils/readable-runtime-paths";
-import { assertPromptTokenShare } from "@paperclipai/adapter-utils/token-preflight";
+import { assertAssembledPrompt, preflightSessionPrompt, applyPromptRotation } from "@paperclipai/adapter-utils/token-preflight";
 import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   joinPromptSections, renderTemplate, selectPaperclipPromptSections,
@@ -500,7 +500,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ? await fs.readFile(keepPath, "utf8").then(t => JSON.parse(t) as KeepState).catch(() => null) : null;
       const before = await seatConversation(session, cwd) ?? await newestConversation(cwd);
       const keepSize = before ? (await fs.stat(path.join(projectDir(cwd), `${before}.jsonl`)).catch(() => null))?.size ?? 0 : 0;
-      const reuse = shouldReuseConversation({
+      let reuse = shouldReuseConversation({
         enabled: keepEnabled, state: keepState, newestId: before, projectId, sizeBytes: keepSize, maxBytes: keepMax,
         acrossProjects: cfg.keepConversationAcrossProjects === true,
         busy: !isClaudeIdle(await claudePane(socket, session)),
@@ -508,6 +508,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (reuse) {
         conversationId = before;
       }
+      const buildDispatchPrompt = async () => {
       const promptBase = asString(cfg.promptTemplate, DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE);
       // A kept conversation already holds the standing text (template, run rules, receipt format)
       // and the brief and history of every issue it handled, so a wake resends only the delta,
@@ -532,7 +533,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
       const promptStateDir = await readableRuntimePath(ctx, "rc", stateDir);
       const promptReceiptPath = path.join(promptStateDir, path.basename(receiptPath));
-      const promptRunEnvPath = path.join(promptStateDir, path.basename(runEnvPath));
+      const promptRunEnvPath = path.join(promptStateDir, path.basename(runEnvPath!));
       const instructions = knownConversation ? [
         `Paperclip run ${ctx.runId}, issue ${issueId}: work on ONLY this issue; standing run rules unchanged.`,
         `Done receipt (Write tool, only on success; do not update the issue yourself): ${promptReceiptPath} with keys runId, issueId,`,
@@ -551,14 +552,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         "if blocked, explain the blocker visibly and stop.",
       ].join(" ");
       // The channel preserves Markdown/newlines; only the tmux fallback flattens.
-      const sections = [instructionsPrefix, intro, taskContextNote, wakePrompt, instructions];
-      const rawLength = joinPromptSections(sections).length;
-      const prompt = joinPromptSections(fitPromptSections(sections, [2, 3], joinPromptSections));
-      assertPromptTokenShare({ seat: ctx.agent.name, model, prompt,
+      const sections = [instructionsPrefix, intro, taskContextNote, wakePrompt,
+        asString(ctx.context.paperclipSessionHandoffMarkdown, ""), instructions];
+      const prompt = joinPromptSections(sections);
+      await assertAssembledPrompt({ seat: ctx.agent.name, model, prompt,
         share: cfg.tokenPreflightShare === undefined ? undefined : Number(cfg.tokenPreflightShare) });
-      if (prompt.length < rawLength) await ctx.onLog("stdout", `[claude-rc] prompt ${rawLength} chars trimmed to ${prompt.length} (task context/wake history)\n`);
       if (prompt.length > PROMPT_BUDGET) throw new Error("Claude prompt exceeds dispatch budget");
+      return { prompt, goal, seenIssueIds, knownConversation, instructionsFull };
+      };
+      let built = await buildDispatchPrompt();
+      const gate = await preflightSessionPrompt(ctx, model, built.prompt, before);
+      if (gate.rotate) {
+        if (!isClaudeIdle(await claudePane(socket, session)))
+          throw new Error(`Claude input guard refused context rotation while busy or owner input is present: ${gate.reason}`);
+        applyPromptRotation(ctx, gate);
+        reuse = false;
+        built = await buildDispatchPrompt();
+        await ctx.onLog("stderr", `[paperclip] Starting fresh: ${gate.reason}\n`);
+      }
+      const { prompt, goal, seenIssueIds, knownConversation, instructionsFull } = built;
       if (!reuse) {
+        if (!isClaudeIdle(await claudePane(socket, session)))
+          throw new Error("Claude input guard refused /clear while busy or owner input is present");
         await sendClaudePane(socket, session, "/clear", stateDir);
         // /clear is acknowledged by this seat's new conversation, even if busy.
         const clearDeadline = Date.now() + 12_000;

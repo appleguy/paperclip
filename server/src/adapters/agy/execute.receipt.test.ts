@@ -79,6 +79,39 @@ describe("agy busy dispatch and receipt completion", () => {
     await expect(fs.stat(path.join(dir, "active.json"))).rejects.toThrow();
   });
 
+  it("refuses rotation without positive idle evidence and preserves the conversation", async () => {
+    const ctx = context(dir);
+    ctx.evaluateSessionPrompt = vi.fn(async () => ({ rotate: true, reason: "peak plus prompt", handoffMarkdown: "Unfinished" }));
+    const result = await execute(ctx);
+    expect(result.errorFamily).toBe("target_busy");
+    expect(submitted).toEqual([]);
+    expect(ctx.onDispatch).not.toHaveBeenCalled();
+    await expect(fs.stat(path.join(dir, "active.json"))).rejects.toThrow();
+  });
+
+  it("rotates only an attested idle conversation and sends the fresh handoff", async () => {
+    const ctx = context(dir);
+    ctx.runtime = { sessionId: conversation, sessionParams: { sessionId: conversation }, sessionDisplayId: conversation, taskKey: "probe" };
+    ctx.evaluateSessionPrompt = vi.fn(async () => ({ rotate: true, reason: "peak plus prompt", handoffMarkdown: "Unfinished rotation marker" }));
+    await fs.writeFile(path.join(dir, "status-line.json"), JSON.stringify({
+      agentState: "idle", observedAt: new Date().toISOString(), conversationId: conversation,
+      pendingInputCount: 0, toolConfirmationPending: false,
+    }));
+    const next = "44444444-4444-4444-8444-444444444444";
+    const original = transport.exec.getMockImplementation()!;
+    transport.exec.mockImplementation((command, args, options, callback) => original(command, args, options,
+      (error: unknown, output: unknown) => {
+        if (args.includes("send-keys") && submitted.at(-1) === "/new") capture = screen().replaceAll(conversation, next);
+        callback(error, output);
+      }));
+    await fs.writeFile(receiptFilePath(dir, RUN), JSON.stringify(receipt()));
+    const result = await execute(ctx);
+    expect(result).toMatchObject({ exitCode: 0, sessionId: next });
+    expect(submitted).toHaveLength(2);
+    expect(submitted[0]).toBe("/new");
+    expect(submitted[1]).toContain("Unfinished rotation marker");
+  });
+
   it("adopts an old same-issue checkpoint without redispatch or an editor gate", async () => {
     const active = {
       runId: OLD, issueId: "probe", receiptPath: receiptFilePath(dir, OLD), rcUrl: URL,

@@ -196,6 +196,7 @@ async function runExecutor(
     prepareRemoteManagedHome?: AcpxEngineExecutorOptions["prepareRemoteManagedHome"];
     startupTraceContext?: AdapterExecutionContext["startupTraceContext"];
     expectedExitCode?: number;
+    evaluateSessionPrompt?: AdapterExecutionContext["evaluateSessionPrompt"];
   } = {},
 ) {
   // Skill reconciliation must never inspect or modify the developer's real
@@ -244,6 +245,7 @@ async function runExecutor(
       executionTarget: options.executionTarget,
       runtimeMcp: options.runtimeMcp,
       startupTraceContext: options.startupTraceContext,
+      evaluateSessionPrompt: options.evaluateSessionPrompt,
       onLog: async (stream: "stdout" | "stderr", text: string) => {
         logs.push({ stream, text });
       },
@@ -412,6 +414,20 @@ const ALLOWED_TURN_SPAN_ATTRIBUTE_KEYS = new Set<string>([
 ]);
 
 describe("shared ACPX engine runtime behavior", () => {
+  it("rotates before opening a persistent record and resumes the new generation", async () => {
+    const root = await makeTempRoot();
+    const config = { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state"), cwd: root, model: "gpt-6.1-terra" };
+    const first = await runExecutor(config);
+    const evaluate = vi.fn(async () => ({ rotate: true, reason: "peak plus prompt exceeds model limit", handoffMarkdown: "Resume unfinished marker" }));
+    const rotated = await runExecutor(config, { runtime: { sessionId: "backend-session", sessionParams: first.result.sessionParams }, evaluateSessionPrompt: evaluate });
+    expect(evaluate).toHaveBeenCalledWith({ model: "gpt-6.1-terra", sessionId: "backend-session", promptTokens: expect.any(Number) });
+    expect(rotated.result.sessionParams?.sessionKey).not.toBe(first.result.sessionParams?.sessionKey);
+    expect(rotated.sessionInputs[0]?.resumeSessionId).toBeUndefined();
+    expect(rotated.turnInputs[0]?.text).toContain("Resume unfinished marker");
+    const resumed = await runExecutor(config, { runtime: { sessionParams: sessionCodec.deserialize(rotated.result.sessionParams) } });
+    expect(resumed.result.sessionParams?.sessionKey).toBe(rotated.result.sessionParams?.sessionKey);
+    expect(resumed.sessionInputs[0]?.resumeSessionId).toBe("backend-session");
+  });
   it("refuses an oversized Paperclip prompt before starting an ACP turn", async () => {
     const root = await makeTempRoot();
     const { result, turnInputs } = await runExecutor({

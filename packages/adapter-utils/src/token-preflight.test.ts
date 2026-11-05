@@ -1,7 +1,23 @@
-import { describe, expect, it } from "vitest";
-import { assertPromptTokenShare, estimatePromptTokens, tokenPreflightModelLimit } from "./token-preflight.js";
+import { describe, expect, it, vi } from "vitest";
+const native = vi.hoisted(() => ({ count: vi.fn() }));
+vi.mock("@google/genai/tokenizer", () => ({ LocalTokenizer: class {
+  constructor(model: string) { if (model !== "gemini-2.5-pro") throw new Error("unsupported model"); }
+  countTokens = native.count;
+} }));
+import { assertPromptTokenShare, assertAssembledPrompt, promptTokenBound, estimatePromptTokens, tokenPreflightModelLimit } from "./token-preflight.js";
 
 describe("token preflight", () => {
+  it("uses the provider tokenizer only for its supported mapping and retains a byte fallback on failure", async () => {
+    native.count.mockResolvedValueOnce({ totalTokens: 1 });
+    expect(await assertAssembledPrompt({ seat: "S9", model: "gemini-2.5-pro", prompt: "long text", share: 0.00001 })).toBe(1);
+    native.count.mockRejectedValueOnce(new Error("asset unavailable"));
+    expect(await promptTokenBound("gemini-2.5-pro", "😀a")).toBe(5);
+    native.count.mockResolvedValueOnce({ totalTokens: NaN });
+    expect(await promptTokenBound("gemini-2.5-pro", "😀a")).toBe(5);
+    expect(await promptTokenBound("gemini-3.8-pro", "😀a")).toBe(5);
+    expect(await promptTokenBound("gpt-6.1-sol", "😀a")).toBe(5);
+    expect(native.count).toHaveBeenCalledTimes(3);
+  });
   it.each([
     ["gpt-6.1-sol", 272_000], ["gpt-6.1-terra", 272_000],
     ["gemini-3.8-pro", 200_000], ["claude-haiku-5-5", 100_000],

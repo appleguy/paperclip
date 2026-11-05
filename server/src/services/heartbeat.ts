@@ -3134,7 +3134,7 @@ export function heartbeatService(
         context.projectId = executionWorkspace.projectId;
       }
       const {
-        previousSessionDisplayId, runtimeSessionParamsForAdapter, taskSessionCredentialCompatible, runtimeForAdapter, configFreshnessResultMetadata, sessionCompaction,
+        previousSessionDisplayId, runtimeSessionParamsForAdapter, taskSessionCredentialCompatible, runtimeForAdapter, configFreshnessResultMetadata, sessionCompaction, evaluateSessionPrompt,
       } = await resolveHeartbeatAdapterSession({
         agent,
         task: { context, taskKey, issueId, continuationSummary, executionContinuation },
@@ -3415,6 +3415,7 @@ export function heartbeatService(
             runtimeForAdapter,
             getNativeFreshSessionHandoff,
             getFreshSessionHandoff,
+            evaluateSessionPrompt,
             runOptions,
           },
           workspace: {

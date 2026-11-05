@@ -539,6 +539,20 @@ describePostgres("heartbeat run state database wiring", () => {
     expect(await withLimit(40)).toMatchObject({ rotate: true, reason: "session raw input reached 40 tokens (threshold 40)" });
   });
 
+  it("gates peak plus assembled prompt even with optional compaction disabled", async () => {
+    const { companyId, agent, issue, state } = await fixture();
+    await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, invocationSource: "assignment", sessionIdAfter: "firewall",
+      usageJson: { peakContextTokens: 90, rawInputTokens: 900 }, resultJson: { summary: "Unfinished work" } });
+    const check = (promptTokens: number) => state.evaluateSessionCompaction({
+      agent: { ...agent, runtimeConfig: { heartbeat: { sessionCompaction: { enabled: false } } } },
+      sessionId: "firewall", issueId: issue.id, promptTokens, modelLimit: 100 });
+    expect((await check(10)).rotate).toBe(false);
+    const rotated = await check(11);
+    expect(rotated.rotate).toBe(true);
+    expect(rotated.reason).toContain("previous context 90 plus prompt bound 11 exceeds model limit 100");
+    expect(rotated.handoffMarkdown).toContain("Unfinished work");
+  });
+
   it.each(["superseded", "cancelled"] as const)("fences %s conversation session writes and clears", async (scenario) => {
     const { companyId, agent, issue, state } = await fixture();
     await db.update(issues).set({

@@ -1,4 +1,6 @@
 import { and, desc, eq } from "drizzle-orm";
+import { tokenPreflightModelLimit } from "@paperclipai/adapter-utils/token-preflight";
+import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { agentConfigRevisions, type Db, type agents, type agentTaskSessions, type heartbeatRuns, type issues, type projects } from "@paperclipai/db";
 import type { AiConnectionBinding, AiRuntimeConnectionBinding } from "@paperclipai/shared";
 import { getServerAdapter } from "../../adapters/index.js";
@@ -305,12 +307,22 @@ export async function resolveHeartbeatAdapterSession(input: HeartbeatAdapterSess
     stripPaperclipSessionMetadataFromSessionParams(runtimeSessionParams),
   );
 
-  const sessionCompaction = await evaluateSessionCompaction({
+  // These adapters evaluate after assembling their real prompt. Keep the same
+  // decision object so completion records the late rotation as well.
+  const deferred = ["codex_local", "claude_local", "gemini_local", "acpx_local", "opencode_local", "claude_rc_local", "agy_local"].includes(agent.adapterType);
+  const sessionCompaction = deferred ? { rotate: false, reason: null, handoffMarkdown: null, previousRunId: null } as Awaited<ReturnType<typeof evaluateSessionCompaction>> : await evaluateSessionCompaction({
     agent,
     sessionId: previousSessionDisplayId ?? runtimeSessionIdForAdapter,
     issueId,
     continuationSummaryBody: continuationSummary?.body ?? null,
   });
+  const evaluateSessionPrompt: AdapterExecutionContext["evaluateSessionPrompt"] = async ({ model, promptTokens, sessionId }) => {
+    const decision = await evaluateSessionCompaction({ agent, sessionId, issueId,
+      continuationSummaryBody: continuationSummary?.body ?? null,
+      promptTokens, modelLimit: tokenPreflightModelLimit(model) });
+    Object.assign(sessionCompaction, decision);
+    return decision;
+  };
   if (sessionCompaction.rotate) {
     context.paperclipSessionHandoffMarkdown =
       sessionCompaction.handoffMarkdown;
@@ -409,5 +421,5 @@ export async function resolveHeartbeatAdapterSession(input: HeartbeatAdapterSess
     },
   };
 
-  return { previousSessionDisplayId, runtimeSessionParamsForAdapter, taskSessionCredentialCompatible, runtimeForAdapter, configFreshnessResultMetadata, sessionCompaction };
+  return { previousSessionDisplayId, runtimeSessionParamsForAdapter, taskSessionCredentialCompatible, runtimeForAdapter, configFreshnessResultMetadata, sessionCompaction, evaluateSessionPrompt };
 }

@@ -1,6 +1,6 @@
 import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import { readableRuntimePath } from "@paperclipai/adapter-utils/readable-runtime-paths";
-import { assertPromptTokenShare } from "@paperclipai/adapter-utils/token-preflight";
+import { assertAssembledPrompt, preflightSessionPrompt, applyPromptRotation } from "@paperclipai/adapter-utils/token-preflight";
 import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -707,15 +707,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : null;
     const runAttempt = async (resumeSessionId: string | null) => {
       await hydrateFreshSessionHandoff(ctx, { resumedSession: Boolean(resumeSessionId) });
-      const { basePrompt, promptMetrics } = buildPrompt(Boolean(resumeSessionId));
-      const prompt = joinPromptSections([
+      let { basePrompt, promptMetrics } = buildPrompt(Boolean(resumeSessionId));
+      let prompt = joinPromptSections([
         selectInitialCommunicationGuidance(context, { resumedSession: Boolean(resumeSessionId) }),
         runHandle ? runHandleNote(runHandle.handle) : "",
         basePrompt,
       ]);
-      const preflight = () => assertPromptTokenShare({ seat: agent.name, model, prompt,
-        share: config.tokenPreflightShare === undefined ? undefined : Number(config.tokenPreflightShare) });
-      if (!narMode) preflight();
+      const preflight = async (actualSessionId?: string) => {
+        const gate = await preflightSessionPrompt(ctx, model, prompt, actualSessionId ?? resumeSessionId);
+        if (gate.rotate) {
+          if (sharedSession) throw new Error(`Token preflight refused shared OpenCode CLI resume: safe generation rotation requires NAR; ${gate.reason}`);
+          applyPromptRotation(ctx, gate);
+          resumeSessionId = null;
+          await hydrateFreshSessionHandoff(ctx, { resumedSession: false });
+          ({ basePrompt, promptMetrics } = buildPrompt(false));
+          prompt = joinPromptSections([selectInitialCommunicationGuidance(context, { resumedSession: false }),
+            runHandle ? runHandleNote(runHandle.handle) : "", basePrompt]);
+          await assertAssembledPrompt({ seat: agent.name, model, prompt,
+            share: config.tokenPreflightShare === undefined ? undefined : Number(config.tokenPreflightShare) });
+          await onLog("stderr", `[paperclip] Starting fresh: ${gate.reason}\n`);
+        }
+        return { rotate: gate.rotate, prompt };
+      };
+      if (!narMode) await preflight();
       const args = buildArgs(resumeSessionId);
       if (onMeta) {
         await onMeta({

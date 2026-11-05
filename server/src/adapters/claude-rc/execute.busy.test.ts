@@ -71,6 +71,14 @@ afterEach(async () => {
 });
 
 describe("SCO-947 busy delivery and completion", () => {
+  it("refuses peak-context rotation without clearing a working conversation", async () => {
+    ctx.evaluateSessionPrompt = vi.fn(async () => ({ rotate: true, reason: "peak plus prompt", handoffMarkdown: "Unfinished work" }));
+    const result = await execute(ctx);
+    expect(result.errorFamily).toBe("target_busy");
+    expect(deps.route).not.toHaveBeenCalled();
+    expect(deps.tmux.mock.calls.some(([, args]) => ["kill-session", "paste-buffer", "send-keys"].includes(args[0]))).toBe(false);
+    await expect(fs.stat(path.join(stateDir, "active.json"))).rejects.toThrow();
+  });
   it("dispatches into the busy conversation and completes on its receipt without clearing", async () => {
     const result = await execute(ctx);
     expect(result.exitCode).toBe(0);

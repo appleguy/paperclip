@@ -263,6 +263,10 @@ export interface AdapterExecutionContext {
   context: Record<string, unknown>;
   /** Build bounded history only when an actual provider attempt starts fresh. */
   getFreshSessionHandoff?: () => Promise<string | null>;
+  /** Called on the assembled prompt, before selecting a provider session. Never call for an in-flight rejoin. */
+  evaluateSessionPrompt?: (input: { model: string; promptTokens: number; sessionId: string | null }) => Promise<{
+    rotate: boolean; reason: string | null; handoffMarkdown: string | null;
+  }>;
   runtimeCommandSpec?: AdapterRuntimeCommandSpec | null;
   executionTarget?: AdapterExecutionTarget | null;
   /**

@@ -133,6 +133,7 @@ export interface HeartbeatRuntimeExecutionInput {
     adapter: ServerAdapterModule;
     runtimeForAdapter: AdapterExecutionContext["runtime"];
     getFreshSessionHandoff: AdapterExecutionContext["getFreshSessionHandoff"];
+    evaluateSessionPrompt?: AdapterExecutionContext["evaluateSessionPrompt"];
     runOptions: Selection["recovery"];
   };
   workspace: {
@@ -886,6 +887,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
             input.effects.onLegacyAdapterEntered();
             return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
               getFreshSessionHandoff,
+              evaluateSessionPrompt: input.runtime.evaluateSessionPrompt,
               agentIdentity,
               observability,
               runId: run.id,

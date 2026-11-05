@@ -1370,6 +1370,8 @@ export function createHeartbeatRunState(db: Db) {
     sessionId: string | null;
     issueId: string | null;
     continuationSummaryBody?: string | null;
+    promptTokens?: number;
+    modelLimit?: number | null;
   }): Promise<SessionCompactionDecision> {
     const { agent, sessionId, issueId } = input;
     if (!sessionId) {
@@ -1382,7 +1384,8 @@ export function createHeartbeatRunState(db: Db) {
     }
 
     const policy = parseSessionCompactionPolicy(agent);
-    if (!policy.enabled || !hasSessionCompactionThresholds(policy)) {
+    const promptGate = input.modelLimit != null && input.promptTokens != null;
+    if ((!policy.enabled || !hasSessionCompactionThresholds(policy)) && !promptGate) {
       return {
         rotate: false,
         reason: null,
@@ -1449,10 +1452,12 @@ export function createHeartbeatRunState(db: Db) {
         : 0;
 
     let reason: string | null = null;
-    if (policy.maxSessionRuns > 0 && runs.length > policy.maxSessionRuns) {
+    if (promptGate && latestRawInputTokens + input.promptTokens! > input.modelLimit!) {
+      reason = `previous context ${latestRawInputTokens} plus prompt bound ${input.promptTokens} exceeds model limit ${input.modelLimit} tokens`;
+    } else if (policy.enabled && policy.maxSessionRuns > 0 && runs.length > policy.maxSessionRuns) {
       reason = `session exceeded ${policy.maxSessionRuns} runs`;
     } else if (
-      policy.maxRawInputTokens > 0 &&
+      policy.enabled && policy.maxRawInputTokens > 0 &&
       latestRawUsage &&
       latestRawInputTokens >= policy.maxRawInputTokens
     ) {
@@ -1460,7 +1465,7 @@ export function createHeartbeatRunState(db: Db) {
         `session raw input reached ${formatCount(latestRawInputTokens)} tokens ` +
         `(threshold ${formatCount(policy.maxRawInputTokens)})`;
     } else if (
-      policy.maxSessionAgeHours > 0 &&
+      policy.enabled && policy.maxSessionAgeHours > 0 &&
       sessionAgeHours >= policy.maxSessionAgeHours
     ) {
       reason = `session age reached ${Math.floor(sessionAgeHours)} hours`;

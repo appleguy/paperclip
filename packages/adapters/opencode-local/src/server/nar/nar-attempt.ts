@@ -34,7 +34,7 @@ export interface NarAttemptInput {
   resumeSessionId?: string | null;
   prompt: string;
   /** Check only new submissions; an in-flight recovery must remain observable. */
-  preflight?: () => void;
+  preflight?: (sessionId?: string) => void | { rotate: boolean; prompt: string } | Promise<void | { rotate: boolean; prompt: string }>;
   timeoutSec: number;
   signal?: AbortSignal;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
@@ -275,7 +275,18 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
       await onLog("stdout", `[paperclip] NAR rejoined in-flight message ${inflight}; prompt not resent\n`);
       await onLog("stdout", narEventLine("nar_rejoin", { sessionId: conversationId, messageId: inflight }));
     } else {
-    input.preflight?.();
+    const checked = await input.preflight?.(conversationId);
+    if (checked) {
+      input.prompt = checked.prompt;
+      if (checked.rotate) {
+        const freshId = await chooseSessionId(driver, scope, null, msgId);
+        if (freshId === conversationId || await driver.inflightMessage(freshId))
+          throw new Error("NAR input guard refused context rotation: conversation became busy");
+        const fresh = await driver.bindConversation(host,
+          { ...scope, cwd: input.cwd, model: input.model || undefined, title: input.title }, "new", fence, freshId);
+        conversationId = fresh.conversationId;
+      }
+    }
     const payloadSha256 = createHash("sha256").update(input.prompt).digest("hex");
     await onLog("stdout", narEventLine("nar_prompt_dispatch", { sessionId: conversationId, clientMessageId: msgId, promptSha256: payloadSha256 }));
     const sub = await driver.submit(host, conversationId, { opId, kind: "prompt", payloadSha256, text: input.prompt }, fence);

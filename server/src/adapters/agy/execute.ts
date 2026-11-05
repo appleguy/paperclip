@@ -11,7 +11,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { readableRuntimePath } from "@paperclipai/adapter-utils/readable-runtime-paths";
-import { assertPromptTokenShare } from "@paperclipai/adapter-utils/token-preflight";
+import { assertAssembledPrompt, preflightSessionPrompt, applyPromptRotation } from "@paperclipai/adapter-utils/token-preflight";
 import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   joinPromptSections, renderTemplate, selectPaperclipPromptSections,
@@ -405,6 +405,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // Reuse the live conversation: /new could interrupt work or drop a queued wake.
     // Exact run/issue IDs in the receipt bind completion without clearing the TUI.
     conversationId = parseRemoteConversationId(await pane(socket, session));
+    const buildDispatchPrompt = async () => {
     const promptBase = asString(cfg.promptTemplate, DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE);
     const { taskContextNote, wakePrompt } = selectPaperclipPromptSections(ctx.context);
     const instructionsFilePath = asString(cfg.instructionsFilePath, "");
@@ -427,10 +428,38 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       "under the run's scoped identity. Do NOT update the issue yourself. Do not write a done receipt on failure.",
       "If blocked, explain the blocker visibly without a done receipt. The adapter will leave the issue open.",
     ].join(" ");
-    const prompt = normalizeOneLine(joinPromptSections([instructionsPrefix, intro, taskContextNote, wakePrompt, instructions]));
-    assertPromptTokenShare({ seat: ctx.agent.name, model, prompt,
+    const prompt = normalizeOneLine(joinPromptSections([instructionsPrefix, intro, taskContextNote, wakePrompt,
+      asString(ctx.context.paperclipSessionHandoffMarkdown, ""), instructions]));
+    await assertAssembledPrompt({ seat: ctx.agent.name, model, prompt,
       share: cfg.tokenPreflightShare === undefined ? undefined : Number(cfg.tokenPreflightShare) });
     if (prompt.length > 50_000) throw new Error("agy prompt exceeds TUI paste budget");
+    return prompt;
+    };
+    let prompt = await buildDispatchPrompt();
+    const gate = await preflightSessionPrompt(ctx, model, prompt, conversationId);
+    if (gate.rotate) {
+      const snapshot = await readStatusSnapshot(stateDir) as AgyStatusLineSnapshot | null;
+      // Ordinary wake delivery may queue on a working turn. A destructive /new
+      // requires fresh positive evidence that the exact conversation is idle.
+      if (!snapshot || snapshot.agentState !== "idle" || snapshot.conversationId !== conversationId
+          || !Number.isFinite(Date.parse(snapshot.observedAt)) || Date.now() - Date.parse(snapshot.observedAt) > 10_000
+          || Date.parse(snapshot.observedAt) > Date.now() || snapshot.pendingInputCount !== 0 || snapshot.toolConfirmationPending
+          || !(await inputReadiness(socket, session)).allowed)
+        throw new Error(`agy input guard refused context rotation: idle conversation not verified; ${gate.reason}`);
+      applyPromptRotation(ctx, gate);
+      prompt = await buildDispatchPrompt();
+      await send(socket, session, "/new", stateDir);
+      const before = conversationId;
+      const deadline = Date.now() + 12_000;
+      do {
+        conversationId = parseRemoteConversationId(await pane(socket, session));
+        if (conversationId && conversationId !== before) break;
+        await sleep(500);
+      } while (Date.now() < deadline);
+      if (!conversationId || conversationId === before)
+        throw new Error("agy /new did not confirm an isolated conversation; no prompt sent");
+      await ctx.onLog("stderr", `[paperclip] Starting fresh: ${gate.reason}\n`);
+    }
     // No checkpoint is created for an initial guard refusal. Once a checkpoint
     // exists, a crash or uncertain paste still requires reconciliation.
     const preflight = await inputReadiness(socket, session);
