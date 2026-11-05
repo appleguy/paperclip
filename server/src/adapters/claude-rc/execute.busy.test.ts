@@ -21,8 +21,9 @@ vi.mock("./channel.js", async importOriginal => ({
 }));
 vi.mock("./done-gate.js", async importOriginal => ({
   ...await importOriginal<typeof import("./done-gate.js")>(), gateReceiptRaw: deps.gate,
+  productionDeps: () => ({ repos: async () => [], git: async () => ({ code: 0, out: "" }), liveSha: async () => null }),
 }));
-import { execute, isClaudeIdle, projectDir, reconcileOrphanActive, typeNativeGoal } from "./execute.js";
+import { claimSlot, execute, isClaudeIdle, projectDir, reconcileOrphanActive, typeNativeGoal } from "./execute.js";
 import { receiptFilePath } from "../agy/execute.js";
 
 const rcUrl = "https://claude.ai/code/session_busy";
@@ -85,7 +86,7 @@ afterEach(async () => {
 });
 
 describe("SCO-947 busy delivery and completion", () => {
-  it.each(["refused", "missing", "malformed"])("SCO-980 retains an idle %s receipt checkpoint across repeated execute wakes", async kind => {
+  it.each(["refused", "missing", "malformed"])("SCO-1053 replaces a terminal idle %s checkpoint without replay", async kind => {
     const oldRun = "11111111-1111-4111-8111-111111111111";
     certifyTerminalCheckpoint(oldRun, "issue-busy");
     const oldReceiptPath = receiptFilePath(stateDir, oldRun);
@@ -103,25 +104,87 @@ describe("SCO-947 busy delivery and completion", () => {
     await fs.writeFile(path.join(stateDir, "keep-conversation.json"), JSON.stringify({
       conversationId: "conversation-busy", projectId: "", issueIds: ["issue-busy"],
     }));
-    // Stop at the real execute transport boundary, before its receipt wait loop.
-    // A fresh dispatch instead of adoption must fail these argument assertions.
+    // Stop at the real execute transport boundary after the new checkpoint is written.
     deps.route.mockImplementation(async (op: string, prompt: string, adopted: boolean) => {
-      expect([op, prompt, adopted]).toEqual([oldRun, "", true]);
-      throw new Error("fixture stops after observing adoption");
+      expect(op).toBe(ctx.runId);
+      expect(prompt).toContain("issue-busy");
+      expect(adopted).toBe(false);
+      throw new Error("fixture stops after observing fresh dispatch");
     });
-    for (let i = 0; i < 4; i++) {
-      ctx.runId = `wake-${i}`;
-      const result = await execute(ctx);
-      expect(result.errorMessage).toContain("fixture stops after observing adoption");
-      expect(await fs.readFile(path.join(stateDir, "active.json"), "utf8")).toBe(checkpoint);
-    }
-    expect(deps.route).toHaveBeenCalledTimes(4);
+    const result = await execute(ctx);
+    expect(result.errorMessage).toContain("fixture stops after observing fresh dispatch");
+    expect(JSON.parse(await fs.readFile(path.join(stateDir, "active.json"), "utf8")).runId).toBe(ctx.runId);
+    expect(deps.route).toHaveBeenCalledTimes(1);
     expect(deps.submit).not.toHaveBeenCalled();
     expect(deps.deliver).not.toHaveBeenCalled();
-    expect((await fs.readdir(stateDir)).filter(n => n.startsWith("active.") && n !== "active.json")).toEqual([]);
+    const archives = (await fs.readdir(stateDir)).filter(n => n.startsWith(`active.unverified-${oldRun}-`));
+    expect(archives).toHaveLength(1);
+    expect(await fs.readFile(path.join(stateDir, archives[0]!), "utf8")).toBe(checkpoint);
     if (kind === "malformed") expect(await fs.readFile(oldReceiptPath, "utf8")).toBe("{");
     if (kind === "refused") expect(await fs.readFile(`${oldReceiptPath}.refused-1`, "utf8")).toBe("refused evidence");
   });
+
+  it.each(["failed", "cancelled", "timed_out"])("SCO-1053 dispatches a cross-issue wake over a %s idle checkpoint", async status => {
+    const oldRun = "11111111-1111-4111-8111-111111111111";
+    certifyTerminalCheckpoint(oldRun, "original-issue");
+    vi.mocked(fetch).mockImplementation(async () => Response.json({ id: oldRun, agentId: ctx.agent.id,
+      companyId: ctx.agent.companyId, status, contextSnapshot: { issueId: "original-issue" } }));
+    const checkpoint = JSON.stringify({ runId: oldRun, issueId: "original-issue",
+      receiptPath: receiptFilePath(stateDir, oldRun), rcUrl });
+    await fs.writeFile(path.join(stateDir, "active.json"), checkpoint);
+    if (status === "failed") await fs.writeFile(receiptFilePath(stateDir, oldRun), "{");
+    screen = `${rcUrl}\n❯ \n  bypass permissions on`;
+    ctx.config.keepConversation = true;
+    await fs.writeFile(path.join(stateDir, "keep-conversation.json"), JSON.stringify({
+      conversationId: "conversation-busy", projectId: "", issueIds: ["original-issue"],
+    }));
+    const result = await execute(ctx);
+    expect(result.errorMessage).toBeUndefined();
+    expect(result.exitCode).toBe(0);
+    expect(deps.route).toHaveBeenCalledTimes(1);
+    expect(deps.route.mock.calls[0]!.slice(0, 3)).toEqual([ctx.runId, expect.stringContaining("issue-busy"), false]);
+    expect(deps.deliver).toHaveBeenCalledWith(ctx, stateDir, ctx.runId, "issue-busy", expect.objectContaining({ kind: "done" }));
+    const archives = (await fs.readdir(stateDir)).filter(n => n.startsWith(`active.unverified-${oldRun}-`));
+    expect(archives).toHaveLength(1);
+    expect(await fs.readFile(path.join(stateDir, archives[0]!), "utf8")).toBe(checkpoint);
+    expect(vi.mocked(fetch).mock.calls.filter(([, init]) => init?.method === "POST")).toEqual([]);
+  });
+
+  it.each(["running", "queued", "unknown", "busy", "synthesizing", "owner-input", "receipt", "block", "late-receipt", "unreadable-receipt"])(
+    "SCO-1053 retains a foreign checkpoint with %s evidence", async kind => {
+      const oldRun = "11111111-1111-4111-8111-111111111111";
+      certifyTerminalCheckpoint(oldRun, "original-issue");
+      if (["running", "queued", "unknown"].includes(kind)) vi.mocked(fetch).mockImplementation(async () => Response.json({
+        id: oldRun, agentId: ctx.agent.id, companyId: ctx.agent.companyId,
+        status: kind, contextSnapshot: { issueId: "original-issue" },
+      }));
+      const oldReceiptPath = receiptFilePath(stateDir, oldRun);
+      const checkpoint = JSON.stringify({ runId: oldRun, issueId: "original-issue", receiptPath: oldReceiptPath, rcUrl });
+      const activePath = path.join(stateDir, "active.json");
+      await fs.writeFile(activePath, checkpoint);
+      screen = kind === "busy" ? busy : kind === "synthesizing"
+        ? `✻ Synthesizing… 9m\n❯ \n  bypass permissions on`
+        : `${rcUrl}\n❯ ${kind === "owner-input" ? "owner is typing" : ""}\n  bypass permissions on`;
+      const writeReceipt = () => fs.writeFile(oldReceiptPath, JSON.stringify({
+        runId: oldRun, issueId: "original-issue", status: "done", summary: "Original work completed",
+        report: "Original completed work and its supporting evidence. ".repeat(8),
+      }));
+      if (kind === "receipt") await writeReceipt();
+      if (kind === "unreadable-receipt") await fs.mkdir(oldReceiptPath);
+      if (kind === "block") {
+        await fs.mkdir(path.join(stateDir, "channel-bridge"));
+        await fs.writeFile(path.join(stateDir, "channel-bridge/ledger.jsonl"), JSON.stringify({
+          ev: "terminal", op_id: oldRun, kind: "block", reason: "Required input unavailable",
+        }) + "\n");
+      }
+      if (kind === "late-receipt") deps.tmux.mockImplementation(async () => { await writeReceipt(); return screen; });
+      await expect(claimSlot(ctx, [{ index: 0, session: "seat", stateDir }], "issue-busy", Date.now() + 2000)).rejects.toThrow();
+      expect(await fs.readFile(activePath, "utf8")).toBe(checkpoint);
+      expect((await fs.readdir(stateDir)).filter(n => n.startsWith("active.unverified-"))).toEqual([]);
+      expect(deps.route).not.toHaveBeenCalled();
+      if (["running", "queued", "unknown", "receipt", "block", "unreadable-receipt"].includes(kind)) expect(deps.tmux).not.toHaveBeenCalled();
+    },
+  );
 
   it.each(["busy", "synthesizing", "same-run", "not-older", "unknown-age", "receipt", "block"])("SCO-1018 preserves %s adoption evidence", async kind => {
     const oldRun = "11111111-1111-4111-8111-111111111111";
@@ -164,7 +227,8 @@ describe("SCO-947 busy delivery and completion", () => {
     expect(result.errorFamily).toBe("target_busy");
     expect(await fs.readFile(path.join(stateDir, "active.json"), "utf8")).toBe(checkpoint);
     expect(await fs.readFile(path.join(stateDir, "run-env.sh"), "utf8")).toBe("original scoped environment");
-    expect(deps.tmux).not.toHaveBeenCalled();
+    if (value === "valid") expect(deps.tmux).not.toHaveBeenCalled();
+    else expect(deps.tmux.mock.calls.every(([, args]) => args[0] === "capture-pane")).toBe(true);
     expect(deps.route).not.toHaveBeenCalled();
     expect(deps.deliver).not.toHaveBeenCalled();
     const requests = vi.mocked(fetch).mock.calls.filter(([, init]) => init?.method === "POST");

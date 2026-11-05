@@ -48,7 +48,7 @@ export function rcSlot(index: number, session: string, stateDir: string): RcSlot
 
 /**
  * Pick and lock one seat: the seat already holding this issue's checkpoint (adoption), else the first seat
- * with no checkpoint after verified foreign settlements are archived. One seat keeps today's exact path.
+ * with no checkpoint after settled or terminal idle checkpoints are archived.
  */
 export async function claimSlot(
   ctx: AdapterExecutionContext, slots: RcSlot[], issueId: string, deadline: number,
@@ -81,6 +81,7 @@ export async function claimSlot(
       const raw = await activeOf(slot);
       const state = await checkpointRunState(ctx, raw);
       if (state === "live" || state === "unknown") { await unlock(); continue; }
+      if (state === "terminal") await reconcileIdleTerminal(ctx, slot, raw);
       await reconcileForeignSettlement(ctx, slot.stateDir, path.join(slot.stateDir, "active.json"));
       // Same-issue adoption observes the original operation; it never submits a second one.
       adoptableActive(await activeOf(slot), issueId, slot.stateDir, "claude_rc_local");
@@ -91,6 +92,33 @@ export async function claimSlot(
     }
   }
   throw new Error("claude_rc_local previous task unresolved; Remote Control seat busy; wake coalesced without dispatch");
+}
+
+/** SCO-1053: a terminal run with no outcome must not strand the seat on another issue. */
+async function reconcileIdleTerminal(ctx: AdapterExecutionContext, slot: RcSlot, raw: string): Promise<void> {
+  const active = adoptableActive(raw, JSON.parse(raw).issueId, slot.stateDir, "claude_rc_local");
+  if (!active) return;
+  const hasOutcome = async () => {
+    const receipt = await fs.readFile(active.receiptPath, "utf8").catch(error => {
+      if (error.code === "ENOENT") return "";
+      throw error;
+    });
+    try { parseReceipt(receipt, active.runId, active.issueId); return true; }
+    catch { /* Missing or unparseable receipts do not settle the old operation. */ }
+    return Boolean(await readBlockTerminal(slot.stateDir, active.runId));
+  };
+  if (await hasOutcome()) return;
+  const socket = asString(ctx.config.tmuxSocket, "pc-claude-rc");
+  if (!isClaudeIdle(await claudePane(socket, slot.session))) return;
+  // A receipt/block may arrive while capturing the pane. Preserve that outcome.
+  if (await hasOutcome()) return;
+  const activePath = path.join(slot.stateDir, "active.json");
+  if (await fs.readFile(activePath, "utf8") !== raw) return;
+  const archive = `active.unverified-${active.runId}-${Date.now()}.json`;
+  await fs.rename(activePath, path.join(slot.stateDir, archive));
+  const dir = await fs.open(slot.stateDir, "r");
+  try { await dir.sync(); } finally { await dir.close(); }
+  await ctx.onLog("stdout", `[claude-rc] Archived terminal idle checkpoint ${archive}; no replay of original issue ${active.issueId}\n`);
 }
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
@@ -466,7 +494,10 @@ async function ensureSession(
 
 /** Terminal `block` the worker recorded via pcbridge paperclip_block for this op, if any. */
 async function readBlockTerminal(stateDir: string, opId: string): Promise<string | null> {
-  const raw = await fs.readFile(path.join(stateDir, "channel-bridge", "ledger.jsonl"), "utf8").catch(() => "");
+  const raw = await fs.readFile(path.join(stateDir, "channel-bridge", "ledger.jsonl"), "utf8").catch(error => {
+    if (error.code === "ENOENT") return "";
+    throw error;
+  });
   for (const line of raw.split("\n").reverse()) {
     if (!line.includes(opId) || !line.includes('"terminal"')) continue;
     try {
