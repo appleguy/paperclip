@@ -17,6 +17,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { baselineMutationPaths, validateCompletionProvenance, type GateBaseline } from "./done-gate-provenance.js";
 import { statusPaths } from "./done-gate-worktree.js";
+import { attributable, nonmutatingShell, opaqueWriterOf, type OpaqueInput } from "./done-gate-shell.js";
 
 const run = promisify(execFile);
 
@@ -28,7 +29,7 @@ const UI_PREFIXES = ["ui/", "master/ui/"];
 
 export type GateReceipt = { runId?: unknown; commits?: unknown; liveCheck?: unknown; notMine?: unknown };
 export type GateVerdict = { ok: true; notes: string[] } | { ok: false; reasons: string[]; evidence?: "unknown" };
-export type MutationRecord = { paths: string[]; unknown: string[]; observedCommits?: string[] };
+export type MutationRecord = { paths: string[]; unknown: string[]; observedCommits?: string[]; opaque?: OpaqueInput[] };
 export type GitEvidence = { code: number; out: string; error?: string };
 
 export type GateDeps = {
@@ -40,12 +41,15 @@ export type GateDeps = {
 // Only tools with a known nonmutating contract may establish read-only work.
 // Shell, nested agents and new tools remain unknown until a durable write set exists.
 const READ_ONLY_TOOLS = new Set(["Read", "Grep", "Glob", "WebFetch", "WebSearch", "TodoWrite", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode"]);
+// Bridge completion writes runtime state, not canonical source repositories.
+const RUNTIME_ONLY_TOOLS = new Set(["mcp__pcbridge__paperclip_finish"]);
 
 /** Run mutation record from the durable Claude transcript; keep incomplete evidence. */
 export function editedPaths(jsonl: string, sinceMs: number): MutationRecord {
   const seen = new Set<string>();
   const unknown = new Set<string>();
   const observedCommits = new Set<string>();
+  const opaque: OpaqueInput[] = [];
   const commitTools = new Set<string>();
   const quietCommitHeadTools = new Set<string>();
   const lines = jsonl.split("\n");
@@ -87,9 +91,11 @@ export function editedPaths(jsonl: string, sinceMs: number): MutationRecord {
         unknown.add("tool record has no run timestamp");
         continue;
       }
-      if (READ_ONLY_TOOLS.has(c.name ?? "")) continue;
+      if (READ_ONLY_TOOLS.has(c.name ?? "") || RUNTIME_ONLY_TOOLS.has(c.name ?? "")) continue;
+      if (c.name === "Bash" && nonmutatingShell(c.input?.command)) continue;
       if (!["Edit", "Write", "NotebookEdit", "MultiEdit"].includes(c.name ?? "")) {
         unknown.add(`write set unavailable for tool ${c.name ?? "unnamed"}`);
+        opaque.push({ tool: c.name ?? "", text: c.name === "Bash" ? (typeof c.input?.command === "string" ? c.input.command : "") : JSON.stringify(c.input ?? {}) });
         continue;
       }
       const p = c.input?.file_path ?? c.input?.notebook_path;
@@ -99,7 +105,7 @@ export function editedPaths(jsonl: string, sinceMs: number): MutationRecord {
       else unknown.add(`relative mutation path has no absolute cwd: ${p}`);
     }
   }
-  return { paths: [...seen], unknown: [...unknown], ...(observedCommits.size ? { observedCommits: [...observedCommits] } : {}) };
+  return { paths: [...seen], unknown: [...unknown], ...(observedCommits.size ? { observedCommits: [...observedCommits] } : {}), ...(opaque.length ? { opaque } : {}) };
 }
 
 /** Resolve aliases even for deleted/new targets, using their nearest existing parent. */
@@ -145,9 +151,25 @@ export async function evaluateDoneGate(receipt: GateReceipt, edited: string[] | 
   const record = Array.isArray(edited) ? { paths: edited, unknown: [] } : edited;
   if (record.unknown.length && (!baseline || record.unknown.some(reason => reason.startsWith("transcript ")))) return { ok: false, evidence: "unknown", reasons: [`mutation evidence unknown: ${record.unknown.join("; ")}. A complete run-owned mutation record or baseline is required; commit prose cannot establish the write set.`] };
   let candidates = record.paths;
+  const notes: string[] = [];
   if (record.unknown.length && baseline) {
-    try { candidates = [...new Set([...candidates, ...await baselineMutationPaths(receipt, { ...deps, git }, baseline, record.observedCommits)])]; }
+    // SCO-1003: with only opaque tools unknown, a dispatch delta is this run's
+    // when one of those tools could have written it. Other runs' dirt on the
+    // shared checkout is noted, never refused. Nested agents, skills and other
+    // unknowns keep every delta.
+    const opaqueOnly = record.unknown.every(reason => reason.startsWith("write set unavailable for tool "))
+      && attributable(record.opaque ?? []);
+    const notMine = new Set(strings(receipt.notMine));
+    const unattributed: string[] = [];
+    const explicitPaths = new Set(record.paths);
+    const attribute = opaqueOnly ? (absolute: string, rel: string) => {
+      const own = explicitPaths.has(absolute) || (!notMine.has(rel) && !notMine.has(absolute) && opaqueWriterOf(record.opaque ?? [], absolute, rel));
+      if (!own) unattributed.push(rel);
+      return own;
+    } : undefined;
+    try { candidates = [...new Set([...candidates, ...await baselineMutationPaths(receipt, { ...deps, git }, baseline, record.observedCommits, attribute)])]; }
     catch (error) { return unknownEvidence(`mutation baseline evidence unknown: ${error instanceof Error ? error.message : "Git evidence unavailable"}`); }
+    if (unattributed.length) notes.push(`${unattributed.length} checkout changes since dispatch not attributed to this run: ${unattributed.slice(0, 8).join(", ")}`);
   }
   const repos = await deps.repos();
   const resolvedRepos = new Map<string, string>();
@@ -155,6 +177,8 @@ export async function evaluateDoneGate(receipt: GateReceipt, edited: string[] | 
     for (const repo of repos) resolvedRepos.set(await canonicalPath(repo), repo);
   } catch { return { ok: false, evidence: "unknown", reasons: ["mutation evidence unknown: checkout alias resolution failed"] }; }
   const touched = new Map<string, string[]>(); // repo -> edited files
+  const independent = new Set<string>();
+  const explicit = new Set(record.paths);
   for (const file of candidates) {
     if (!path.isAbsolute(file)) return { ok: false, evidence: "unknown", reasons: ["mutation evidence unknown: relative path has no run cwd"] };
     let f: string;
@@ -163,23 +187,23 @@ export async function evaluateDoneGate(receipt: GateReceipt, edited: string[] | 
     const resolved = repoOf(f, [...resolvedRepos.keys()]);
     const r = resolved ? resolvedRepos.get(resolved)! : null;
     if (r && resolved) {
+      if (explicit.has(file)) independent.add(f);
       const files = touched.get(r) ?? [];
       files.push(path.join(r, path.relative(resolved, f)));
       touched.set(r, files);
     }
   }
   const commits = strings(receipt.commits).map(s => s.trim());
-  if (touched.size === 0 && commits.length === 0) return { ok: true, notes: ["no canonical repo edited"] };
+  if (touched.size === 0 && commits.length === 0) return { ok: true, notes: ["no canonical repo edited", ...notes] };
   const canonicalTouched = new Map<string, string[]>();
   for (const [repo, files] of touched) {
     const resolved = [...resolvedRepos].find(([, original]) => original === repo)![0];
     canonicalTouched.set(resolved, files.map(file => path.join(resolved, path.relative(repo, file))));
   }
-  const provenance = await validateCompletionProvenance(receipt, canonicalTouched, { ...deps, git }, baseline);
+  const provenance = await validateCompletionProvenance(receipt, canonicalTouched, { ...deps, git }, baseline, independent);
   if (!provenance.ok) return provenance;
 
   const reasons: string[] = [];
-  const notes: string[] = [];
 
   // Own uncommitted edits: the run's edited files that git still reports dirty.
   for (const [repo, files] of touched) {

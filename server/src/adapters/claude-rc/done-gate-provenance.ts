@@ -55,7 +55,8 @@ export async function captureDoneGateBaseline(runId: string, deps: GateDeps): Pr
 }
 
 /** Unknown tools are settled against every original dispatch repository, never prose. */
-export async function baselineMutationPaths(receipt: GateReceipt, deps: GateDeps, baseline: GateBaseline, observedCommits: string[] = []): Promise<string[]> {
+export async function baselineMutationPaths(receipt: GateReceipt, deps: GateDeps, baseline: GateBaseline, observedCommits: string[] = [],
+  attribute?: (absolute: string, rel: string) => boolean): Promise<string[]> {
   if (!baseline.runId || receipt.runId !== baseline.runId || !Array.isArray(baseline.repos)
     || (!baseline.repos.length && !baseline.unbornRepos?.length && !baseline.unavailableRepos?.length))
     throw new Error("completion receipt does not match a complete dispatch baseline");
@@ -96,7 +97,7 @@ export async function baselineMutationPaths(receipt: GateReceipt, deps: GateDeps
         for (const rel of (await git(["diff-tree", "--root", "--no-commit-id", "--no-renames", "--name-only", "-z", "-r", sha])).split("\0").filter(Boolean)) own.add(rel);
       }
       committed = committed.filter(rel => own.has(rel));
-    }
+    } else if (attribute) committed = committed.filter(rel => attribute(path.join(start.repo, rel), rel));
     const dirty = statusPaths(await git(["status", "--porcelain=v1", "-z", "--untracked-files=all"]));
     const baselineDirty = new Set(start.dirtyPaths ?? []);
     const fingerprints = start.dirtyFingerprints
@@ -107,6 +108,7 @@ export async function baselineMutationPaths(receipt: GateReceipt, deps: GateDeps
       if (start.dirtyFingerprints?.[rel] && start.dirtyFingerprints[rel] === fingerprints[rel]) continue;
       // A legacy baseline without dirt evidence cannot grant an exemption.
       if (!start.dirtyFingerprints && baselineDirty.has(rel) && (notMine.has(rel) || notMine.has(absolute))) continue;
+      if (attribute && !attribute(absolute, rel)) continue;
       paths.add(absolute);
     }
   }
@@ -119,6 +121,7 @@ export async function validateCompletionProvenance(
   touched: Map<string, string[]>,
   deps: GateDeps,
   baseline?: GateBaseline,
+  independent?: Set<string>,
 ): Promise<GateVerdict> {
   if (!touched.size) return { ok: true, notes: [] };
   const unknown = (reason: string): GateVerdict => ({ ok: false, evidence: "unknown", reasons: [reason] });
@@ -146,7 +149,10 @@ export async function validateCompletionProvenance(
       const relative = [...new Set(files.map(file => path.relative(repo, file)))];
       const status = await git(repo, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
       const ownPaths = new Set(relative);
-      if (statusPaths(status.out).some(rel => ownPaths.has(rel))) reasons.push(`uncommitted edits of this run in ${repo}; notMine cannot exempt independently recorded run mutations`);
+      const dirty = statusPaths(status.out).filter(rel => ownPaths.has(rel));
+      if (dirty.some(rel => !independent || independent.has(path.join(repo, rel))))
+        reasons.push(`uncommitted edits of this run in ${repo}; notMine cannot exempt independently recorded run mutations`);
+      else if (dirty.length) reasons.push(`uncommitted changes in ${repo} since dispatch that this run's tools may have written (${dirty.length} paths): ${dirty.slice(0, 12).join(", ")}; commit them, or list them in notMine if another run owns them`);
       const covered = new Set<string>();
       const netPaths = new Set((await git(repo, ["diff", "--name-only", "--no-renames", "-z", start.head, "HEAD"])).out.split("\0").filter(Boolean));
       for (const sha of commits) {

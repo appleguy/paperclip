@@ -870,6 +870,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           await sleep(1100);
           continue;
         }
+        if (gate.notes.length) await ctx.onLog("stdout", `[claude-rc] Done gate passed ${issueId}: ${gate.notes.join(" | ").slice(0, 600)}\n`);
         break;
       } else if (await readBlockTerminal(stateDir, receiptRunId).then(async reason => {
         if (reason === null) return false;

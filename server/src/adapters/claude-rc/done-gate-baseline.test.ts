@@ -42,6 +42,10 @@ it("settles shell, agent and MCP writes from dispatch Git evidence and rejects d
     expect(await gateReceiptRaw('{"runId":"run"}', transcript, 100, deps)).toMatchObject({ ok: false, evidence: "unknown" });
   }
   await fs.writeFile(path.join(repo, "own.ts"), "shell mutation\n");
+  // An input-checkable tool that names nothing leaves the change unattributed (SCO-1003).
+  expect(await check([])).toMatchObject({ ok: true, notes: expect.arrayContaining([expect.stringContaining("own.ts")]) });
+  // A nested agent's writes are unrecorded, so every dispatch delta stays its own.
+  await fs.writeFile(transcript, JSON.stringify({ timestamp: "2026-11-05T02:00:00Z", message: { content: [{ type: "tool_use", name: "Agent", input: {} }] } }));
   expect((await check([old], ["peer.ts", "own.ts"])).ok).toBe(false);
   expect((await check([])).ok).toBe(false);
   const own = await commit();

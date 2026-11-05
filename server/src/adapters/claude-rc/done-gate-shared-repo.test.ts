@@ -44,10 +44,16 @@ it("separates concurrent commits, unchanged dirt, changed baseline dirt and omit
   expect(record.observedCommits).toEqual([own.slice(0, 7)]);
   expect(editedPaths(transcript.replace("git commit -m fixture", "git commit -qm fixture && git log --oneline -1")
     .replace(`[main ${own.slice(0, 7)}] fixture`, `${own.slice(0, 7)} fixture`), 1).observedCommits).toEqual([own.slice(0, 7)]);
-  const check = (commits = [own], notMine: string[] = []) => evaluateDoneGate({ runId: "run", commits, notMine }, record, deps, baseline);
+  // A nested agent's writes are unrecorded: every dispatch delta stays this run's.
+  const unrecorded = editedPaths(transcript + "\n" + JSON.stringify({ timestamp: "2026-11-05T02:00:00Z",
+    message: { content: [{ type: "tool_use", name: "Agent", input: {} }] } }), 1);
+  const check = (commits = [own], notMine: string[] = []) => evaluateDoneGate({ runId: "run", commits, notMine }, unrecorded, deps, baseline);
   expect(await check()).toMatchObject({ ok: true });
   await fs.writeFile(path.join(nested, "file.ts"), "changed nested content\n");
   expect(await check()).toMatchObject({ ok: false });
+  // SCO-1003: a shell command that names nothing does not claim a concurrent run's change.
+  expect(await evaluateDoneGate({ runId: "run", commits: [own] }, record, deps, baseline))
+    .toMatchObject({ ok: true, notes: expect.arrayContaining([expect.stringContaining("not attributed")]) });
   await fs.writeFile(path.join(nested, "file.ts"), "nested original\n");
   expect(await check()).toMatchObject({ ok: true });
   expect(await check([])).toMatchObject({ ok: false });
