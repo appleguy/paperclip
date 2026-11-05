@@ -1,4 +1,6 @@
 import { registerNativeCancellationDelivery } from "./services/native-runtime/native-cancellation-delivery.js";
+import { startHotWatcher } from "./hot/hot-modules.js";
+import { HOT_REL } from "./adapters/claude-rc/index.js";
 import { registerNativeRuntimeResponseDelivery } from "./services/native-runtime/native-runtime-response-delivery.js";
 import { attentionRetentionService, registerAttentionRetentionWork } from "./services/attention-retention.js";
 import { registerRoutineExecutionStatusWork } from "./services/routine-execution-status-work.js";
@@ -1065,6 +1067,7 @@ async function startServerWithDatabaseTeardown(
       resolveListen();
     });
   });
+  startHotWatcher([HOT_REL]); // SCO-818
   startupListenerBound = true;
   // The factory publishes the verified numeric endpoint on listening. Native
   // recovery must never fall back to a configured/public URL if it is absent.

@@ -1,8 +1,15 @@
 import type { ServerAdapterModule } from "../types.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { execute } from "./execute.js";
+import { execute as builtinExecute } from "./execute.js";
+import { hotImport } from "../../hot/hot-modules.js";
+import type { AdapterExecutionContext } from "../types.js";
 const run = promisify(execFile);
+
+// SCO-818: hot-deployable. New calls use the hot payload copy when one is active.
+export const HOT_REL = "adapters/claude-rc/execute.js";
+const execute = async (ctx: AdapterExecutionContext) =>
+  (await hotImport(HOT_REL, async () => ({ execute: builtinExecute }))).execute(ctx);
 
 export const claudeRcAdapter: ServerAdapterModule = {
   type: "claude_rc_local",

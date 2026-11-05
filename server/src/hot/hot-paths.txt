@@ -1,0 +1,19 @@
+# SCO-818 hot-deploy classification, read by bin/pc-deploy (via hot-deploy.mjs).
+# A deploy whose changed files are all "hot" or "none" skips the server restart.
+# Anything else falls back to the SCO-817 drain/restart path.
+#
+# hot: loaded through hotImport() from the new payload; new calls use it, running calls finish on old code.
+hot server/src/adapters/claude-rc/execute.ts
+hot server/src/adapters/claude-rc/done-gate.ts
+hot server/src/adapters/claude-rc/channel.ts
+hot server/src/adapters/claude-rc/rc-name.ts
+# hot-capable test files never ship to production behaviour.
+hot-glob server/src/adapters/claude-rc/*.test.ts
+# none: not part of the running server payload.
+none-prefix doc/
+none-prefix docs/
+none-prefix ops/
+none-prefix tests/
+none-prefix evals/
+none-suffix .md
+# Registered at the plugin layer (UI bundles load without restart): handled by pc plugin tools, not pc-deploy.
