@@ -14,7 +14,7 @@ export async function captureDoneGateBaseline(runId: string, deps: GateDeps): Pr
   const repos: GateBaseline["repos"] = [];
   for (const repo of await deps.repos()) {
     const head = await deps.git(repo, ["rev-parse", "--verify", "HEAD^{commit}"]);
-    // Missing/unborn repositories remain absent and cannot establish completion.
+    // Unborn repositories remain absent; completion rechecks that they stayed unborn.
     if (head.code === 0 && !head.error && SHA.test(head.out.trim())) {
       const dirty = await deps.git(repo, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
       repos.push({ repo: await fs.realpath(repo), head: head.out.trim(),
@@ -42,8 +42,13 @@ export async function baselineMutationPaths(receipt: GateReceipt, deps: GateDeps
     throw new Error("completion receipt does not match a complete dispatch baseline");
   for (const repo of await deps.repos()) {
     const canonical = await fs.realpath(repo);
-    if (!baseline.repos.some(start => start.repo === canonical))
+    if (!baseline.repos.some(start => start.repo === canonical)) {
+      const head = await deps.git(repo, ["rev-parse", "--verify", "HEAD^{commit}"]);
+      // Match capture's omission of unborn repositories, without exempting a
+      // repository that gained its first commit after dispatch.
+      if (head.code !== 0 && !head.error) continue;
       throw new Error(`dispatch baseline unavailable for repository ${canonical}`);
+    }
   }
   const paths = new Set<string>();
   const notMine = new Set(Array.isArray(receipt.notMine) ? receipt.notMine.filter((s): s is string => typeof s === "string") : []);

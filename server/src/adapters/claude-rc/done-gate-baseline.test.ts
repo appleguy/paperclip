@@ -27,8 +27,12 @@ it("settles shell, agent and MCP writes from dispatch Git evidence and rejects d
   await fs.writeFile(path.join(repo, "own.ts"), "before\n");
   const old = await commit();
   await fs.writeFile(path.join(repo, "peer.ts"), "preexisting dirt\n");
-  const deps: GateDeps = { repos: async () => [repo], git, liveSha: async () => null };
+  const unborn = path.join(root, "unborn");
+  await fs.mkdir(unborn);
+  expect((await git(unborn, ["init", "-q"])).code).toBe(0);
+  const deps: GateDeps = { repos: async () => [repo, unborn], git, liveSha: async () => null };
   const baseline = await captureDoneGateBaseline("run", deps);
+  expect(baseline.repos.map(start => start.repo)).toEqual([repo]);
   const transcript = path.join(root, "transcript.jsonl");
   const check = (commits: string[], notMine = ["peer.ts"], start = baseline) => gateReceiptRaw(JSON.stringify({ runId: "run", commits, notMine }), transcript, 100, deps, start);
   for (const name of ["Bash", "Agent", "Skill", "mcp__tool"]) {
@@ -42,6 +46,16 @@ it("settles shell, agent and MCP writes from dispatch Git evidence and rejects d
   expect((await check([])).ok).toBe(false);
   const own = await commit();
   expect((await check([own])).ok).toBe(true);
+  const failedHead: GateDeps = { ...deps, git: async (cwd, args) => cwd === unborn
+    ? { code: 1, out: "", error: "Git unavailable" } : git(cwd, args) };
+  expect(await gateReceiptRaw('{"runId":"run"}', transcript, 100, failedHead, baseline))
+    .toMatchObject({ ok: false, evidence: "unknown" });
+  expect((await git(unborn, ["-c", "core.hooksPath=/dev/null", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+    "commit", "--allow-empty", "-qm", "first commit after dispatch"])).code).toBe(0);
+  expect(await check([own])).toMatchObject({ ok: false, evidence: "unknown",
+    reasons: [expect.stringContaining(`dispatch baseline unavailable for repository ${unborn}`)] });
+  // Keep subsequent negative controls scoped to the original repository.
+  deps.repos = async () => [repo];
   expect(await check([own], ["peer.ts"], { ...baseline, repos: [] })).toMatchObject({ ok: false, evidence: "unknown" });
   expect((await check([old])).ok).toBe(false);
   expect((await check([own], [])).ok).toBe(false);
