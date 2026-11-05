@@ -122,7 +122,7 @@ import { drainHttpRequestWork } from "./middleware/idle-admission.js";
 import { initializeCloudRuntimeConfig } from "./services/cloud-runtime-config.js";
 import { loadCloudBootstrapConfig, loadConfig, type Config } from "./config.js";
 import { logger } from "./middleware/logger.js";
-import { setStartupRecoveryPhase } from "./startup-recovery-state.js";
+import { getStartupRecoveryState, setStartupRecoveryPhase } from "./startup-recovery-state.js";
 import {
   StartupRefusalError,
   migrationRefusalError,
@@ -1225,6 +1225,7 @@ async function startServerWithDatabaseTeardown(
     drainRunIds?: string[];
   }>) | null = null;
   let heartbeatSchedulerStopped = false;
+  let wakeRunDispatchWhenReady: (() => void) | undefined;
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     const finishIdleWork = beginIdleTrackedWork();
@@ -1291,7 +1292,7 @@ async function startServerWithDatabaseTeardown(
     server.on("close", backupExpirationWork.stop);
   }
   const taskDrainExpiryWork = registerTaskDrainExpiryWork(deliveryWork, () => {
-    if (heartbeatSchedulerStopped || isWarmStandby()) return;
+    if (heartbeatSchedulerStopped || isWarmStandby() || getStartupRecoveryState().phase !== "ready") return;
     trackHeartbeatSchedulerWork(accountingHeartbeat.resumeQueuedRunsAfterDrain().catch(err => {
       logger.error({ err }, "failed to resume queued work after task drain expiry");
     }));
@@ -1690,8 +1691,12 @@ async function startServerWithDatabaseTeardown(
       () => !isIdleTaskDrainActive() && !isWarmStandby() && !heartbeatSchedulerStopped).ready;
     if (config.heartbeatSchedulerEnabled) await heartbeat.registerDeferredReceiptWork(deliveryWork,
       () => !isIdleTaskDrainActive() && !isWarmStandby() && !heartbeatSchedulerStopped).ready;
-    if (config.heartbeatSchedulerEnabled) await heartbeat.registerRunDispatchWork(deliveryWork,
-      () => !isIdleTaskDrainActive() && !isWarmStandby() && !heartbeatSchedulerStopped).ready;
+    if (config.heartbeatSchedulerEnabled) {
+      const dispatchWorker = heartbeat.registerRunDispatchWork(deliveryWork,
+        () => getStartupRecoveryState().phase === "ready" && !isIdleTaskDrainActive() && !isWarmStandby() && !heartbeatSchedulerStopped);
+      await dispatchWorker.ready;
+      wakeRunDispatchWhenReady = dispatchWorker.wake;
+    }
     if (config.heartbeatSchedulerEnabled) await heartbeat.registerScheduledRetryCancellationWork(deliveryWork,
       () => !isIdleTaskDrainActive() && !heartbeatSchedulerStopped && !isWarmStandby()).ready;
 
@@ -1900,6 +1905,7 @@ async function startServerWithDatabaseTeardown(
   }
   markIdleStartupComplete({ scheduledBackups: config.databaseBackupEnabled });
   setStartupRecoveryPhase("ready");
+  wakeRunDispatchWhenReady?.();
   deploymentHints?.markReady();
   logger.info(`Server startup recovery complete on ${config.host}:${listenPort}`);
   void systemdNotify(["--ready", `--status=Listening on ${config.host}:${listenPort}`]).then((notified) => {

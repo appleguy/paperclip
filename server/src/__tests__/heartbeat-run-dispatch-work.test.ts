@@ -13,6 +13,7 @@ import { heartbeatService } from "../services/heartbeat.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
 import { notifyRunDispatch } from "../services/run-dispatch-notifications.js";
+import { getStartupRecoveryState, resetStartupRecoveryStateForTests, setStartupRecoveryPhase } from "../startup-recovery-state.js";
 
 const external = resolveExternalTestDatabaseUrl("PAPERCLIP_RUN_DISPATCH_TEST_DATABASE_URL");
 const support = external ? { supported: true } : await getEmbeddedPostgresTestSupport();
@@ -45,6 +46,7 @@ describe.skipIf(!support.supported)("run dispatch production wiring (controlled 
     await worker?.stop(); await coordinator?.stop();
     await heartbeat.drainActiveRunExecutions();
     worker = undefined; coordinator = undefined;
+    resetStartupRecoveryStateForTests();
     vi.useRealTimers(); vi.restoreAllMocks();
     expect(errors).toEqual([]);
   });
@@ -53,7 +55,7 @@ describe.skipIf(!support.supported)("run dispatch production wiring (controlled 
   async function start() {
     coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => !draining,
       canReconcile: () => true, onError: error => errors.push(error) });
-    worker = heartbeat.registerRunDispatchWork(coordinator, () => !draining);
+    worker = heartbeat.registerRunDispatchWork(coordinator, () => !draining && getStartupRecoveryState().phase === "ready");
     await worker.ready;
   }
   async function fixture() {
@@ -157,6 +159,18 @@ describe.skipIf(!support.supported)("run dispatch production wiring (controlled 
     if (scheduled.outcome !== "scheduled") throw new Error("Expected retry creation");
     heartbeat = heartbeatService(db);
     await start(); await completed(scheduled.run.id); await quiet();
+  });
+  it("holds an overdue retry until startup is ready, then wakes it", async () => {
+    const f = await fixture();
+    const scheduled = await heartbeat.scheduleBoundedRetry(f.runId, { now: new Date(Date.now() - 120_000), delayMs: 60_000 });
+    if (scheduled.outcome !== "scheduled") throw new Error("Expected retry creation");
+    setStartupRecoveryPhase("recovering");
+    await start();
+    await new Promise(resolve => setTimeout(resolve, 300));
+    expect((await status(scheduled.run.id)).status).toBe("scheduled_retry");
+    setStartupRecoveryPhase("ready");
+    worker!.wake();
+    await completed(scheduled.run.id); await quiet();
   });
   it("cancels a future retry and removes its old deadline", async () => {
     const f = await fixture(); await start();
