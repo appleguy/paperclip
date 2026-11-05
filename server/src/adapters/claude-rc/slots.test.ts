@@ -5,7 +5,8 @@ import path from "node:path";
 import { claimSlot, rcSlot, rcSlotCount, RC_MAX_SLOTS } from "./execute.js";
 import { deriveRcName, RC_NAME_MAX, slotRcName } from "./rc-name.js";
 
-const ctx = { context: { issueId: "i2" }, agent: { id: "a" }, onLog: async () => {} } as never;
+const runId = "11111111-1111-4111-8111-111111111111";
+const ctx = { runId, context: { issueId: "i2" }, agent: { id: "a" }, onLog: async () => {} } as never;
 
 describe("claude_rc_local concurrent seats (SCO-965)", () => {
   it("clamps slot count", () => {
@@ -35,7 +36,7 @@ describe("claude_rc_local concurrent seats (SCO-965)", () => {
       const a = await claimSlot(ctx, slots, "i1", Date.now() + 2000);
       const b = await claimSlot(ctx, slots, "i2", Date.now() + 2000);
       expect([a.slot.index, b.slot.index]).toEqual([0, 1]);
-      await expect(claimSlot(ctx, slots, "i3", Date.now() + 1200)).rejects.toThrow(/serialization timeout/);
+      await expect(claimSlot(ctx, slots, "i3", Date.now() + 1200)).rejects.toThrow(/previous task unresolved/);
       await a.unlock(); await b.unlock();
       // Seat 0 now holds an unresolved checkpoint for another issue; seat 1 is free.
       await writeFile(path.join(root, "active.json"), JSON.stringify({ issueId: "i1" }));
@@ -43,10 +44,14 @@ describe("claude_rc_local concurrent seats (SCO-965)", () => {
       expect(c.slot.index).toBe(1);
       await c.unlock();
       // Same issue returns to its own checkpointed seat.
-      const d = await claimSlot(ctx, slots, "i1", Date.now() + 2000);
+      await writeFile(path.join(root, "active.json"), JSON.stringify({ runId, issueId: "i1",
+        receiptPath: path.join(root, `receipt-${runId}.json`), rcUrl: "https://claude.ai/code/test" }));
+      const ownCtx = { runId, context: { issueId: "i1" }, agent: { id: "a" }, onLog: async () => {} } as never;
+      const d = await claimSlot(ownCtx, slots, "i1", Date.now() + 2000);
       expect(d.slot.index).toBe(0);
       await d.unlock();
       // Every seat checkpointed by other issues: target_busy-shaped refusal, not a wait.
+      await writeFile(path.join(root, "active.json"), JSON.stringify({ issueId: "i1" }));
       await writeFile(path.join(root, "s1", "active.json"), JSON.stringify({ issueId: "i9" }));
       await expect(claimSlot(ctx, slots, "i3", Date.now() + 2000)).rejects.toThrow(/previous task unresolved/);
     } finally { await rm(root, { recursive: true, force: true }); }

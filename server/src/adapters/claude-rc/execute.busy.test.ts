@@ -33,6 +33,15 @@ let stateDir: string;
 let screen: string;
 let ctx: AdapterExecutionContext;
 
+function certifyTerminalCheckpoint(runId: string, issueId: string) {
+  vi.mocked(fetch).mockImplementation(async url => Response.json(
+    String(url).endsWith(`/heartbeat-runs/${runId}`)
+      ? { id: runId, agentId: ctx.agent.id, companyId: ctx.agent.companyId,
+          status: "cancelled", contextSnapshot: { issueId } }
+      : [],
+  ));
+}
+
 beforeEach(async () => {
   vi.clearAllMocks();
   dir = await fs.mkdtemp("/Volumes/NVM/AI_Agent_Runtime/tmp/sco947-test-");
@@ -78,6 +87,7 @@ afterEach(async () => {
 describe("SCO-947 busy delivery and completion", () => {
   it.each(["refused", "missing", "malformed"])("SCO-1018 archives an idle %s receipt checkpoint and completes a fresh dispatch", async kind => {
     const oldRun = "11111111-1111-4111-8111-111111111111";
+    certifyTerminalCheckpoint(oldRun, "issue-busy");
     const oldReceiptPath = receiptFilePath(stateDir, oldRun);
     const checkpoint = JSON.stringify({ runId: oldRun, op_id: oldRun, issueId: "issue-busy",
       receiptPath: oldReceiptPath, rcUrl, cwd, conversationId: "conversation-busy",
@@ -133,6 +143,7 @@ describe("SCO-947 busy delivery and completion", () => {
 
   it.each(["{", "valid"])("retains foreign %s receipt before touching the transport or run environment", async value => {
     const oldRun = "11111111-1111-4111-8111-111111111111";
+    certifyTerminalCheckpoint(oldRun, "original-issue");
     const oldReceiptPath = receiptFilePath(stateDir, oldRun);
     const checkpoint = JSON.stringify({ runId: oldRun, issueId: "original-issue", receiptPath: oldReceiptPath, rcUrl });
     await fs.writeFile(path.join(stateDir, "active.json"), checkpoint);
@@ -156,6 +167,7 @@ describe("SCO-947 busy delivery and completion", () => {
 
   it("adopts the original same-issue receipt without submitting a new operation", async () => {
     const oldRun = "11111111-1111-4111-8111-111111111111";
+    certifyTerminalCheckpoint(oldRun, "issue-busy");
     const oldReceiptPath = receiptFilePath(stateDir, oldRun);
     await fs.writeFile(path.join(stateDir, "active.json"), JSON.stringify({
       runId: oldRun, issueId: "issue-busy", receiptPath: oldReceiptPath, rcUrl, cwd, conversationId: "conversation-busy",

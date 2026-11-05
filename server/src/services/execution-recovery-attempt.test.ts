@@ -27,10 +27,18 @@ describe("failure attempts across resource waits", () => {
 });
 
 describe("persisted independent accounting", () => {
-  it.each(["max_turns_continuation", "issue_disposition_repair", "workspace_busy", "ai_connection_busy", "ai_connection_pool_wait"])("%s cannot erase prior infrastructure debits or spend more", scheduledRetryReason => {
+  it.each(["max_turns_continuation", "issue_disposition_repair", "workspace_busy", "target_busy", "ai_connection_busy", "ai_connection_pool_wait"])("%s cannot erase prior infrastructure debits or spend more", scheduledRetryReason => {
     expect(executionFailureRetryCount({ scheduledRetryReason, scheduledRetryAttempt: 20,
       contextSnapshot: { executionRetryAccounting: { version: 1, failureRetries: 2, maxTurnContinuations: 1 } },
     })).toBe(2);
+  });
+  it("starts a new dispatch wait at zero after unrelated infrastructure retries", () => {
+    const run = { scheduledRetryReason: "transient_failure", scheduledRetryAttempt: 2 };
+    expect(executionRetryAttemptCount(run, "target_busy")).toBe(0);
+    const accounting = accountingForScheduledRetry(run, "target_busy", 1);
+    expect(accounting.failureRetries).toBe(2);
+    expect(executionRetryAttemptCount({ scheduledRetryReason: "target_busy", scheduledRetryAttempt: 3,
+      contextSnapshot: { executionRetryAccounting: accounting } }, "target_busy")).toBe(3);
   });
   it("never lowers the current failure count from a partial or stale ledger", () => {
     for (const executionRetryAccounting of [

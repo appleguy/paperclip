@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { Db } from "@paperclipai/db";
-import { agents, agentWakeupRequests, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRunEvents, heartbeatRuns, issues, projects, projectWorkspaces } from "@paperclipai/db";
-import { and, eq } from "drizzle-orm";
+import { agents, agentWakeupRequests, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRunEvents, heartbeatRuns, issueComments, issues, projects, projectWorkspaces } from "@paperclipai/db";
+import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { writePaperclipSkillSyncPreference } from "@paperclipai/adapter-utils/server-utils";
 import { HttpError } from "../../errors.js";
@@ -135,11 +135,10 @@ describe("local OpenCode admission retry", () => {
   });
 });
 
-describe("SCO-752 target_busy backoff", () => {
-  it("backs off exponentially to a 15 min ceiling instead of a fixed ~90 s poll", () => {
-    const delays = [0, 1, 2, 5, 50].map((attempt) => extracted.computeTargetBusyRetryDelayMs(attempt, () => 0));
-    expect(delays).toEqual([10 * 60_000, 15 * 60_000, 15 * 60_000, 15 * 60_000, 15 * 60_000]);
-    expect(extracted.computeTargetBusyRetryDelayMs(0, () => 1)).toBe(10 * 60_000 + 60_000);
+describe("dispatch-deferred target_busy backoff", () => {
+  it("backs off 2, 4, 8, 16, 30 minutes and never exceeds the cap", () => {
+    const delays = [0, 1, 2, 3, 4, 5, 50].map(extracted.computeTargetBusyRetryDelayMs);
+    expect(delays).toEqual([2, 4, 8, 16, 30, 30, 30].map(minutes => minutes * 60_000));
   });
 });
 
@@ -314,6 +313,116 @@ describePostgres("heartbeat retry module database wiring", () => {
     await db.update(issues).set({ executionRunId: run.id, checkoutRunId: run.id }).where(eq(issues.id, issue.id));
     return { companyId, agent, issue, run };
   }
+
+  async function refuseDispatch(run: Run) {
+    const [refused] = await db.update(heartbeatRuns).set({
+      status: "cancelled", errorCode: "target_busy", error: "previous task unresolved",
+      finishedAt: now, resultJson: { errorFamily: "target_busy",
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+    }).where(eq(heartbeatRuns.id, run.id)).returning();
+    if (run.wakeupRequestId) await db.update(agentWakeupRequests).set({ status: "cancelled" })
+      .where(eq(agentWakeupRequests.id, run.wakeupRequestId));
+    return refused!;
+  }
+
+  it.each(["todo", "in_progress", "in_review", "blocked"])("three consecutive deferrals retain one pending wake and unchanged %s status", async status => {
+    const f = await fixture();
+    await db.update(issues).set({ status }).where(eq(issues.id, f.issue.id));
+    let current = f.run;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      current = await refuseDispatch(current);
+      // Use no options: restart recovery must select the same lane and backoff.
+      const result = await boundRetries().retries.scheduleBoundedRetryForRun(current, f.agent, { now });
+      expect(result.outcome).toBe("scheduled");
+      const pending = await db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.issueId, f.issue.id),
+        eq(heartbeatRuns.agentId, f.agent.id), inArray(heartbeatRuns.status, ["scheduled_retry", "queued"]),
+      ));
+      expect(pending).toHaveLength(1);
+      expect(pending[0]).toMatchObject({ scheduledRetryAttempt: attempt, scheduledRetryReason: "target_busy",
+        scheduledRetryAt: new Date(now.getTime() + 2 ** attempt * 60_000),
+        contextSnapshot: { executionRetryAccounting: { failureRetries: 0 } } });
+      const wakes = await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, f.companyId), eq(agentWakeupRequests.status, "queued"),
+      ));
+      expect(wakes).toHaveLength(1);
+      expect(wakes[0].runId).toBe(pending[0].id);
+      const [issue] = await db.select().from(issues).where(eq(issues.id, f.issue.id));
+      expect(issue.status).toBe(status);
+      current = pending[0];
+    }
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).toHaveLength(0);
+  });
+
+  it("coalesces different refused runs concurrently by agent and issue, including queued retries", async () => {
+    const f = await fixture();
+    const first = await refuseDispatch(f.run);
+    const [other] = await db.insert(heartbeatRuns).values({
+      companyId: f.companyId, agentId: f.agent.id, scopeKind: "issue", issueId: f.issue.id,
+      status: "cancelled", errorCode: "target_busy", finishedAt: now,
+      resultJson: first.resultJson, contextSnapshot: first.contextSnapshot,
+    }).returning();
+    const results = await Promise.all([first, other].map(run =>
+      boundRetries().retries.scheduleBoundedRetryForRun(run, f.agent, { now })));
+    expect(results.every(result => result.outcome === "scheduled")).toBe(true);
+    const pending = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "scheduled_retry"),
+    ));
+    expect(pending).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))).toHaveLength(1);
+    await db.update(heartbeatRuns).set({ status: "queued" }).where(eq(heartbeatRuns.id, pending[0].id));
+    expect(await boundRetries().retries.scheduleBoundedRetryForRun(other, f.agent, { now }))
+      .toMatchObject({ reusedExisting: true, run: { id: pending[0].id, status: "queued" } });
+  });
+
+  it("defers two issues on one agent independently", async () => {
+    const f = await fixture();
+    const [secondIssue] = await db.insert(issues).values({ companyId: f.companyId,
+      title: "Independent wait", status: "todo", assigneeAgentId: f.agent.id }).returning();
+    const first = await refuseDispatch(f.run);
+    const [second] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agent.id,
+      scopeKind: "issue", issueId: secondIssue.id, status: "cancelled", errorCode: "target_busy", finishedAt: now,
+      resultJson: first.resultJson, contextSnapshot: { issueId: secondIssue.id } }).returning();
+    await Promise.all([first, second].map(run => boundRetries().retries.scheduleBoundedRetryForRun(run, f.agent, { now })));
+    const pending = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "scheduled_retry"),
+    ));
+    expect(pending).toHaveLength(2);
+    expect(new Set(pending.map(run => run.issueId))).toEqual(new Set([f.issue.id, secondIssue.id]));
+    expect(pending.map(run => run.scheduledRetryAttempt)).toEqual([1, 1]);
+  });
+
+  it("starts the busy backoff at two minutes while retaining prior failure debits", async () => {
+    const f = await fixture();
+    const source = await refuseDispatch(f.run);
+    source.scheduledRetryReason = "transient_failure";
+    source.scheduledRetryAttempt = 2;
+    await db.update(heartbeatRuns).set({ scheduledRetryReason: source.scheduledRetryReason,
+      scheduledRetryAttempt: source.scheduledRetryAttempt }).where(eq(heartbeatRuns.id, source.id));
+    expect(await boundRetries().retries.scheduleBoundedRetryForRun(source, f.agent, { now })).toMatchObject({
+      outcome: "scheduled", run: { scheduledRetryAttempt: 1,
+        scheduledRetryAt: new Date(now.getTime() + 2 * 60_000),
+        contextSnapshot: { executionRetryAccounting: { failureRetries: 2 } } },
+    });
+  });
+
+  it("posts exactly one seat-busy notice on the sixth deferral and stays quiet afterwards", async () => {
+    const f = await fixture();
+    let current = f.run;
+    for (let attempt = 1; attempt <= 8; attempt++) {
+      current = await refuseDispatch(current);
+      const result = await boundRetries().retries.scheduleBoundedRetryForRun(current, f.agent, { now });
+      expect(result.outcome).toBe("scheduled");
+      if (result.outcome !== "scheduled") throw new Error("Expected deferred wake");
+      // A second recovery pass on the same predecessor cannot repeat the notice.
+      await boundRetries().retries.scheduleBoundedRetryForRun(current, f.agent, { now });
+      const notices = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id));
+      expect(notices).toHaveLength(attempt >= 6 ? 1 : 0);
+      if (notices[0]) expect(notices[0]).toMatchObject({ authorType: "system", body: expect.stringContaining("seat is still busy") });
+      expect(result.run.scheduledRetryAt!.getTime() - now.getTime()).toBe(Math.min(2 ** attempt, 30) * 60_000);
+      current = result.run;
+    }
+  });
 
   it.each([false, true])("records a workspace wait only for the deferral's workspace (task moved after cancel: %s)", async (moved) => {
     const { run, agent, issue, companyId } = await fixture();

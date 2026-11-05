@@ -53,6 +53,7 @@ import {
 import { logger } from "../../middleware/logger.js";
 import { parseObject } from "../../adapters/utils.js";
 import { logActivity } from "../activity-log.js";
+import { insertIssueComment } from "../issue-comment-writes.js";
 import { readContinuationAttempt } from "../recovery/index.js";
 import { withRecoveryContext } from "../recovery/status-only-context.js";
 import {
@@ -165,9 +166,8 @@ export const WORKSPACE_BUSY_RETRY_JITTER_MS = 60 * 1000;
 // (releaseTargetBusyRetriesForAgent, fired when another run of the agent ends);
 // this timer is only the safety net for a hold Paperclip cannot observe (an
 // owner's live session).
-export const TARGET_BUSY_RETRY_BASE_DELAY_MS = 10 * 60 * 1000;
-export const TARGET_BUSY_RETRY_MAX_DELAY_MS = 15 * 60 * 1000;
-export const TARGET_BUSY_RETRY_JITTER_MS = 60 * 1000;
+export const TARGET_BUSY_RETRY_BASE_DELAY_MS = 2 * 60 * 1000;
+export const TARGET_BUSY_RETRY_MAX_DELAY_MS = 30 * 60 * 1000;
 
 // Preserve the one-hour shared-workspace holder cutoff independently of the
 // informational output-silence warnings. Warning sooner must not let another
@@ -259,14 +259,11 @@ export function computeWorkspaceBusyRetryDelayMs(
 /** `attempt` is the consecutive target_busy attempts already consumed (>= 0). */
 export function computeTargetBusyRetryDelayMs(
   attempt: number,
-  random: () => number = Math.random,
 ) {
-  const jitter = Math.min(Math.max(random(), 0), 1);
-  const backoff = Math.min(
+  return Math.min(
     TARGET_BUSY_RETRY_MAX_DELAY_MS,
     TARGET_BUSY_RETRY_BASE_DELAY_MS * 2 ** Math.max(0, Math.min(attempt, 8)),
   );
-  return backoff + Math.floor(jitter * TARGET_BUSY_RETRY_JITTER_MS);
 }
 
 function resolveCodexTransientFallbackMode(
@@ -470,27 +467,33 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     const preparationRecovery = parseObject(run.resultJson?.executionRecovery);
     const interruptedPreparation = run.status === "interrupted" &&
       preparationRecovery.kind === "bootstrap" && preparationRecovery.providerWorkStarted === false;
+    // target_busy is the existing normalized dispatch-deferred contract. Recovery
+    // sweeps must retain its independent wait lane even without caller options.
     const retryReason = opts?.retryReason ??
-      (interruptedPreparation ? "interrupted_preparation" : BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON);
+      (run.errorCode === TARGET_BUSY_RETRY_REASON || readHeartbeatRunErrorFamily(run) === "target_busy"
+        ? TARGET_BUSY_RETRY_REASON
+        : interruptedPreparation ? "interrupted_preparation" : BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON);
+    const targetWait = retryReason === TARGET_BUSY_RETRY_REASON;
     const wakeReason =
-      opts?.wakeReason ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON;
+      opts?.wakeReason ?? (targetWait ? "target_busy_retry" : BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON);
+    const consumedAttempts = executionRetryAttemptCount(run, retryReason);
     const maxAttempts = Math.max(
       0,
       Math.floor(
-        opts?.maxAttempts ?? BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+        opts?.maxAttempts ?? (targetWait ? consumedAttempts + 1 : BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS),
       ),
     );
-    const consumedAttempts = executionRetryAttemptCount(run, retryReason);
     const nextAttempt = consumedAttempts + 1;
+    const delayMs = opts?.delayMs ?? (targetWait ? computeTargetBusyRetryDelayMs(consumedAttempts) : undefined);
     const computedBaseSchedule =
-      opts?.delayMs != null
+      delayMs != null
         ? nextAttempt <= maxAttempts
           ? {
               attempt: nextAttempt,
-              baseDelayMs: Math.max(0, Math.floor(opts.delayMs)),
-              delayMs: Math.max(0, Math.floor(opts.delayMs)),
+              baseDelayMs: Math.max(0, Math.floor(delayMs)),
+              delayMs: Math.max(0, Math.floor(delayMs)),
               dueAt: new Date(
-                now.getTime() + Math.max(0, Math.floor(opts.delayMs)),
+                now.getTime() + Math.max(0, Math.floor(delayMs)),
               ),
               maxAttempts,
             }
@@ -776,6 +779,18 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
           await tx.execute(
             sql`select id from heartbeat_runs where company_id = ${run.companyId} and id = ${run.id} for update`,
           );
+          if (targetWait && issueId) {
+            // The issue lock serializes different refused runs, not just repeat
+            // recovery of one predecessor. Never coalesce another issue/agent.
+            const [pending] = await tx.select().from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.companyId, run.companyId),
+              eq(heartbeatRuns.agentId, run.agentId),
+              eq(heartbeatRuns.issueId, issueId),
+              eq(heartbeatRuns.scheduledRetryReason, TARGET_BUSY_RETRY_REASON),
+              inArray(heartbeatRuns.status, ["scheduled_retry", "queued"]),
+            )).orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id)).limit(1);
+            if (pending) return { outcome: "scheduled", run: pending, reusedExisting: true };
+          }
           const [existing] = await tx
             .select()
             .from(heartbeatRuns)
@@ -1134,6 +1149,15 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
             updatedAt: now,
           })
           .where(eq(agentWakeupRequests.id, wakeupRequest.id));
+
+        // One notice per uninterrupted wait chain, committed with its successor.
+        // Duplicate scheduling returns above; later deferrals remain quiet.
+        if (targetWait && issueId && nextAttempt === 6) {
+          await insertIssueComment(tx, {
+            companyId: run.companyId, issueId, authorType: "system", createdByRunId: run.id,
+            body: "The agent seat is still busy after six dispatch deferrals. This task keeps its current status and will retry automatically, at most every 30 minutes while the seat remains busy.",
+          });
+        }
 
         let detachWorkspaceFromIssue = false;
         if (issueId && shouldQuarantineWorkspaceForRetry) {

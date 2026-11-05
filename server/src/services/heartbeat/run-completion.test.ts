@@ -487,6 +487,29 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(f.deps.finalizeAgentStatus).toHaveBeenCalledWith(f.agent.id, expected, expect.any(String), expect.objectContaining({ keepIdleOnFailure: result.errorCode === "provider_quota" }));
   });
 
+  it("settles a pre-dispatch refusal as a wait without blocking its task or spending failure attempts", async () => {
+    const f = await fixture({ scheduledRetryReason: "transient_failure", scheduledRetryAttempt: 2 });
+    const [issue] = await db.insert(issues).values({ companyId: f.run.companyId,
+      title: "Busy seat task", status: "in_progress", assigneeAgentId: f.agent.id,
+      executionRunId: f.run.id }).returning();
+    const [run] = await db.update(heartbeatRuns).set({ scopeKind: "issue", issueId: issue.id,
+      contextSnapshot: { issueId: issue.id } }).where(eq(heartbeatRuns.id, f.run.id)).returning();
+    f.input.run = run;
+    f.input.issueId = issue.id;
+    f.input.adapterResult = { exitCode: 1, signal: null, timedOut: false,
+      errorFamily: "target_busy", errorMessage: "Claude TUI not idle; leave the owner's live work intact",
+      executionRecovery: { kind: "bootstrap", providerWorkStarted: false } };
+    await f.completion.completeRun(f.input);
+    expect(await read(run.id)).toMatchObject({ status: "cancelled", errorCode: "target_busy",
+      resultJson: { errorFamily: "target_busy", executionRecovery: { providerWorkStarted: false } } });
+    expect(f.deps.scheduleBoundedRetryForRun).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ id: run.id }), f.agent,
+      { retryReason: "target_busy", wakeReason: "target_busy_retry" },
+    );
+    expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0].status).toBe("in_progress");
+    expect(f.deps.issuesSvc.addComment).not.toHaveBeenCalled();
+  });
+
   it.each(["completeRun", "failRun"] as const)("waits for an owned Stop before %s can write a competing outcome", async operation => {
     const f = await fixture();
     let settle!: () => void;

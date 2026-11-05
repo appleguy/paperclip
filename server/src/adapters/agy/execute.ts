@@ -52,7 +52,7 @@ function asString(v: unknown, fallback: string): string {
 }
 /** Pre-dispatch refusals meaning the seat is occupied: the wake waits instead of failing. */
 export function isTargetBusyRefusal(reason: string): boolean {
-  return /previous task unresolved|input guard refused|Remote Control seats? busy|single Remote Control session busy/i.test(reason);
+  return /previous task unresolved|Claude TUI not idle|RC URL changed; refusing to dispatch to an unverified session|input guard refused|Remote Control seats? busy|single Remote Control session busy/i.test(reason);
 }
 
 /** A released process mutex alone does not prove that its provider run has stopped. */

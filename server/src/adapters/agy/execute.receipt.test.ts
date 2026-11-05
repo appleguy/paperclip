@@ -66,6 +66,16 @@ describe("agy busy dispatch and receipt completion", () => {
     context: { issueId: "probe" }, onLog: vi.fn(), onDispatch: vi.fn(),
   }) as unknown as AdapterExecutionContext;
 
+  function certifyTerminalCheckpoint(issueId: string) {
+    const handler = api.getMockImplementation()!;
+    api.mockImplementation(async (url, init) => {
+      if (new globalThis.URL(url).pathname.endsWith(`/heartbeat-runs/${OLD}`))
+        return Response.json({ id: OLD, agentId: "probe", companyId: "probe", status: "cancelled",
+          contextSnapshot: { issueId } });
+      return handler(url, init);
+    });
+  }
+
   it("delivers into a busy conversation without statusLine or /new and completes on its receipt", async () => {
     await fs.writeFile(receiptFilePath(dir, RUN), JSON.stringify(receipt()));
     const ctx = context(dir);
@@ -175,6 +185,7 @@ describe("agy busy dispatch and receipt completion", () => {
   });
 
   it("adopts an old same-issue checkpoint without redispatch or an editor gate", async () => {
+    certifyTerminalCheckpoint("probe");
     const active = {
       runId: OLD, issueId: "probe", receiptPath: receiptFilePath(dir, OLD), rcUrl: URL,
       conversationId: conversation, startedAt: "2000-01-01T00:00:00Z",
@@ -185,7 +196,7 @@ describe("agy busy dispatch and receipt completion", () => {
     const result = await execute(context(dir));
     expect(result.exitCode).toBe(0);
     expect(submitted).toEqual([]);
-    expect(api).toHaveBeenCalledTimes(4);
+    expect(api).toHaveBeenCalledTimes(5);
   });
 
   it("reattaches the exact run checkpoint without submitting another prompt", async () => {
@@ -216,6 +227,7 @@ describe("agy busy dispatch and receipt completion", () => {
   });
 
   it("settles a foreign receipt while busy, then dispatches the current wake", async () => {
+    certifyTerminalCheckpoint("previous");
     await fs.writeFile(path.join(dir, "active.json"), JSON.stringify({
       runId: OLD, issueId: "previous", receiptPath: receiptFilePath(dir, OLD), rcUrl: URL,
     }));
@@ -223,7 +235,7 @@ describe("agy busy dispatch and receipt completion", () => {
     await fs.writeFile(receiptFilePath(dir, RUN), JSON.stringify(receipt()));
     expect((await execute(context(dir))).exitCode).toBe(0);
     expect(submitted).toHaveLength(1);
-    expect(api).toHaveBeenCalledTimes(8);
+    expect(api).toHaveBeenCalledTimes(9);
   });
 
   it("keeps an old receiptless checkpoint even with an empty editor", async () => {

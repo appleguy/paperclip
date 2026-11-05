@@ -83,8 +83,11 @@ describe("target-busy refusals", () => {
     for (const m of [
       "claude_rc_local previous task unresolved; inspect active.json",
       "Claude input guard refused: owner input nonempty",
+      "Claude TUI not idle; leave the owner's live work intact",
+      "RC URL changed; refusing to dispatch to an unverified session",
     ]) expect(isTargetBusyRefusal(m)).toBe(true);
     expect(isTargetBusyRefusal("Claude workspace trust prompt: approve this dedicated workspace")).toBe(false);
+    expect(isTargetBusyRefusal("agy RC URL changed since the adopted dispatch; operator reconciliation required")).toBe(false);
   });
 });
 
