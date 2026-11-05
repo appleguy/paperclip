@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { receiptFilePath } from "../agy/execute.js";
-import { reconcileForeignSettlement, settleOutcome } from "./settlement.js";
+import { isReviewContinuation, reconcileForeignSettlement, settleOutcome } from "./settlement.js";
 
 const sourceRunId = "11111111-1111-4111-8111-111111111111";
 const receipt = { runId: sourceRunId, issueId: "original", status: "done", summary: "Original work complete",
@@ -138,14 +138,47 @@ describe("F07 durable receipt settlement", () => {
       if (init.method === "PATCH") status = "in_review";
       return response;
     });
-    await expect(settleOutcome(ctx(), dir, sourceRunId, "original", outcome)).rejects.toThrow("remains in_review");
-    await expect(settleOutcome(ctx(), dir, sourceRunId, "original", outcome)).rejects.toThrow("already attempted");
+    await expect(settleOutcome(ctx(), dir, sourceRunId, "original", outcome)).resolves.toMatchObject({ status: "in_review" });
+    expect(await isReviewContinuation(ctx(), dir, sourceRunId, "original", receipt)).toBe(true);
+    expect(await isReviewContinuation(ctx(), dir, sourceRunId, "original", { ...receipt, report: receipt.report + "changed" })).toBe(false);
+    expect(await isReviewContinuation(ctx("next"), dir, sourceRunId, "next", receipt)).toBe(false);
+    await expect(settleOutcome(ctx(), dir, sourceRunId, "original", outcome)).resolves.toMatchObject({ status: "in_review" });
     expect(calls.filter(c => c.startsWith("PATCH"))).toHaveLength(1);
     await retained();
+    await expect(reconcileForeignSettlement(ctx("next"), dir, activePath)).rejects.toThrow("unresolved");
+    await retained();
+    status = "done"; // The real reviewer, rather than the delivery retry, finished review.
+    await expect(settleOutcome(ctx(), dir, sourceRunId, "original", outcome)).resolves.toMatchObject({ status: "done" });
+    expect(calls.filter(c => c.startsWith("PATCH"))).toHaveLength(1);
+    await reconcileForeignSettlement(ctx("next"), dir, activePath);
+    await expect(fs.stat(activePath)).rejects.toThrow();
   });
   it("keeps same-issue adoption on the existing operation", async () => {
     await reconcileForeignSettlement(ctx(), dir, activePath);
     await retained(); expect(calls).toEqual([]);
+  });
+
+  it.each(["", "{", "null", "{}"])("retains an invalid status acknowledgement and recovers review without repeating PATCH: %j", async body => {
+    const handler = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url: string, init: RequestInit) => {
+      const response = await handler(url, init);
+      if (init.method === "PATCH") { status = "in_review"; return new Response(body); }
+      return response;
+    });
+    await expect(settleOutcome(ctx(), dir, sourceRunId, "original", outcome)).rejects.toThrow();
+    await retained();
+    await expect(fs.stat(path.join(dir, `settled-${sourceRunId}.json`))).rejects.toThrow();
+    await expect(settleOutcome(ctx(), dir, sourceRunId, "original", outcome)).resolves.toMatchObject({ status: "in_review" });
+    expect(calls.filter(c => c.startsWith("PATCH"))).toHaveLength(1);
+  });
+
+  it.each(["", "{", "null", "{}"])("rejects an invalid report success acknowledgement: %j", async body => {
+    const handler = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url: string, init: RequestInit) =>
+      init.method === "PUT" ? new Response(body) : handler(url, init));
+    await expect(settleOutcome(ctx(), dir, sourceRunId, "original", outcome)).rejects.toThrow();
+    await retained();
+    expect(calls.some(c => c.startsWith("PATCH"))).toBe(false);
   });
   it("requires verified blocked delivery before releasing a foreign block terminal", async () => {
     await settleOutcome(ctx(), dir, sourceRunId, "original", { kind: "block", reason: "Missing input" });

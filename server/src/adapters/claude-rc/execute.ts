@@ -22,7 +22,7 @@ import {
 import { deriveRcName, reportsToDepth, sanitizeRcName, slotRcName, type RcAgentNode } from "./rc-name.js";
 import { gateReceiptRaw, refusalMessage, productionDeps } from "./done-gate.js";
 import { captureDoneGateBaseline, type GateBaseline } from "./done-gate-provenance.js";
-import { reconcileForeignSettlement, settleOutcome } from "./settlement.js";
+import { isReviewContinuation, reconcileForeignSettlement, settleOutcome } from "./settlement.js";
 import {
   CHANNEL_NAME, findBridgeRoot, prepareChannelHost, routeChannelInput, type ChannelHost,
   type ChannelStatus,
@@ -757,6 +757,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const raw = await fs.readFile(receiptPath, "utf8").catch(() => "");
       if (raw) {
         receipt = parseReceipt(raw, receiptRunId, issueId);
+        // Delivered work waiting on review must not be refused/restarted by a
+        // later source-tree change. Settlement below only observes review state.
+        if (await isReviewContinuation(ctx, stateDir, receiptRunId, issueId, receipt)) break;
         // SCO-762 done gate: canonical-repo edits need committed SHAs on main (live or queued for autodeploy).
         const checkpoint = await fs.readFile(activePath, "utf8").then(t => JSON.parse(t) as { startedAt?: string; doneGateBaseline?: GateBaseline });
         const startedAt = Date.parse(asString(checkpoint.startedAt, ""));
@@ -807,9 +810,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
     if (!receipt)
       return failure("Claude did not produce a validated completion receipt; checkpoint retained", true);
-    await settleOutcome(ctx, stateDir, receiptRunId, issueId, { kind: "done", receipt });
-    await ctx.onLog("stdout", `[claude-rc] Done ${issueId}: ${receipt.summary}; conversation=${conversationId ?? "unknown"}\n`);
-    await fs.rm(activePath);
+    const disposition = await settleOutcome(ctx, stateDir, receiptRunId, issueId, { kind: "done", receipt });
+    const issueClosed = disposition.status === "done";
+    await ctx.onLog("stdout", `[claude-rc] ${issueClosed ? "Done" : "Awaiting review"} ${issueId}: ${receipt.summary}; conversation=${conversationId ?? "unknown"}\n`);
+    if (issueClosed) await fs.rm(activePath);
     return {
       exitCode: 0, signal: null, timedOut: false, provider: "anthropic", biller: "anthropic", model,
       billingType: "subscription", costStatus: "unpriced", summary: receipt.summary,
@@ -818,7 +822,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         sessionId: conversationId, cwd, remoteControlUrl: rcUrl,
         remoteControlName: name, tmuxSocket: socket, tmuxSession: session,
       },
-      resultJson: { issueId, receiptPath, remoteControlUrl: rcUrl, conversationId, reportPublished: true, issueClosed: true },
+      resultJson: { issueId, receiptPath, remoteControlUrl: rcUrl, conversationId, reportPublished: true,
+        issueClosed, issueStatus: disposition.status, reviewPending: !issueClosed },
     };
   } catch (e) {
     const error = e instanceof Error ? e.message : String(e);

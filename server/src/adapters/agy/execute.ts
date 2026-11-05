@@ -365,7 +365,9 @@ async function claimSlot(
   throw new Error("agy Remote Control seats busy: serialization timeout");
 }
 
-export async function deliver(ctx: AdapterExecutionContext, receipt: Receipt, title = "Antigravity execution report", label = "agy Remote Control"): Promise<void> {
+export type DeliveryDisposition = { status: "done" | "in_review"; reportRevisionId: string };
+
+export async function deliver(ctx: AdapterExecutionContext, receipt: Receipt, title = "Antigravity execution report", label = "agy Remote Control", stateDir?: string): Promise<DeliveryDisposition> {
   // Paperclip-owned run-scoped auth stays entirely inside the server adapter.
   // The live agy TUI sees only an issue ID and receipt path, NEVER the token.
   if (!ctx.authToken) throw new Error("missing scoped agent token for report/closure");
@@ -393,17 +395,44 @@ export async function deliver(ctx: AdapterExecutionContext, receipt: Receipt, ti
     }
     if (response.status === 404 && method === "GET") return null;
     if (!response.ok) throw new Error(`Paperclip ${method} ${suffix} returned HTTP ${response.status}`);
-    return method === "GET" ? await response.json().catch(() => null) : null;
+    return await response.json(); // HTTP success alone is not persisted delivery evidence.
   };
   // A rerun on an issue that already has a report must send the revision it replaces, or PUT returns 409.
-  const existing = await invoke("GET", "/documents/report", undefined) as { latestRevisionId?: unknown } | null;
+  const existing = await invoke("GET", "/documents/report", undefined) as { body?: unknown; latestRevisionId?: unknown } | null;
+  if (existing !== null && (typeof existing?.latestRevisionId !== "string" || !existing.latestRevisionId))
+    throw new Error("agy report response missing revision");
   const baseRevisionId = typeof existing?.latestRevisionId === "string" ? existing.latestRevisionId : undefined;
-  await invoke("PUT", "/documents/report", {
+  const report = existing?.body === receipt.report ? existing : await invoke("PUT", "/documents/report", {
     title, format: "markdown", body: receipt.report,
     changeSummary: `${label} run ${ctx.runId}`,
     ...(baseRevisionId ? { baseRevisionId } : {}),
-  });
-  await invoke("PATCH", "", { status: "done" });
+  }) as { body?: unknown; latestRevisionId?: unknown } | null;
+  if (report?.body !== receipt.report || typeof report.latestRevisionId !== "string" || !report.latestRevisionId)
+    throw new Error("agy report acknowledgement did not verify the receipt");
+  // A retained receipt may already have entered review. Repeating done could
+  // advance that review stage, so continuation only observes its persisted state.
+  let persisted = await invoke("GET", "", undefined) as { status?: unknown } | null;
+  if (persisted?.status !== "in_review" && persisted?.status !== "done") {
+    if (typeof persisted?.status !== "string") throw new Error("agy issue response missing status");
+    if (stateDir) {
+      if (!/^[A-Za-z0-9_-]{1,80}$/.test(receipt.runId)) throw new Error("invalid delivery source run");
+      // Record intent before the transition: a lost/malformed acknowledgement
+      // must never let a retry advance a review stage as another done request.
+      const intent = await fs.open(path.join(stateDir, `delivery-intent-${receipt.runId}.json`), "wx", 0o600)
+        .catch(error => {
+          if (error.code === "EEXIST") throw new Error("agy status transition already attempted; checkpoint retained for reconciliation");
+          throw error;
+        });
+      try { await intent.writeFile(JSON.stringify({ issueId: receipt.issueId, runId: receipt.runId })); await intent.sync(); }
+      finally { await intent.close(); }
+      const dir = await fs.open(stateDir, "r");
+      try { await dir.sync(); } finally { await dir.close(); }
+    }
+    persisted = await invoke("PATCH", "", { status: "done" }) as { status?: unknown } | null;
+  }
+  if (persisted?.status !== "done" && persisted?.status !== "in_review")
+    throw new Error(`agy delivery remains ${String(persisted?.status)}; checkpoint retained`);
+  return { status: persisted.status, reportRevisionId: report.latestRevisionId };
 }
 
 /**
@@ -422,10 +451,12 @@ async function settleForeignCheckpoint(
   try { receipt = parseReceipt(await fs.readFile(a.receiptPath, "utf8"), a.runId, a.issueId); } catch { /* none yet */ }
   if (!receipt) return; // adoptableActive preserves the unresolved ownership conflict
   try {
-    await deliver(ctx, receipt);
+    const disposition = await deliver(ctx, receipt, undefined, undefined, stateDir);
+    if (disposition.status === "in_review") return; // Preserve the original reconciliation context.
     await ctx.onLog("stdout", `[agy] Settled finished receipt of run ${a.runId} onto issue ${a.issueId}\n`);
   } catch (e) {
     await ctx.onLog("stderr", `[agy] Could not settle receipt of run ${a.runId} onto issue ${a.issueId} (${e instanceof Error ? e.message : e}); receipt kept at ${a.receiptPath}\n`);
+    return;
   }
   await fs.rename(activePath, path.join(stateDir, `active.stale-${a.runId}-${Date.now()}.json`));
 }
@@ -589,15 +620,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
     if (!receipt)
       return failure("agy did not produce a validated completion receipt; checkpoint retained", true);
-    await deliver(ctx, receipt);
-    await ctx.onLog("stdout", `[agy] Done ${issueId}: ${receipt.summary}; conversation=${conversationId ?? "unknown"}\n`);
-    await fs.rm(activePath); // completed only after authenticated report + issue closure
+    const disposition = await deliver(ctx, receipt, undefined, undefined, stateDir);
+    const issueClosed = disposition.status === "done";
+    await ctx.onLog("stdout", `[agy] ${issueClosed ? "Done" : "Awaiting review"} ${issueId}: ${receipt.summary}; conversation=${conversationId ?? "unknown"}\n`);
+    if (issueClosed) await fs.rm(activePath);
     return {
       exitCode: 0, signal: null, timedOut: false, provider: "google", biller: "google", model,
       billingType: "subscription", costStatus: "unpriced", summary: receipt.summary,
       sessionId: conversationId, sessionDisplayId: conversationId,
       sessionParams: { sessionId: conversationId, cwd, remoteControlUrl: rcUrl, tmuxSocket: socket, tmuxSession: session },
-      resultJson: { issueId, receiptPath, remoteControlUrl: rcUrl, conversationId, reportPublished: true, issueClosed: true },
+      resultJson: { issueId, receiptPath, remoteControlUrl: rcUrl, conversationId, reportPublished: true,
+        issueClosed, issueStatus: disposition.status, reviewPending: !issueClosed },
     };
   } catch (e) {
     const error = e instanceof Error ? e.message : String(e);

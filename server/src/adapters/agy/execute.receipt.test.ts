@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
@@ -28,7 +28,7 @@ describe("agy busy dispatch and receipt completion", () => {
   let dir: string;
   let submitted: string[];
   let capture: string;
-  let api: ReturnType<typeof vi.fn>;
+  let api: Mock<(url: string, init: RequestInit) => Promise<Response>>;
   beforeEach(async () => {
     dir = await fs.mkdtemp(path.join(ROOT, "agy-receipt-test-"));
     submitted = [];
@@ -42,7 +42,17 @@ describe("agy busy dispatch and receipt completion", () => {
         callback(null, { stdout, stderr: "" });
       })().catch(callback);
     });
-    api = vi.fn(async () => new Response("{}", { status: 200 }));
+    const reports = new Map<string, unknown>();
+    const statuses = new Map<string, string>();
+    api = vi.fn(async (url: string, init: RequestInit) => {
+      const route = new globalThis.URL(url).pathname;
+      if (route.endsWith("/documents/report")) {
+        if (init.method === "PUT") reports.set(route, { ...JSON.parse(String(init.body)), latestRevisionId: "rev" });
+        return reports.has(route) ? Response.json(reports.get(route)) : new Response(null, { status: 404 });
+      }
+      if (init.method === "PATCH") statuses.set(route, "done");
+      return Response.json({ status: statuses.get(route) ?? "in_progress" });
+    });
     vi.stubGlobal("fetch", api);
   });
   afterEach(async () => {
@@ -60,13 +70,14 @@ describe("agy busy dispatch and receipt completion", () => {
     await fs.writeFile(receiptFilePath(dir, RUN), JSON.stringify(receipt()));
     const ctx = context(dir);
     const result = await execute(ctx);
-    expect(result.exitCode).toBe(0);
+    expect(result.exitCode, result.errorMessage ?? undefined).toBe(0);
     expect(ctx.onDispatch).toHaveBeenCalledOnce();
     expect(submitted).toHaveLength(1);
     expect(submitted[0]).toContain("Paperclip run");
     expect(submitted[0]).not.toMatch(/\/new|\/remote-control/);
-    expect(api.mock.calls.map((args) => (args[1] as RequestInit).method)).toEqual(["GET", "PUT", "PATCH"]);
-    expect(JSON.parse(String((api.mock.calls[2]![1] as RequestInit).body))).toEqual({ status: "done" });
+    expect(api.mock.calls.map((args) => (args[1] as RequestInit).method)).toEqual(["GET", "PUT", "GET", "PATCH"]);
+    expect(JSON.parse(String((api.mock.calls[3]![1] as RequestInit).body))).toEqual({ status: "done" });
+    expect(result.resultJson).toMatchObject({ issueClosed: true, issueStatus: "done", reviewPending: false });
     await expect(fs.stat(path.join(dir, "active.json"))).rejects.toThrow();
   });
 
@@ -77,6 +88,57 @@ describe("agy busy dispatch and receipt completion", () => {
     expect(submitted).toEqual([]);
     expect(api).not.toHaveBeenCalled();
     await expect(fs.stat(path.join(dir, "active.json"))).rejects.toThrow();
+  });
+
+  it("reports review-wait and reuses the receipt without another PATCH or provider dispatch", async () => {
+    await fs.writeFile(receiptFilePath(dir, RUN), JSON.stringify(receipt()));
+    let status = "in_progress";
+    const handler = api.getMockImplementation()!;
+    api.mockImplementation(async (url: string, init: RequestInit) => {
+      if (!new globalThis.URL(url).pathname.endsWith("/documents/report")) {
+        if (init.method === "PATCH") status = "in_review";
+        return Response.json({ status });
+      }
+      return handler(url, init);
+    });
+    const ctx = context(dir);
+    const first = await execute(ctx);
+    expect(first).toMatchObject({ exitCode: 0, resultJson: { issueClosed: false, issueStatus: "in_review", reviewPending: true } });
+    expect(ctx.onLog).not.toHaveBeenCalledWith("stdout", expect.stringContaining("[agy] Done"));
+    expect(await fs.readFile(path.join(dir, "active.json"), "utf8")).toContain(RUN);
+    const second = await execute(context(dir));
+    expect(second.resultJson).toMatchObject({ issueClosed: false, reviewPending: true });
+    expect(submitted).toHaveLength(1);
+    expect(api.mock.calls.filter(args => args[1].method === "PATCH")).toHaveLength(1);
+    expect(api.mock.calls.filter(args => args[1].method === "PUT")).toHaveLength(1);
+    status = "done";
+    expect((await execute(context(dir))).resultJson).toMatchObject({ issueClosed: true, reviewPending: false });
+    await expect(fs.stat(path.join(dir, "active.json"))).rejects.toThrow();
+    expect(submitted).toHaveLength(1);
+  });
+
+  it.each(["", "{", "null", "{}", '{"status":"in_progress"}'])("retains a checkpoint on an invalid success acknowledgement: %j", async body => {
+    await fs.writeFile(receiptFilePath(dir, RUN), JSON.stringify(receipt()));
+    const handler = api.getMockImplementation()!;
+    api.mockImplementation(async (url: string, init: RequestInit) =>
+      init.method === "PATCH" ? new Response(body) : handler(url, init));
+    const result = await execute(context(dir));
+    expect(result.exitCode).toBe(1);
+    expect(result.resultJson?.issueClosed).not.toBe(true);
+    expect(await fs.readFile(path.join(dir, "active.json"), "utf8")).toContain(RUN);
+    expect((await execute(context(dir))).exitCode).toBe(1);
+    expect(api.mock.calls.filter(args => args[1].method === "PATCH")).toHaveLength(1);
+    expect(submitted).toHaveLength(1);
+  });
+
+  it.each(["", "{", "null", "{}"])("does not close an issue after an invalid report acknowledgement: %j", async body => {
+    await fs.writeFile(receiptFilePath(dir, RUN), JSON.stringify(receipt()));
+    const handler = api.getMockImplementation()!;
+    api.mockImplementation(async (url: string, init: RequestInit) =>
+      init.method === "PUT" ? new Response(body) : handler(url, init));
+    expect((await execute(context(dir))).exitCode).toBe(1);
+    expect(api.mock.calls.some(args => args[1].method === "PATCH")).toBe(false);
+    await fs.stat(path.join(dir, "active.json"));
   });
 
   it("refuses rotation without positive idle evidence and preserves the conversation", async () => {
@@ -123,7 +185,7 @@ describe("agy busy dispatch and receipt completion", () => {
     const result = await execute(context(dir));
     expect(result.exitCode).toBe(0);
     expect(submitted).toEqual([]);
-    expect(api).toHaveBeenCalledTimes(3);
+    expect(api).toHaveBeenCalledTimes(4);
   });
 
   it("reattaches the exact run checkpoint without submitting another prompt", async () => {
@@ -161,7 +223,7 @@ describe("agy busy dispatch and receipt completion", () => {
     await fs.writeFile(receiptFilePath(dir, RUN), JSON.stringify(receipt()));
     expect((await execute(context(dir))).exitCode).toBe(0);
     expect(submitted).toHaveLength(1);
-    expect(api).toHaveBeenCalledTimes(6);
+    expect(api).toHaveBeenCalledTimes(8);
   });
 
   it("keeps an old receiptless checkpoint even with an empty editor", async () => {

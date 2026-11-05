@@ -48,6 +48,7 @@ beforeEach(async () => {
     return "";
   });
   deps.gate.mockResolvedValue({ ok: true, reasons: [] });
+  deps.deliver.mockResolvedValue({ status: "done" });
   ctx = {
     agent: { id: "agent", name: "Busy seat", companyId: "company" }, runId: "run-busy",
     config: { cwd, stateDir, tmuxSocket: "socket", tmuxSession: "seat" },
@@ -215,6 +216,17 @@ describe("SCO-947 busy delivery and completion", () => {
     expect(deps.deliver).toHaveBeenCalledOnce();
     expect(deps.tmux.mock.calls.some(([, args]) => ["kill-session", "paste-buffer", "send-keys"].includes(args[0]))).toBe(false);
     await expect(fs.stat(path.join(stateDir, "active.json"))).rejects.toThrow();
+  });
+
+  it("reports persisted review-wait without claiming closure or removing the checkpoint", async () => {
+    deps.deliver.mockResolvedValue({ status: "in_review" });
+    const result = await execute(ctx);
+    expect(result).toMatchObject({ exitCode: 0, resultJson: {
+      issueClosed: false, issueStatus: "in_review", reviewPending: true,
+    } });
+    expect(ctx.onLog).not.toHaveBeenCalledWith("stdout", expect.stringContaining("[claude-rc] Done"));
+    expect(await fs.readFile(path.join(stateDir, "active.json"), "utf8")).toContain(ctx.runId);
+    expect(deps.route).toHaveBeenCalledOnce();
   });
 
   it("keeps the actual working folder when a busy seat's configured cwd changes", async () => {
