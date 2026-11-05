@@ -296,6 +296,18 @@ export class OpenCodeHttpDriver implements ProviderDriver {
     throw new OpenCodeHttpError("mismatch", `active session ${conversationId} has no user message`);
   }
 
+  // Progress fingerprint: the newest message of the conversation (list is newest first) changes whenever a
+  // part streams, a tool settles or tokens update. null when unreadable, so a read failure never counts as a stall.
+  async progressMark(conversationId: string): Promise<string | null> {
+    try {
+      const list = await this.json("GET", `/api/session/${encodeURIComponent(conversationId)}/message?limit=1`);
+      if (list.status !== 200 || !Array.isArray(list.data?.data)) return null;
+      return createHash("sha256").update(JSON.stringify(list.data.data[0] ?? null)).digest("hex");
+    } catch {
+      return null;
+    }
+  }
+
   async readOutcomeMsg(conversationId: string, msgId: string): Promise<OutcomeRead> {
     let log;
     try { log = await this.observe(conversationId); } catch { return "unknown"; }
