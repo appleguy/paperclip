@@ -148,7 +148,7 @@ function el(tag,cls,value){var n=document.createElement(tag);if(cls)n.className=
 function resultText(message,fail){status.textContent=message;status.className=fail?"fail":""}
 async function json(path){
  var response=await fetch(path,{credentials:"same-origin",cache:"no-store",headers:{"Accept":"application/json"}});
- if(!response.ok){var e=new Error(response.status===401?"Sign in to Paperclip, then reopen this page.":"Quota request failed (HTTP "+response.status+").");e.status=response.status;throw e}
+ if(!response.ok){var e=new Error((response.status===401||response.status===403)?"Sign in to Paperclip at https://mac.local/, then reopen this page.":"Quota request failed (HTTP "+response.status+").");e.status=response.status;throw e}
  return await response.json();
 }
 function isShort(item){return !!item&&(item.pool==="session"||String(item.pool||"").endsWith(":5h"))}
