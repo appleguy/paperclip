@@ -394,6 +394,14 @@ function isManagedShimContents(contents: string): boolean {
   );
 }
 
+// Homebrew upgrades delete the versioned Cellar dir; the opt/<formula> link is stable.
+export function stableNodeExecPath(execPath = process.execPath, exists = fs.existsSync): string {
+  const match = /^(.*)\/Cellar\/([^/]+)\/[^/]+\/bin\/([^/]+)$/.exec(execPath);
+  if (!match) return execPath;
+  const stable = `${match[1]}/opt/${match[2]}/bin/${match[3]}`;
+  return exists(stable) ? stable : execPath;
+}
+
 export function writeManagedShim(paths = resolveInstallStorePaths()): void {
   assertManagedShimWritable(paths);
   const homeDir = path.dirname(path.dirname(path.dirname(paths.shimPath)));
@@ -405,7 +413,8 @@ export function writeManagedShim(paths = resolveInstallStorePaths()): void {
   const entrypoint = path.join(paths.currentPath, "node_modules", "paperclipai", "dist", "index.js");
   // ACP servers and package-manager shims use /usr/bin/env node. Pin their
   // runtime too, even when systemd/launchd supplies a different PATH.
-  const contents = `#!/bin/sh\n# ${MANAGED_SHIM_MARKER}\nset -eu\nexport PATH=${shellQuote(path.dirname(process.execPath))}:"\${PATH:-/usr/local/bin:/usr/bin:/bin}"\nexec ${shellQuote(process.execPath)} ${shellQuote(entrypoint)} "\$@"\n`;
+  const nodePath = stableNodeExecPath();
+  const contents = `#!/bin/sh\n# ${MANAGED_SHIM_MARKER}\nset -eu\nexport PATH=${shellQuote(path.dirname(nodePath))}:"\${PATH:-/usr/local/bin:/usr/bin:/bin}"\nexec ${shellQuote(nodePath)} ${shellQuote(entrypoint)} "\$@"\n`;
   writeFileAtomic(paths.shimPath, contents, 0o755);
 }
 

@@ -3,10 +3,19 @@
  * emission, while Paperclip submits through the bridge-ctl stdin control path.
  * A local write is NOT an acknowledgement: only the UserPromptSubmit hook is.
  */
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+
+// Homebrew upgrades delete the versioned Cellar dir; the opt/<formula> link is stable.
+function stableNodePath(execPath = process.execPath): string {
+  const m = /^(.*)\/Cellar\/([^/]+)\/[^/]+\/bin\/([^/]+)$/.exec(execPath);
+  if (!m) return execPath;
+  const stable = `${m[1]}/opt/${m[2]}/bin/${m[3]}`;
+  return existsSync(stable) ? stable : execPath;
+}
 
 export const CHANNEL_NAME = "pcbridge";
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -68,7 +77,7 @@ export async function prepareChannelHost(stateDir: string, installRoot: string):
   const mcp = {
     mcpServers: {
       [CHANNEL_NAME]: {
-        command: process.execPath,
+        command: stableNodePath(),
         args: [path.join(root, "server.cjs")],
         env: { PC_BRIDGE_DIR: dir, PC_BRIDGE_SERVER: CHANNEL_NAME },
       },
@@ -79,7 +88,7 @@ export async function prepareChannelHost(stateDir: string, installRoot: string):
     const command = [
       `PC_BRIDGE_DIR=${quoteShell(dir)}`,
       `PC_BRIDGE_SERVER=${quoteShell(CHANNEL_NAME)}`,
-      quoteShell(process.execPath),
+      quoteShell(stableNodePath()),
       quoteShell(path.join(root, "hook.cjs")),
       event,
     ].join(" ");

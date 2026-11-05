@@ -19,6 +19,7 @@ import {
   withInstallStoreLock,
   writeInstallManifestAtomic,
   writeManagedShim,
+  stableNodeExecPath,
   type InstallManifest,
   type InstallRecord,
 } from "../install-store.js";
@@ -108,7 +109,7 @@ describe("managed install store", () => {
   it("writes a stable shim with the validated runtime and custom store path", () => {
     writeManagedShim(paths);
     const shim = fs.readFileSync(paths.shimPath, "utf8");
-    expect(shim).toContain(process.execPath);
+    expect(shim).toContain(stableNodeExecPath());
     expect(shim).toContain(paths.currentPath);
     expect(shim).not.toContain("PAPERCLIP_HOME");
     expect(fs.statSync(paths.shimPath).mode & 0o777).toBe(0o755);
@@ -226,5 +227,13 @@ describe("managed install store", () => {
     fs.writeFileSync(paths.shimPath, `# ${MANAGED_SHIM_MARKER}\n`);
     fs.linkSync(paths.shimPath, path.join(root, "linked-shim"));
     expect(() => writeManagedShim(paths)).toThrow("multiply linked shim");
+  });
+});
+
+describe("stableNodeExecPath", () => {
+  it("rewrites a Homebrew Cellar node to the stable opt link when it exists", () => {
+    expect(stableNodeExecPath("/opt/homebrew/Cellar/node/26.12.1_1/bin/node", () => true)).toBe("/opt/homebrew/opt/node/bin/node");
+    expect(stableNodeExecPath("/opt/homebrew/Cellar/node/26.12.1_1/bin/node", () => false)).toBe("/opt/homebrew/Cellar/node/26.12.1_1/bin/node");
+    expect(stableNodeExecPath("/usr/local/bin/node", () => true)).toBe("/usr/local/bin/node");
   });
 });
