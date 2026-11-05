@@ -13,7 +13,7 @@ import { costEvents, issueComments, statusDecisions } from "@paperclipai/db";
 import { finalizeNativeRun } from "./native-run-finalizer.js";
 import { accountRunCost } from "../run-cost-accounting.js";
 import { settleLiveRunnerGoalBeforeInterrupt } from "../runner-goals.js";
-import { canonicalNativeRuntimeContextDigest } from "../../vendor/paperclip-runner/index.js";
+import { canonicalNativeRuntimeContextDigest, defaultCapabilityRunnerdBinary } from "../../vendor/paperclip-runner/index.js";
 import { buildNativeExecutionInput } from "./native-execution-input.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
 import { cancelNativeSession, executePaperclipNativeSession } from "./native-session-executor.js";
@@ -33,7 +33,7 @@ vi.mock("../runner-goals.js", async (importOriginal) => {
 });
 
 /**
- * C1 canary harness (owner-admitted: one Codex turn, gpt-6-luna, model_reasoning_effort=low, no retry, no ACTIVE goal).
+ * C1 canary harness (owner-admitted: one Codex turn, Luna or Sol, low effort, no retry, no ACTIVE goal).
  *
  * Skipped unless PAPERCLIP_C1_CANARY_WORD=C1. PAPERCLIP_C1_HOST selects the daemon:
  *   isolated (default) - throwaway daemon in a temp HOME, no credentials, wiring check: stops before the turn.
@@ -41,19 +41,20 @@ vi.mock("../runner-goals.js", async (importOriginal) => {
  * The owner mode never starts, restarts or stops the owner daemon and never reads ~/.codex credentials; the daemon
  * authenticates itself. The embedded Postgres, registration, grant and issue live only inside this process.
  * Stop conditions (recorded, then asserted): a second turn start, an unrequested tool call, any goal that is not paused,
- * model/effort other than gpt-6-luna/low. The turn itself is bounded by turnTimeoutMs; the executor is called once
+ * model/effort other than the selected Luna or Sol/low. The turn is bounded by turnTimeoutMs; the executor is called once
  * (no heartbeat orchestration, so no retry or continuation exists).
  */
-const MODEL = "gpt-6-luna", EFFORT = "low";
+const MODEL = process.env.PAPERCLIP_C1_MODEL ?? "gpt-6-luna", EFFORT = "low";
 const armed = process.env.PAPERCLIP_C1_CANARY_WORD === "C1";
 const ownerMode = process.env.PAPERCLIP_C1_HOST === "owner";
 
 (armed ? it : it.skip)(`C1 canary harness (${ownerMode ? "owner daemon, one turn" : "isolated daemon, stops before the turn"})`, async () => {
+  expect(["gpt-6-luna", "gpt-6.1-sol"]).toContain(MODEL);
   const root = await mkdtemp("/Volumes/NVM/AI_Agent_Runtime/tmp/codex-c1-");
   const workspace = join(root, "workspace"), assets = join(root, "assets");
   await mkdir(workspace); await mkdir(assets); await writeFile(join(assets, "AGENTS.md"), "C1 canary instructions\n");
   const exec = promisify(execFile), cli = "/opt/homebrew/bin/codex";
-  const runner = process.env.PAPERCLIP_ATTACH_TRANSITION_RUNNER ?? "/Volumes/NVM/AI_Agent_Runtime/tmp/lead-rust-target/debug/paperclip-runnerd";
+  const runner = process.env.PAPERCLIP_ATTACH_TRANSITION_RUNNER ?? defaultCapabilityRunnerdBinary();
   const ownerHome = homedir();
   const home = ownerMode ? ownerHome : join(root, "home"), codexHome = ownerMode ? join(ownerHome, ".codex") : home;
   const env = { PATH: "/opt/homebrew/bin:/usr/bin:/bin", HOME: home, CODEX_HOME: codexHome, TMPDIR: ownerMode ? process.env.TMPDIR ?? "/Volumes/NVM/AI_Agent_Runtime/tmp" : home, LANG: "C" };
@@ -118,7 +119,8 @@ const ownerMode = process.env.PAPERCLIP_C1_HOST === "owner";
         if (event.eventType === "turn.started") turnStarts.push(event.eventType);
         if (killMode && event.eventType === "turn.started" && killResult === "not_requested") { killResult = "requested"; void promisify(execFile)("pgrep", ["-P", String(process.pid), "-f", "paperclip-runnerd"]).then(({ stdout }) => { const pid = Number(stdout.trim().split("\n")[0]); if (!Number.isInteger(pid) || pid <= 1) throw new Error("no_runnerd_child"); process.kill(pid, "SIGKILL"); killResult = { killedPid: pid }; }).catch((error) => { killResult = "error:" + String(error?.message ?? error); }); }
         if (stopMode && event.eventType === "turn.started" && stopResult === "not_requested") { stopResult = "requested"; stopRequest = (activeMode ? settleLiveRunnerGoalBeforeInterrupt(db, { companyId, issueId, agentId }).then((r) => { goalSettle = r; }, (error: unknown) => { goalSettle = "error:" + String((error as Error)?.message ?? error).slice(0, 300); }) : Promise.resolve()).then(() => cancelNativeSession(runId, "owner_stop")).then((value) => { stopResult = value; }, (error) => { stopResult = "error:" + String(error?.message ?? error); }); }
-        if (/^tool\./.test(event.eventType) || /tool_call/.test(event.eventType)) tools.push(event.eventType);
+        // paperclip_finish is the required completion receipt, not task work.
+        if ((/^tool\./.test(event.eventType) || /tool_call/.test(event.eventType)) && (event.payload as any)?.name !== "paperclip_finish") tools.push(event.eventType);
       },
       onUsage: async (receipt) => { usage.push(receipt); },
       onCodexSharedSessionReady: async () => { wired = true; if (activeMode) { await goalAction("create", ACTIVE_OBJECTIVE, 0, 15000); safetyPause = setTimeout(() => { safetyPaused = true; void sessionRow().then((row) => goalAction("pause", ACTIVE_OBJECTIVE, row!.goalRevision)).catch(() => undefined); }, 90_000); } else if (!ownerMode) await goalAction("create", "initial goal", 0); },
@@ -150,10 +152,10 @@ const ownerMode = process.env.PAPERCLIP_C1_HOST === "owner";
       finalize = { finalizeError, accountError, pending: closedRun?.costAccountingPending, accountedAt: closedRun?.costAccountedAt, usageKeys: Object.keys((closedRun?.usageJson as object) ?? {}), runStatus: closedRun?.status, runError: closedRun?.error, issueStatus: (await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status, comments: (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).map((c) => String(c.body).slice(0, 200)), decisions: (await db.select().from(statusDecisions).where(eq(statusDecisions.runId, runId))).map((d) => ({ s: (d as any).status, k: (d as any).kind })), costRows: (await db.select().from(costEvents).where(eq(costEvents.heartbeatRunId, runId))).length };
     }
     const proof = { goalSettle, finalize, killMode, killResult, finalizationRow: (await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId)))[0] ?? null, activeMode, safetyPaused, stopMode, stopResult, outcomeError: outcome.error ? String((outcome.error as Error).message ?? outcome.error) : null, turnStartsObserved: turnStarts.length, turnStartedRows: started.length, runEventTypes: [...new Set(rows.map((row) => row.eventType))], goalEvents, tools, usageCheckpoints: usage.length, goalAfterTurn: finalSession?.goalJson ?? null, issueStatus: (await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.status, runStatus: (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]?.status, runDetail: (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]?.resultJson ?? null, eventTrace: rows.map((row) => `${row.seq}:${row.eventType}:${JSON.stringify(row.payload ?? null).slice(0, row.eventType === "harness.diagnostic" ? 600 : 220)}`), outcomeSettlement: (outcome.error as any)?.settlement ?? null, outcomeStack: String((outcome.error as Error)?.stack ?? "").split("\n").filter((l) => l.trimStart().startsWith("at ")).slice(0, 14).join("\n"), outcomeCause: String(((outcome.error as any)?.cause?.message) ?? "").slice(0, 300) };
-    await writeFile(join(root, "c1-proof.json"), JSON.stringify({ proof, usage }, null, 2));
+    await writeFile(join(root, "c1-proof.json"), JSON.stringify({ proof: { ...proof, model: MODEL, effort: EFFORT, threadId: (finalSession?.sessionParamsJson as any)?.codexSharedBootstrapV1?.threadId ?? finalSession?.sessionDisplayId ?? null }, usage }, null, 2));
     process.stdout.write(`C1_PROOF ${join(root, "c1-proof.json")}\n`);
     if (!activeMode && (turnStarts.length > 1 || started.length > 1)) violations.push("second_turn");
-    if (!toolMode && (tools.length > 0 || rows.some((row) => /^tool\./.test(row.eventType) || /tool_call/.test(row.eventType)))) violations.push("tool_call_outside_grant");
+    if (!toolMode && (tools.length > 0 || rows.some((row) => (/^tool\./.test(row.eventType) || /tool_call/.test(row.eventType)) && (row.payload as any)?.prpEvent?.payload?.name !== "paperclip_finish"))) violations.push("tool_call_outside_grant");
     const status = (finalSession?.goalJson as any)?.status; if (!activeMode && status && status !== "paused") violations.push("goal_not_paused");
     expect(violations).toEqual([]);
     if (!activeMode) expect(turnStarts).toHaveLength(1);

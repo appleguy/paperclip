@@ -847,6 +847,7 @@ mod shared_mode_guard_tests {
             1,
             None,
             None,
+            None,
             &mut |_| Ok(())
         )
         .err()
@@ -4093,7 +4094,7 @@ fn is_non_active_goal_set_diagnostic(message: &Value) -> bool {
     }
 }
 
-fn contains_provider_turn_binding(value: &Value) -> bool {
+pub(crate) fn contains_provider_turn_binding(value: &Value) -> bool {
     match value {
         Value::Array(values) => values.iter().any(contains_provider_turn_binding),
         Value::Object(fields) => fields.iter().any(|(key, child)| {

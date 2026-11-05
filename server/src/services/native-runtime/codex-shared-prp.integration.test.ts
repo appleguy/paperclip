@@ -14,7 +14,8 @@ import { commitCodexSharedGoalReceipt, reserveCodexSharedGoalAction, withReserve
 import { registerCodexSharedGoalController } from "./codex-shared-goal-controller.js";
 import { dispatchLiveRunnerGoalControl } from "../runner-goal-control-broker.js";
 import { applyRunnerGoalPrpEvent } from "../runner-goals.js";
-const exec=promisify(execFile), runner=process.env.PAPERCLIP_ATTACH_TRANSITION_RUNNER??"/Volumes/NVM/AI_Agent_Runtime/tmp/codex-shared-proof.UC8Vu3/target/debug/paperclip-runnerd";
+import { defaultCapabilityRunnerdBinary } from "../../vendor/paperclip-runner/index.js";
+const exec=promisify(execFile), runner=process.env.PAPERCLIP_ATTACH_TRANSITION_RUNNER??defaultCapabilityRunnerdBinary();
 const sleep=(ms:number)=>new Promise(resolve=>setTimeout(resolve,ms));
 const digest=(goal:unknown)=>createHash("sha256").update(JSON.stringify(goal)).digest("hex");
 it("projects a paused edit through the real PRP runner and isolated daemon without blocking its event writer",async()=>{
@@ -54,7 +55,22 @@ it("projects a paused edit through the real PRP runner and isolated daemon witho
   await expect(claimRegisteredCodexSharedOption({...claim,executionWorkspaceId:randomUUID()})).rejects.toThrow("resource_lease_lost");
   await expect(claimRegisteredCodexSharedOption({...claim,controller:{...claim.controller,pid:claim.controller.pid+1}})).rejects.toThrow("lease_lost");
   expect(await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.taskKey,issueId))).toHaveLength(0);
+  // Same-run recovery may acquire a new lease while earlier attempts remain
+  // active. Exercise more than the former eight-row cap, and preserve an
+  // unrelated workspace lease. A rejected claim must roll back supersession.
+  const staleIds=Array.from({length:9},()=>randomUUID());
+  await db.insert(environmentLeases).values(staleIds.map((id,index)=>({id,companyId,executionWorkspaceId,issueId,heartbeatRunId:runId,status:"active",createdAt:new Date(1000+index)})));
+  const foreignWorkspaceId=randomUUID(),foreignLeaseId=randomUUID();
+  await db.insert(executionWorkspaces).values({id:foreignWorkspaceId,companyId,projectId,name:"unrelated",mode:"shared",strategyType:"local"});
+  await db.insert(environmentLeases).values({id:foreignLeaseId,companyId,executionWorkspaceId:foreignWorkspaceId,issueId,heartbeatRunId:runId,status:"active"});
+  await expect(claimRegisteredCodexSharedOption({...claim,delegationGrantId:revoked.grantId})).rejects.toThrow("delegation_unavailable");
+  expect((await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId,runId))).every(row=>row.status==="active")).toBe(true);
   const option=await claimRegisteredCodexSharedOption(claim);const admission=option.admission;
+  expect(option.environmentLeaseId).toBe(environmentLeaseId);
+  const resumedLeases=await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId,runId));
+  expect(resumedLeases.filter(row=>row.executionWorkspaceId===executionWorkspaceId && row.status==="active").map(row=>row.id)).toEqual([environmentLeaseId]);
+  expect(resumedLeases.filter(row=>staleIds.includes(row.id)).every(row=>row.status==="released" && row.releasedAt!==null)).toBe(true);
+  expect(resumedLeases.find(row=>row.id===foreignLeaseId)?.status).toBe("active");
   const [claimedSession]=await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.taskKey,issueId));taskSessionId=claimedSession!.id;
   const badTemplate={authorizedTools:launch.authorizedTools,provider:{provider:"codex",model:b.model,cwd:launch.cwd,instructions:launch.instructions,approvalPolicy:launch.approvalPolicy,readOnly:launch.readOnly,sharedDaemon:{...option.daemon,writer:{...option.daemon.writer,reasoningEffort:"low"}}}};
   await expect(admission.bootstrapAuthority.reserve({bootstrapId:option.daemon.bootstrapId,runAttachTemplate:badTemplate})).rejects.toThrow("bootstrap_mismatch");

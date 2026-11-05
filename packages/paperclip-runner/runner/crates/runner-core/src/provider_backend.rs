@@ -35,6 +35,16 @@ use crate::provider_events::{
 };
 use crate::stable_identity::{is_stable_id, DURABLE_STABLE_ID_CHARS, SHORT_STABLE_ID_CHARS};
 
+// A thread-scoped startup warning is diagnostic, not evidence that another
+// turn ran. Requests and warnings carrying execution identity remain uncertain.
+fn is_shared_bootstrap_warning(notification: &Value) -> bool {
+    notification.get("id").is_none()
+        && notification.get("method").and_then(Value::as_str) == Some("warning")
+        && notification
+            .get("params")
+            .is_none_or(|params| !crate::codex_provider::contains_provider_turn_binding(params))
+}
+
 const PROVIDER_STATE_SCHEMA: &str = "paperclip.runner.codex-provider-state.v1";
 pub const CODEX_PROVIDER_STATE_FILE: &str = "codex-provider-state.json";
 const MAX_PROVIDER_STATE_BYTES: u64 = 16 * 1024 * 1024;
@@ -3580,19 +3590,40 @@ impl CodexCommandExecutor {
                 "shared daemon identity or workspace mismatch",
             ));
         }
-        if bootstrap
-            && socket
-                .receive_notification(std::time::Duration::ZERO)
-                .map_err(|_| DurableRunnerError::invalid("shared bootstrap observation lost"))?
-                .is_some()
-        {
+        let bootstrap_notification = if bootstrap {
+            loop {
+                let notification = socket
+                    .receive_notification(std::time::Duration::ZERO)
+                    .map_err(|_| DurableRunnerError::invalid("shared bootstrap observation lost"))?;
+                match notification {
+                    Some(warning) if is_shared_bootstrap_warning(&warning) => {
+                        self.state.as_mut().expect("prepared state").push_event(
+                            NormalizedProviderEvent {
+                                event_type: "harness.diagnostic".to_owned(),
+                                priority: EventPriority::P1,
+                                payload: json!({"code":"shared_bootstrap_warning","severity":"warning","warning":sanitize_value(&warning["params"])}),
+                            },
+                        )?;
+                        self.save_state()?;
+                    }
+                    intervention => break intervention,
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(notification) = bootstrap_notification {
             let state = self.state.as_mut().expect("prepared state");
             state.lifecycle = "reconciliation_required".to_owned();
             state.push_event(NormalizedProviderEvent{event_type:"harness.diagnostic".to_owned(),priority:EventPriority::P1,payload:json!({"code":"shared_native_intervention","origin":"unknown","phase":"bootstrap"})})?;
             self.save_state()?;
-            return Err(DurableRunnerError::invalid(
-                "shared bootstrap observation requires reconciliation",
-            ));
+            return Err(DurableRunnerError::invalid(format!(
+                "shared bootstrap observation requires reconciliation: {}",
+                notification
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or("request")
+            )));
         }
         let generation = state
             .provider_process_generation
@@ -6730,6 +6761,26 @@ impl CommandExecutor for CodexCommandExecutor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bootstrap_warning_does_not_authorize_execution_or_requests() {
+        use super::is_shared_bootstrap_warning;
+        use serde_json::json;
+        assert!(is_shared_bootstrap_warning(&json!({"method":"warning","params":{"threadId":"owned","message":"startup warning"}})));
+        for notification in [
+            json!({"id":1,"method":"warning","params":{"threadId":"owned"}}),
+            json!({"method":"warning","params":{"threadId":"owned","turnId":"turn"}}),
+            json!({"method":"warning","params":{"nested":{"item":{"id":"item"}}}}),
+            json!({"method":"warning","params":{"requestId":"request"}}),
+            json!({"method":"turn/started","params":{"threadId":"owned"}}),
+            json!({"method":"thread/status/changed","params":{"threadId":"owned"}}),
+            json!({"id":2,"method":"item/tool/call","params":{"threadId":"owned"}}),
+        ] {
+            assert!(
+                !is_shared_bootstrap_warning(&notification),
+                "{notification}"
+            );
+        }
+    }
     #[cfg(target_os = "macos")]
     mod shared_thread_name_tests {
         include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/shared_thread_name_tests.rs"));
