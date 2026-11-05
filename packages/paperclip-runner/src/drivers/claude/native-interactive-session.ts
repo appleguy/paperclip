@@ -13,6 +13,8 @@ import type { openClaudeNativeMcpBinding } from "./claude-native-mcp-binding.js"
 export interface ClaudeInteractiveSessionOptions {
   executable: string; cwd: string; sessionId: string; model: string; remoteControlName?: string;
   effort: ClaudeInteractiveLaunch["effort"]; autoCompactTokens?: number;
+  profile?: ClaudeInteractiveLaunch["profile"];
+  resume?: boolean;
   journalDirectory: string; ownerAuthority: ClaudeInteractiveOwnerAuthority;
   home: string; claudeConfigDir?: string;
   /** Reader must be explicitly bound to this namespace by its owner. */
@@ -81,7 +83,7 @@ export class ClaudeInteractiveSession {
           const args=[...launch.args], index=args.indexOf("--settings");
           if (index<0 || args[index+1]!=="{}") throw new Error("Claude hook settings unavailable");
           ingress=await ClaudeHookEventIngress.prepare({directory,executable:input.hookHelperExecutable!});
-          const hooks:Record<string,unknown>={SessionStart:[{matcher:"startup",hooks:[{type:"command",command:hook.sessionStartCommand(),timeout:15}]}]};
+          const hooks:Record<string,unknown>={SessionStart:[{matcher:"startup|resume",hooks:[{type:"command",command:hook.sessionStartCommand(),timeout:15}]}]};
           for(const event of ["UserPromptSubmit","PreToolUse","PostToolUse","PostToolUseFailure","PermissionDenied","Stop","StopFailure"]) hooks[event]=[{hooks:[{type:"command",command:ingress.hookCommand(),timeout:10}]}];
           args[index+1]=JSON.stringify({hooks});
           launch={...launch,args};
@@ -110,7 +112,7 @@ export class ClaudeInteractiveSession {
       written(operationId) { if (!journal) throw new Error("Claude owner journal unavailable"); return journal.written(operationId); },
     };
     try {
-      const controller=await ClaudeInteractiveController.launch({executable:input.executable,cwd:input.cwd,sessionId:input.sessionId,remoteControlName:input.remoteControlName,model:input.model,effort:input.effort,autoCompactTokens:input.autoCompactTokens ?? 200_000},factory,verifier,input.ownerAuthority,ownerJournal);
+      const controller=await ClaudeInteractiveController.launch({executable:input.executable,cwd:input.cwd,sessionId:input.sessionId,remoteControlName:input.remoteControlName,model:input.model,effort:input.effort,autoCompactTokens:input.autoCompactTokens ?? 200_000,profile:input.profile,resume:input.resume},factory,verifier,input.ownerAuthority,ownerJournal);
       returned=true;
       return new ClaudeInteractiveSession(controller,hookStart,ingress,input.mcpBinding ? closeMcp : undefined);
     } finally { try { await hook?.dispose(); } finally { if(!returned) { try { await ingress?.close(); } finally { await closeMcp(); } } } }

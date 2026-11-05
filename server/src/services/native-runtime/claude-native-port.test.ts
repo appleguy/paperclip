@@ -9,7 +9,19 @@ import { CONTROL_PLANE_CONFORMANCE_RESULT } from "../../vendor/paperclip-runner/
 import { ClaudeManagedSessions } from "../claude-native-presence.js";
 import { CLAUDE_INTERACTIVE_DRIVER_KIND } from "./claude-native-admission.js";
 import { ClaudeLiveSessionRegistry } from "./claude-native-live-sessions.js";
-import { startClaudeNativeSession } from "./claude-native-port.js";
+import { claudeNativePromptInput, startClaudeNativeSession } from "./claude-native-port.js";
+
+describe("Claude native terminal prompt submission", () => {
+  it("frames literal multiline text and submits it once", () => {
+    expect(claudeNativePromptInput("first\r\nsecond\rthird\tvalue")).toBe("\u001b[200~first\nsecond\nthird\tvalue\u001b[201~\r");
+  });
+  it("rejects terminal control injection and the size limit before writing", () => {
+    for (const text of ["", "  ", "bad\u001b[201~\rcommand", "bad\u0003", "bad\u0000", "a".repeat(65536)]) {
+      expect(() => claudeNativePromptInput(text)).toThrow(/claude_native_prompt_/);
+    }
+    expect(Buffer.byteLength(claudeNativePromptInput("a".repeat(65523)))).toBe(65536);
+  });
+});
 
 const support = await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("Claude native port over a real admitted run (zero inference)", () => {
@@ -59,10 +71,11 @@ const support = await getEmbeddedPostgresTestSupport();
     const h = start(f);
     const { port, authorizeWorkSessionResult } = await h.started;
     expect(h.launch).toHaveBeenCalledTimes(1);
-    expect(h.launched[0]).toMatchObject({ sessionId: f.nativeSessionId, model: "sonnet", effort: "high", autoCompactTokens: 200000 });
+    expect(h.launched[0]).toMatchObject({ sessionId: f.nativeSessionId, model: "sonnet", effort: "high", autoCompactTokens: 200000, profile: "enrolled" });
     const requestedName = h.launched[0]!.remoteControlName;
     expect(requestedName).toContain("Agent");
-    expect(requestedName).toContain(f.runId.slice(0, 8));
+    expect(requestedName).toContain(f.agentId.slice(0, 8));
+    expect(requestedName).not.toContain(f.runId.slice(0, 8));
     expect(requestedName).not.toContain("Task");
     const eventsForRun = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.runId));
     expect(eventsForRun).toEqual(expect.arrayContaining([expect.objectContaining({ eventType: "claude.remote_control.requested", payload: {
@@ -92,7 +105,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const events: Array<{ eventType: string; payload: unknown; sourceEventId: string }> = [];
     const reading = (async () => { for await (const event of session.events()) events.push(event as never); })();
     await session.startTurn({ message: { role: "user", text: "do the task" } } as never);
-    expect(h.control.ownerInput).toHaveBeenCalledWith(expect.objectContaining({ text: "do the task" }));
+    expect(h.control.ownerInput).toHaveBeenCalledWith(expect.objectContaining({ text: "\u001b[200~do the task\u001b[201~\r" }));
     // Visible text, owner input and Stop are not completion: nothing is emitted until finish is journaled.
     await new Promise((done) => setTimeout(done, 80));
     expect(events).toEqual([]);

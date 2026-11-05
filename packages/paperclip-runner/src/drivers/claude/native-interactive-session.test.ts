@@ -18,6 +18,14 @@ function fixture(directory:string) {
 }
 async function temp(){return mkdtemp("/Volumes/NVM/AI_Agent_Runtime/tmp/claude-session-test-");}
 describe("Claude interactive session composition",()=>{
+  it("refuses a saved enrolled conversation before spawning", async () => {
+    const dir = await temp();
+    try {
+      const f = fixture(dir);
+      await expect(ClaudeInteractiveSession.launch({ ...f.options, profile: "enrolled" })).rejects.toThrow("exclusive admission");
+      expect(f.start).not.toHaveBeenCalled();
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
   it("uses the real controller and journal with exact identity; no-tools and detach retain the owner process",async()=>{
     const dir=await temp();try{
       const f=fixture(dir), session=await ClaudeInteractiveSession.launch(f.options);

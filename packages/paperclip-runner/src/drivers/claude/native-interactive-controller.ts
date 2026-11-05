@@ -45,6 +45,10 @@ export interface ClaudeInteractiveLaunch {
   model: string;
   effort: "low" | "medium" | "high" | "max";
   autoCompactTokens: number;
+  /** Enrolled seats retain the owner's settings, hooks, tools and MCP servers. */
+  profile?: "qualification" | "enrolled";
+  /** Saved-session resume requires exclusive admission, which is not available yet. */
+  resume?: boolean;
 }
 export type ClaudeInteractiveStatus = {
   nativeSessionId: string;
@@ -57,7 +61,7 @@ export type ClaudeInteractiveStatus = {
 const uuid=/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const safeModel=/^[a-zA-Z0-9._-]{1,128}$/;
 
-/** Opt-in no-tools qualification profile, not a full executor or HarnessDriver.
+/** Native interactive launch, with an isolated no-tools qualification profile.
  * The PTY factory chooses an authorized environment; this boundary never copies
  * credentials, supplies prompts, or asserts the RC server accepted a connection. */
 export class ClaudeInteractiveController {
@@ -68,8 +72,12 @@ export class ClaudeInteractiveController {
   static async launch(input:ClaudeInteractiveLaunch, factory:ClaudeInteractivePtyFactory | undefined, verifier:ClaudeInteractiveVerifier, ownerAuthority?:ClaudeInteractiveOwnerAuthority, ownerJournal?:ClaudeInteractiveOwnerJournal):Promise<ClaudeInteractiveController> {
     if (!isAbsolute(input.executable) || !isAbsolute(input.cwd) || !uuid.test(input.sessionId) || !safeModel.test(input.model) || !["low","medium","high","max"].includes(input.effort) || !Number.isSafeInteger(input.autoCompactTokens) || input.autoCompactTokens < 100_000 || input.autoCompactTokens > 200_000) throw new Error("invalid Claude interactive launch configuration");
     const config=Object.freeze({...input,executable:resolve(input.executable),cwd:resolve(input.cwd)});
+    if (config.profile !== undefined && !["qualification", "enrolled"].includes(config.profile)) throw new Error("invalid Claude interactive profile");
+    if (config.resume !== undefined && typeof config.resume !== "boolean") throw new Error("invalid Claude resume mode");
     if (config.remoteControlName !== undefined && (!config.remoteControlName.trim() || config.remoteControlName.length > 256 || /[\x00-\x1f\x7f]/.test(config.remoteControlName))) throw new Error("invalid Claude Remote Control name");
-    const args=["--remote-control",...(config.remoteControlName ? [config.remoteControlName] : []),"--session-id",config.sessionId,"--autocompact",String(config.autoCompactTokens),"--model",config.model,"--effort",config.effort,"--setting-sources","","--settings","{}","--strict-mcp-config","--no-chrome","--tools",""];
+    if (config.resume || (config.profile === "enrolled" && await verifier.session(config.sessionId, config.cwd))) throw new Error("Claude saved session requires exclusive admission");
+    const enrolled = config.profile === "enrolled";
+    const args=["--remote-control",...(config.remoteControlName ? [config.remoteControlName] : []),"--session-id",config.sessionId,"--autocompact",String(config.autoCompactTokens),"--model",config.model,"--effort",config.effort,"--setting-sources",enrolled ? "user,project,local" : "","--settings","{}",...(enrolled ? ["--dangerously-skip-permissions"] : ["--strict-mcp-config"]),"--no-chrome","--tools",enrolled ? "default" : ""];
     const pty=await (factory ?? new ClaudeNativePtyFactory()).start({executable:config.executable,cwd:config.cwd,args});
     if (!Number.isSafeInteger(pty.pid) || pty.pid <= 0 || typeof pty.generation !== "string" || !pty.generation || pty.generation.length > 1024) throw new Error("invalid Claude PTY process identity; reconcile launch before retry");
     return new ClaudeInteractiveController(config,pty,verifier,ownerAuthority,ownerJournal);

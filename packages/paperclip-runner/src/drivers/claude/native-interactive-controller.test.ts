@@ -8,6 +8,30 @@ it("launches an explicit interactive no-tools PTY and distinguishes provisional 
 it("rejects mismatched identity and never signals a reused process",async()=>{const f=fixture(),c=await ClaudeInteractiveController.launch(config,f.factory,f.verifier);f.verifier.session.mockResolvedValue({sessionId:id,cwd:"/other"});await expect(c.observe()).rejects.toThrow("SDK identity");f.verifier.process.mockResolvedValue(false);await expect(c.stopOwnedProcess()).rejects.toThrow("process identity");expect(f.pty.stop).not.toHaveBeenCalled();});
 it("lets the owned PTY confirm an independently observed exit",async()=>{const f=fixture(),c=await ClaudeInteractiveController.launch(config,f.factory,f.verifier);f.verifier.process.mockResolvedValue(false);f.pty.hasExited=()=>true;await c.stopOwnedProcess();expect(f.pty.stop).toHaveBeenCalledOnce();});
 it("passes the descriptive remote session name as one argument",async()=>{const f=fixture();await ClaudeInteractiveController.launch({...config,remoteControlName:"SCO-337 · Agent · Task"},f.factory,f.verifier);expect(f.factory.start.mock.calls[0][0].args.slice(0,2)).toEqual(["--remote-control","SCO-337 · Agent · Task"]);});
+it("retains owner configuration for an enrolled seat", async () => {
+  const f = fixture();
+  await ClaudeInteractiveController.launch({ ...config, profile: "enrolled" }, f.factory, f.verifier);
+  const args = f.factory.start.mock.calls[0][0].args;
+  expect(args[args.indexOf("--setting-sources") + 1]).toBe("user,project,local");
+  expect(args[args.indexOf("--tools") + 1]).toBe("default");
+  expect(args).toContain("--dangerously-skip-permissions");
+  expect(args).not.toContain("--strict-mcp-config");
+  expect(args).not.toContain("--fork-session");
+});
+it("refuses explicit resume and saved enrolled sessions before spawning", async () => {
+  for (const launch of [{ resume: true }, { profile: "enrolled" as const }, { profile: "enrolled" as const, resume: false }]) {
+    const f = fixture();
+    f.verifier.session.mockResolvedValue({ sessionId: id, cwd: "/work" });
+    await expect(ClaudeInteractiveController.launch({ ...config, ...launch }, f.factory, f.verifier)).rejects.toThrow("exclusive admission");
+    expect(f.factory.start).not.toHaveBeenCalled();
+  }
+});
+it("does not spawn an enrolled session when saved-session lookup fails", async () => {
+  const f = fixture();
+  f.verifier.session.mockRejectedValue(new Error("metadata unavailable"));
+  await expect(ClaudeInteractiveController.launch({ ...config, profile: "enrolled" }, f.factory, f.verifier)).rejects.toThrow("metadata unavailable");
+  expect(f.factory.start).not.toHaveBeenCalled();
+});
 it("rejects unsafe bounds and retries a failed stop but latches a successful one",async()=>{const f=fixture();await expect(ClaudeInteractiveController.launch({...config,autoCompactTokens:250000},f.factory,f.verifier)).rejects.toThrow();expect(f.factory.start).not.toHaveBeenCalled();const c=await ClaudeInteractiveController.launch(config,f.factory,f.verifier);f.pty.stop.mockRejectedValueOnce(new Error("uncertain"));await expect(c.stopOwnedProcess()).rejects.toThrow("uncertain");await c.stopOwnedProcess();expect(f.pty.stop).toHaveBeenCalledTimes(2);await expect(c.stopOwnedProcess()).rejects.toThrow("stopping");});
 it("admits authorized owner input with durable reservation and reports delivery unknown",async()=>{
   const f=fixture(); const writeInput=vi.fn(); const authority={authorize:vi.fn(async()=>true)};
@@ -23,6 +47,14 @@ it("permits provisional bootstrap but never retries an existing reservation",asy
   const f=fixture(); const writeInput=vi.fn(); const journal={begin:vi.fn().mockResolvedValueOnce("reserved").mockResolvedValueOnce("existing"),written:vi.fn(async()=>{})};const c=await ClaudeInteractiveController.launch(config,{start:async()=>({...f.pty,writeInput})},f.verifier,{authorize:async()=>true},journal);
   expect(await c.ownerInput({operationId:"op1",text:"one\r"})).toMatchObject({binding:"provisional",delivery:"unknown"});
   await expect(c.ownerInput({operationId:"op1",text:"one\r"})).rejects.toThrow("outcome uncertain");expect(writeInput).toHaveBeenCalledTimes(1);expect(f.pty.stop).not.toHaveBeenCalled();
+});
+it("does not replay a terminal write when recording its outcome fails",async()=>{
+  const f=fixture(),writeInput=vi.fn();
+  const journal={begin:vi.fn().mockResolvedValueOnce("reserved").mockResolvedValueOnce("existing"),written:vi.fn(async()=>{throw new Error("journal unavailable");})};
+  const c=await ClaudeInteractiveController.launch(config,{start:async()=>({...f.pty,writeInput})},f.verifier,{authorize:async()=>true},journal);
+  await expect(c.ownerInput({operationId:"ambiguous",text:"hello\r"})).rejects.toThrow("outcome uncertain");
+  await expect(c.ownerInput({operationId:"ambiguous",text:"hello\r"})).rejects.toThrow("outcome uncertain");
+  expect(writeInput).toHaveBeenCalledOnce();expect(journal.written).toHaveBeenCalledOnce();
 });
 it("retries an uncertain stop and resolves once the process is already gone",async()=>{
   const f=fixture(),c=await ClaudeInteractiveController.launch(config,f.factory,f.verifier);

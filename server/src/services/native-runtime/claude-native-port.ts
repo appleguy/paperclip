@@ -32,6 +32,16 @@ export interface StartClaudeNativeSessionInput {
   pollMs?: number;
 }
 
+/** Submit one literal multiline prompt to the interactive editor. Owner input
+ * remains a separate raw-terminal operation (including explicit Ctrl-C). */
+export function claudeNativePromptInput(text: string): string {
+  const literal = text.replace(/\r\n?/g, "\n");
+  if (!literal.trim() || /[\x00-\x08\x0b-\x1f\x7f]/.test(literal)) throw new Error("claude_native_prompt_invalid");
+  const framed = `\u001b[200~${literal}\u001b[201~\r`;
+  if (Buffer.byteLength(framed, "utf8") > 65536) throw new Error("claude_native_prompt_too_large");
+  return framed;
+}
+
 async function defaultLaunch(options: Record<string, unknown>): Promise<ClaudeLaunchedControl> {
   const runner = await import("@paperclipai/paperclip-runner");
   const klass = (runner as unknown as { ClaudeInteractiveRunner?: { launch(input: Record<string, unknown>): Promise<ClaudeLaunchedControl> } }).ClaudeInteractiveRunner;
@@ -58,7 +68,8 @@ export async function startClaudeNativeSession(db: Db, input: StartClaudeNativeS
   const [issue] = await db.select({ identifier: issues.identifier }).from(issues).where(and(eq(issues.companyId, b.companyId), eq(issues.id, b.issueId))).limit(1);
   if (!agent || !issue) throw new Error("claude_session_name_scope_unavailable");
   const namePart = (value: string) => value.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 75);
-  const remoteControlName = [issue.identifier || b.issueId.slice(0, 8), agent.name, b.runId.slice(0, 8)].map(namePart).join(" · ");
+  // The enrolled seat's display identity survives successive task runs.
+  const remoteControlName = [agent.name, b.agentId.slice(0, 8)].map(namePart).join(" · ");
 
   const identity = Object.freeze({ runId: b.runId, sessionId: nativeSessionId, companyId: b.companyId, issueId: b.issueId, agentId: b.agentId });
   const admit = createClaudeNativeAdmission(db, {
@@ -96,7 +107,7 @@ export async function startClaudeNativeSession(db: Db, input: StartClaudeNativeS
   try {
     control = await (input.launch ?? defaultLaunch)({
       executable: input.host.claudeExecutable, cwd: resolve(cwd), sessionId: nativeSessionId, remoteControlName, model: execution.provider.model,
-      effort: execution.provider.effort, autoCompactTokens: execution.provider.autoCompactTokens, journalDirectory: directory,
+      effort: execution.provider.effort, autoCompactTokens: execution.provider.autoCompactTokens, journalDirectory: directory, profile: "enrolled",
       ownerAuthority: { authorize: async () => active.value }, home: input.host.home, claudeConfigDir: input.host.claudeConfigDir,
       sdk: await import("@anthropic-ai/claude-agent-sdk").then(({ getSessionInfo }) => ({ getSessionInfo, namespace: { home: input.host.home, claudeConfigDir: input.host.claudeConfigDir } })),
       hookHelperExecutable,
@@ -115,7 +126,7 @@ export async function startClaudeNativeSession(db: Db, input: StartClaudeNativeS
     identity, runnerInstanceId: input.runnerInstanceId, nativeSessionId,
     async verify() { await readReceipt(); await control.identity(); },
     readReceipt,
-    async dispatch(prompt: { id: string; text: string }) { await control.ownerInput({ operationId: prompt.id, text: prompt.text }); },
+    async dispatch(prompt: { id: string; text: string }) { await control.ownerInput({ operationId: prompt.id, text: claudeNativePromptInput(prompt.text) }); },
     async waitForReceipt(signal: AbortSignal) {
       for (;;) {
         signal.throwIfAborted();
