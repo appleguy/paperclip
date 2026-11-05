@@ -1,5 +1,5 @@
 import { receiptFingerprint } from "./receipt-fingerprint.js";
-import { agentAvatarUrl, resolveAgentAppearance, createCostEventSchema, createServiceCostEventSchema, normalizeCents, isUuidLike, type MoneyInput, type CostByUserReport } from "@paperclipai/shared";
+import { agentAvatarUrl, resolveAgentAppearance, createCostEventSchema, createServiceCostEventSchema, normalizeCents, isUuidLike, type MoneyInput, type CostByUserReport, type RunLedgerDailyReport, type RunLedgerDailyRow } from "@paperclipai/shared";
 import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, ne, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
@@ -12,6 +12,33 @@ import { visibleIssueCondition } from "./issue-visibility.js";
 
 import { resolveCostDateRange, type CostDateRange } from "./cost-date-range.js";
 export type { CostDateRange } from "./cost-date-range.js";
+
+interface RunLedgerGroupRow {
+  date: string;
+  agentId: string;
+  agentName: string;
+  status: string;
+  errorCode: string | null;
+  runCount: number | string;
+  inputTokens: number | string;
+  cachedInputTokens: number | string;
+  outputTokens: number | string;
+  costCents: number | string;
+  accountingPendingRuns: number | string;
+  retryRunCount: number | string;
+  scheduledRetryAttempts: number | string;
+  processLossRetryCount: number | string;
+  wastedRunCount: number | string;
+  wastedTokens: number | string;
+  wastedCostCents: number | string;
+}
+
+function reportNumber(value: number | string | null | undefined): number {
+  const parsed = Number(value ?? 0);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+const unsuccessfulRunStatuses = ["failed", "timed_out", "cancelled", "interrupted"] as const;
 
 const METERED_BILLING_TYPE = "metered_api";
 const SUBSCRIPTION_BILLING_TYPES = ["subscription_included", "subscription_overage"] as const;
@@ -368,6 +395,168 @@ export function costService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
         runtimeMs: Number(runRow?.runtimeMs ?? 0),
       };
     },
+
+    runLedgerDaily: (companyId: string, range?: CostDateRange): Promise<RunLedgerDailyReport> =>
+      withAccountingReadSnapshot(db, companyId, async tx => {
+        range = resolveCostDateRange(range);
+        const fromFilter = range?.from ? sql`AND coalesce(r.started_at, r.created_at) >= ${range.from}` : sql``;
+        const toFilter = range?.to ? sql`AND coalesce(r.started_at, r.created_at) <= ${range.to}` : sql``;
+        const queryRows = await tx.execute<RunLedgerGroupRow>(sql`
+          WITH run_scope AS (
+            SELECT r.*
+            FROM heartbeat_runs r
+            WHERE r.company_id = ${companyId}
+              ${fromFilter}
+              ${toFilter}
+          ), run_costs AS (
+            SELECT
+              c.heartbeat_run_id,
+              count(*)::int AS event_count,
+              coalesce(sum(CASE
+                WHEN c.receipt_hash IS NULL AND c.provider = 'openai' AND c.model NOT LIKE 'openai/_%'
+                  THEN greatest(0, c.input_tokens - c.cached_input_tokens)
+                ELSE c.input_tokens
+              END), 0)::double precision AS input_tokens,
+              coalesce(sum(c.cached_input_tokens), 0)::double precision AS cached_input_tokens,
+              coalesce(sum(c.output_tokens), 0)::double precision AS output_tokens,
+              coalesce(sum(c.cost_cents), 0)::double precision AS cost_cents
+            FROM cost_events c
+            JOIN run_scope scoped_run ON scoped_run.id = c.heartbeat_run_id
+            WHERE c.company_id = ${companyId}
+            GROUP BY c.heartbeat_run_id
+          ), run_rows AS (
+            SELECT
+              to_char(coalesce(r.started_at, r.created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD') AS date,
+              r.agent_id,
+              r.status,
+              r.error_code,
+              r.retry_of_run_id,
+              r.scheduled_retry_attempt,
+              r.process_loss_retry_count,
+              r.cost_accounting_pending,
+              CASE
+                WHEN c.heartbeat_run_id IS NOT NULL THEN c.input_tokens
+                WHEN r.usage_json->>'rawInputIncludesCached' = 'true'
+                  THEN greatest(0, ${sql<number>`CASE WHEN coalesce(r.usage_json->>'inputTokens', '') ~ '^[0-9]+$' THEN (r.usage_json->>'inputTokens')::double precision ELSE 0 END`} - ${sql<number>`CASE WHEN coalesce(r.usage_json->>'cachedInputTokens', '') ~ '^[0-9]+$' THEN (r.usage_json->>'cachedInputTokens')::double precision ELSE 0 END`})
+                ELSE ${sql<number>`CASE WHEN coalesce(r.usage_json->>'inputTokens', '') ~ '^[0-9]+$' THEN (r.usage_json->>'inputTokens')::double precision ELSE 0 END`}
+              END AS input_tokens,
+              CASE
+                WHEN c.heartbeat_run_id IS NOT NULL THEN c.cached_input_tokens
+                ELSE ${sql<number>`CASE WHEN coalesce(r.usage_json->>'cachedInputTokens', '') ~ '^[0-9]+$' THEN (r.usage_json->>'cachedInputTokens')::double precision ELSE 0 END`}
+              END AS cached_input_tokens,
+              CASE
+                WHEN c.heartbeat_run_id IS NOT NULL THEN c.output_tokens
+                ELSE ${sql<number>`CASE WHEN coalesce(r.usage_json->>'outputTokens', '') ~ '^[0-9]+$' THEN (r.usage_json->>'outputTokens')::double precision ELSE 0 END`}
+              END AS output_tokens,
+              coalesce(c.cost_cents, 0)::double precision AS cost_cents
+            FROM run_scope r
+            LEFT JOIN run_costs c ON c.heartbeat_run_id = r.id
+          ), status_groups AS (
+            SELECT
+              date,
+              agent_id,
+              status,
+              CASE WHEN status IN ('failed', 'timed_out', 'cancelled', 'interrupted') THEN nullif(error_code, '') ELSE NULL END AS error_code,
+              count(*)::int AS run_count,
+              coalesce(sum(input_tokens), 0)::double precision AS input_tokens,
+              coalesce(sum(cached_input_tokens), 0)::double precision AS cached_input_tokens,
+              coalesce(sum(output_tokens), 0)::double precision AS output_tokens,
+              coalesce(sum(cost_cents), 0)::double precision AS cost_cents,
+              count(*) FILTER (WHERE cost_accounting_pending)::int AS accounting_pending_runs,
+              count(*) FILTER (WHERE retry_of_run_id IS NOT NULL OR scheduled_retry_attempt > 0)::int AS retry_run_count,
+              coalesce(sum(scheduled_retry_attempt), 0)::int AS scheduled_retry_attempts,
+              coalesce(sum(process_loss_retry_count), 0)::int AS process_loss_retry_count,
+              count(*) FILTER (
+                WHERE status IN ('failed', 'timed_out', 'cancelled', 'interrupted')
+                  AND (input_tokens + cached_input_tokens + output_tokens > 0 OR cost_cents > 0)
+              )::int AS wasted_run_count,
+              coalesce(sum(CASE WHEN status IN ('failed', 'timed_out', 'cancelled', 'interrupted')
+                THEN input_tokens + cached_input_tokens + output_tokens ELSE 0 END), 0)::double precision AS wasted_tokens,
+              coalesce(sum(CASE WHEN status IN ('failed', 'timed_out', 'cancelled', 'interrupted')
+                THEN cost_cents ELSE 0 END), 0)::double precision AS wasted_cost_cents
+            FROM run_rows
+            GROUP BY date, agent_id, status,
+              CASE WHEN status IN ('failed', 'timed_out', 'cancelled', 'interrupted') THEN nullif(error_code, '') ELSE NULL END
+          )
+          SELECT
+            g.date,
+            g.agent_id AS "agentId",
+            a.name AS "agentName",
+            g.status,
+            g.error_code AS "errorCode",
+            g.run_count AS "runCount",
+            g.input_tokens AS "inputTokens",
+            g.cached_input_tokens AS "cachedInputTokens",
+            g.output_tokens AS "outputTokens",
+            g.cost_cents AS "costCents",
+            g.accounting_pending_runs AS "accountingPendingRuns",
+            g.retry_run_count AS "retryRunCount",
+            g.scheduled_retry_attempts AS "scheduledRetryAttempts",
+            g.process_loss_retry_count AS "processLossRetryCount",
+            g.wasted_run_count AS "wastedRunCount",
+            g.wasted_tokens AS "wastedTokens",
+            g.wasted_cost_cents AS "wastedCostCents"
+          FROM status_groups g
+          JOIN agents a ON a.id = g.agent_id AND a.company_id = ${companyId}
+          ORDER BY g.date DESC, a.name ASC, g.status ASC, g.error_code ASC
+        `);
+
+        const dailyRows = new Map<string, RunLedgerDailyRow>();
+        for (const row of queryRows) {
+          const key = `${row.date}:${row.agentId}`;
+          const daily = dailyRows.get(key) ?? {
+            date: row.date,
+            agentId: row.agentId,
+            agentName: row.agentName,
+            runCount: 0,
+            succeeded: 0,
+            failed: 0,
+            timedOut: 0,
+            cancelled: 0,
+            interrupted: 0,
+            other: 0,
+            errorCauses: {},
+            inputTokens: 0,
+            cachedInputTokens: 0,
+            outputTokens: 0,
+            costCents: 0,
+            accountingPendingRuns: 0,
+            retryRunCount: 0,
+            scheduledRetryAttempts: 0,
+            processLossRetryCount: 0,
+            wastedRunCount: 0,
+            wastedTokens: 0,
+            wastedCostCents: 0,
+          };
+          const runCount = reportNumber(row.runCount);
+          daily.runCount += runCount;
+          switch (row.status) {
+            case "succeeded": daily.succeeded += runCount; break;
+            case "failed": daily.failed += runCount; break;
+            case "timed_out": daily.timedOut += runCount; break;
+            case "cancelled": daily.cancelled += runCount; break;
+            case "interrupted": daily.interrupted += runCount; break;
+            default: daily.other += runCount;
+          }
+          if ((unsuccessfulRunStatuses as readonly string[]).includes(row.status)) {
+            const cause = row.errorCode?.trim() || "unknown";
+            daily.errorCauses[cause] = (daily.errorCauses[cause] ?? 0) + runCount;
+          }
+          daily.inputTokens += reportNumber(row.inputTokens);
+          daily.cachedInputTokens += reportNumber(row.cachedInputTokens);
+          daily.outputTokens += reportNumber(row.outputTokens);
+          daily.costCents += reportNumber(row.costCents);
+          daily.accountingPendingRuns += reportNumber(row.accountingPendingRuns);
+          daily.retryRunCount += reportNumber(row.retryRunCount);
+          daily.scheduledRetryAttempts += reportNumber(row.scheduledRetryAttempts);
+          daily.processLossRetryCount += reportNumber(row.processLossRetryCount);
+          daily.wastedRunCount += reportNumber(row.wastedRunCount);
+          daily.wastedTokens += reportNumber(row.wastedTokens);
+          daily.wastedCostCents += reportNumber(row.wastedCostCents);
+          dailyRows.set(key, daily);
+        }
+        return { rows: Array.from(dailyRows.values()) };
+      }),
 
     byUser: (companyId: string, range?: CostDateRange): Promise<CostByUserReport> => withAccountingReadSnapshot(db, companyId, async tx => {
       // Keep membership, identity and spend in one non-blocking read snapshot.

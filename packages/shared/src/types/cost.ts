@@ -216,3 +216,33 @@ export interface CostByProject {
   cachedInputTokens: number;
   outputTokens: number;
 }
+
+/** Daily per-agent rollup over the durable heartbeat run and cost ledgers. */
+export interface RunLedgerDailyRow {
+  date: string;
+  agentId: string;
+  agentName: string;
+  runCount: number;
+  succeeded: number;
+  failed: number;
+  timedOut: number;
+  cancelled: number;
+  interrupted: number;
+  other: number;
+  errorCauses: Record<string, number>;
+  inputTokens: number;
+  cachedInputTokens: number;
+  outputTokens: number;
+  costCents: number;
+  accountingPendingRuns: number;
+  retryRunCount: number;
+  scheduledRetryAttempts: number;
+  processLossRetryCount: number;
+  wastedRunCount: number;
+  wastedTokens: number;
+  wastedCostCents: number;
+}
+
+export interface RunLedgerDailyReport {
+  rows: RunLedgerDailyRow[];
+}

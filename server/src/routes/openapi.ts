@@ -5783,6 +5783,7 @@ const costReportQuerySchema = z.object({
 
 const costSummaryPaths = [
   "summary",
+  "run-ledger",
   "by-agent",
   "by-user",
   "by-agent-model",

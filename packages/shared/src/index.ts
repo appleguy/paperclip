@@ -1241,6 +1241,8 @@ export type {
   CostByAgentModel,
   CostWindowSpendRow,
   CostByProject,
+  RunLedgerDailyRow,
+  RunLedgerDailyReport,
   FinanceEvent,
   FinanceSummary,
   FinanceByBiller,

@@ -31,6 +31,7 @@ import { EmptyState } from "../components/EmptyState";
 import { FinanceBillerCard } from "../components/FinanceBillerCard";
 import { FinanceKindCard } from "../components/FinanceKindCard";
 import { FinanceTimelineCard } from "../components/FinanceTimelineCard";
+import { RunLedgerPanel } from "../components/RunLedgerPanel";
 import { Identity } from "../components/Identity";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { PageTabBar } from "../components/PageTabBar";
@@ -47,7 +48,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 const NO_COMPANY = "__none__";
-export type CostsMainTab = "overview" | "budgets" | "providers" | "billers" | "finance" | "decisions" | "fast-responses";
+export type CostsMainTab = "overview" | "run-ledger" | "budgets" | "providers" | "billers" | "finance" | "decisions" | "fast-responses";
 
 export interface CostsProps {
   /** Render inside Audit without a second page-level title or breadcrumb. */
@@ -211,7 +212,7 @@ export function Costs({
 
   useEffect(() => {
     const tab = searchParams.get("tab");
-    setMainTab(!lockTab && tab && ["overview", "providers", "billers", "finance", "budgets", "decisions", "fast-responses"].includes(tab) ? tab as CostsMainTab : initialTab);
+    setMainTab(!lockTab && tab && ["overview", "run-ledger", "providers", "billers", "finance", "budgets", "decisions", "fast-responses"].includes(tab) ? tab as CostsMainTab : initialTab);
   }, [initialTab, lockTab, searchParams]);
 
   const [today, setToday] = useState(() => new Date().toDateString());
@@ -306,6 +307,13 @@ export function Costs({
       return { summary, byAgent, byProject, byAgentModel };
     },
     enabled: !!selectedCompanyId && customReady && showSummaryChrome,
+    refetchInterval: 30_000,
+  });
+
+  const { data: runLedgerData, isLoading: runLedgerLoading, error: runLedgerError } = useQuery({
+    queryKey: [...queryKeys.costs(companyId, reportQueryFrom, reportQueryTo), "run-ledger"],
+    queryFn: () => costsApi.runLedger(companyId, from || undefined, to || undefined),
+    enabled: !!selectedCompanyId && customReady && mainTab === "run-ledger",
     refetchInterval: 30_000,
   });
 
@@ -742,6 +750,7 @@ export function Costs({
           <div className="max-w-full overflow-x-auto pb-2">
             <TabsList variant="line" className="justify-start">
               <TabsTrigger value="overview">Overview</TabsTrigger>
+              <TabsTrigger value="run-ledger">Runs</TabsTrigger>
               {!hideBudgetsTab ? <TabsTrigger value="budgets">Budgets</TabsTrigger> : null}
               <TabsTrigger value="providers">Providers</TabsTrigger>
               <TabsTrigger value="billers">Billers</TabsTrigger>
@@ -754,6 +763,11 @@ export function Costs({
 
         <TabsContent value="fast-responses" className="mt-4">{showCustomPrompt ? <p className="text-sm text-muted-foreground">Select a start and end date to load data.</p> : <FastResponseHistory companyId={companyId} from={from} to={to} />}</TabsContent>
         <TabsContent value="decisions" className="mt-4">{showCustomPrompt ? <p className="text-sm text-muted-foreground">Select a start and end date to load data.</p> : <DecisionHistory companyId={companyId} from={from} to={to} />}</TabsContent>
+        <TabsContent value="run-ledger" className="mt-4">
+          {showCustomPrompt ? <p className="text-sm text-muted-foreground">Select a start and end date to load data.</p> : (
+            <RunLedgerPanel report={runLedgerData} isLoading={runLedgerLoading} error={runLedgerError} />
+          )}
+        </TabsContent>
         <TabsContent value="overview" className="mt-4 space-y-4">
           {showCustomPrompt ? (
             <p className="text-sm text-muted-foreground">Select a start and end date to load data.</p>
