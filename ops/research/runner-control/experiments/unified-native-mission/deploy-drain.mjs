@@ -6,6 +6,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { execFileSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 
 const SCRATCH = "/Volumes/NVM/AI_Agent_Runtime/tmp";
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -160,15 +161,37 @@ async function isVerified(client, sha) {
     (typeof health.commit !== "string" || health.commit === sha);
 }
 async function status(client) {
-  const value = await client.api("GET", "/api/instance/task-drain");
+  const value = await client.api("GET", "/api/instance/task-drain?upgradeReadiness=1");
   ensure(object(value) && typeof value.draining === "boolean" &&
     Number.isInteger(value.activeRuns) && Number.isInteger(value.pendingWakes), "invalid drain response");
   return value;
 }
 async function held(client, manifest) {
   const s = await status(client);
-  ensure(s.draining && s.startedAt === manifest.startedAt, "deploy admission fence was lost or replaced");
+  ensure(s.draining && s.serverPid === manifest.serverPid && s.ownerId === manifest.ownerId &&
+    s.startedAt === manifest.startedAt, "deploy admission fence was lost or replaced");
   return s;
+}
+
+export function deployOwner(pid) {
+  ensure(Number.isSafeInteger(pid) && pid > 1 && process.platform === "darwin", "invalid deploy shell identity");
+  const birth = execFileSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], {
+    encoding: "utf8", timeout: 2000, env: { PATH: "/usr/bin:/bin", LC_ALL: "C", TZ: "UTC" },
+  }).trim().replace(/\s+/g, " ");
+  ensure(/^[A-Za-z]{3} [A-Za-z]{3} \d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/.test(birth), "invalid deploy shell birth");
+  return { pid, birth: "darwin:" + birth };
+}
+
+export async function releaseOwned(client, record) {
+  const s = await status(client);
+  if (!s.draining || s.serverPid !== record.serverPid || s.ownerId !== record.ownerId) return false;
+  try {
+    await client.api("DELETE", "/api/instance/task-drain?ownerId=" + encodeURIComponent(record.ownerId));
+    return true;
+  } catch (error) {
+    if (error instanceof Error && error.message === "local DELETE returned HTTP 409") return false;
+    throw error;
+  }
 }
 
 // Legacy manifests encode the deploy shell PID in their filename. A reused
@@ -530,29 +553,33 @@ async function main() {
     await reclaimOrphan(client);
     const before = await client.api("GET", "/api/instance/task-drain?upgradeReadiness=1");
     ensure(!before.draining && Number.isInteger(before.serverPid), "another task drain owns admission");
-    const started = await client.api("POST", "/api/instance/task-drain", { ttlMs: 1_200_000 });
-    ensure(typeof started?.startedAt === "string", "task drain did not acknowledge start");
-    const record = { schema: 1, startedAt: started.startedAt, serverPid: before.serverPid,
-      manifestFile: file, phase: "draining", runs: [], orphans: [], createdAt: now(), evidence: [] };
+    const ownerId = randomUUID();
+    const owner = deployOwner(process.ppid);
+    const record = { schema: 1, ownerId, deployOwner: owner, serverPid: before.serverPid,
+      manifestFile: file, phase: "starting", runs: [], orphans: [], createdAt: now(), evidence: [] };
+    await writePrivate(file, record);
     try {
+      const started = await client.api("POST", "/api/instance/task-drain", {
+        purpose: "deploy", ownerId, deployOwner: owner, ttlMs: 1_200_000,
+      });
+      ensure(typeof started?.startedAt === "string" && started.ownerId === ownerId,
+        "task drain did not acknowledge deploy ownership");
+      record.startedAt = started.startedAt;
+      record.phase = "draining";
       await writePrivate(file, record);
       await held(client, record);
     } catch (error) {
-      const current = await status(client).catch(() => null);
-      if (current?.draining && current.startedAt === started.startedAt) {
-        await client.api("DELETE", "/api/instance/task-drain").catch(() => {});
-      }
+      await releaseOwned(client, record).catch(() => {});
       throw error;
     }
     console.log("deploy-drain: admission fenced; active runs may finish normally");
     return;
   }
   const record = await readJson(file);
-  ensure(record.schema === 1 && typeof record.startedAt === "string", "invalid private drain manifest");
+  ensure(record.schema === 1 && UUID.test(record.ownerId || "") && Number.isInteger(record.serverPid),
+    "invalid private drain manifest");
   if (action === "release") {
-    const s = await status(client);
-    if (s.draining && s.startedAt === record.startedAt) {
-      await client.api("DELETE", "/api/instance/task-drain");
+    if (await releaseOwned(client, record)) {
       console.log("deploy-drain: admission restored after aborted deploy");
     } else {
       console.log("deploy-drain: original admission fence is no longer owned; no mutation");
@@ -560,6 +587,7 @@ async function main() {
     record.phase = "released"; await writePrivate(file, record);
     return;
   }
+  ensure(typeof record.startedAt === "string", "drain did not finish starting");
   if (action === "finish") {
     ensure(typeof extra === "string" && /^[0-9a-f]{40}$/.test(extra), "exact installed SHA required");
     const { state } = await waitForRestartReady(async () => {
