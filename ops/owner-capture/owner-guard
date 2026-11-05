@@ -1,0 +1,386 @@
+#!/bin/sh
+# SCO-687/712/722: owner-typed steering can never be lost to /clear, compaction, restart or a task switch.
+# One ledger, one truth: $STATE/open/<sid>.jsonl. A record is open until `close` (persisted as issue/comment/tag edit, answered, dropped).
+#   capture   UserPromptSubmit hook (Claude, Codex; OpenCode plugin): record owner prompt at receipt
+#   resume    SessionStart hook: show + adopt open records of this session, this process (/clear) or a dead process in this seat (restart)
+#   gate      Stop hook (Claude, Codex): block turn end while this session holds open records (once per stop; escalation owns the rest);
+#             SCO-756 goal layer: with an active managed goal, also while the seat holds workable issues (no-progress escape)
+#   close ID REASON | open [MIN] | list (open records, JSONL) | note SRC [REASON] (stdin text; SCO-747 Steering page) | watch-check (SCO-865: reopen records closed against a stalled or cancelled issue) | escalate [MIN] | tick | fleet [DAYS] | codex-trust [--check] | scan TRANSCRIPT | guard [TRANSCRIPT]
+# Owner typing = user message w/o From:/To: envelope and not a known automated injection (AUTO regex).
+set -eu
+G=/Volumes/NVM/Paperclip/ops/owner-capture/owner-guard
+# automated injections that are never owner typing (peer mail, watchdogs, restart/compaction boilerplate, Paperclip wakes, our own gate)
+AUTO='^\s*(\[(peer|OpenRig|watcher|watchdog|OpenRig watchdog)|Urgent \(marked by|Self-handoff|/compact|OpenRig|Recovered queue|Restore audit|[0-9]+ message\(s\) waiting|Delivery |You are a bounded worker|You are agent [0-9a-f-]{36}|SCO-[0-9]+ Step |OWNER STEERING OPEN|You are an agent in a Paperclip company|## Paperclip Wake Payload|Paperclip task context|Paperclip may post a short platform-generated|The following is the Codex agent history added since your last approval|Paperclip has materialized selected runtime skills|The previous response was interrupted\. Continue from where you left off|Your task is to predict the single next message)'
+STATE=${OWNER_GUARD_STATE:-/Volumes/NVM/Paperclip/ops/owner-capture/state}
+API=/Volumes/NVM/Paperclip/bin/api
+mkdir -p "$STATE"
+
+# OpenCode keeps one db per XDG_DATA_HOME: the default plus every per-backend seat (backends/*/data, SCO-721); OPENCODE_DB pins one (tests)
+ocdbs() { if [ -n "${OPENCODE_DB:-}" ]; then printf "%s\n" "$OPENCODE_DB"; return; fi
+  ls "$HOME/.local/share/opencode/opencode.db" /Volumes/NVM/Paperclip/backends/*/data/opencode/opencode.db /Volumes/NVM/Research/*/*/data/opencode/opencode.db 2>/dev/null || true; }
+ocv2() { [ -n "$(sqlite3 -readonly "$1" "select 1 from sqlite_master where name='session_v2'" 2>/dev/null)" ]; } # OpenCode 2.2.x schema
+ocsess() { if ocv2 "$1"; then echo session_v2; else echo session; fi; }
+ocdb_of() { # SESSION_ID[@DB] -> db holding it
+  case "$1" in *@*) printf "%s" "${1#*@}"; return;; esac
+  for d in $(ocdbs); do [ -n "$(sqlite3 -readonly "$d" "select 1 from $(ocsess "$d") where id='$1'" 2>/dev/null)" ] && { printf "%s" "$d"; return; }; done; }
+scan_codex() { # rollout jsonl: plain user messages, minus injected context/envelopes
+  jq -c -n --arg auto "$AUTO" --arg from "${2:-0}" '
+    def txt: [.[]?|select(.type=="input_text")|.text]|join("\n");
+    [inputs] as $all | select(($all[0].payload.source // "") != "exec") # codex exec is non-interactive, never owner-typed (SCO-899)
+    | ($all[0].payload.id // "codex") as $sid | ($all[0].payload.cwd // "") as $cwd | range(0;$all|length) as $i | $all[$i] as $r | ($i+1) as $ln
+    | select($ln > ($from|tonumber))
+    | select($r.type=="response_item" and $r.payload.type=="message" and $r.payload.role=="user")
+    | ($r.payload.content|txt) as $t
+    | select($t|length>0)
+    | select($t|test("^\\s*(<|# AGENTS.md|\\{\"schema\"|From:|To:)")|not) | select($t|test($auto)|not) | select($t|test("## Paperclip Wake Payload|Paperclip task context:")|not)
+    | {line:$ln, ts:$r.timestamp, sid:$sid, cwd:$cwd, src:"codex", text:$t}' < "$1"
+}
+scan_opencode() { # SESSION_ID[@DB] [FROM_N]: user text (n = ordinal within session, or seq on 2.2.x), minus compaction/synthetic/wakes
+  db=$(ocdb_of "$1"); set -- "${1%%@*}" "${2:-0}"; [ -n "$db" ] || return 0
+  if ocv2 "$db"; then # 2.2.x: session_message type=user (synthetic/compaction are their own types)
+    sqlite3 -readonly -json "$db" "select m.seq as line, m.time_created as ts, m.session_id as sid, coalesce(s.directory,'') as cwd, 'opencode' as src, json_extract(m.data,'\$.text') as text
+      from session_message m left join session_v2 s on s.id=m.session_id where m.session_id='$1' and m.type='user' and json_extract(m.data,'\$.text') not like '{\"schema\"%'"
+  else
+  sqlite3 -readonly -json "$db" "select row_number() over (order by p.time_created,p.id) as line, p.time_created as ts, m.session_id as sid, coalesce(s.directory,'') as cwd, 'opencode' as src, json_extract(p.data,'\$.text') as text
+    from part p join message m on m.id=p.message_id left join session s on s.id=m.session_id where m.session_id='$1' and json_extract(m.data,'\$.role')='user' and json_extract(p.data,'\$.type')='text'
+    and coalesce(json_extract(p.data,'\$.synthetic'),0)=0 and json_extract(p.data,'\$.text') not like '{\"schema\"%'
+    and not exists (select 1 from part q where q.message_id=m.id and json_extract(q.data,'\$.type')='compaction')"
+  fi |
+  jq -c --arg auto "$AUTO" --arg from "${2:-0}" '.[]? | select(.line > ($from|tonumber)) | select(.text|test($auto)|not) | select(.text|test("^\\s*<(conversation-checkpoint|shell|tool_result|tool-result)\\b|## Paperclip Wake Payload|Paperclip task context:|^\\s*Paperclip may post a short|^\\s*Paperclip access: use the paperclip-run MCP tools")|not)
+    | select(.text|test("^\\s*\"?(Respond with hello\\.?|Reply with the single word ok\\.?|Read probe\\.txt with the read tool|NAR live proof\\. Reply with exactly)")|not)' # adapter preamble + health probes
+}
+
+scan() { # TRANSCRIPT [FROM_LINE]
+  case "$1" in
+    */rollout-*.jsonl) scan_codex "$@"; return ;;
+    opencode:*) scan_opencode "${1#opencode:}" "${2:-0}"; return ;;
+  esac
+  jq -c -n --arg auto "$AUTO" --arg from "${2:-0}" '
+    def txt: if type=="string" then . else ([.[]?|select(.type=="text")|.text]|join("\n")) end;
+    def owner: (. // "") | select(length>0)
+      | select(test("^\\s*<(channel|system-reminder|local-command|command-name|task-notification|pasted|conversation-checkpoint|cross-session-message)")|not)
+      | select(test("^\\s*(From|To):")|not) | select(test($auto)|not)
+      | select(test("^\\s*(\\[Request interrupted|This session is being continued)")|not);
+    [inputs] as $all | range(0;$all|length) as $i | $all[$i] as $r | ($i+1) as $ln
+    | select($ln > ($from|tonumber))
+    | ( if ($r.type=="user" and ($r.isMeta|not) and ($r.isSidechain|not) and (($r.message.content|type)=="string" or (($r.message.content|type)=="array" and ([$r.message.content[]?|.type]|all(.=="text")))))
+          then ($r.message.content|txt|owner)
+        elif ($r.attachment.type=="queued_command" and ($r.attachment.origin.kind=="human" or $r.attachment.humanTurn==true))
+          then ($r.attachment.prompt|txt|owner)
+        else empty end ) as $t
+    | {line:$ln, ts:($r.timestamp//$r.attachment.timestamp), sid:$r.sessionId, cwd:($r.cwd//""), src:"claude", text:$t}' < "$1"
+}
+
+sid_of() { # TRANSCRIPT-or-opencode:ID -> session id
+  if [ "${1#opencode:}" != "$1" ]; then x=${1#opencode:}; printf '%s' "${x%%@*}"; return; fi
+  b=$(basename "$1" .jsonl)
+  case "$b" in rollout-*) printf '%s' "$b" | sed -E 's/^.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/\1/';; *) printf '%s' "$b";; esac
+}
+# Codex homes: the owner's plus Paperclip's per-company homes (their rollouts are owner-steerable via Remote Control too)
+codex_homes() { printf '%s\n' "$HOME/.codex"; ls -d "$HOME"/.paperclip/instances/*/companies/*/codex-home 2>/dev/null || true; }
+transcripts() { # DAYS [NEWER_THAN_FILE]: candidate transcripts for fleet sync
+  nw=; [ -n "${2:-}" ] && [ -e "$2" ] && nw="-newer $2"
+  find "$HOME/.claude/projects" -maxdepth 2 -name '*.jsonl' -mtime -"$1" $nw 2>/dev/null || true
+  for h in $(codex_homes); do find "$h/sessions" -name 'rollout-*.jsonl' -mtime -"$1" $nw 2>/dev/null || true; done
+  for d in $(ocdbs); do sqlite3 -readonly "$d" "select 'opencode:'||id||'@$d' from $(ocsess "$d") where time_updated > (strftime('%s','now')-$1*86400)*1000" 2>/dev/null || true; done
+}
+
+# ---- durable ledger: {id:"<s8>:<h6>",ts,sid,cwd,proc,src,text} opens; {id,close,ts} closes; {id,adopt,proc,ts} hand-overs; {id,escalated,ts}.
+OPEN=$STATE/open
+OWNER_JQ='def owner: (. // "") | select(length>0)
+  | select(test("## Paperclip Wake Payload|Paperclip task context:|Paperclip run [0-9a-f-]{36}")|not)
+  | select(test("^\\s*<(channel|system-reminder|local-command|command-name|task-notification|pasted|conversation-checkpoint|cross-session-message)")|not)
+  | select(test("^\\s*(From|To):")|not) | select(test($auto)|not)
+  | select(test("^\\s*(\\[Request interrupted|This session is being continued)")|not);'
+# current state per id: base record + holder (last adopter or capturer), its process, closed, escalated
+STATE_JQ='group_by(.id) | map(select(any(.[]; .text != null)) | . as $e | (map(select(.text != null))[0]) as $b | (map(select(.adopt != null))|last) as $a
+  | ([range(0;length)|select($e[.].reopen != null)]|last // -1) as $ri # SCO-865: a reopen event after a close makes the record open again; escalation restarts after it
+  | $b + {holder: ($a.adopt // $b.sid), proc: ($a.proc // $b.proc // ""), closed: ((map(select(.close != null or .reopen != null))|last|.close) != null),
+      escalated: ([range(0;length)|select(. > $ri and $e[.].escalated != null)|$e[.].escalated]|last), reopened: (map(select(.reopen != null))|last|.ts), why: (map(select(.reopen != null))|last|.reopen)})'
+nowz() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+lstart() { ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//;s/ /_/g'; }
+proc_key() { # agent process identity pid@start: stable across /clear and compaction, new on restart
+  p=${OWNER_GUARD_PID:-} # tests only; otherwise the nearest claude/codex/opencode ancestor (CLAUDE_PID leaks into child agents)
+  if [ -z "$p" ]; then q=$PPID; i=0
+    while [ "$i" -lt 6 ] && [ "${q:-1}" -gt 1 ]; do
+      case "$(ps -o comm= -p "$q" 2>/dev/null)" in *claude*|*codex*|*opencode*) p=$q; break;; esac
+      q=$(ps -o ppid= -p "$q" 2>/dev/null | tr -d ' '); i=$((i+1))
+    done
+  fi
+  [ -n "$p" ] && printf '%s@%s' "$p" "$(lstart "$p")"; return 0
+}
+alive() { case "$1" in ''|*@) return 1;; esac; [ "$(lstart "${1%%@*}")" = "${1#*@}" ]; }
+ledger_add() { # stdin: JSONL {ts,sid,text[,cwd,proc,src]} ; $1 = cwd override. Dedupe by id or normalized text; closed stays closed.
+  mkdir -p "$OPEN"
+  while IFS= read -r m; do
+    sid=$(printf '%s' "$m" | jq -r .sid); [ -n "$sid" ] && [ "$sid" != null ] || continue
+    f="$OPEN/$sid.jsonl"; h=$(printf '%s' "$m" | jq -j .text | shasum | cut -c1-6)
+    id="$(printf %.8s "$sid"):$h"
+    if [ -r "$f" ]; then
+      grep -q "\"id\":\"$id\"" "$f" && continue
+      nt=$(printf '%s' "$m" | jq -r '.text|.[0:4000]|gsub("\\s+";"")')
+      jq -e --arg t "$nt" 'select(.text != null and (.text|gsub("\\s+";""))==$t)' "$f" >/dev/null 2>&1 && continue
+    fi
+    printf '%s' "$m" | jq -c --arg id "$id" --arg cwd "$1" '{id:$id,ts:(.ts|if type=="number" then (./1000|floor|todate) else sub("\\.[0-9]+Z$";"Z") end),sid,
+      cwd:(if $cwd != "" then $cwd else (.cwd // "") end),proc:(.proc // ""),src:(.src // ""),text:(.text|.[0:4000])}' >> "$f"
+  done
+}
+capture() { # UserPromptSubmit hook: record the owner prompt at receipt, before the model sees it
+  case "${CLAUDE_CODE_ENTRYPOINT:-}" in sdk-*) exit 0;; esac # claude -p / SDK workers: never owner typing
+  in=$(cat 2>/dev/null || true)
+  rt=$(printf '%s' "$in" | jq -r '.transcript_path // empty' 2>/dev/null) # codex exec: non-interactive, never owner typing (SCO-899)
+  case "$rt" in *rollout-*) [ -f "$rt" ] && [ "$(head -1 "$rt" | jq -r '.payload.source // empty' 2>/dev/null)" = exec ] && exit 0;; esac
+  m=$(printf '%s' "$in" | jq -c --arg auto "$AUTO" --arg ts "$(nowz)" --arg proc "$(proc_key)" --arg src "${OWNER_GUARD_SRC:-}" "$OWNER_JQ"' (.prompt|owner) as $t
+    | {ts:$ts,sid:.session_id,text:$t,cwd:(.cwd//""),proc:$proc,src:(if $src != "" then $src elif ((.transcript_path//"")|test("rollout-")) then "codex" else "claude" end)}' 2>/dev/null) || exit 0
+  [ -n "$m" ] || exit 0
+  printf '%s\n' "$m" | ledger_add ""
+}
+ledger_records() { # Read each JSONL line independently; never rewrite damaged originals.
+  for ledger in "$OPEN"/*.jsonl; do
+    [ -e "$ledger" ] || [ -L "$ledger" ] || continue
+    ledger_sid=${ledger##*/}; ledger_sid=${ledger_sid%.jsonl}
+    if ! jq -Rnc --arg sid "$ledger_sid" -f "$(dirname "$0")/ledger-read.jq" < "$ledger"; then
+      printf 'owner-guard: ledger unreadable; original retained; state unknown\n' >&2
+      jq -nc --arg sid "$ledger_sid" '{id:("__ledger_unknown__:"+$sid),sid:$sid,ts:"1970-01-01T00:00:00Z",cwd:"",proc:"",src:"ledger-corruption",text:"Ledger could not be read; owner state is unknown. Repair the original ledger before clearing this warning.",_ledger_unknown:true}'
+    fi
+  done
+}
+open_all() { # current open records as JSONL, oldest first; includes explicit unknown-state warnings
+  ledger_records | jq -cs "$STATE_JQ"' | map(select(.closed|not)) | sort_by(.ts) | .[]'
+}
+note() { # SCO-747 Steering page: stdin = owner text typed there; SRC [CLOSE REASON...]; prints the record id
+  src=${1:-steering}; shift || true; t=$(cat); [ -n "$t" ] || { echo "text required on stdin" >&2; exit 2; }
+  jq -nc --arg t "$t" --arg ts "$(nowz)" --arg src "$src" '{ts:$ts,sid:"steering",text:$t,cwd:"steering",proc:"",src:$src}' | ledger_add ""
+  id="steering:$(printf '%s' "$t" | shasum | cut -c1-6)"; [ -z "${1:-}" ] || close "$id" "$@" 2>/dev/null || true; printf '%s\n' "$id"
+}
+hookin() { in=$(cat 2>/dev/null || true); sid=$(printf '%s' "$in" | jq -r '.session_id // empty' 2>/dev/null); cwd=$(printf '%s' "$in" | jq -r '.cwd // empty' 2>/dev/null); }
+resume() { # SessionStart hook: stdout becomes session context. Bounded. Adopted records become this session's (gate covers them).
+  hookin; me=$(proc_key)
+  sel=$(open_all | jq -c --arg sid "$sid" --arg cwd "$cwd" --arg me "$me" 'select(._ledger_unknown or (now-((.reopened // .ts)|fromdateiso8601))<604800)
+    | select(._ledger_unknown or .holder==$sid or ($me != "" and .proc==$me) or ($cwd != "" and .cwd==$cwd and .proc != ""))' | while IFS= read -r r; do
+      h=$(printf '%s' "$r" | jq -r .holder); p=$(printf '%s' "$r" | jq -r .proc)
+      if [ "$h" != "$sid" ] && { [ -z "$me" ] || [ "$p" != "$me" ]; } && alive "$p"; then continue; fi # another live seat's record
+      printf '%s\n' "$r"
+    done)
+  [ -n "$sel" ] || exit 0
+  [ -n "$sid" ] && printf '%s\n' "$sel" | jq -c --arg sid "$sid" --arg me "$me" --arg ts "$(nowz)" 'select((._ledger_unknown|not) and .holder != $sid)|{id,adopt:$sid,proc:$me,ts:$ts,f:.sid}' |
+    while IFS= read -r a; do printf '%s\n' "$a" | jq -c 'del(.f)' >> "$OPEN/$(printf '%s' "$a" | jq -r .f).jsonl"; done
+  printf '%s\n' "$sel" | jq -rs '. as $r |
+    "OWNER STEERING STILL OPEN (\($r|length); captured at receipt, survives /clear and compaction; this session now holds them and cannot end its turn until each is closed). Persist each as an issue/comment/tag edit or answer it, then run: '"$G"' close <id> <ISSUE-ID|answered|covered|dropped + reason>\n" +
+    ([$r[-12:][]|"- [\(.id)] \(.ts):\(if .why then " [REOPENED: \(.why)]" else "" end) \(.text|gsub("\n";" ")|.[0:500])"]|join("\n")) +
+    (if ($r|length)>12 then "\n(+\($r|length-12) older: owner-guard open 0)" else "" end)'
+  exit 0
+}
+gate() { # Stop hook (Claude, Codex): refuse to end the turn while this session holds open owner records
+  hookin; [ -n "$sid" ] || exit 0
+  act=$(printf '%s' "$in" | jq -r '.stop_hook_active // false' 2>/dev/null || echo false)
+  r=$(open_all | jq -rs --arg s "$sid" --arg g "$G" '[.[]|select(._ledger_unknown or .holder==$s)] | if length==0 then empty else
+    "OWNER STEERING OPEN in this session (\(length)). Before ending the turn persist each (issue, comment, tag edit) or answer it, then run: \($g) close <id> <ISSUE-ID|answered|covered|dropped + reason>\n" +
+    ([.[]|"- [\(.id)] \(.ts):\(if .why then " [REOPENED: \(.why)]" else "" end) \(.text|gsub("\n";" ")|.[0:300])"]|join("\n")) end')
+  if [ -z "$r" ]; then [ "$act" = true ] || goalgate; exit 0; fi
+  if [ "$act" = true ]; then # blocked once already in this stop: let it end (no loop); the record stays open and escalates
+    jq -nc '{systemMessage:"owner-guard: open owner steering left in this session; it escalates to Board unless closed"}'; exit 0; fi
+  jq -nc --arg r "$r" '{decision:"block",reason:$r}'
+}
+# SCO-756 goal layer: a seat whose Paperclip agent carries an active managed goal may not end a turn while it holds
+# workable work NOW (an assigned todo/in_progress issue with no live run, or one blocked with no blocker, unblock descriptor or scheduled
+# check: SCO-768, stale run holds auto-block workable owner asks). A blocked issue with a reason, or a scheduled wake, is
+# waiting, never workable. Inside a Paperclip run it stays out (Paperclip dispatches the next issue). The same
+# workable set blocking twice with no progress (no issue updated) lets the stop through and reports it once.
+# Seat map: claude_rc_local writes <stateDir>/seat.json {agentId,companyId,conversationId,goals:{issueId:state}}.
+PC=${OWNER_GUARD_PC:-/Volumes/NVM/Paperclip/bin/pc}
+goalgate() {
+  seat=; for f in ${OWNER_GUARD_SEATS:-$HOME/.paperclip/claude-rc-state*/seat.json}; do
+    [ -r "$f" ] && seat=$(jq -c --arg s "$sid" --arg d "${f%/seat.json}" 'select(.conversationId==$s)|.+{dir:$d}' "$f" 2>/dev/null) && [ -n "$seat" ] && break; seat=; done
+  [ -n "$seat" ] || return 0
+  goals=$(printf '%s' "$seat" | jq -c '[.goals // {} | to_entries[] | select(.value=="active") | .key]')
+  [ "$goals" != "[]" ] || return 0
+  [ ! -e "$(printf '%s' "$seat" | jq -r .dir)/active.json" ] || return 0
+  list=$("$PC" issue list -C "$(printf '%s' "$seat" | jq -r .companyId)" --assignee-agent-id "$(printf '%s' "$seat" | jq -r .agentId)" \
+    --status todo,in_progress,blocked,in_review --json 2>/dev/null) || return 0 # Paperclip unreachable: fail open
+  printf '%s' "$list" | jq -e --argjson g "$goals" 'type=="array" and any(.[]; .id as $i | $g | index($i))' >/dev/null 2>&1 || return 0
+  work=$(printf '%s' "$list" | jq -c '[.[] | select(((.status=="todo" or .status=="in_progress") or (.status=="blocked" and (.blockerAttention.unresolvedBlockerCount // 0)==0 and .unblockDescriptor==null and .monitorNextCheckAt==null)) and .activeRun==null and .executionRunId==null)
+    | {identifier,status,title,updatedAt}] | sort_by(.identifier)')
+  [ "$work" != "[]" ] || return 0
+  key=$(printf '%s' "$work" | jq -r 'map("\(.identifier)@\(.updatedAt)")|join(",")')
+  mkdir -p "$STATE/gate"; gf="$STATE/gate/$sid.json"
+  prev=$(cat "$gf" 2>/dev/null || echo '{}')
+  n=$(printf '%s' "$prev" | jq -r --arg k "$key" 'if .key==$k then (.n // 0)+1 else 1 end')
+  if [ "$n" -ge 3 ]; then # blocked twice for this exact set without progress: allow, report once
+    if [ "$(printf '%s' "$prev" | jq -r '.reported // false')" != true ]; then
+      printf '%s goal-gate no progress sid=%s agent=%s work=%s\n' "$(nowz)" "$sid" "$(printf '%s' "$seat" | jq -r .agentId)" "$key" >> "$STATE/goal-gate.log"
+      jq -nc --arg k "$key" --argjson n "$n" '{key:$k,n:$n,reported:true}' > "$gf"
+      jq -nc --arg k "$key" '{systemMessage:("owner-guard goal gate: blocked twice on the same workable issues with no progress (\($k)); stop allowed, reported once. Mark them blocked or schedule a wake if they are waiting.")}'
+    fi; return 0; fi
+  jq -nc --arg k "$key" --argjson n "$n" '{key:$k,n:$n}' > "$gf"
+  printf '%s' "$work" | jq -c '{decision:"block",reason:("GOAL ACTIVE and you hold workable issues now (\(length)): " +
+    (map("\(.identifier) [\(.status)] \(.title|.[0:80])")|join("; ")) +
+    ". Continue the top one by priority, or record why it waits (blockedByIssueIds, status blocked, or a scheduled wake) before stopping. Waiting is never stop-hook polling.")}'
+}
+close() { # ID-or-prefix REASON...
+  id=$1; shift; [ -n "${1:-}" ] || { echo "reason required" >&2; exit 2; }
+  hit=$(open_all | jq -r --arg p "$id" 'select(._ledger_unknown|not)|select((.id|startswith($p)) or (.id|endswith(":"+$p)))|"\(.sid) \(.id)"')
+  [ -n "$hit" ] || { echo "no open record $id" >&2; exit 1; }
+  printf '%s\n' "$hit" | while read -r sid full; do
+    jq -nc --arg id "$full" --arg c "$*" --arg ts "$(nowz)" '{id:$id,close:$c,ts:$ts}' >> "$OPEN/$sid.jsonl"
+    # SCO-865: closed against an issue = keep watching that issue; watch-check reopens the record if it stalls or is cancelled
+    iss=$(printf '%s' "$1" | grep -oE '^SCO-[0-9]+' || true)
+    [ -z "$iss" ] || jq -nc --arg id "$full" --arg i "$iss" --arg ts "$(nowz)" '{id:$id,watch:$i,ts:$ts}' >> "$OPEN/$sid.jsonl"
+  done
+}
+openlist() { # MIN: exceptions only, open records older than MIN minutes (default 60)
+  min=${1:-60}
+  r=$(open_all | jq -c --argjson m "$min" 'select((now-(.ts|fromdateiso8601))>$m*60)|{id,ts,src,holder:(.holder|.[0:8]),cwd:(.cwd|split("/")|last),escalated,text:(.text|.[0:120])}')
+  [ -z "$r" ] && return 0
+  printf '%s\n' "$r"; echo "owner-guard: $(printf '%s\n' "$r"|wc -l|tr -d ' ') open owner record(s) older than ${min}m" >&2; return 1
+}
+# Escalation: records open past MIN fire the Paperclip webhook routine "Owner steering escalation" (creates a Board issue per batch).
+# $STATE/escalate.url = webhook URL; $STATE/escalate.hdr = "Authorization: Bearer <secret>" (mode 600, never printed, curl -H @file).
+escalate() {
+  min=${1:-${OWNER_ESCALATE_MIN:-60}}
+  r=$(open_all | jq -c --argjson m "$min" 'select(.escalated==null and (now-(.ts|fromdateiso8601))>$m*60)|{id,ts,src,sid,holder,cwd,text:(.text|.[0:1500])}')
+  [ -n "$r" ] || return 0
+  n=$(printf '%s\n' "$r" | wc -l | tr -d ' ')
+  [ -r "$STATE/escalate.url" ] && [ -r "$STATE/escalate.hdr" ] || { echo "owner-guard: $n record(s) due for escalation; webhook not configured" >&2; return 1; }
+  printf '%s\n' "$r" | jq -cs --argjson m "$min" '{olderThanMin:($m|tostring),count:(length|tostring),
+    records:(map("- `\(.id)` \(.ts) [\(.src // "?")] seat `\(.cwd)` holder `\(.holder|.[0:8])`: \(.text|gsub("\n";" ")|.[0:600])")|join("\n"))}' |
+    curl -fsS -m 20 -H @"$STATE/escalate.hdr" -H 'Content-Type: application/json' --data-binary @- "$(cat "$STATE/escalate.url")" >/dev/null ||
+    { echo "owner-guard: escalation webhook failed for $n record(s)" >&2; return 1; }
+  ts=$(nowz); printf '%s\n' "$r" | while IFS= read -r x; do
+    [ "$(printf '%s' "$x" | jq -r '._ledger_unknown // false')" = true ] && continue
+    printf '%s' "$x" | jq -c --arg ts "$ts" '{id,escalated:$ts,ts:$ts}' >> "$OPEN/$(printf '%s' "$x" | jq -r .sid).jsonl"; done
+  echo "owner-guard: escalated $n open owner record(s) to Board" >&2
+}
+
+# SCO-865: a record closed against SCO-N stays watched. watch-check reads the issue live (PC issue get / interactions, read-only) and
+# reopens the record when the issue is cancelled, or blocked/todo/in_progress with no update for OWNER_WATCH_STALE_MIN (default 120) and no
+# live external blocker (an unfinished blockedBy issue, assigneeUserId set = owner-gated, a pending board interaction). `done` ends the watch.
+# Prints one line per exception, nothing when healthy. Reopened = appended {reopen} event, so open/list/resume/gate/escalate show it again.
+watched() { ledger_records | jq -cs 'group_by(.id) | .[] | select(any(.[]; .text != null)) | (map(select(.watch != null or .unwatch != null or .reopen != null))|last) as $l
+  | select($l.watch != null) | (map(select(.text != null))[0]) as $b | {id:$b.id,sid:$b.sid,issue:$l.watch,since:$l.ts,text:($b.text|gsub("\\s+";" ")|.[0:80])}'; }
+reopen_rec() { # ID SID ISSUE REASON WATCHJSON
+  jq -nc --arg id "$1" --arg r "$3 $4" --arg ts "$(nowz)" '{id:$id,reopen:$r,ts:$ts}' >> "$OPEN/$2.jsonl"
+  echo "owner-guard watch: reopened [$1] closed against $3 ($4): $(printf '%s' "$5" | jq -r .text)"
+}
+watch_check() {
+  stale=${OWNER_WATCH_STALE_MIN:-120}; bad=0
+  ws=$(watched); [ -n "$ws" ] || return 0
+  while IFS= read -r w; do
+    id=$(printf '%s' "$w" | jq -r .id); sid=$(printf '%s' "$w" | jq -r .sid); iss=$(printf '%s' "$w" | jq -r .issue); since=$(printf '%s' "$w" | jq -r .since)
+    j=$("$PC" issue get "$iss" --json 2>/dev/null) && [ -n "$j" ] || { bad=$((bad+1)); continue; }
+    v=$(printf '%s' "$j" | jq -r --arg since "$since" --argjson stale "$stale" 'def ep: sub("\\.[0-9]+Z$";"Z")|fromdateiso8601;
+      .status as $s | if $s=="done" then "done" elif $s=="cancelled" then "reopen cancelled"
+      elif ($s=="blocked" or $s=="todo" or $s=="in_progress") then ([(.updatedAt|ep),($since|ep)]|max) as $last
+        | if (now-$last) <= $stale*60 or .assigneeUserId != null or any(.blockedBy[]?; type != "object" or ((.status // "") | IN("done","cancelled") | not)) then "ok"
+          else "check \($s) \((now-$last)/360|floor/10)h" end
+      else "ok" end' 2>/dev/null) || { bad=$((bad+1)); continue; }
+    case "$v" in
+      done) jq -nc --arg id "$id" --arg ts "$(nowz)" '{id:$id,unwatch:"done",ts:$ts}' >> "$OPEN/$sid.jsonl";;
+      check*) # idle/blocked with no structural blocker: a pending board interaction still counts as a live external blocker
+        p=$("$PC" issue interactions "$iss" --json 2>/dev/null) || { bad=$((bad+1)); continue; }
+        printf '%s' "$p" | jq -e 'any(.[]?; .status=="pending")' >/dev/null 2>&1 && continue
+        reopen_rec "$id" "$sid" "$iss" "${v#check }, no live external blocker" "$w";;
+      reopen*) reopen_rec "$id" "$sid" "$iss" "${v#reopen }" "$w";;
+    esac
+  done <<WEND
+$ws
+WEND
+  [ "$bad" -eq 0 ] || echo "owner-guard watch-check: $bad watched issue(s) unreadable"
+  return 0
+}
+
+guard() {
+  in=$(cat 2>/dev/null || true); tr=${1:-}
+  [ -n "$tr" ] || tr=$(printf '%s' "$in" | jq -r '.transcript_path // empty')
+  case "$tr" in opencode:*) ;; *) [ -r "$tr" ] || exit 0;; esac
+  sid=$(sid_of "$tr")
+  s8=$(printf %.8s "$sid"); cur="$STATE/$sid.cursor"
+  from=0; [ -r "$cur" ] && from=$(cat "$cur")
+  msgs=$(scan "$tr" "$from")
+  case "$tr" in opencode:*) last=$(printf '%s\n' "$msgs" | jq -s 'map(.line)|max // 0');; *) last=$(wc -l < "$tr" | tr -d ' ');; esac
+  [ -n "$msgs" ] || { echo "$last" > "$cur"; exit 0; }
+  printf '%s\n' "$msgs" | ledger_add "$(printf '%s' "$in" | jq -r '.cwd // empty' 2>/dev/null)"
+  body=$(printf '%s\n' "$msgs" | jq -rs --arg s8 "$s8" --arg tr "$tr" '
+    "**Owner-typed messages checkpointed before context drop** (SCO-687 guard; transcript `\($tr)`)\n\n" +
+    ([.[]|"- owner-msg \($s8):\(.line) @ \(.ts): \(.text|gsub("\n";" ")|.[0:600])"]|join("\n")) +
+    "\n\nAlso in the owner-steering ledger (owner-guard open 0); close each there once persisted."')
+  rc=0
+  if [ -n "${PAPERCLIP_API_KEY:-}" ] && [ -n "${PAPERCLIP_TASK_ID:-}" ]; then
+    printf '%s' "$body" | jq -Rs '{body:.}' | $API POST ./comments - >/dev/null 2>&1 || rc=1
+  else rc=1; fi
+  echo "$last" > "$cur" # messages are in the ledger either way; the ledger, not the cursor, is the truth
+  [ $rc -eq 0 ] || { printf '%s\n' "$body" > "$STATE/$sid.pending"
+    printf '{"systemMessage":"owner-guard: %s owner message(s) checkpointed to the ledger (not posted: no run credentials)"}\n' "$(printf '%s\n' "$msgs"|wc -l|tr -d ' ')"; }
+}
+
+sync() { # DAYS [NEWER_THAN]: catch-all for anything a receipt hook missed (OpenCode before its plugin, untrusted Codex hooks): transcripts -> ledger
+  for tr in $(transcripts "$@"); do
+    sid=$(sid_of "$tr"); cur="$STATE/$sid.cursor"; from=0; [ -r "$cur" ] && from=$(cat "$cur")
+    full=$(scan "$tr" "$from" 2>/dev/null) || continue
+    [ -n "$full" ] || continue
+    printf '%s\n' "$full" | ledger_add ""
+    printf '%s\n' "$full" | jq -s 'map(.line)|max' > "$cur"
+  done
+}
+fleet() { # exceptions only: sync, then ledger records open > OWNER_OPEN_MIN (one truth: the ledger)
+  sync "${1:-2}"; openlist "${OWNER_OPEN_MIN:-60}"
+}
+tick() { # launchd every 10 min: incremental sync + escalation; silent unless something is wrong
+  st="$STATE/tick.stamp"; nx="$STATE/tick.next"; touch "$nx"
+  sync 2 "$st"; mv "$nx" "$st"; escalate
+}
+
+seed() { # DAYS: one-time baseline, set every session cursor to its current end (after triage)
+  days=${1:-30}
+  for tr in $(transcripts "$days"); do
+    case "$tr" in opencode:*) scan_opencode "${tr#opencode:}" 0 | jq -s 'map(.line)|max // 0' > "$STATE/$(sid_of "$tr").cursor";;
+      *) wc -l < "$tr" | tr -d ' ' > "$STATE/$(sid_of "$tr").cursor";; esac
+  done
+}
+
+# Codex runs a hook only after it is trusted (hooks.state.<key>.trusted_hash in each CODEX_HOME config.toml); untrusted = silent no-op.
+# Trust only owner-guard's own handlers. Hash = sha256 of sorted compact {event_name,matcher?,hooks:[{type,command,timeout(600),async}]}
+# (codex-rs hooks discovery hook_hash; recipe verified against existing trusted entries).
+codex_trust() { # [--check]
+  hj=$HOME/.codex/hooks.json
+  want=$(jq -c --arg hj "$hj" '.hooks|to_entries[] as $e | ($e.key|gsub("(?<a>[a-z])(?<b>[A-Z])";"\(.a)_\(.b)")|ascii_downcase) as $lab
+    | $e.value|to_entries[] as $g | $g.value.hooks|to_entries[] | select(.value.command|test("owner-capture/owner-guard"))
+    | {key:"\($hj):\($lab):\($g.key):\(.key)", id:({event_name:$lab,hooks:[{type:"command",command:.value.command,timeout:(.value.timeout//600),async:(.value.async==true)}
+      + (if .value.statusMessage then {statusMessage:.value.statusMessage} else {} end)]} + (if $g.value.matcher then {matcher:$g.value.matcher} else {} end))}' "$hj")
+  out=$(for home in $(codex_homes); do
+    cf=$home/config.toml; [ -w "$cf" ] || continue
+    printf '%s\n' "$want" | while IFS= read -r w; do
+      key=$(printf '%s' "$w" | jq -r .key); hash="sha256:$(printf '%s' "$w" | jq -cjS .id | shasum -a 256 | cut -d' ' -f1)"
+      hdr="[hooks.state.\"$key\"]"
+      cur=$(awk -v h="$hdr" '$0==h{f=1;next} /^\[/{f=0} f&&/^trusted_hash/{print $3}' "$cf" | tr -d '"')
+      [ "$cur" = "$hash" ] && continue
+      if [ "${1:-}" = --check ]; then echo "untrusted: $home $key"; bad=1; continue; fi
+      if [ -n "$cur" ]; then awk -v h="$hdr" -v t="trusted_hash = \"$hash\"" '$0==h{f=1;print;next} /^\[/{f=0} f&&/^trusted_hash/{print t;next} {print}' "$cf" > "$cf.og.tmp" && mv "$cf.og.tmp" "$cf"
+      else printf '\n%s\ntrusted_hash = "%s"\n' "$hdr" "$hash" >> "$cf"; fi
+      echo "trusted: $home $key"
+    done
+  done)
+  [ -n "$out" ] || return 0
+  printf '%s\n' "$out"; case "$out" in *untrusted:*) return 1;; esac
+}
+
+case "${1:-}" in
+  seed) shift; seed "$@" ;;
+  capture) capture ;;
+  _ledger_add) shift; ledger_add "$@" ;;
+  resume) resume ;;
+  gate) gate ;;
+  close) shift; close "$@" ;;
+  watch-check) watch_check ;;
+  open) shift; openlist "${1:-0}" ;;
+  list) open_all ;;
+  note) shift; note "$@" ;;
+  escalate) shift; escalate "$@" ;;
+  tick) tick ;;
+  sync) shift; sync "${1:-2}" ;;
+  scan) shift; scan "$@" ;;
+  guard) shift; guard "$@" ;;
+  fleet) shift; fleet "$@" ;;
+  codex-trust) shift; codex_trust "$@" ;;
+  *) sed -n 2,8p "$0" >&2; exit 2 ;;
+esac
