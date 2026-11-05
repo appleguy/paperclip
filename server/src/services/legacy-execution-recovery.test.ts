@@ -113,3 +113,10 @@ it("does not hold a repair that dispatch suppressed before it reached the provid
   expect(legacyExecutionNeedsReconciliation(suppressed)).toBe(false);
   expect(legacyExecutionNeedsReconciliation({ ...suppressed, status: "failed" })).toBe(true);
 });
+
+it("does not hold a claude_rc run interrupted by a server shutdown (TUI left intact), but holds other adapters", () => {
+  const run = { runtimeMode: "legacy", status: "interrupted", errorCode: "server_shutdown_interrupted", resultJson: {},
+    runnerProfileJson: { adapterDispatch: { adapterType: "claude_rc" } } } as never;
+  expect(legacyExecutionNeedsReconciliation(run)).toBe(false);
+  expect(legacyExecutionNeedsReconciliation({ ...(run as object), runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } } } as never)).toBe(true);
+});

@@ -74,7 +74,8 @@ export function legacyExecutionNeedsReconciliation(
   // A claude_rc run aborted by a server shutdown leaves the shared TUI and its checkpoint intact
   // (adapters/claude-rc/execute.ts); no provider action is lost, so redeploys must not strand the issue.
   if ((run.status === "interrupted" || run.status === "cancelled")
-      && /shared TUI left intact/i.test(String(run.error ?? ""))) return false;
+      && (/shared TUI left intact/i.test(String(run.error ?? ""))
+        || (run.errorCode === "server_shutdown_interrupted" && claimedAdapterType({ runnerProfileJson: run.runnerProfileJson ?? null }) === "claude_rc"))) return false;
   // Waiting for a subscription or workspace precedes provider execution. It is
   // a resource wait, not a failed provider attempt or permission to replay work.
   if (run.status === "cancelled" && (run.errorCode === "ai_connection_busy" || run.errorCode === "ai_connection_pool_exhausted") &&
