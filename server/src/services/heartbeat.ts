@@ -1015,6 +1015,7 @@ export function heartbeatService(
     promoteDueScheduledRetries,
     nextScheduledRetryAt,
     retryScheduledRetryNow,
+    releaseTargetBusyRetriesForAgent,
     scheduleBoundedRetry,
   } = createHeartbeatRetries(db, {
     hasCaseHandoffForRun: async (run) => Boolean(await pendingCaseHandoffForRun(db, run.id, run.companyId)),
@@ -4018,6 +4019,12 @@ export function heartbeatService(
             .catch(err => {
               logger.warn({ err, runId: run.id }, "failed to deliver settled tool reviews after execution cleanup");
             });
+        }
+        // SCO-752: a run that held the seat has ended; wake its parked busy waits now.
+        if (latestRun && ["succeeded", "failed", "timed_out"].includes(latestRun.status)) {
+          await releaseTargetBusyRetriesForAgent(run.agentId).catch(err => {
+            logger.warn({ err, runId: run.id }, "failed to release target_busy retries after seat freed");
+          });
         }
         await startNextQueuedRunForAgent(run.agentId);
       }

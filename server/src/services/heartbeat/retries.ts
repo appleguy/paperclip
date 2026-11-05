@@ -30,6 +30,7 @@ import {
   asc,
   desc,
   eq,
+  gt,
   inArray,
   ne,
   notInArray,
@@ -152,6 +153,15 @@ export const WORKSPACE_BUSY_RETRY_BASE_DELAY_MS = 60 * 1000;
 
 export const WORKSPACE_BUSY_RETRY_JITTER_MS = 60 * 1000;
 
+// SCO-752: a busy agent seat (target_busy) is re-checked on an exponential
+// backoff, not a fixed ~90 s poll. The seat freeing is the primary trigger
+// (releaseTargetBusyRetriesForAgent, fired when another run of the agent ends);
+// this timer is only the safety net for a hold Paperclip cannot observe (an
+// owner's live session).
+export const TARGET_BUSY_RETRY_BASE_DELAY_MS = 10 * 60 * 1000;
+export const TARGET_BUSY_RETRY_MAX_DELAY_MS = 15 * 60 * 1000;
+export const TARGET_BUSY_RETRY_JITTER_MS = 60 * 1000;
+
 // Preserve the one-hour shared-workspace holder cutoff independently of the
 // informational output-silence warnings. Warning sooner must not let another
 // run overtake a quiet holder and mutate its shared workspace.
@@ -235,6 +245,19 @@ export function computeWorkspaceBusyRetryDelayMs(
     WORKSPACE_BUSY_RETRY_BASE_DELAY_MS +
     Math.floor(jitter * WORKSPACE_BUSY_RETRY_JITTER_MS)
   );
+}
+
+/** `attempt` is the consecutive target_busy attempts already consumed (>= 0). */
+export function computeTargetBusyRetryDelayMs(
+  attempt: number,
+  random: () => number = Math.random,
+) {
+  const jitter = Math.min(Math.max(random(), 0), 1);
+  const backoff = Math.min(
+    TARGET_BUSY_RETRY_MAX_DELAY_MS,
+    TARGET_BUSY_RETRY_BASE_DELAY_MS * 2 ** Math.max(0, Math.min(attempt, 8)),
+  );
+  return backoff + Math.floor(jitter * TARGET_BUSY_RETRY_JITTER_MS);
 }
 
 function resolveCodexTransientFallbackMode(
@@ -1729,6 +1752,29 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     };
   }
 
+  // SCO-752: the agent's seat just freed (one of its runs ended), so its parked
+  // target_busy waits are due now instead of at the backoff/safety timer.
+  async function releaseTargetBusyRetriesForAgent(agentId: string, now = new Date()) {
+    return db.transaction(async (tx) => {
+      const released = await tx
+        .update(heartbeatRuns)
+        .set({ scheduledRetryAt: now, updatedAt: now })
+        .where(
+          and(
+            eq(heartbeatRuns.agentId, agentId),
+            eq(heartbeatRuns.status, "scheduled_retry"),
+            eq(heartbeatRuns.scheduledRetryReason, TARGET_BUSY_RETRY_REASON),
+            gt(heartbeatRuns.scheduledRetryAt, now),
+          ),
+        )
+        .returning({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId });
+      if (released.length > 0) {
+        await notifyScheduledRetryDispatch(tx, { companyId: released[0]!.companyId });
+      }
+      return released.map((row) => row.id);
+    });
+  }
+
   async function retryScheduledRetryNow(input: {
     issueId: string;
     actor?: {
@@ -1931,6 +1977,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     promoteDueScheduledRetries,
     nextScheduledRetryAt,
     retryScheduledRetryNow,
+    releaseTargetBusyRetriesForAgent,
 
     scheduleBoundedRetry: async (
       runId: string,

@@ -135,6 +135,14 @@ describe("local OpenCode admission retry", () => {
   });
 });
 
+describe("SCO-752 target_busy backoff", () => {
+  it("backs off exponentially to a 15 min ceiling instead of a fixed ~90 s poll", () => {
+    const delays = [0, 1, 2, 5, 50].map((attempt) => extracted.computeTargetBusyRetryDelayMs(attempt, () => 0));
+    expect(delays).toEqual([10 * 60_000, 15 * 60_000, 15 * 60_000, 15 * 60_000, 15 * 60_000]);
+    expect(extracted.computeTargetBusyRetryDelayMs(0, () => 1)).toBe(10 * 60_000 + 60_000);
+  });
+});
+
 describe("heartbeat retry module callbacks", () => {
   it("preserves legacy helper and error-class identity", () => {
     expect(legacy.computeBoundedTransientHeartbeatRetrySchedule).toBe(extracted.computeBoundedTransientHeartbeatRetrySchedule);

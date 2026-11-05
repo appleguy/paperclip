@@ -8,7 +8,7 @@ import { pendingCaseHandoffForRun } from "./case-handoff-lifecycle.js";
 import { NON_RETRYABLE_PREFLIGHT_FAILURE_CODES, isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
 import { ChatControlRecoveryUnresolvedError } from "./queue.js";
 import { RemoteWorkspacePreparationTimeoutError } from "../remote-workspace-transport.js";
-import { readTransientRecoveryContractFromRun, readHeartbeatRunErrorFamily, isTransientWorkspacePreparationCode, computeWorkspaceBusyRetryDelayMs } from "./retries.js";
+import { readTransientRecoveryContractFromRun, readHeartbeatRunErrorFamily, isTransientWorkspacePreparationCode, computeTargetBusyRetryDelayMs } from "./retries.js";
 import { TARGET_BUSY_RETRY_REASON } from "../../modules/run-dispatch/index.js";
 import { isLocalOpenCodeAdmissionDecline } from "../local-opencode-admission-retry.js";
 import { type RunSessionOutcome, resolveNextSessionState, normalizeUsageTotals, resolveCacheAdjustedCostUsd, resolveLedgerBiller, resolveLedgerCostStatus, normalizeLedgerBillingType } from "./run-state.js";
@@ -959,11 +959,12 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       }
       if (targetBusy && outcome === "cancelled") {
         // No attempt ceiling: the wait ends when the seat frees up or the quota resets.
+        // SCO-752: exponential backoff; a freed seat releases it early (releaseTargetBusyRetriesForAgent).
         await scheduleBoundedRetryForRun(livenessRun, agent, {
           retryReason: TARGET_BUSY_RETRY_REASON,
           wakeReason: "target_busy_retry",
           maxAttempts: (livenessRun.scheduledRetryAttempt ?? 0) + 1,
-          delayMs: computeWorkspaceBusyRetryDelayMs(),
+          delayMs: computeTargetBusyRetryDelayMs(livenessRun.scheduledRetryAttempt ?? 0),
         });
       } else if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {
         const policy = parseMaxTurnContinuationPolicy(agent);
