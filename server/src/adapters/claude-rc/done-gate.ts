@@ -144,9 +144,9 @@ export function productionDeps(): GateDeps {
   };
 }
 
-/** Message typed back to the worker when the gate refuses; single line (TUI submit refuses newlines). */
+/** Message typed back to the worker when the gate refuses; single line (TUI submit refuses newlines). Leading "From:" envelope keeps owner-capture from recording it as owner typing (SCO-806). */
 export function refusalMessage(reasons: string[], attempt: number, max: number): string {
-  return `DONE GATE refused your receipt (${attempt}/${max}, SCO-762): ${reasons.join(" | ")} Fix this, then write the receipt again at the same path. Do not close the issue yourself.`;
+  return `From: paperclip-done-gate | DONE GATE refused your receipt (${attempt}/${max}, SCO-762): ${reasons.join(" | ")} Fix this, then write the receipt again at the same path. Do not close the issue yourself.`;
 }
 
 /** Gate a raw receipt file against the run's transcript; used by the claude_rc adapter before deliver(). */
