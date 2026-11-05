@@ -7,7 +7,9 @@ import {
   agentRuntimeState,
   agentWakeupRequests,
   agents,
+  authUsers,
   companies,
+  companyMemberships,
   companySkills,
   createDb,
   environmentLeases,
@@ -25,6 +27,8 @@ import {
 import { heartbeatService } from "../services/heartbeat.ts";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { runningProcesses } from "../adapters/index.ts";
+import { readIssueWakeDelta } from "../services/issue-rewake-throttle-db.ts";
+import { ISSUE_WAKE_DELTA_KEY } from "../services/issue-rewake-throttle.ts";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async () => ({
@@ -67,6 +71,8 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-issue-rewake-throttle-");
     db = createDb(tempDb.connectionString);
     heartbeat = heartbeatService(db);
+    await db.insert(authUsers).values({ id: "responsible-user", name: "Test owner", email: "rewake@example.test",
+      createdAt: new Date(), updatedAt: new Date() });
   }, 20_000);
 
   afterEach(async () => {
@@ -99,6 +105,7 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
         await db.delete(environments);
         await db.delete(executionWorkspaces);
         await db.delete(companySkills);
+        await db.delete(companyMemberships);
         await db.delete(companies);
         break;
       } catch (error) {
@@ -124,6 +131,8 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
     });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "responsible-user",
+      membershipRole: "member", status: "active" });
     await db.insert(agents).values({
       id: agentId,
       companyId,
@@ -183,13 +192,13 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
     return runId;
   }
 
-  function assignmentWake(agentId: string, issueId: string) {
+  function pollWake(agentId: string, issueId: string) {
     return heartbeat.wakeup(agentId, {
       source: "assignment",
       triggerDetail: "system",
-      reason: "issue_assigned",
+      reason: "issue_queue_drive",
       payload: { issueId },
-      contextSnapshot: { issueId, wakeReason: "issue_assigned" },
+      contextSnapshot: { issueId, wakeReason: "issue_queue_drive" },
       requestedByActorType: "system",
       requestedByActorId: "test",
     });
@@ -215,7 +224,7 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
     await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 40 });
     await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 10 });
 
-    const throttledWake = await assignmentWake(agentId, issueId);
+    const throttledWake = await pollWake(agentId, issueId);
     expect(throttledWake).toBeNull();
 
     const skipped = await latestWakeRequest(agentId);
@@ -245,7 +254,7 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
       entityId: issueId,
     });
 
-    const admittedWake = await assignmentWake(agentId, issueId);
+    const admittedWake = await pollWake(agentId, issueId);
     expect(admittedWake).not.toBeNull();
   });
 
@@ -277,11 +286,13 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
     await db.insert(activityLog).values({
       companyId,
       actorType: "agent",
-      actorId: randomUUID(),
+      actorId: agentId,
       action: "issue.comment_added",
       entityType: "issue",
       entityId: issueId,
     });
+    await db.insert(issueComments).values({ id: agentCommentId, companyId, issueId,
+      authorAgentId: agentId, authorType: "agent", body: "Still waiting." });
     const throttledAgentCommentWake = await heartbeat.wakeup(agentId, {
       source: "automation",
       triggerDetail: "system",
@@ -293,7 +304,7 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
         wakeCommentId: agentCommentId,
       },
       requestedByActorType: "agent",
-      requestedByActorId: randomUUID(),
+      requestedByActorId: agentId,
     });
     expect(throttledAgentCommentWake).toBeNull();
     expect((await latestWakeRequest(agentId))?.reason).toBe("issue_rewake_throttled");
@@ -336,6 +347,8 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
     await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 10 });
 
     const commentId = randomUUID();
+    await db.insert(issueComments).values({ id: commentId, companyId, issueId,
+      authorAgentId: agentId, authorType: "agent", body: "Continue." });
     const resumeWake = await heartbeat.wakeup(agentId, {
       source: "automation",
       triggerDetail: "system",
@@ -362,7 +375,7 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
     await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 40 });
     await seedTerminalRun({ companyId, agentId, issueId, status: "failed", finishedSecondsAgo: 10 });
 
-    const recoveryWake = await assignmentWake(agentId, issueId);
+    const recoveryWake = await pollWake(agentId, issueId);
     expect(recoveryWake).not.toBeNull();
   });
 
@@ -377,13 +390,13 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
       actorId: agentId,
       agentId,
       runId: progressRunId,
-      action: "issue.comment_added",
+      action: "issue.document_upserted",
       entityType: "issue",
       entityId: issueId,
       createdAt: new Date(Date.now() - 11_000),
     });
 
-    const wake = await assignmentWake(agentId, issueId);
+    const wake = await pollWake(agentId, issueId);
     expect(wake).not.toBeNull();
   });
 
@@ -414,7 +427,7 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
       createdAt: new Date(Date.now() - 11_000),
     });
 
-    const wake = await assignmentWake(agentId, issueId);
+    const wake = await pollWake(agentId, issueId);
     expect(wake).toBeNull();
     expect((await latestWakeRequest(agentId))?.reason).toBe("issue_rewake_throttled");
   });
@@ -431,8 +444,136 @@ describeEmbeddedPostgres("heartbeat issue rewake throttle", () => {
     });
     await seedTerminalRun({ companyId, agentId, issueId, finishedSecondsAgo: 10 });
 
-    const wake = await assignmentWake(agentId, issueId);
+    const wake = await pollWake(agentId, issueId);
     expect(wake).toBeNull();
     expect((await latestWakeRequest(agentId))?.reason).toBe("issue_rewake_throttled");
+  });
+
+  it("does not suppress a new assignment", async () => {
+    const f = await seedCompanyAgentIssue();
+    await seedTerminalRun({ ...f, finishedSecondsAgo: 40 });
+    await seedTerminalRun({ ...f, finishedSecondsAgo: 10 });
+    expect(await heartbeat.wakeup(f.agentId, { reason: "issue_assigned", source: "assignment",
+      payload: { issueId: f.issueId }, requestedByActorType: "system" })).not.toBeNull();
+  });
+
+  async function delta(f: { companyId: string; agentId: string; issueId: string }, reason = "issue_monitor_due", wakeCommentId: string | null = null) {
+    const [issue] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    const [agent] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    return readIssueWakeDelta(db, { ...f, issue: issue!,
+      candidate: { reason, wakeCommentId, forceFreshSession: false, hasExplicitResume: false },
+      agentConfig: { adapterType: agent!.adapterType, adapterConfig: agent!.adapterConfig, runtimeConfig: agent!.runtimeConfig },
+    });
+  }
+
+  async function consumeDelta(f: { companyId: string; agentId: string; issueId: string }) {
+    const current = await delta(f);
+    await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.agentId,
+      source: "automation", status: "claimed", payload: { issueId: f.issueId, [ISSUE_WAKE_DELTA_KEY]: current.fingerprint } });
+    return current;
+  }
+
+  it("own comments and monitor reschedules neither advance the fingerprint nor reset backoff", async () => {
+    const f = await seedCompanyAgentIssue();
+    await seedTerminalRun({ ...f, finishedSecondsAgo: 40 });
+    const runId = await seedTerminalRun({ ...f, finishedSecondsAgo: 10 });
+    const before = await delta(f);
+    for (const action of ["issue.comment_added", "issue.monitor_scheduled", "issue.updated"]) {
+      await db.insert(activityLog).values({ companyId: f.companyId, actorType: "agent", actorId: f.agentId,
+        runId, action, entityType: "issue", entityId: f.issueId, details: { source: "comment", identifier: "TEST" } });
+    }
+    expect((await delta(f)).fingerprint).toBe(before.fingerprint);
+    expect(await heartbeat.wakeup(f.agentId, { reason: "issue_monitor_due", payload: { issueId: f.issueId } })).toBeNull();
+    expect((await latestWakeRequest(f.agentId))?.reason).toBe("issue_rewake_throttled");
+  });
+
+  it("suppresses the consumed monitor delta before it creates a deferred wake behind an active run", async () => {
+    const f = await seedCompanyAgentIssue();
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.agentId,
+      status: "queued", contextSnapshot: { issueId: f.issueId } });
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, f.issueId));
+    await consumeDelta(f);
+    expect(await heartbeat.wakeup(f.agentId, { reason: "issue_monitor_due", payload: { issueId: f.issueId } })).toBeNull();
+    expect((await latestWakeRequest(f.agentId))?.reason).toBe("issue_rewake_no_meaningful_delta");
+    const deferred = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, f.agentId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+    expect(deferred).toHaveLength(0);
+    await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+  });
+
+  it("a changed document or workspace change reopens a consumed delta once", async () => {
+    const f = await seedCompanyAgentIssue();
+    const runId = await seedTerminalRun({ ...f, finishedSecondsAgo: 10 });
+    await consumeDelta(f);
+    expect((await delta(f)).blocked).toBe(true);
+    await db.insert(activityLog).values({ companyId: f.companyId, actorType: "agent", actorId: f.agentId,
+      action: "issue.document_upserted", entityType: "issue", entityId: f.issueId });
+    expect((await delta(f)).blocked).toBe(false);
+    await consumeDelta(f);
+    expect((await delta(f)).blocked).toBe(true);
+    await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, agentId: f.agentId,
+      runId, seq: 1, eventType: "workspace.diff.recorded", payload: { changeSetId: "change-a" } });
+    expect((await delta(f)).blocked).toBe(false);
+  });
+
+  it("identical failures do not advance the fingerprint, but a new fault or config does", async () => {
+    const f = await seedCompanyAgentIssue();
+    const runId = await seedTerminalRun({ ...f, status: "failed", finishedSecondsAgo: 40 });
+    await db.update(heartbeatRuns).set({ errorCode: "same-fault" }).where(eq(heartbeatRuns.id, runId));
+    await consumeDelta(f);
+    const repeatId = await seedTerminalRun({ ...f, status: "failed", finishedSecondsAgo: 10 });
+    await db.update(heartbeatRuns).set({ errorCode: "same-fault" }).where(eq(heartbeatRuns.id, repeatId));
+    expect((await delta(f)).blocked).toBe(true);
+    await db.update(heartbeatRuns).set({ error: "different failure with the same code" }).where(eq(heartbeatRuns.id, repeatId));
+    expect((await delta(f)).blocked).toBe(false);
+    await consumeDelta(f);
+    await db.update(heartbeatRuns).set({ errorCode: "new-fault" }).where(eq(heartbeatRuns.id, repeatId));
+    expect((await delta(f)).blocked).toBe(false);
+    await consumeDelta(f);
+    await db.update(agents).set({ adapterConfig: { model: "changed-model" } }).where(eq(agents.id, f.agentId));
+    expect((await delta(f)).blocked).toBe(false);
+  });
+
+  it("resolves comment authors from storage and preserves other-author and owner comments", async () => {
+    const f = await seedCompanyAgentIssue();
+    await consumeDelta(f);
+    const peerId = randomUUID();
+    await db.insert(agents).values({ id: peerId, companyId: f.companyId, name: "Peer", role: "engineer", adapterType: "http" });
+    const ownId = randomUUID(), otherId = randomUUID(), ownerId = randomUUID();
+    await db.insert(issueComments).values([
+      { id: ownId, companyId: f.companyId, issueId: f.issueId, authorAgentId: f.agentId, authorType: "agent", body: "Own" },
+      { id: otherId, companyId: f.companyId, issueId: f.issueId, authorAgentId: peerId, authorType: "agent", body: "Other" },
+      { id: ownerId, companyId: f.companyId, issueId: f.issueId, authorUserId: "owner", authorType: "user", body: "Owner" },
+    ]);
+    expect((await delta(f, "issue_commented", ownId)).blocked).toBe(true);
+    for (const id of [otherId, ownerId, randomUUID()]) {
+      expect((await delta(f, "issue_commented", id)).blocked).toBe(false);
+    }
+    expect((await delta(f, "issue_blockers_resolved")).blocked).toBe(false);
+    expect((await delta(f, "issue_assigned")).blocked).toBe(false);
+  });
+
+  it("serializes concurrent monitor admission to one wake for a new delta", async () => {
+    const f = await seedCompanyAgentIssue();
+    await consumeDelta(f);
+    await db.insert(activityLog).values({ companyId: f.companyId, actorType: "system", actorId: "system",
+      action: "issue.document_upserted", entityType: "issue", entityId: f.issueId });
+    let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      await held;
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
+        summary: "Concurrent test", provider: "test", model: "test-model" };
+    });
+    try {
+      const wakes = await Promise.all(Array.from({ length: 3 }, () => heartbeat.wakeup(f.agentId, {
+        reason: "issue_monitor_due", payload: { issueId: f.issueId },
+      })));
+      expect(wakes.filter(Boolean)).toHaveLength(1);
+    } finally {
+      release();
+    }
   });
 });

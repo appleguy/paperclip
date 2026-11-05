@@ -1,27 +1,11 @@
+import { createHash } from "node:crypto";
+
 /**
- * PAP-13775: throttle no-information issue re-wakes.
- *
- * After a process death (or any stall), external drivers — assignment pollers,
- * stranded-issue reconcilers, on-demand invokes — can re-wake the same agent
- * for the same issue every few seconds for as long as the issue stays
- * `in_progress`. When each of those runs ends without changing any
- * issue-visible state, every wake pays a full adapter session for zero new
- * information (the Phase 4 interruption-recovery smoke paid 25 sessions and
- * 2.4x cost for one recovery this way).
- *
- * This module decides when such a wake should be skipped: once an issue has
- * accumulated a streak of consecutive succeeded-but-no-issue-progress runs by
- * the same agent, further event-free wakes are held back for an escalating
- * cooldown anchored to the last run's finish time. Fresh issue activity, an
- * explicit resume, forceFreshSession, and event-carrying wake reasons bypass
- * the throttle. Human comment wakes also bypass it. Agent-authored comment
- * wakes deliberately stay in the normal throttle class so a cross-issue write
- * cannot smuggle human wake privileges.
- *
- * Server-side recovery retries (process-loss retries, missing-comment
- * follow-ups) insert their runs directly and never pass through this gate, so
- * crash recovery stays immediate; only repeated no-op re-invocations slow
- * down.
+ * PAP-13775 / SCO-888: a durable meaningful-delta fingerprint prevents repeated
+ * own-comment, monitor and retry wakes from buying another reasoning turn.
+ * The cooldown remains the fallback for historical runs without a fingerprint.
+ * Assignments, other-author comments, blocker resolutions and human answers
+ * always pass; unknown attribution is never evidence for suppression.
  */
 
 /** Consecutive no-progress runs required before the cooldown engages. */
@@ -41,28 +25,38 @@ export const ISSUE_REWAKE_RUN_SAMPLE_LIMIT = 8;
 
 /**
  * Wake reasons that assert issue state rather than deliver a new event.
- * These (plus reason-less on-demand invokes) are the only wakes the throttle
- * applies to; every event-shaped reason (comments, mentions, blockers
- * resolved, interactions, approvals, monitors, reviews, …) passes through.
+ * Only known poll/retry/monitor reasons are eligible. Unknown reasons pass.
  */
 export const THROTTLED_ISSUE_REWAKE_REASONS: ReadonlySet<string> = new Set([
   "issue_queue_drive",
-  "issue_assigned",
   "issue_continuation_needed",
   "issue_assignment_recovery",
   "issue_graph_liveness_backstop",
+  "issue_monitor_due",
+  "heartbeat_timer",
+  "target_busy_retry",
+  "dispatch_deferred_retry",
+  "process_lost_retry",
+  "run_liveness_continuation",
+  "scheduled_retry",
+  "transient_failure_retry",
+  "issue_continuation",
+  "issue_disposition_repair",
+  "issue_recovery_action_restored",
+  "issue_recovery_handoff",
+  "issue_review_path_lost",
+  "provider_quota_recovery",
+  "retry",
 ]);
 
 /**
  * Activity actions that count as issue-visible progress when attributed to a
  * run. Deliberately narrower than run-liveness "concrete action evidence":
- * tool calls inside the workspace do not move the issue, so they do not reset
- * the streak — a run must leave a comment, mutation, document, work product,
- * interaction, or scheduled continuation behind.
+ * Narration and timer scheduling do not reset the streak. Actual workspace
+ * changes are represented separately by the durable workspace.diff projection.
  */
 export const ISSUE_PROGRESS_ACTIVITY_ACTIONS: string[] = [
   "issue.updated",
-  "issue.comment_added",
   "issue.created",
   "issue.child_created",
   "issue.assigned",
@@ -81,7 +75,6 @@ export const ISSUE_PROGRESS_ACTIVITY_ACTIONS: string[] = [
   "issue.attachment_added",
   "issue.attachment_removed",
   "issue.thread_interaction_created",
-  "issue.monitor_scheduled",
   "issue.approval_linked",
 ];
 
@@ -92,16 +85,57 @@ export const ISSUE_PROGRESS_ACTIVITY_ACTIONS: string[] = [
  */
 export const ISSUE_NEW_INPUT_ACTIVITY_ACTIONS: string[] = [
   ...ISSUE_PROGRESS_ACTIVITY_ACTIONS,
+  "issue.comment_added",
   "issue.thread_interaction_accepted",
   "issue.thread_interaction_answered",
   "issue.thread_interaction_item_verdicts_submitted",
   "issue.blockers_resolved_wake_emitted",
 ];
 
+/** Actual state fields; execution locks, timestamps and monitor metadata are bookkeeping. */
+export const ISSUE_WAKE_STATE_FIELDS = [
+  "title", "description", "status", "priority", "assigneeAgentId", "assigneeUserId",
+  "parentId", "projectId", "projectWorkspaceId", "executionWorkspaceId", "workMode",
+  "dueAt", "labelIds", "cycleId", "blockedByIssueIds", "unblockDescriptor",
+] as const;
+
+/** Durable receipts consume this server-derived fingerprint under the issue lock. */
+export const ISSUE_WAKE_DELTA_KEY = "issueWakeDelta";
+
+function stable(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value).sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${stable(entry)}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+export function buildIssueWakeFingerprint(input: {
+  activity: string | null;
+  state: unknown;
+  result: { status: string; errorCode: string | null; error?: string | null; exitCode: number | null; signal: string | null } | null;
+  config: unknown;
+  work: unknown;
+}): string {
+  return createHash("sha256").update(stable({ version: 1, ...input })).digest("hex");
+}
+
+export function shouldSuppressIssueWakeDelta(input: {
+  candidate: boolean;
+  fingerprint: string;
+  consumedFingerprint: string | null;
+}): boolean {
+  return input.candidate && input.consumedFingerprint === input.fingerprint;
+}
+
 export interface IssueRewakeCandidateInput {
   reason: string | null;
   wakeCommentId: string | null;
   requestedByActorType?: "user" | "agent" | "system" | null;
+  /** Resolved from the stored comment, never the caller's actor assertion. */
+  commentAuthorAgentId?: string | null;
+  agentId?: string;
   forceFreshSession: boolean;
   hasExplicitResume: boolean;
 }
@@ -112,11 +146,15 @@ export interface IssueRewakeCandidateInput {
  */
 export function isThrottleCandidateIssueRewake(input: IssueRewakeCandidateInput): boolean {
   if (input.forceFreshSession) return false;
+  if (input.requestedByActorType === "user") return false;
+  // An event delivery can carry a comment cursor from earlier context. That
+  // cursor must never turn an assignment or blocker resolution into a poll.
+  if (["issue_assigned", "issue_blockers_resolved", "issue_children_completed"].includes(input.reason ?? "")) return false;
   // Explicit resume is an operator privilege, not an actor-class escape hatch.
   // Agent-authored resume comments remain subject to the normal rewake throttle.
   if (input.hasExplicitResume && input.requestedByActorType !== "agent") return false;
-  if (input.wakeCommentId) return input.requestedByActorType === "agent";
-  if (input.reason === null) return true;
+  if (input.wakeCommentId) return Boolean(input.agentId && input.commentAuthorAgentId === input.agentId);
+  if (input.reason === null) return false;
   return THROTTLED_ISSUE_REWAKE_REASONS.has(input.reason);
 }
 
@@ -124,6 +162,10 @@ export interface RecentIssueRunSample {
   id: string;
   status: string;
   finishedAt: Date | null;
+  errorCode?: string | null;
+  error?: string | null;
+  exitCode?: number | null;
+  signal?: string | null;
 }
 
 export interface IssueRewakeThrottleInput {
@@ -160,9 +202,14 @@ export function evaluateIssueRewakeThrottle(input: IssueRewakeThrottleInput): Is
 
   let noProgressStreak = 0;
   for (const run of runs) {
-    // A failed/cancelled/interrupted run breaks the streak: its follow-up is
-    // recovery, not a redundant re-poll, and must not be delayed.
-    if (run.status !== "succeeded" || !run.finishedAt) break;
+    if (!run.finishedAt) break;
+    if (run.status !== "succeeded") {
+      // The first failure remains recoverable. Only an identical repeat feeds
+      // the streak; a new failure/result is meaningful input.
+      const older = runs[noProgressStreak + 1];
+      if (!run.errorCode || !older || older.status !== run.status || older.errorCode !== run.errorCode
+        || older.error !== run.error || older.exitCode !== run.exitCode || older.signal !== run.signal) break;
+    }
     if (input.runIdsWithIssueProgress.has(run.id)) break;
     noProgressStreak += 1;
   }
