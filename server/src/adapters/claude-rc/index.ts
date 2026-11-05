@@ -45,8 +45,10 @@ in argv). --mcp-config loads it, and --settings installs local observation hooks
 [ASSUMPTION] The experimental --dangerously-load-development-channels
 server:pcbridge flag remains compatible with the installed Claude Code 2.1.x.
 
+The Remote Control name is derived at launch ("<hops below Board> <agent name>", sanitized, max 60);
+any remoteControlName config is ignored.
 Config: cwd, stateDir, tmuxSocket (pc-claude-rc), tmuxSession (claude),
-remoteControlName (Paperclip Claude), model (claude-sonnet-5-5|claude-haiku-5-5),
+model (claude-sonnet-5-5|claude-haiku-5-5),
 effort (low|medium|high, default medium), expectedRemoteControlUrl, timeoutSec,
 channelBridgeRoot (optional repository package directory).
 
@@ -64,7 +66,6 @@ any other unresolved checkpoint blocks dispatch.
       { key: "stateDir", label: "Private dispatch/receipt directory", type: "text" },
       { key: "tmuxSocket", label: "tmux server socket", type: "text", default: "pc-claude-rc" },
       { key: "tmuxSession", label: "tmux session", type: "text", default: "claude" },
-      { key: "remoteControlName", label: "Remote Control session name", type: "text", default: "Paperclip Claude" },
       { key: "effort", label: "Effort", type: "text", default: "medium" },
       { key: "expectedRemoteControlUrl", label: "Expected RC session URL", type: "text" },
       { key: "channelBridgeRoot", label: "Claude channel bridge package directory (optional)", type: "text" },

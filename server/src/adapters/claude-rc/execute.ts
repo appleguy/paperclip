@@ -17,6 +17,7 @@ import {
   acquire, adoptableActive, isTargetBusyRefusal, deliver, normalizeOneLine, parseReceipt, tmux,
   type Receipt,
 } from "../agy/execute.js";
+import { deriveRcName, reportsToDepth, sanitizeRcName, type RcAgentNode } from "./rc-name.js";
 import {
   CHANNEL_NAME, findBridgeRoot, prepareChannelHost, routeChannelInput, type ChannelHost,
 } from "./channel.js";
@@ -25,7 +26,6 @@ const CLAUDE = "/opt/homebrew/bin/claude";
 const MODELS = new Set(["claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5-5"]);
 const EFFORTS = new Set(["low", "medium", "high"]);
 const ID = /^[a-zA-Z0-9_-]{1,55}$/;
-const NAME = /^[A-Za-z0-9 ._-]{1,60}$/;
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
 function asString(v: unknown, fallback: string): string {
@@ -286,11 +286,34 @@ async function postComment(ctx: AdapterExecutionContext, issueId: string, body: 
   });
 }
 
+async function derivedRcName(ctx: AdapterExecutionContext): Promise<string> {
+  let depth = 0;
+  try {
+    if (ctx.authToken) {
+      const port = Number(process.env.PAPERCLIP_LISTEN_PORT ?? process.env.PORT ?? "3100");
+      const res = await fetch(new URL(`/api/companies/${encodeURIComponent(ctx.agent.companyId)}/agents`, `http://127.0.0.1:${port}`), {
+        redirect: "manual", signal: AbortSignal.timeout(10_000),
+        headers: { Authorization: `Bearer ${ctx.authToken}`, "X-Paperclip-Run-Id": ctx.runId },
+      });
+      if (res.ok) depth = reportsToDepth(ctx.agent.id, (await res.json()) as RcAgentNode[]);
+      else await ctx.onLog("stderr", `[claude-rc] RC name depth lookup HTTP ${res.status}; using depth 0\n`);
+    }
+  } catch (e) {
+    await ctx.onLog("stderr", `[claude-rc] RC name depth lookup failed (${(e as Error).message}); using depth 0\n`);
+  }
+  const name = deriveRcName(ctx.agent.name, depth);
+  const configured = typeof ctx.config.remoteControlName === "string" ? ctx.config.remoteControlName.trim() : "";
+  if (configured && sanitizeRcName(configured) !== name)
+    await ctx.onLog("stdout", `[claude-rc] Ignoring configured remoteControlName "${configured}"; Remote Control name is derived: "${name}"\n`);
+  return name;
+}
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const cfg = ctx.config;
   const session = asString(cfg.tmuxSession, "claude");
   const socket = asString(cfg.tmuxSocket, "pc-claude-rc");
-  const name = asString(cfg.remoteControlName, "Paperclip Claude");
+  // SCO-782: derived from agent name + reportsTo depth; any configured remoteControlName is ignored.
+  const name = await derivedRcName(ctx);
   const stateDir = path.resolve(asString(cfg.stateDir, path.join(os.homedir(), ".paperclip/claude-rc-state")));
   const cwd = path.resolve(asString(cfg.cwd, "/Volumes/NVM/Paperclip/workspaces/claude-rc"));
   const model = asString(cfg.model, "claude-sonnet-5-5");
@@ -310,7 +333,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (!MODELS.has(model)) throw new Error(`claude_rc_local permits only ${[...MODELS].join(", ")}; received ${model}`);
     if (!EFFORTS.has(effort)) throw new Error(`invalid effort ${effort}`);
     assertWorkableCwd(cwd);
-    if (!ID.test(socket) || !ID.test(session) || !NAME.test(name)) throw new Error("invalid tmux socket/session/name");
+    if (!ID.test(socket) || !ID.test(session)) throw new Error("invalid tmux socket/session/name");
     if (!issueId) return {
       exitCode: 0, signal: null, timedOut: false, provider: "anthropic", biller: "anthropic", model,
       billingType: "subscription", costStatus: "unpriced", summary: "claude_rc_local: no issue on this wake; nothing to dispatch",
