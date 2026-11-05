@@ -2209,7 +2209,11 @@ function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   checkoutRunId: string | null | undefined;
   executionRunId: string | null | undefined;
   requestAddsExplicitBlockers?: boolean;
+  // SCO-944: the comment's run belongs to the assignee agent (any issue), so it
+  // is the assignee's own comment, not a human asking to resume.
+  actorRunIsAssigneeRun?: boolean;
 }) {
+  if (input.actorRunIsAssigneeRun) return false;
   // A request that wires a non-empty blockedByIssueIds list is declaring that
   // the issue is waiting on other work. The implicit reopen exists for plain
   // conversational comments ("please continue"), not structured dependency
@@ -3493,6 +3497,15 @@ export function issueRoutes(
       sourceRun?.companyId === comment.companyId &&
       sourceRun.agentId === assigneeAgentId
     );
+  };
+  const actorRunBelongsToAssignee = async (
+    companyId: string,
+    runId: string | null | undefined,
+    assigneeAgentId: string | null | undefined,
+  ) => {
+    if (!runId || !assigneeAgentId) return false;
+    const run = await heartbeat.getRun(runId).catch(() => null);
+    return run?.companyId === companyId && run.agentId === assigneeAgentId;
   };
   const enqueueStalledReviewDecisionWakeup =
     opts.stalledReviewDecisionEnqueueWakeup ?? heartbeat.wakeup;
@@ -14337,6 +14350,11 @@ export function issueRoutes(
           actorType: actor.actorType,
           actorId: actor.actorId,
         });
+      const actorRunIsAssigneeRun = await actorRunBelongsToAssignee(
+        existing.companyId,
+        actor.runId,
+        requestedAssigneeAgentId,
+      );
       const effectiveMoveToTodoRequested =
         !assigneeSelfCommentOnTerminal &&
         !(isBlocked && !!commentBody && (await getExecutionBlocker(db, existing.companyId, existing.id))?.workspaceRepairRequired) &&
@@ -14350,6 +14368,7 @@ export function issueRoutes(
               actorRunId: actor.runId,
               checkoutRunId: existing.checkoutRunId,
               executionRunId: existing.executionRunId,
+              actorRunIsAssigneeRun,
               requestAddsExplicitBlockers:
                 Array.isArray(req.body.blockedByIssueIds) &&
                 req.body.blockedByIssueIds.length > 0,
@@ -19000,6 +19019,11 @@ export function issueRoutes(
           actorType: actor.actorType,
           actorId: actor.actorId,
         });
+      const actorRunIsAssigneeRun = await actorRunBelongsToAssignee(
+        issue.companyId,
+        actor.runId,
+        issue.assigneeAgentId,
+      );
       const effectiveMoveToTodoRequested =
         !assigneeSelfCommentOnTerminal &&
         !(isBlocked && (await getExecutionBlocker(db, issue.companyId, issue.id))?.workspaceRepairRequired) &&
@@ -19012,6 +19036,7 @@ export function issueRoutes(
             actorRunId: actor.runId,
             checkoutRunId: issue.checkoutRunId,
             executionRunId: issue.executionRunId,
+            actorRunIsAssigneeRun,
           }) ||
           shouldResumeInProgressScheduledRetry);
       const hasUnresolvedFirstClassBlockers =
