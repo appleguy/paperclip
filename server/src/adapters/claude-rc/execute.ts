@@ -179,6 +179,22 @@ export function goalForConversation(goal: unknown, reuse: boolean, state: KeepSt
   if (!goal || typeof goal !== "object") return goal;
   return { ...(goal as Record<string, unknown>), deliveredKey: reuse ? state?.goalKeys?.[issueId] ?? null : null };
 }
+export const PROMPT_BUDGET = 50_000;
+/** Shrink the largest trimmable section until the joined prompt fits; a long task history must not fail the wake. */
+export function fitPromptSections(sections: string[], trimmable: number[], join: (s: string[]) => string, budget = PROMPT_BUDGET): string[] {
+  const out = [...sections];
+  const marker = (n: number) => `\n\n[paperclip] ${n} chars of this section omitted to fit the dispatch budget; fetch the issue thread and documents for anything you need.\n\n`;
+  for (let i = 0; i < 4 && join(out).length > budget; i++) {
+    const idx = trimmable.reduce((a, b) => (out[b].length > out[a].length ? b : a));
+    const over = join(out).length - budget;
+    const s = out[idx];
+    const cut = Math.min(s.length, over + 400);
+    if (cut <= 0) break;
+    const head = Math.floor((s.length - cut) * 0.6);
+    out[idx] = s.slice(0, head) + marker(cut) + s.slice(head + cut);
+  }
+  return out;
+}
 export function shouldReuseConversation(o: {
   enabled: boolean; state: KeepState | null; newestId: string | null; projectId: string;
   sizeBytes: number; maxBytes: number; acrossProjects?: boolean;
@@ -479,8 +495,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         "if blocked, explain the blocker visibly and stop.",
       ].join(" ");
       // The channel preserves Markdown/newlines; only the tmux fallback flattens.
-      const prompt = joinPromptSections([instructionsPrefix, intro, taskContextNote, wakePrompt, instructions]);
-      if (prompt.length > 50_000) throw new Error("Claude prompt exceeds dispatch budget");
+      const sections = [instructionsPrefix, intro, taskContextNote, wakePrompt, instructions];
+      const rawLength = joinPromptSections(sections).length;
+      const prompt = joinPromptSections(fitPromptSections(sections, [2, 3], joinPromptSections));
+      if (prompt.length < rawLength) await ctx.onLog("stdout", `[claude-rc] prompt ${rawLength} chars trimmed to ${prompt.length} (task context/wake history)\n`);
+      if (prompt.length > PROMPT_BUDGET) throw new Error("Claude prompt exceeds dispatch budget");
       if (keepEnabled) {
         await ctx.onLog("stdout", `[claude-rc] keepConversation ${reuse ? "reuse" : "fresh"}: prompt ${prompt.length} bytes (instructions ${reuse ? 0 : instructionsFull.length} of ${instructionsFull.length}); conversation ${Math.round(keepSize)} bytes\n`);
         const issueIds = [...seenIssueIds.filter(id => id !== issueId), issueId].slice(-200);
