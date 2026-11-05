@@ -221,12 +221,32 @@ export function shouldReuseConversation(o: {
     && (o.acrossProjects === true || o.state.projectId === o.projectId) && o.sizeBytes < o.maxBytes;
 }
 
+/** SCO-693: true when the TUI's working folder is not the configured cwd (symlinks resolved). */
+export async function paneCwdDiffers(panePath: string, cwd: string): Promise<boolean> {
+  if (!panePath) return false;
+  const real = async (p: string) => fs.realpath(p).catch(() => path.resolve(p));
+  return (await real(panePath)) !== (await real(cwd));
+}
+
 async function ensureSession(
   socket: string, session: string, cwd: string, stateDir: string,
   name: string, model: string, effort: string, channel: ChannelHost, rejoinOnly: boolean, keepConversation = false,
 ): Promise<string> {
   let exists = true;
   try { await tmux(socket, ["has-session", "-t", session]); } catch { exists = false; }
+  // SCO-693: a changed adapterConfig.cwd must take effect. A non-keepConversation seat holds no state
+  // worth keeping between wakes, so at an idle boundary recreate its TUI in the new cwd.
+  if (exists && !rejoinOnly && !keepConversation) {
+    const panePath = (await tmux(socket, ["display-message", "-p", "-t", session, "#{pane_current_path}"]).catch(() => "")).trim();
+    if (await paneCwdDiffers(panePath, cwd)) {
+      if (!(await waitIdle(socket, session, Date.now() + 120_000)))
+        throw new Error(`Claude TUI is in ${panePath}, configured cwd is ${cwd}, but the TUI is not idle; will recreate at the next idle boundary`);
+      const proc = (await tmux(socket, ["display-message", "-p", "-t", session, "#{pane_current_command}"])).trim();
+      if (proc !== "claude") throw new Error(`tmux pane is ${proc}, not claude; refusing to commandeer it`);
+      await tmux(socket, ["kill-session", "-t", session]);
+      exists = false;
+    }
+  }
   if (!exists) {
     if (rejoinOnly) {
       throw new Error("Claude active op lost its original TUI; hold for operator reconciliation, never replay");
@@ -243,32 +263,12 @@ async function ensureSession(
       CLAUDE, "--remote-control", name, "--name", name, "--model", model, "--effort", effort,
       "--dangerously-skip-permissions",
       "--mcp-config", channel.mcpConfigPath,
-/** SCO-693: true when the TUI's working folder is not the configured cwd (symlinks resolved). */
-export async function paneCwdDiffers(panePath: string, cwd: string): Promise<boolean> {
-  if (!panePath) return false;
-  const real = async (p: string) => fs.realpath(p).catch(() => path.resolve(p));
-  return (await real(panePath)) !== (await real(cwd));
-}
-
       "--settings", channel.hookSettingsPath,
       "--dangerously-load-development-channels", `server:${CHANNEL_NAME}`]);
   }
   const processName = (await tmux(socket, ["display-message", "-p", "-t", session, "#{pane_current_command}"])).trim();
   if (processName !== "claude") throw new Error(`tmux pane is ${processName}, not claude; refusing to commandeer it`);
   if (!exists) {
-  // SCO-693: a changed adapterConfig.cwd must take effect. A non-keepConversation seat holds no state
-  // worth keeping between wakes, so at an idle boundary recreate its TUI in the new cwd.
-  if (exists && !rejoinOnly && !keepConversation) {
-    const panePath = (await tmux(socket, ["display-message", "-p", "-t", session, "#{pane_current_path}"]).catch(() => "")).trim();
-    if (await paneCwdDiffers(panePath, cwd)) {
-      if (!(await waitIdle(socket, session, Date.now() + 120_000)))
-        throw new Error(`Claude TUI is in ${panePath}, configured cwd is ${cwd}, but the TUI is not idle; will recreate at the next idle boundary`);
-      const proc = (await tmux(socket, ["display-message", "-p", "-t", session, "#{pane_current_command}"])).trim();
-      if (proc !== "claude") throw new Error(`tmux pane is ${proc}, not claude; refusing to commandeer it`);
-      await tmux(socket, ["kill-session", "-t", session]);
-      exists = false;
-    }
-  }
     // Only for a TUI this call just launched with our own local bridge: accept
     // the one-time development-channels notice (option 1). Never on an existing
     // session, where the screen may hold the owner's own prompt.
