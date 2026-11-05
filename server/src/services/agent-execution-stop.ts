@@ -55,7 +55,8 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
     if (run.status !== "cancelled" || !run.startedAt) continue;
     // No process, group, lease or coordinator remains. A cancellation that was never acknowledged
     // and has been idle this long will not be acknowledged later, so it must not hold termination forever.
-    if (Date.now() - (run.updatedAt ?? run.finishedAt ?? run.startedAt).getTime() > STALE_UNACKNOWLEDGED_CANCEL_MS) continue;
+    // Anchor the grace period to terminalization; later bookkeeping must not keep a lost stop acknowledgement alive.
+    if (Date.now() - (run.finishedAt ?? run.startedAt).getTime() > STALE_UNACKNOWLEDGED_CANCEL_MS) continue;
     if (run.runtimeMode === "native" && !run.processPid && !run.processGroupId &&
         !await hasNativeLocalProcessStop(db, run.companyId, run.id) &&
         !await isCancelledNativeStartup(db, run, coordinators.find(row => row.runId === run.id))) return false;

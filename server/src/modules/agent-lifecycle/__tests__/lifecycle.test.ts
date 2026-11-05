@@ -17,6 +17,7 @@ import request from "supertest";
 import { agentRoutes } from "../../../routes/agents.js";
 import { errorHandler } from "../../../middleware/error-handler.js";
 import { createLifecycleDriver } from "../../../services/agent-lifecycle-driver.js";
+import { createDeliveryWorkCoordinator } from "../../../services/delivery-work-coordinator.js";
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { agents, approvals, projects, issues, heartbeatRuns, nativeRunFinalizations, budgetPolicies, environmentLeases, environments, agentApiKeys, activityLog, agentConfigRevisions, userCompanyPreferences, companies, companyMemberships, principalPermissionGrants, plugins, pluginCompanySettings, applyPendingMigrations, closeRegisteredClients, createDb, type Db } from "@paperclipai/db";
@@ -412,6 +413,37 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     await db.update(nativeRunFinalizations).set({ leaseExpiresAt: new Date(0) }).where(eq(nativeRunFinalizations.runId, run.id));
     expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(true);
     expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, run.id)))[0]).toMatchObject({ leaseOwner: null, leaseExpiresAt: null });
+  });
+
+  it("automatically recovers a pause after the stop grace even when bookkeeping refreshed the cancelled run", async () => {
+    const agent = await hire();
+    await createAgentLifecycle(db).pauseAgent(agent.id);
+    const now = new Date();
+    const finishedAt = new Date(now.getTime() - 15 * 60 * 1000 - 1_000);
+    await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id,
+      status: "cancelled", invocationSource: "on_demand", runtimeMode: "legacy",
+      startedAt: new Date(finishedAt.getTime() - 60_000), finishedAt, updatedAt: now }).returning();
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(true);
+
+    const driver = createLifecycleDriver(db, {} as never);
+    const runHost = vi.spyOn(driver, "runHost");
+    const errors: unknown[] = [];
+    const work = startAgentLifecycle(db, driver, () => true);
+    const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError: error => { errors.push(error); } });
+    const registered = coordinator.register(DELIVERY_QUEUES.agentLifecycle, {
+      retryMs: 10, run: () => work.sweep(), hasPending: () => work.hasPending(), nextRunAt: () => work.nextRunAt(),
+    });
+    work.setWake(registered.wake);
+    try {
+      await registered.ready;
+      const lifecycle = await current(agent.id);
+      const hostResults = await Promise.all(runHost.mock.results.map(result => result.value));
+      expect({ lifecycleState: lifecycle.lifecycleState, hostCalls: runHost.mock.calls.length,
+        hostResults, errors: errors.map(error => error instanceof Error ? error.message : String(error)) })
+        .toEqual({ lifecycleState: "paused", hostCalls: 1, hostResults: ["complete"], errors: [] });
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agent.id));
+      expect(run).toMatchObject({ status: "cancelled", updatedAt: now, finishedAt });
+    } finally { await coordinator.stop(); await work.stop(); }
   });
 
   it("releases an expired native owner whose renewed lease expiry has microsecond precision", async () => {

@@ -78,20 +78,27 @@ fi
 if [ "${PC_DEPLOY_IN_LOCK:-}" != 1 ]; then
   [ -x "$flock" ] || { echo 'pc-deploy: atomic flock unavailable' >&2; exit 1; }
   mkdir -p "$tmp"
-  # Each caller waits for its own exclusive turn. A full deploy finishes in
-  # well under 10 minutes; a holder older than that is stuck and is killed
-  # (owner 2026-11-03: deploys never hold on a stuck process). The kernel
-  # releases the lock on SIGKILL. Queued waiters may also be killed; every
-  # deploy installs master HEAD, so the surviving caller covers their request.
+  # Refuse overlapping control sessions; never kill the lock holder.
   rc=0
-  "$flock" -x -w 600 -E 76 "$tmp/pc-deploy.flock" \
+  "$flock" -x -n -E 76 "$tmp/pc-deploy.flock" \
     /usr/bin/env PC_DEPLOY_IN_LOCK=1 /bin/sh "$0" "$@" || rc=$?
-  [ "$rc" -eq 76 ] || exit "$rc"
-  holders=$(lsof -t "$tmp/pc-deploy.flock" 2>/dev/null | grep -vx "$$" || :)
-  echo "pc-deploy: WARNING deploy lock held >10 min; killing stuck holder(s): $holders" >&2
-  [ -z "$holders" ] || { kill -TERM $holders 2>/dev/null || :; sleep 10; kill -KILL $holders 2>/dev/null || :; }
-  exec "$flock" -x -w 60 -E 76 "$tmp/pc-deploy.flock" \
-    /usr/bin/env PC_DEPLOY_IN_LOCK=1 /bin/sh "$0" "$@"
+  if [ "$rc" -eq 76 ]; then
+    holders=$(lsof -nP -t "$tmp/pc-deploy.flock" 2>/dev/null | grep -vx "$$" || :)
+    if [ -n "$holders" ]; then
+      for holder in $holders; do
+        details=$(ps -p "$holder" -o command= 2>/dev/null || :)
+        if [ -n "$details" ]; then
+          echo "pc-deploy: deploy lock held by PID $holder: $details" >&2
+        else
+          echo "pc-deploy: deploy lock held by PID $holder" >&2
+        fi
+      done
+    else
+      echo "pc-deploy: deploy lock is held; holder details unavailable" >&2
+    fi
+    exit 76
+  fi
+  exit "$rc"
 fi
 
 # Re-read the active colour inside the lock: a preceding deploy may have

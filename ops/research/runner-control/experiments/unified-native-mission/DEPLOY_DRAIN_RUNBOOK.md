@@ -4,7 +4,7 @@ Canonical source: `pc-deploy.sh` (installed at `/Volumes/NVM/Paperclip/bin/pc-de
 
 ## Lifecycle and proof
 
-1. Acquire OS-level exclusive `flock`; every contender waits for its own attempt, with an explicit nonzero timeout instead of a lost "queued" receipt. OS releases a dead holder's lock, avoiding PID reuse and stale-directory TOCTOU.
+1. Acquire OS-level exclusive `flock` without waiting. A contender refuses immediately and reports each current holder PID and command; it never signals or kills another deploy. OS releases a dead holder's lock, avoiding PID reuse and stale-directory TOCTOU.
 2. Validate known source branch, origin, exact immutable 40-character HEAD, and cached healthy *process* receipt (PID + SHA + current payload). If already verified, return without restarting. A symlink alone is insufficient.
 3. Respect 30-minute spacing by checking Paperclip instance-admin `GET /api/instance/task-drain?upgradeReadiness=1` server PID and uptime before any restart. Push exact SHA and install with `--ref <sha>` (not a mutable branch).
 4. Start audited `POST /api/instance/task-drain` with a bounded 20-minute TTL to fence new admission. Wait up to 600 seconds for running work to settle.
