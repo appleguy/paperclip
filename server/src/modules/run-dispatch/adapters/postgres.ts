@@ -213,7 +213,11 @@ function statusEffect(run: HeartbeatRun, previousStatus: string | null): PostCom
 
 export function createPostgresRunDispatchAdapter(
   db: Db,
-): ScheduledRetryReader & RunDispatchWriter {
+): ScheduledRetryReader & RunDispatchWriter & {
+  cancelPreviousAssigneeQueuedRuns(tx: Db, input: {
+    companyId: string; issueId: string; previousAgentId: string | null; currentAgentId: string | null;
+  }): Promise<PostCommitEffect[]>;
+} {
   const budgets = budgetService(db);
   const treeControlSvc = issueTreeControlService(db);
   const issuesSvc = issueService(db);
@@ -1183,6 +1187,10 @@ export function createPostgresRunDispatchAdapter(
           ),
         );
 
+      await tx.update(issues).set({ checkoutRunId: null, updatedAt: now }).where(and(
+        eq(issues.companyId, row.companyId), eq(issues.id, issueId), eq(issues.checkoutRunId, row.id),
+      ));
+
       await appendHeartbeatRunEvent(tx as unknown as Db, {
         companyId: row.companyId,
         runId: row.id,
@@ -1200,6 +1208,32 @@ export function createPostgresRunDispatchAdapter(
         errorCode: decision.errorCode,
         postCommitEffects: [statusEffect(row, expectedStatus)],
       };
+  }
+
+  // The caller holds the issue row lock and has already changed the owner in
+  // this transaction. Use the same settlement as the queued dispatch gate.
+  async function cancelPreviousAssigneeQueuedRuns(tx: Db, input: {
+    companyId: string; issueId: string; previousAgentId: string | null; currentAgentId: string | null;
+  }) {
+    if (!input.previousAgentId) return [];
+    const runs = await tx.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.agentId, input.previousAgentId),
+      eq(heartbeatRuns.status, "queued"),
+      or(eq(heartbeatRuns.issueId, input.issueId), eq(heartbeatRuns.nativeIssueId, input.issueId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`,
+        sql`${heartbeatRuns.contextSnapshot}->>'taskId' = ${input.issueId}`),
+    )).for("update");
+    const effects: PostCommitEffect[] = [];
+    for (const run of runs) {
+      const result = await cancelStaleRunInTx(tx, run, input.issueId, {
+        stale: true, errorCode: "issue_assignee_changed",
+        reason: "Cancelled because issue assignee changed before the queued run could start; the new owner will be woken instead",
+        details: { issueId: input.issueId, previousAssigneeAgentId: input.previousAgentId,
+          currentAssigneeAgentId: input.currentAgentId },
+      }, "queued", new Date());
+      if (result.outcome === "cancelled") effects.push(...result.postCommitEffects);
+    }
+    return effects;
   }
 
   async function decideCurrentRunStaleness(tx: Db, run: HeartbeatRun, now: Date, publications?: ActivityPublication[]) {
@@ -1512,6 +1546,7 @@ export function createPostgresRunDispatchAdapter(
     nextScheduledRetryAt,
     listDueRetries,
     cancelStaleQueuedRun,
+    cancelPreviousAssigneeQueuedRuns,
     dispatchResolvedInteractionIfCurrent,
     promoteOrCancelDueRetry,
   };

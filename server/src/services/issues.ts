@@ -6,6 +6,7 @@ import { finishedIdleWake } from "./idle-work-proof.js";
 import { notifyDeferredExecutionEligibility } from "./deferred-execution-notifications.js";
 import { notifyIssueRecovery } from "./issue-recovery-notifications.js";
 import { notifyRunDispatch } from "./run-dispatch-notifications.js";
+import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { notifyIssueAttentionRetentionWork } from "./retention-work-notifications.js";
 import { notifyRoutineExecutionStatus } from "./routine-execution-status-notifications.js";
@@ -11482,6 +11483,15 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        // Compare with the locked owner, not only the pre-transaction read:
+        // another assignment may have committed while this update waited.
+        if ((patch.assigneeAgentId !== undefined && patch.assigneeAgentId !== receiptExisting.assigneeAgentId) ||
+            (patch.assigneeUserId !== undefined && patch.assigneeUserId !== receiptExisting.assigneeUserId)) {
+          patch.checkoutRunId = null;
+          patch.executionRunId = null;
+          patch.executionAgentNameKey = null;
+          patch.executionLockedAt = null;
+        }
         if (issueData.executionPolicy !== undefined) assertQualityReviewPolicyMutation({ previousPolicy: receiptExisting.executionPolicy, nextPolicy: issueData.executionPolicy, actorAgentId, actorUserId });
         if ((patch.status ?? receiptExisting.status) === "done" &&
             (receiptExisting.status !== "done" || issueData.executionPolicy !== undefined)) {
@@ -11728,6 +11738,10 @@ export function issueService(db: Db) {
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
+        if (updated.assigneeAgentId !== receiptExisting.assigneeAgentId) {
+          await createPostgresRunDispatchAdapter(tx).cancelPreviousAssigneeQueuedRuns(tx, { companyId: updated.companyId,
+            issueId: updated.id, previousAgentId: receiptExisting.assigneeAgentId, currentAgentId: updated.assigneeAgentId });
+        }
         if (updated.status === "done") {
           await completeTerminalCaseHandoffsForIssue(tx, { companyId: updated.companyId, issueId: updated.id,
             publications: activityPublications });
@@ -12705,6 +12719,10 @@ export function issueService(db: Db) {
           .returning()
           .then((rows) => rows[0] ?? null);
         if (!updated) return null;
+        if (!isTerminal && existing.assigneeAgentId) {
+          await createPostgresRunDispatchAdapter(tx as unknown as Db).cancelPreviousAssigneeQueuedRuns(tx as unknown as Db,
+            { companyId: existing.companyId, issueId: id, previousAgentId: existing.assigneeAgentId, currentAgentId: null });
+        }
         const [enriched] = await withIssueLabels(tx, [updated]);
         return enriched;
       }),
@@ -12721,6 +12739,7 @@ export function issueService(db: Db) {
           .select({
             id: issues.id,
             companyId: issues.companyId,
+            assigneeAgentId: issues.assigneeAgentId,
             checkoutRunId: issues.checkoutRunId,
             executionRunId: issues.executionRunId,
           })
@@ -12762,6 +12781,10 @@ export function issueService(db: Db) {
           .returning()
           .then((rows) => rows[0] ?? null);
         if (!updated) return null;
+        if (options.clearAssignee && existing.assigneeAgentId) {
+          await createPostgresRunDispatchAdapter(tx as unknown as Db).cancelPreviousAssigneeQueuedRuns(tx as unknown as Db,
+            { companyId: existing.companyId, issueId: id, previousAgentId: existing.assigneeAgentId, currentAgentId: null });
+        }
 
         const [enriched] = await withIssueLabels(tx, [updated]);
         return {
