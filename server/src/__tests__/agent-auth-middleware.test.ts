@@ -234,6 +234,16 @@ describe("agent auth middleware", () => {
     expect((await request(client).get(endpoint).set("Authorization", `Bearer ${token}`)).status).toBe(200);
   });
 
+  it("allows a running OpenCode mention wake to write on an issue it does not lock", async () => {
+    const agentId = randomUUID(), companyId = randomUUID(), runId = randomUUID(), issueId = randomUUID();
+    const { db } = createDbState({ agent: { id: agentId, companyId }, run: { id: runId, companyId, agentId, issueId },
+      issue: { id: issueId, executionRunId: null, checkoutRunId: null } });
+    const token = createLocalAgentJwt(agentId, companyId, "opencode_local", runId, null);
+    const result = await request(createApp(db)).patch(`/companies/${companyId}/issues/${issueId}`)
+      .set("Authorization", `Bearer ${token}`).send({ status: "done" });
+    expect(result.status).toBe(200);
+  });
+
   it("allows the running OpenCode execution owner to write", async () => {
     const agentId = randomUUID(), companyId = randomUUID(), runId = randomUUID(), issueId = randomUUID();
     const { db } = createDbState({ agent: { id: agentId, companyId }, run: { id: runId, companyId, agentId, issueId },

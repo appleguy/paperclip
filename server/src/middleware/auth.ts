@@ -426,9 +426,15 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
             _res.status(403).json({ error: "This OpenCode run has an invalid issue binding", code: "agent_run_not_active" });
             return;
           }
+          // Refuse only when a successor run of this same agent owns the issue. A mention or
+          // comment wake on another owner's (or an unlocked) issue never holds its lock.
           const [issue] = await db.select({ executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId })
             .from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, claims.company_id)));
-          if (!issue || (issue.executionRunId ?? issue.checkoutRunId) !== claims.run_id) {
+          const ownerRunId = issue ? issue.executionRunId ?? issue.checkoutRunId : null;
+          const [ownerRun] = ownerRunId && ownerRunId !== claims.run_id
+            ? await db.select({ agentId: heartbeatRuns.agentId }).from(heartbeatRuns).where(eq(heartbeatRuns.id, ownerRunId))
+            : [];
+          if (!issue || ownerRun?.agentId === claims.sub) {
             _res.status(403).json({ error: "This OpenCode run no longer owns the issue", code: "agent_run_not_active" });
             return;
           }
