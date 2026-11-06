@@ -4,6 +4,21 @@
  * `now`. A clock without a time zone is read as UTC.
  */
 export function parseProviderQuotaClockReset(error: string, now: Date) {
+  // A date without a clock or zone means midnight UTC. Do not consume a
+  // prefix of a date-and-time: that would schedule before the stated time.
+  const dateOnly = error.match(/(?:try again at|resets?(?:\s+at)?)\s+(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+(\d{1,2})(?:st|nd|rd|th)?(?=\s*(?:[.!"\\]|$))/i);
+  if (dateOnly) {
+    const month = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"].indexOf(dateOnly[1]!.slice(0, 3).toLowerCase());
+    const day = Number(dateOnly[2]);
+    let year = now.getUTCFullYear();
+    let candidate = new Date(Date.UTC(year, month, day));
+    if (candidate.getUTCMonth() !== month || candidate.getUTCDate() !== day) return null;
+    if (candidate.getTime() <= now.getTime()) {
+      candidate = new Date(Date.UTC(++year, month, day));
+      if (candidate.getUTCMonth() !== month || candidate.getUTCDate() !== day) return null;
+    }
+    return candidate;
+  }
   const match = error.match(
     /(?:try again at|resets?(?:\s+at)?)\s+(\d{1,2})(?::(\d{2}))?\s*(?:([ap])\.?\s*m\.?)?(?:\s*\(([^)]+)\)|\s+([A-Z]{2,5}))?/i,
   );

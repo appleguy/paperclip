@@ -120,6 +120,27 @@ describe("classifyAdapterFailureForRecovery", () => {
     });
   });
 
+  it("uses a date-only quota reset as midnight UTC rather than the fallback backoff", () => {
+    const now = new Date("2026-11-03T20:00:00.000Z");
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "provider_quota",
+      error: "You've hit your usage limit. Try again at Nov 5th.",
+      resultJson: null,
+    }, now)).toEqual({
+      kind: "provider_quota",
+      retryAt: new Date("2026-11-05T00:00:00.000Z"),
+      parsedResetTime: true,
+    });
+  });
+
+  it.each(["Nov 5th, 2026 2:04 AM", "Feb 30th."])("does not interpret %s as a date-only reset", (date) => {
+    const now = new Date("2026-11-03T20:00:00.000Z");
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "provider_quota", error: `You've hit your usage limit. Try again at ${date}`,
+      resultJson: null,
+    }, now)).toEqual({ kind: "provider_quota", retryAt: new Date(now.getTime() + PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS), parsedResetTime: false });
+  });
+
   it("parses provider reset clocks in 24-hour format", () => {
     const now = new Date("2026-07-15T20:00:00.000Z");
     const classification = classifyAdapterFailureForRecovery({
