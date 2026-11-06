@@ -165,7 +165,7 @@ export function classifyOpenCodeError(err: unknown): { code: string; detail: str
 
 /** Read this op's usage from the session message log: messages created at/after our user message. */
 async function collectOutcome(
-  driverFetch: typeof fetch, url: string, passwordFile: string, sessionId: string, msgId: string, requireTarget = false,
+  driverFetch: typeof fetch, url: string, passwordFile: string, sessionId: string, msgId: string,
 ): Promise<{ texts: string[]; usage: ReturnType<typeof parseOpenCodeJsonl>["usage"]; usageReported: boolean; costUsd: number | null; sessionOutcome: string | null; capacityRefusal: boolean; cause: { code: string; detail: string } | null }> {
   const pw = (await fs.readFile(passwordFile, "utf8")).trim();
   const headers = { authorization: "Basic " + Buffer.from(`opencode:${pw}`).toString("base64"), accept: "application/json" };
@@ -176,11 +176,18 @@ async function collectOutcome(
   };
   const sid = encodeURIComponent(sessionId);
   const list: any[] = (await get(`/api/session/${sid}/message?limit=200`))?.data ?? [];
-  const mine = list.find((m) => m?.id === msgId);
+  if (list.some((m) => !m || typeof m !== "object" || typeof m.id !== "string" || typeof m.type !== "string"))
+    throw new Error("malformed message in outcome window");
+  const targetIndex = list.findIndex((m) => m.id === msgId);
+  const mine = targetIndex >= 0 ? list[targetIndex] : null;
   const created = mine?.time?.created;
-  if (requireTarget && typeof created !== "number") throw new Error("recovered message absent from outcome window");
-  const ops = typeof created === "number" ? list.filter((m) => m?.type === "assistant" && (m?.time?.created ?? 0) >= created) : [];
-  ops.sort((a, b) => (a.time?.created ?? 0) - (b.time?.created ?? 0));
+  if (mine?.type !== "user" || typeof created !== "number" || !Number.isFinite(created))
+    throw new Error("recovered message absent or invalid in outcome window");
+  // OpenCode lists messages newest first. Timestamps can tie, so only
+  // messages after this user prompt in provider order belong to its turn.
+  const turn = list.slice(0, targetIndex);
+  if (turn.some((m) => m.type === "user")) throw new Error("successor appeared in outcome window");
+  const ops = turn.filter((m) => m.type === "assistant").reverse();
   const usage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, peakContextTokens: 0 };
   let usageReported = false;
   let cost: number | null = 0;
@@ -207,7 +214,7 @@ async function collectOutcome(
   const errored = [...ops].reverse().find((m) => m?.error != null || m?.finish === "error" || m?.finish?.type === "error");
   let capacityRefusal = errored != null && isCapacityError(errored.error ?? errored.finish ?? errored);
   // The failed outcome record (and the errored assistant message) carry the structured provider error.
-  const outcomeRec = [...list].reverse().find((m) => m?.outcome === "failed" && m?.error != null && (m?.time?.created ?? 0) >= (created ?? 0));
+  const outcomeRec = turn.find((m) => m?.outcome === "failed" && m?.error != null);
   let cause = classifyOpenCodeError(outcomeRec?.error ?? errored?.error ?? null);
   try {
     const sess = (await get(`/api/session/${sid}`))?.data;
@@ -545,7 +552,7 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
   try {
     if (await driver.hasSuccessor(conversationId, msgId))
       return held("OpenCode found a successor in message history; outcome held", true, conversationId, "unowned_successor");
-    out = await collectOutcome(f, server.url, server.passwordFile, conversationId, msgId, true);
+    out = await collectOutcome(f, server.url, server.passwordFile, conversationId, msgId);
     if (await driver.hasSuccessor(conversationId, msgId))
       return held("OpenCode found a successor while reading the outcome; outcome held", true, conversationId, "unowned_successor");
   } catch {

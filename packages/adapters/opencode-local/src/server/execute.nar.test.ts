@@ -184,6 +184,19 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect([...sessions.values()][0]!.info.model).toEqual({ providerID: "openai", id: "fixture", variant: "medium" });
   });
 
+  it("does not attribute an older turn with the same timestamp to the live outcome", async () => {
+    const sid = sessionIdFor(scope);
+    sessions.set(sid, { info: { id: sid, location: { directory: root }, time: { created: 998 } }, msgs: [
+      { id: "old_user", type: "user", time: { created: 999 } },
+      { id: "old_answer", type: "assistant", time: { created: clock }, content: [{ type: "text", text: "old answer" }],
+        cost: 9, tokens: { input: 900, output: 900, cache: { read: 0, write: 0 } } },
+    ] });
+    const result = await execute(context("run-tied-outcome", { nativeRuntime: "nar" }, "issue-one", sid) as never);
+    expect(result).toMatchObject({ exitCode: 0, summary: "answer 3", costUsd: 0.5,
+      usage: { inputTokens: 302, outputTokens: 31, cachedInputTokens: 7 } });
+    expect(promptPosts).toBe(1);
+  });
+
   it("checkpoints the exact run and message before submitting a NAR prompt", async () => {
     const saved: unknown[] = [];
     const result = await execute({ ...context("run-bound", { nativeRuntime: "nar" }),
