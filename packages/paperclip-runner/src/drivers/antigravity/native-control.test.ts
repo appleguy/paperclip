@@ -17,7 +17,7 @@ describe("agy documented headless stream", () => {
     parser.finish();
   });
   it("rejects mismatched conversation, version, malformed and oversized data", () => {
-    expect(() => new AntigravityHeadlessStream("1.4.13")).toThrow();
+    for (const version of ["1.4.11", "1.4.13", "1.5.0", "1.6.0", "2.0.0"]) expect(() => new AntigravityHeadlessStream(version)).toThrow(/Unsupported agy version/);
     expect(() => new AntigravityHeadlessStream("1.4.12", "other").push(line(init))).toThrow();
     const parser = new AntigravityHeadlessStream("1.4.12");
     parser.push(line(init));

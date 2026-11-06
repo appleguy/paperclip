@@ -23,6 +23,23 @@ describe("native headless backend boundary", () => {
     await expect(new AntigravityHeadlessNativeBackend(binding).openSession({ identity: { ...identity, runId: "other" }, workingDirectory: "/tmp" })).rejects.toThrow(/identity/);
     expect(launch).not.toHaveBeenCalled();
   });
+  it("describes the bound qualified CLI version and exposes no RC or resume capability", async () => {
+    const descriptor = await new AntigravityHeadlessNativeBackend({ ...binding, verifiedVersion: "1.5.1" }).descriptor();
+    expect(descriptor).toMatchObject({ kind: "runner", name: "antigravity-headless-observer", version: "1.5.1" });
+    expect(descriptor.capabilities).toMatchObject({ resume: false, interruption: false });
+    expect(descriptor.capabilities.unsupported).toContain("interactive remote control");
+  });
+  it("threads qualified model and effort into the launch and reports the observed conversation", async () => {
+    const launch = vi.spyOn(AntigravityHeadlessController, "launch").mockImplementation(options => {
+      queueMicrotask(() => options.onEvent({ kind: "init", conversationId: "observed-conv", cwd: "/tmp", permissionMode: "request-review" }));
+      return { closeOwned: vi.fn(async () => {}) } as unknown as AntigravityHeadlessController;
+    });
+    const backend = new AntigravityHeadlessNativeBackend({ ...binding, verifiedVersion: "1.5.1", conversationId: "observed-conv", model: "model-a", effort: "high" });
+    const session = await backend.openSession({ identity, workingDirectory: "/tmp" });
+    expect(launch).toHaveBeenCalledWith(expect.objectContaining({ verifiedVersion: "1.5.1", conversationId: "observed-conv", model: "model-a", effort: "high" }));
+    expect((await session.snapshot()).providerSessionId).toBe("observed-conv");
+    await session.close({ reason: "test" });
+  });
 });
 
 it("freezes the admitted run and native conversation against later caller mutation", async () => {

@@ -4,17 +4,18 @@ import { AntigravityHeadlessController } from "./headless-controller.js";
 const capabilities: NativeSessionCapabilities = { resume: false, typedEvents: false, steering: false, interruption: false, structuredResult: false, providerTermination: "unavailable", unsupported: ["automatic recovery", "turn dispatch", "approval responses", "interrupt", "interactive remote control"] };
 /** Opt-in exact-conversation bootstrap; no PRP commands or prompts are sent. */
 export class AntigravityHeadlessNativeBackend implements NativeSessionBackend {
-  private readonly binding: { executable: string; verifiedVersion: string; cwd: string; conversationId: string; identity: NativeRunIdentity; env: NodeJS.ProcessEnv; timeoutMs?: number };
-  constructor(binding: { executable: string; verifiedVersion: string; cwd: string; conversationId: string; identity: NativeRunIdentity; env: NodeJS.ProcessEnv; timeoutMs?: number }) { this.binding = { ...binding, identity: { ...binding.identity }, env: { ...binding.env } }; }
-  async descriptor() { return { kind: "runner" as const, name: "antigravity-headless-observer", version: "1.4.12", capabilities }; }
+  private readonly binding: { executable: string; verifiedVersion: string; cwd: string; conversationId: string; model?: string; effort?: "low" | "medium" | "high" | "xhigh" | "max"; identity: NativeRunIdentity; env: NodeJS.ProcessEnv; timeoutMs?: number };
+  constructor(binding: { executable: string; verifiedVersion: string; cwd: string; conversationId: string; model?: string; effort?: "low" | "medium" | "high" | "xhigh" | "max"; identity: NativeRunIdentity; env: NodeJS.ProcessEnv; timeoutMs?: number }) { this.binding = { ...binding, identity: { ...binding.identity }, env: { ...binding.env } }; }
+  async descriptor() { return { kind: "runner" as const, name: "antigravity-headless-observer", version: this.binding.verifiedVersion, capabilities }; }
   async openSession(input: OpenNativeSessionInput): Promise<NativeSession> {
     const b = this.binding;
     if (input.workingDirectory !== b.cwd || Object.keys(b.identity).some(key => input.identity[key as keyof NativeRunIdentity] !== b.identity[key as keyof NativeRunIdentity])) throw new Error("Native identity mismatch");
     if (input.signal?.aborted) throw new Error("Native bootstrap aborted");
     let ready!: () => void;
+    let observedConversationId: string | undefined;
     const initialized = new Promise<void>(resolve => { ready = resolve; });
-    const controller = AntigravityHeadlessController.launch({ executable: b.executable, verifiedVersion: b.verifiedVersion, cwd: b.cwd, conversationId: b.conversationId, env: b.env,
-      authorize: () => false, onEvent: event => { if (event.kind === "init") ready(); }, onUncertain: () => {} });
+    const controller = AntigravityHeadlessController.launch({ executable: b.executable, verifiedVersion: b.verifiedVersion, cwd: b.cwd, conversationId: b.conversationId, model: b.model, effort: b.effort, env: b.env,
+      authorize: () => false, onEvent: event => { if (event.kind === "init") { observedConversationId = event.conversationId; ready(); } }, onUncertain: () => {} });
     let timer: ReturnType<typeof setTimeout> | undefined;
     let aborted: (() => void) | undefined;
     try {
@@ -32,7 +33,7 @@ export class AntigravityHeadlessNativeBackend implements NativeSessionBackend {
       async *events() {},
       async startTurn() { throw new Error("Antigravity headless turn dispatch has no durable owner"); },
       async result() { return null; },
-      async snapshot() { return { backendKind: "runner", driverKind: "antigravity_headless_observer", sessionId: b.identity.sessionId, identity: { ...b.identity }, providerSessionId: b.conversationId, workingDirectory: b.cwd }; },
+      async snapshot() { return { backendKind: "runner", driverKind: "antigravity_headless_observer", sessionId: b.identity.sessionId, identity: { ...b.identity }, providerSessionId: observedConversationId ?? b.conversationId, workingDirectory: b.cwd }; },
       async close() { if (!closed) { closed = true; await controller.closeOwned(); } },
     };
     return session;
