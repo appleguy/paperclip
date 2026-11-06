@@ -8,6 +8,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
@@ -24,7 +25,6 @@ import {
 import { deriveRcName, reportsToDepth, sanitizeRcName, slotRcName, type RcAgentNode } from "./rc-name.js";
 import { gateReceiptRaw, refusalMessage, productionDeps } from "./done-gate.js";
 import { captureDoneGateBaseline, type GateBaseline } from "./done-gate-provenance.js";
-import { excludeEnvBoundMcp } from "./mcp-exclusion.js";
 import { isReviewContinuation, reconcileForeignSettlement, settleOutcome } from "./settlement.js";
 import {
   CHANNEL_NAME, findBridgeRoot, prepareChannelHost, routeChannelInput, type ChannelHost,
@@ -498,13 +498,12 @@ async function ensureSession(
     }
     await fs.mkdir(cwd, { recursive: true });
     await fs.mkdir(agentTmpDir(session), { recursive: true });
-    // SCO-1033: a fresh TUI is the safe boundary to drop the env-bound paperclip MCP for this cwd (no key minted).
-    await excludeEnvBoundMcp(cwd).catch(() => undefined);
     // [ASSUMPTION] The experimental channel flag remains accepted by Claude
     // Code 2.1.x; it is hidden in some versions of --help. Live verify before use.
     // No --strict-mcp-config: that would hide the owner's other required MCPs.
     await tmux(socket, ["new-session", "-d", "-s", session, "-x", "200", "-y", "50", "-c", cwd,
       "-e", "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1",
+      "-e", `PAPERCLIP_RC_RUN_ENV=${path.join(stateDir, "run-env.sh")}`,
       // SCO-534: scratch on NVM per agent, never the per-user /var/folders temp.
       "-e", `TMPDIR=${agentTmpDir(session)}`,
       CLAUDE, "--remote-control", name, "--name", name, "--model", model, "--effort", effort,
@@ -639,18 +638,24 @@ export async function execute(ctx: AdapterExecutionContext, settings?: {
     // F07: do not replace the original run's environment or touch its transport
     // until a foreign checkpoint is durably settled under its own issue scope.
     await reconcileForeignSettlement(ctx, stateDir, activePath);
-    // SCO-653: run-scoped write path for the pane. 0600 file read only by bin/pcrc; never printed.
+    // SCO-653: run-scoped credentials for the pane; never printed.
     const port = Number(process.env.PAPERCLIP_LISTEN_PORT ?? process.env.PORT ?? "3100");
     const callbackUrl = asString(process.env.PAPERCLIP_PUBLIC_URL,
       asString(process.env.PAPERCLIP_API_URL, `http://127.0.0.1:${port}`));
     const sq = (v: string) => `'${v.replace(/'/g, `'\\''`)}'`;
     runEnvPath = path.join(stateDir, "run-env.sh");
-    await fs.writeFile(runEnvPath, [
-      `export PAPERCLIP_API_URL=${sq(callbackUrl)}`,
-      `export PAPERCLIP_API_KEY=${sq(ctx.authToken)}`,
-      `export PAPERCLIP_RUN_ID=${sq(ctx.runId)}`,
-      `export PAPERCLIP_TASK_ID=${sq(issueId)}`, ""].join("\n"), { mode: 0o600 });
-    await fs.chmod(runEnvPath, 0o600);
+    const tmpEnvPath = `${runEnvPath}.${randomUUID()}.tmp`;
+    try {
+      await fs.writeFile(tmpEnvPath, [
+        `export PAPERCLIP_API_URL=${sq(callbackUrl)}`,
+        `export PAPERCLIP_API_KEY=${sq(ctx.authToken)}`,
+        `export PAPERCLIP_COMPANY_ID=${sq(ctx.agent.companyId)}`,
+        `export PAPERCLIP_AGENT_ID=${sq(ctx.agent.id)}`,
+        `export PAPERCLIP_RUN_ID=${sq(ctx.runId)}`,
+        `export PAPERCLIP_TASK_ID=${sq(issueId)}`, ""].join("\n"), { mode: 0o600, flag: "wx" });
+      await fs.chmod(tmpEnvPath, 0o600);
+      await fs.rename(tmpEnvPath, runEnvPath);
+    } finally { await fs.rm(tmpEnvPath, { force: true }); }
     const bridgeRoot = await findBridgeRoot(asString(cfg.channelBridgeRoot, "") || undefined);
     const channel = await prepareChannelHost(stateDir, bridgeRoot);
     // SCO-980: inspect delivery evidence before permitting a new operation ID.

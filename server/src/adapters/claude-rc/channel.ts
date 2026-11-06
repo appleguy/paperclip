@@ -138,6 +138,17 @@ export async function prepareChannelHost(stateDir: string, installRoot: string):
         args: [path.join(root, "server.cjs")],
         env: { PC_BRIDGE_DIR: dir, PC_BRIDGE_SERVER: CHANNEL_NAME },
       },
+      "paperclip-seat": {
+        command: stableNodePath(),
+        args: ["/Volumes/NVM/Paperclip/master/packages/mcp-server/dist/stdio.js"],
+        env: {
+          PAPERCLIP_RC_RUN_ENV: path.join(stateDir, "run-env.sh"),
+          PAPERCLIP_API_URL: "", PAPERCLIP_API_KEY: "", PAPERCLIP_COMPANY_ID: "",
+          PAPERCLIP_AGENT_ID: "", PAPERCLIP_RUN_ID: "", PAPERCLIP_TASK_ID: "",
+          PAPERCLIP_RUNTIME_TOOLS_TOKEN: "", PAPERCLIP_RUNTIME_TOOLS_CONNECTIONS_SEARCH_URL: "",
+          PAPERCLIP_RUNTIME_TOOLS_CONNECTION_REQUEST_URL: "",
+        },
+      },
     },
   };
   const events = ["UserPromptSubmit", "PostToolUse", "Stop", "SessionStart"] as const;

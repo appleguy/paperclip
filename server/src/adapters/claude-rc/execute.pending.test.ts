@@ -23,7 +23,7 @@ vi.mock("./channel.js", async original => {
   } };
 });
 vi.mock("./done-gate.js", async original => ({
-  ...await original<typeof import("./done-gate.js")>(), gateReceiptRaw: async () => ({ ok: true, reasons: [] }),
+  ...await original<typeof import("./done-gate.js")>(), gateReceiptRaw: async () => ({ ok: true, reasons: [], notes: [] }),
 }));
 vi.mock("./done-gate-provenance.js", async original => ({
   ...await original<typeof import("./done-gate-provenance.js")>(), captureDoneGateBaseline: async () => ({ repos: [] }),
@@ -90,9 +90,14 @@ describe("pending Claude RC native delivery", () => {
     const cwd = path.join(dir, "workspace");
     const stateDir = path.join(dir, "state");
     const session = "original-conversation";
+    const seatName = `sco1021-${path.basename(dir)}`;
     const rcUrl = "https://claude.ai/code/session_original";
     let busy = true;
+    let created = false;
+    deps.tmux.mockClear();
     deps.tmux.mockImplementation(async (_socket: string, args: string[]) => {
+      if (args[0] === "has-session" && !created) throw new Error("no session");
+      if (args[0] === "new-session") created = true;
       if (args[0] === "capture-pane") return `${rcUrl}\n${busy ? "✻ Thinking… (esc to interrupt)\n" : ""}❯ \n  bypass permissions on`;
       if (args[0] === "display-message") return args.at(-1) === "#{pane_current_path}" ? cwd : "claude";
       return "";
@@ -101,12 +106,12 @@ describe("pending Claude RC native delivery", () => {
     await fs.mkdir(projectDir(cwd), { recursive: true });
     await fs.writeFile(path.join(projectDir(cwd), `${session}.jsonl`), "");
     await fs.writeFile(path.join(dir, ".claude/sessions/1.json"), JSON.stringify({
-      pid: process.pid, sessionId: session, cwd, tmux: "original-seat:@1.%1", updatedAt: 1,
+      pid: process.pid, sessionId: session, cwd, tmux: `${seatName}:@1.%1`, updatedAt: 1,
     }));
     const abort = new AbortController();
     const ctx = {
       agent: { id: "agent", name: "Original seat", companyId: "company" }, runId: "pending-run",
-      config: { cwd, stateDir, tmuxSocket: "socket", tmuxSession: "original-seat", keepConversation: true },
+      config: { cwd, stateDir, tmuxSocket: "socket", tmuxSession: seatName, keepConversation: true },
       context: { issueId: "pending-issue" }, authToken: "test-only-token", signal: abort.signal,
       onLog: vi.fn(), onDispatch: vi.fn(),
     } as unknown as AdapterExecutionContext;
@@ -122,6 +127,11 @@ describe("pending Claude RC native delivery", () => {
       const activePath = path.join(stateDir, "active.json");
       const checkpoint = await fs.readFile(activePath, "utf8");
       const runEnv = await fs.readFile(path.join(stateDir, "run-env.sh"), "utf8");
+      const launch = deps.tmux.mock.calls.find(([, args]) => args[0] === "new-session")?.[1];
+      expect(launch).toContain(`PAPERCLIP_RC_RUN_ENV=${path.join(stateDir, "run-env.sh")}`);
+      expect((await fs.stat(path.join(stateDir, "run-env.sh"))).mode & 0o777).toBe(0o600);
+      expect(runEnv).toContain("export PAPERCLIP_COMPANY_ID='company'");
+      expect(runEnv).toContain("export PAPERCLIP_AGENT_ID='agent'");
       vi.useFakeTimers({ toFake: ["Date"] });
       vi.setSystemTime(Date.now() + 20 * 60_000);
       busy = false;
@@ -138,6 +148,7 @@ describe("pending Claude RC native delivery", () => {
         report: "Completed original work under the original admitted run and session. ".repeat(6),
       }));
       const result = await run;
+      expect(result.errorMessage).toBeUndefined();
       expect(result).toMatchObject({ exitCode: 0, sessionId: session, resultJson: { issueClosed: true } });
       expect(deps.submit).toHaveBeenCalledOnce();
       expect(delivered).toEqual([ctx.runId]);
@@ -145,6 +156,10 @@ describe("pending Claude RC native delivery", () => {
       expect(deps.settle).toHaveBeenCalledExactlyOnceWith(ctx, stateDir, ctx.runId, "pending-issue", expect.objectContaining({ kind: "done" }));
       expect(deps.tmux.mock.calls.some(([, args]) => ["kill-session", "paste-buffer", "send-keys"].includes(args[0]))).toBe(false);
       await expect(fs.stat(activePath)).rejects.toThrow();
-    } finally { abort.abort(); await run; }
+      await expect(fs.stat(path.join(stateDir, "run-env.sh"))).rejects.toThrow();
+    } finally {
+      abort.abort(); await run;
+      await fs.rm(path.join("/Volumes/NVM/AI_Agent_Runtime/tmp", `claude-rc-${seatName}`), { recursive: true, force: true });
+    }
   });
 });

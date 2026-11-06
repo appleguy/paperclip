@@ -205,9 +205,10 @@ describe("claude_rc_local channel dispatch", () => {
     const mcpText = await fs.readFile(host.mcpConfigPath, "utf8");
     const hooksText = await fs.readFile(host.hookSettingsPath, "utf8");
     const mcp = JSON.parse(mcpText);
-    expect(Object.keys(mcp.mcpServers)).toEqual([CHANNEL_NAME]);
+    expect(Object.keys(mcp.mcpServers)).toEqual([CHANNEL_NAME, "paperclip-seat"]);
     expect(Object.keys(mcp.mcpServers[CHANNEL_NAME].env).sort()).toEqual(["PC_BRIDGE_DIR", "PC_BRIDGE_SERVER"]);
-    expect(mcpText).not.toMatch(/token|password|authorization|Bearer|api[_-]?key/i);
+    expect(mcp.mcpServers["paperclip-seat"].env.PAPERCLIP_RC_RUN_ENV).toBe(path.join(dir, "run-env.sh"));
+    expect(mcp.mcpServers["paperclip-seat"].env.PAPERCLIP_API_KEY).toBe("");
     expect(hooksText).not.toMatch(/token|password|authorization|Bearer|api[_-]?key/i);
     expect(hooksText).toContain("UserPromptSubmit");
     expect(hooksText).toContain("SessionStart");
