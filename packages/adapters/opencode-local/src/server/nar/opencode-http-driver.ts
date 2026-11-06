@@ -281,12 +281,9 @@ export class OpenCodeHttpDriver implements ProviderDriver {
       throw new OpenCodeHttpError("mismatch", "session.inbox contains an item without an id");
     }
     if (options && pending.some((item: any) => item.id === options.cancelPendingMessageId)) {
-      try {
-        const cancelled = await this.json("DELETE", `/api/session/${sid}/inbox/${encodeURIComponent(options.cancelPendingMessageId)}`);
-        if (cancelled.status === 204) return this.inflightMessage(conversationId);
-      } catch {
-        // Preserve the existing interrupt path if queued cancellation fails.
-      }
+      const cancelled = await this.json("DELETE", `/api/session/${sid}/inbox/${encodeURIComponent(options.cancelPendingMessageId)}`);
+      if (cancelled.status !== 204) throw new OpenCodeHttpError("http", `session.inbox cancellation HTTP ${cancelled.status}`, cancelled.status);
+      return this.inflightMessage(conversationId);
     }
     const last = pending[pending.length - 1];
     if (typeof last?.id === "string") return last.id;

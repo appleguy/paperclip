@@ -9,6 +9,7 @@ describe("OpenCode stop inbox cancellation", () => {
   let pending: string[];
   let active: string | null;
   let deliveredDuringCancel: boolean;
+  let cancellationFails: boolean;
   let calls: string[];
   let driver: OpenCodeHttpDriver;
   const op = { opId: "stop", kind: "interrupt" as const, payloadSha256: "" };
@@ -21,12 +22,14 @@ describe("OpenCode stop inbox cancellation", () => {
     pending = [];
     active = null;
     deliveredDuringCancel = false;
+    cancellationFails = false;
     calls = [];
     const fetchImpl = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       const pathname = new URL(String(url)).pathname;
       calls.push(`${init?.method} ${pathname}`);
       if (pathname.endsWith("/inbox") && init?.method === "GET") return Response.json({ data: pending.map((id) => ({ id })) });
       if (pathname.includes("/inbox/") && init?.method === "DELETE") {
+        if (cancellationFails) return new Response(null, { status: 500 });
         const id = decodeURIComponent(pathname.split("/").pop()!);
         pending = pending.filter((item) => item !== id);
         if (deliveredDuringCancel) active = id;
@@ -56,6 +59,15 @@ describe("OpenCode stop inbox cancellation", () => {
     deliveredDuringCancel = true;
     expect(await driver.interruptExpectedMessage("ses_fixture", "msg_target", op, fence)).toBe("requested");
     expect(calls.at(-1)).toBe("POST /api/session/ses_fixture/interrupt");
+  });
+
+  it("does not interrupt an unrelated active turn when queued cancellation fails", async () => {
+    pending = ["msg_target"];
+    active = "msg_other";
+    cancellationFails = true;
+    expect(await driver.interruptExpectedMessage("ses_fixture", "msg_target", op, fence)).toBe("uncertain");
+    expect(pending).toEqual(["msg_target"]);
+    expect(calls.some((call) => call.endsWith("/interrupt"))).toBe(false);
   });
 
   it("keeps interrupting a matching active turn", async () => {
