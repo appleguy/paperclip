@@ -30,6 +30,18 @@ export async function reconnectOpenCodeManagedHost(db: Db, binding: OpenCodeShar
   return { host: retained.host, binding: retained.binding, admitted: createOpenCodeNativePort(db, retained.binding, retained.host) };
 }
 
+/** Coordinator entry points for the exact retained controller and session.
+ * The freeze deadline also bounds the time for which the request stays held. */
+export async function freezeOpenCodeManagedHost(db: Db, binding: OpenCodeSharedBinding, options: { timeoutMs: number; signal: AbortSignal }) {
+  const retained = await reconnectOpenCodeManagedHost(db, binding);
+  return retained.admitted.port.freezeProvider(options);
+}
+
+export async function resumeOpenCodeManagedHost(db: Db, binding: OpenCodeSharedBinding, checkpoint: { id: string; requestSha256: string }) {
+  const retained = await reconnectOpenCodeManagedHost(db, binding);
+  await retained.admitted.port.resumeProvider(checkpoint);
+}
+
 /** Called only after exact owned-child shutdown has completed. */
 export function forgetOpenCodeManagedHost(binding: OpenCodeSharedBinding, host: Host) {
   const current = hosts.get(binding.runId);

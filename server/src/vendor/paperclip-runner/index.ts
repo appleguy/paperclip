@@ -98,10 +98,21 @@ const sourceUrl = new URL(
   "../../../../packages/paperclip-runner/src/index.ts",
   import.meta.url,
 );
+type ProviderBoundary = {
+  freeze(input: { timeoutMs: number; signal: AbortSignal }): Promise<{ id: string; requestSha256: string }>;
+  resume(checkpoint: { id: string; requestSha256: string }): void;
+  close(): void;
+};
+// The source-mode shim can be newer than the package's last built declarations.
 const runner = (await import(sourceUrl.href)) as RunnerModule;
+const boundaryRunner = runner as unknown as {
+  OpenCodeProviderBoundary: new () => ProviderBoundary;
+  startOpenCodeProviderProxy(baseUrl: string, key: string, model: string, environment: NodeJS.ProcessEnv, restore: undefined, boundary: ProviderBoundary): ReturnType<RunnerModule["startOpenCodeProviderProxy"]>;
+};
 export const taskDocumentKeySchema = runner.taskDocumentKeySchema;
 
 export const OpenCodeV2Shared = runner.OpenCodeV2Shared;
+export const OpenCodeProviderBoundary = boundaryRunner.OpenCodeProviderBoundary;
 export const CURSOR_CLOUD_DEFAULT_TIMEOUT_MS = runner.CURSOR_CLOUD_DEFAULT_TIMEOUT_MS;
 export const RUNNER_TOOL_SCOPE_TOKEN_HEADER = runner.RUNNER_TOOL_SCOPE_TOKEN_HEADER;
 export const DurablePrpControlPlane = runner.DurablePrpControlPlane;
@@ -155,7 +166,7 @@ export const createNativeSessionBackend = runner.createNativeSessionBackend;
 export const OpenCodeSharedNativeBackend = runner.OpenCodeSharedNativeBackend;
 export const PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA = runner.PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA;
 export const PRP_COMPLETION_TOOL_DESCRIPTION = runner.PRP_COMPLETION_TOOL_DESCRIPTION;
-export const startOpenCodeProviderProxy = runner.startOpenCodeProviderProxy;
+export const startOpenCodeProviderProxy = runner.startOpenCodeProviderProxy as typeof runner.startOpenCodeProviderProxy & typeof boundaryRunner.startOpenCodeProviderProxy;
 export const describeRunnerdNativeSessionBackend = runner.describeRunnerdNativeSessionBackend;
 export const createPaperclipRunnerAuthorizedToolSet =
   runner.createPaperclipRunnerAuthorizedToolSet;

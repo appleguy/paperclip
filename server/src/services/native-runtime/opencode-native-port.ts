@@ -27,6 +27,8 @@ export function createOpenCodeNativePort(db: Db, binding: OpenCodeSharedBinding,
       async verify() { await readOpenCodeHost(db, binding); await host.verifySession(binding.providerSessionId, binding); },
       readReceipt,
       async dispatch(prompt: { id: string; text: string }) { await host.dispatchForRun(db, binding, prompt); },
+      async freezeProvider(input: { timeoutMs: number; signal: AbortSignal }) { return host.freezeProvider(db, binding, input); },
+      async resumeProvider(checkpoint: { id: string; requestSha256: string }) { await host.resumeProvider(db, binding, checkpoint); },
       stop() {
         return stopping ??= (async () => {
           if (!interrupted) { await host.interruptForRun(db, binding); interrupted = true; }

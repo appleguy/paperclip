@@ -197,6 +197,9 @@ export interface NativeSession {
   attachRun?(input: { identity: NativeRunIdentity; currentRunGrant?: NativeRunRuntimeGrant }): Promise<void>;
   /** Relinquish controller authority without suspending provider execution. */
   detachControllerForRestart?(): Promise<void>;
+  /** Inference-only restart while the owned provider process and request stay alive. */
+  freezeProvider?(input: { timeoutMs: number; signal: AbortSignal }): Promise<{ id: string; requestSha256: string }>;
+  resumeProvider?(checkpoint: { id: string; requestSha256: string }): Promise<void>;
   events(input?: { afterCursor?: string | null }): AsyncIterable<PrpEvent>;
   startTurn(input: {
     message: NativeUserMessage;

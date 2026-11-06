@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { agentTaskSessions, heartbeatRuns, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { and, eq, gt, sql } from "drizzle-orm";
 import type { NativeExecutionInputV12 } from "../../vendor/paperclip-runner/index.js";
-import { PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA, PRP_COMPLETION_TOOL_DESCRIPTION, startOpenCodeProviderProxy } from "../../vendor/paperclip-runner/index.js";
+import { OpenCodeProviderBoundary, PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA, PRP_COMPLETION_TOOL_DESCRIPTION, startOpenCodeProviderProxy } from "../../vendor/paperclip-runner/index.js";
 import { startOpenCodeSharedHost } from "./opencode-shared-host.js";
 import { createOpenCodeSemanticHandler } from "./opencode-semantic-handler.js";
 import { createOpenCodeNativePort } from "./opencode-native-port.js";
@@ -84,8 +84,9 @@ export async function startOpenCodeManagedBackend(db: Db, input: { execution: Na
   const profile = await resolveOpenCodeSharedProvider({ model: input.execution.provider.model, environment: input.environment });
   const claim = await claimOpenCodeTaskSession(db, input);
   const tools = [...input.authority.definitions(), ...["paperclip_finish", "paperclip_block"].map(name => ({ name, description: PRP_COMPLETION_TOOL_DESCRIPTION, inputSchema: PRP_COMPLETION_RESULT_PROVIDER_INPUT_SCHEMA }))];
-  const proxy = await startOpenCodeProviderProxy(profile.baseUrl, profile.key, profile.model, input.environment);
-  const host = await startOpenCodeSharedHost({ executable: input.executable, dataRoot: input.dataRoot, workspaceCwd: cwd, provider: { provider: profile.provider, model: profile.model, baseURL: proxy.baseURL, token: proxy.token }, onShutdown: proxy.close, mcp: { tools,
+  const boundary = new OpenCodeProviderBoundary();
+  const proxy = await startOpenCodeProviderProxy(profile.baseUrl, profile.key, profile.model, input.environment, undefined, boundary);
+  const host = await startOpenCodeSharedHost({ executable: input.executable, dataRoot: input.dataRoot, workspaceCwd: cwd, providerBoundary: boundary, provider: { provider: profile.provider, model: profile.model, baseURL: proxy.baseURL, token: proxy.token }, onShutdown: proxy.close, mcp: { tools,
     createHandler: binding => createOpenCodeSemanticHandler(db, binding, { execute: call => input.authority.execute(call), recover: call => input.authority.recover(call), completionFeedback: input.completionFeedback, completionContract: { revision: input.execution.completionContract.contract.revision, criterionIds: input.execution.completionContract.contract.criteria.map(criterion => criterion.id) } }),
   } }).catch(async error => { await proxy.close(); throw error; });
   const binding: OpenCodeSharedBinding = { ...b, projectId: claim.projectId, taskSessionId: claim.taskSessionId, normalizedSessionId: input.execution.session.normalizedSessionId!, runnerInstanceId: input.runnerInstanceId, providerSessionId: `ses_${randomUUID()}`, generation: host.generation, epoch: randomUUID(), version: "2.2.5", model: input.execution.provider.model, effort: input.execution.provider.effort, leaseOwner: input.leaseOwner, leaseAttempt: input.attempt, controllerBootId: input.controller.bootId, controllerPid: input.controller.pid, controllerProcessStartedAt: input.controller.processStartedAt, controllerGeneration: claim.controllerGeneration };

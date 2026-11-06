@@ -13,6 +13,8 @@ export interface OpenCodeSharedNativePort {
   dispatch(input: { id: string; text: string }): Promise<void>;
   startObservation(): Promise<void>;
   waitForReceipt(signal: AbortSignal): Promise<{ result: PrpStructuredRunResult; operationId: string; recordedAt: string }>;
+  freezeProvider?(input: { timeoutMs: number; signal: AbortSignal }): Promise<{ id: string; requestSha256: string }>;
+  resumeProvider?(checkpoint: { id: string; requestSha256: string }): Promise<void>;
   /** Explicit Stop only; resolves after the owned provider has stopped. */
   stop(): Promise<void>;
   close(): Promise<void>;
@@ -38,6 +40,16 @@ export class OpenCodeSharedNativeBackend implements NativeSessionBackend {
     const session: NativeSession = {
       identity: () => ({ ...input.identity }),
       async capabilities() { return capabilities; },
+      ...(port.freezeProvider && port.resumeProvider ? {
+        async freezeProvider(options: { timeoutMs: number; signal: AbortSignal }) {
+          if (!started || cancelled || detached || abort.signal.aborted) throw new Error("opencode_shared_controller_closed");
+          return port.freezeProvider!({ ...options, signal: AbortSignal.any([options.signal, abort.signal]) });
+        },
+        async resumeProvider(checkpoint: { id: string; requestSha256: string }) {
+          if (cancelled || detached || abort.signal.aborted) throw new Error("opencode_shared_controller_closed");
+          await port.resumeProvider!(checkpoint);
+        },
+      } : {}),
       async *events() {
         await startedGate;
         const receipt = await port.waitForReceipt(abort.signal);
@@ -67,6 +79,7 @@ export class OpenCodeSharedNativeBackend implements NativeSessionBackend {
       cancel() {
         if (detached) throw new Error("opencode_shared_controller_detached");
         cancelled = true;
+        abort.abort(new Error("opencode_shared_cancelled"));
         return { cleanup: port.stop().then(() => {
           abort.abort(new Error("opencode_shared_cancelled"));
           rejectStart(new Error("opencode_shared_cancelled"));

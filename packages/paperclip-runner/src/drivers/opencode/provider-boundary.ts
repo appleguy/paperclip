@@ -3,26 +3,38 @@ import { createHash, randomUUID } from "node:crypto";
 /** Opt-in for a private, single-session provider proxy. Memory only: loss of
  * the proxy or the held HTTP request invalidates the checkpoint. */
 export class OpenCodeProviderBoundary {
-  #active = false;
+  #active = 0;
   #closed = false;
+  #cleanup: (() => void) | null = null;
   #pending: { resolve: (value: { id: string; requestSha256: string }) => void; reject: (error: Error) => void } | null = null;
-  #held: { id: string; release: () => void; reject: (error: Error) => void } | null = null;
+  #held: { id: string; requestSha256: string; release: () => void; reject: (error: Error) => void } | null = null;
 
-  freeze(): Promise<{ id: string; requestSha256: string }> {
+  freeze(options: { timeoutMs: number; signal: AbortSignal }): Promise<{ id: string; requestSha256: string }> {
     if (this.#closed || this.#pending || this.#held) throw new Error("provider_boundary_unavailable");
+    if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1 || options.timeoutMs > 600_000) throw new Error("provider_boundary_invalid_deadline");
+    options.signal.throwIfAborted();
+    const cancel = () => this.#terminate(new Error("provider_boundary_cancelled"));
+    const timer = setTimeout(() => this.#terminate(new Error("provider_boundary_deadline")), options.timeoutMs);
+    options.signal.addEventListener("abort", cancel, { once: true });
+    this.#cleanup = () => { clearTimeout(timer); options.signal.removeEventListener("abort", cancel); };
     return new Promise((resolve, reject) => { this.#pending = { resolve, reject }; });
   }
 
-  resume(id: string): void {
-    if (!this.#held || this.#held.id !== id) throw new Error("provider_boundary_checkpoint_mismatch");
+  resume(checkpoint: { id: string; requestSha256: string }): void {
+    if (!this.#held || this.#held.id !== checkpoint.id || this.#held.requestSha256 !== checkpoint.requestSha256) throw new Error("provider_boundary_checkpoint_mismatch");
     const held = this.#held;
     this.#held = null;
+    this.#cleanup?.(); this.#cleanup = null;
     held.release();
   }
 
   close(): void {
+    this.#terminate(new Error("provider_boundary_closed"));
+  }
+
+  #terminate(error: Error): void {
     this.#closed = true;
-    const error = new Error("provider_boundary_closed");
+    this.#cleanup?.(); this.#cleanup = null;
     this.#pending?.reject(error);
     this.#pending = null;
     this.#held?.reject(error);
@@ -30,17 +42,24 @@ export class OpenCodeProviderBoundary {
   }
 
   async enter(body: Buffer, payload: Record<string, unknown>, signal: AbortSignal): Promise<() => void> {
-    if (this.#closed || this.#active) throw new Error("provider_boundary_concurrent_or_closed");
-    this.#active = true;
+    if (this.#closed || this.#held) throw new Error("provider_boundary_concurrent_or_closed");
+    let acquired = false;
     try {
       signal.throwIfAborted();
       if (this.#pending && isToolBoundary(payload)) {
+        if (this.#active !== 0) {
+          this.#terminate(new Error("provider_boundary_concurrent"));
+          throw new Error("provider_boundary_concurrent");
+        }
+        this.#active++;
+        acquired = true;
         const pending = this.#pending;
         this.#pending = null;
         const id = randomUUID();
-        const wait = new Promise<void>((release, reject) => { this.#held = { id, release, reject }; });
+        const requestSha256 = createHash("sha256").update(body).digest("hex");
+        const wait = new Promise<void>((release, reject) => { this.#held = { id, requestSha256, release, reject }; });
         const abort = () => {
-          if (this.#held?.id === id) { this.#held = null; }
+          if (this.#held?.id === id) this.#terminate(new Error("provider_boundary_request_lost"));
           // Reject even if resume and disconnect race; the HTTP layer also
           // passes this signal to the upstream request.
           rejectWait(new Error("provider_boundary_request_lost"));
@@ -48,12 +67,15 @@ export class OpenCodeProviderBoundary {
         let rejectWait!: (error: Error) => void;
         const aborted = new Promise<never>((_, reject) => { rejectWait = reject; });
         signal.addEventListener("abort", abort, { once: true });
-        pending.resolve({ id, requestSha256: createHash("sha256").update(body).digest("hex") });
+        pending.resolve({ id, requestSha256 });
         try { await Promise.race([wait, aborted]); signal.throwIfAborted(); }
         finally { signal.removeEventListener("abort", abort); }
+        return () => { this.#active--; };
       }
-      return () => { this.#active = false; };
-    } catch (error) { this.#active = false; throw error; }
+      this.#active++;
+      acquired = true;
+      return () => { this.#active--; };
+    } catch (error) { if (acquired) this.#active--; throw error; }
   }
 }
 
