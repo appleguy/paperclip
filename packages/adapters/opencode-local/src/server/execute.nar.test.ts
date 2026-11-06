@@ -463,27 +463,12 @@ describe("OpenCode adapter nativeRuntime nar", () => {
       resultJson: { executionRecovery: { providerWorkStarted: true, reason: expect.stringMatching(/^unowned_turn_(verified_idle|settled)$/) } } });
   }, 15_000);
 
-  it.each([true, false])("holds before provider contact when already aborted (reattach: %s)", async (reattachOnly) => {
-    const abort = new AbortController();
-    abort.abort();
-    const result = await runNarOpenCodeAttempt({ configPath: cfg, agentId: scope.agentId, taskId: scope.issueId,
-      runId: "already-aborted", cwd: root, model: "", prompt: "original", timeoutSec: 5,
-      reattachOnly, signal: abort.signal, onLog: async () => {} });
-    expect(result.executionRecovery).toMatchObject({ providerWorkStarted: true, providerWorkEvidence: "unverified",
-      reason: "stop_before_dispatch_unverified" });
-    expect(promptPosts).toBe(0);
-    expect(interruptPosts).toBe(0);
-  });
-
-  it.each([true, false])("holds after binding before prompt POST when aborted (explicit Stop: %s)", async (explicit) => {
+  it("holds a restart before the prompt POST when no durable no-dispatch proof is available", async () => {
     const abort = new AbortController();
     const input = { configPath: cfg, agentId: scope.agentId, taskId: scope.issueId, runId: "before-post", cwd: root,
       model: "", prompt: "original", timeoutSec: 5, pollMs: 1, onLog: async () => {} };
-    const original = await runNarOpenCodeAttempt({ ...input, signal: abort.signal, onBound: async () => {
-      abort.abort(explicit ? Object.assign(new Error("Stop"), { code: "paperclip_explicit_run_stop" }) : new Error("Restart"));
-    } });
-    expect(original.executionRecovery).toMatchObject({ providerWorkStarted: true, providerWorkEvidence: "unverified",
-      reason: "stop_before_dispatch_unverified" });
+    const original = await runNarOpenCodeAttempt({ ...input, signal: abort.signal, onBound: async () => { abort.abort(); } });
+    expect(original.executionRecovery).toMatchObject({ providerWorkStarted: false, reason: "aborted_pre_submit" });
     expect(promptPosts).toBe(0);
 
     // The restarted controller cannot rely on another process's local abort.
