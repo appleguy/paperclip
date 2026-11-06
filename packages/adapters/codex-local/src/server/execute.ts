@@ -118,6 +118,7 @@ import {
 } from "./acp.js";
 import { codexShellEnvironmentKeys } from "@paperclipai/adapter-utils/codex-shell-environment";
 import { withCodexRunQuota } from "./run-quota.js";
+import { readSharedCodexThread, settleSharedCodexThread, sharedConversationStateDir } from "./shared-conversation.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const executeCodexAcp = createCodexAcpExecutor();
@@ -1146,9 +1147,13 @@ async function executeCodex(ctx: AdapterExecutionContext): Promise<AdapterExecut
       );
     }
     const runtimeSessionParams = parseObject(runtime.sessionParams);
-    const runtimeSessionId = asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
-    const runtimeSessionCwd = asString(runtimeSessionParams.cwd, "");
-    const runtimeRemoteExecution = parseObject(runtimeSessionParams.remoteExecution);
+    // keepConversation seats resume their one seat-wide thread on every wake, whatever the issue or workspace.
+    const sharedThreadDir = executionTargetIsRemote ? null : sharedConversationStateDir(config);
+    const sharedThread = sharedThreadDir ? await readSharedCodexThread(sharedThreadDir) : null;
+    const runtimeSessionId = sharedThread?.sessionId ?? asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
+    const runtimeSessionCwd = sharedThread ? "" : asString(runtimeSessionParams.cwd, "");
+    const runtimeRemoteExecution = sharedThread ? {} : parseObject(runtimeSessionParams.remoteExecution);
+    if (sharedThread) await onLog("stdout", `[paperclip] keepConversation: resuming the seat thread "${sharedThread.sessionId}".\n`);
     const canResumeSession =
       runtimeSessionId.length > 0 &&
       (runtimeSessionCwd.length === 0 || path.resolve(runtimeSessionCwd) === path.resolve(effectiveExecutionCwd)) &&
@@ -1693,6 +1698,7 @@ async function executeCodex(ctx: AdapterExecutionContext): Promise<AdapterExecut
         if (retryResult.errorMessage) {
           executionError = new Error(retryResult.errorMessage);
         }
+        if (sharedThreadDir) await settleSharedCodexThread(sharedThreadDir, retryResult, effectiveExecutionCwd);
         return retryResult;
       }
 
@@ -1700,6 +1706,7 @@ async function executeCodex(ctx: AdapterExecutionContext): Promise<AdapterExecut
       if (result.errorMessage) {
         executionError = new Error(result.errorMessage);
       }
+      if (sharedThreadDir) await settleSharedCodexThread(sharedThreadDir, result, effectiveExecutionCwd);
       return result;
     } catch (error) {
       executionError = error;
