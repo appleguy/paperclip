@@ -218,9 +218,17 @@ export class OpenCodeHttpDriver implements ProviderDriver {
 
   async messageExists(conversationId: string, msgId: string): Promise<boolean> {
     const inbox = await this.json("GET", `/api/session/${encodeURIComponent(conversationId)}/inbox`);
-    if (inbox.status === 200 && Array.isArray(inbox.data?.data) && inbox.data.data.some((i: any) => i?.id === msgId)) return true;
+    if (inbox.status !== 200 || !Array.isArray(inbox.data?.data) ||
+        inbox.data.data.some((i: any) => !i || typeof i.id !== "string")) {
+      throw new OpenCodeHttpError("mismatch", "cannot inspect inbox for the original message");
+    }
+    if (inbox.data.data.some((i: any) => i.id === msgId)) return true;
     const m = await this.json("GET", `/api/session/${encodeURIComponent(conversationId)}/message/${encodeURIComponent(msgId)}`);
-    return m.status === 200;
+    if (m.status === 404) return false;
+    if (m.status !== 200 || m.data?.data?.id !== msgId || m.data?.data?.type !== "user") {
+      throw new OpenCodeHttpError("mismatch", "cannot verify the original message");
+    }
+    return true;
   }
 
   // Durable session log replay (after is an exclusive aggregate seq); no follow, ends at the captured watermark.

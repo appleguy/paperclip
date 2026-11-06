@@ -4,7 +4,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const driver = vi.hoisted(() => ({ inflight: null as string | null, exists: false, submits: 0, interrupts: 0 }));
+const driver = vi.hoisted(() => ({ inflight: null as string | null, exists: false, unreadable: false, submits: 0, interrupts: 0 }));
 vi.mock("./opencode-http-driver.js", async (orig) => {
   const real = await orig<typeof import("./opencode-http-driver.js")>();
   class FakeDriver {
@@ -12,7 +12,7 @@ vi.mock("./opencode-http-driver.js", async (orig) => {
     async latestGeneration() { return driver.exists ? 0 : -1; }
     async bindConversation() { return { conversationId: "ses_test" }; }
     async inflightMessage() { return driver.inflight; }
-    async messageExists() { return driver.exists; }
+    async messageExists() { if (driver.unreadable) throw new Error("unreadable inbox"); return driver.exists; }
     async hasSuccessor() { return false; }
     async submit() { driver.submits++; return { grade: "outcome_unknown", evidence: "test" }; }
     async readOutcomeMsg() { return "hook_observed"; }
@@ -39,7 +39,7 @@ async function run(prompt: string, reattachOnly = false) {
 }
 
 describe("NAR structured telemetry events", () => {
-  beforeEach(() => { Object.assign(driver, { inflight: null, exists: false, submits: 0, interrupts: 0 }); });
+  beforeEach(() => { Object.assign(driver, { inflight: null, exists: false, unreadable: false, submits: 0, interrupts: 0 }); });
 
   it("formats a single parseable line", () => {
     const line = narEventLine("nar_rejoin", { sessionId: "s", messageId: "m" });
@@ -90,5 +90,13 @@ describe("NAR structured telemetry events", () => {
   it("does not submit when the original message cannot be found", async () => {
     expect(await run("hello", true)).toEqual([]);
     expect(driver.submits).toBe(0);
+  });
+
+  it("holds reattachment when the original message cannot be verified", async () => {
+    driver.exists = true;
+    driver.unreadable = true;
+    expect(await run("hello", true)).toEqual([]);
+    expect(driver.submits).toBe(0);
+    expect(driver.interrupts).toBe(0);
   });
 });
