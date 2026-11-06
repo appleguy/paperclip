@@ -62,6 +62,7 @@ describe.skipIf(!support.supported)("scoped owner correction delivery", () => {
     expect(steerNativeSession).toHaveBeenCalledTimes(1);
     expect(steerNativeSession).toHaveBeenCalledWith(expect.objectContaining({ runId: s.run.id,
       correlationId: `owner-correction:${s.comment.id}`, message: expect.stringContaining("Preserve existing permissions") }));
+    expect(vi.mocked(steerNativeSession).mock.calls[0][0].message).not.toContain(s.comment.id);
     expect((await receipt()).deliveries).toEqual({ [s.run.id]: { status: "acknowledged", turnId: "turn-one" } });
     expect((await ownerCorrectionContext(db, s.company.id, s.agent.id, otherIssue.id)).ids).toEqual([]);
     expect((await ownerCorrectionContext(db, s.company.id, otherAgent.id, s.issue.id)).ids).toEqual([]);

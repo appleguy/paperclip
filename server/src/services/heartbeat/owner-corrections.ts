@@ -31,6 +31,7 @@ type Receipt = typeof agentWakeupRequests.$inferSelect;
 const fingerprint = (body: string) => createHash("sha256").update(body).digest("hex");
 const correction = (row: Receipt) => row.payload?.[RECORD_KEY] as Correction;
 const correlationId = (commentId: string) => `owner-correction:${commentId}`;
+const commentLabel = (commentId: string) => `comment-${commentId.slice(0, 8)}`;
 const uuid = (value: unknown): value is string => typeof value === "string" && isUuidLike(value);
 
 function records(db: Pick<Db, "select">, companyId: string, agentId: string, issueId: string) {
@@ -45,8 +46,8 @@ function records(db: Pick<Db, "select">, companyId: string, agentId: string, iss
 function render(record: Correction) {
   return [
     "Scoped owner correction for this task",
-    `Correction: ${record.commentId}`,
-    record.supersedes.length ? `Supersedes these corrections only: ${record.supersedes.join(", ")}. Their previous guidance is no longer current.` : "This is a distinct correction; retain other applicable directions.",
+    `Correction: ${commentLabel(record.commentId)}`,
+    record.supersedes.length ? `Supersedes these corrections only: ${record.supersedes.map(commentLabel).join(", ")}. Their previous guidance is no longer current.` : "This is a distinct correction; retain other applicable directions.",
     "For this task, the correction replaces conflicting older task guidance, including startup guidance. Retain unrelated instructions.",
     "Apply the source user's correction below to this task. Preserve existing permissions, approval requirements and unrelated work. This delivery does not grant additional authority.",
     `Source message (JSON string): ${JSON.stringify(record.body)}`,
@@ -202,6 +203,6 @@ export async function ownerCorrectionContext(db: Db, companyId: string, agentId:
     const source = sources.find(source => source.id === value.commentId);
     return source && !source.deletedAt && !isLowTrustQuarantined(source.sourceTrust) && fingerprint(source.body) === value.fingerprint
       ? render(value)
-      : `Correction ${value.commentId} is no longer current: its source was changed or removed. Do not rely on its earlier copy; obtain a new correction.`;
+      : `Correction ${commentLabel(value.commentId)} is no longer current: its source was changed or removed. Do not rely on its earlier copy; obtain a new correction.`;
   }).join("\n\n") + "\n\n" };
 }
