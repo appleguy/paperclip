@@ -255,6 +255,36 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expect(input.instructions.releaseInstructionCopy).toHaveBeenCalledOnce();
   });
 
+  it.each(["restart", "binding", "unverified", "snapshot hold", "late binding", "successor", "expired", "unreadable", "first start"] as const)(
+    "classifies a heartbeat failure with %s evidence", async scenario => {
+      const { run } = await fixture();
+      const { openCodeHeartbeatFailureHold, persistUnverifiedSharedOpenCode } = await import("./opencode-unverified-hold.js");
+      const originalRecovery = { kind: "bootstrap", reason: "outcome_unknown", providerWorkStarted: false, providerWorkEvidence: "unverified" };
+      const binding = { earlySession: { sessionId: "original", sessionParams: { narBinding: { messageId: "original-message" } } } };
+      const initial = scenario === "restart" ? { restartReattach: { count: 1 } } :
+        scenario === "binding" ? binding : ["unverified", "snapshot hold"].includes(scenario) ? { executionRecovery: originalRecovery } : {};
+      const [owned] = await db.update(heartbeatRuns).set({ controllerBootId: randomUUID(),
+        controllerLeaseExpiresAt: new Date(Date.now() + 60_000), resultJson: initial }).where(eq(heartbeatRuns.id, run.id)).returning();
+      const successor = scenario === "successor" ? randomUUID() : owned.controllerBootId;
+      if (scenario === "successor" || scenario === "late binding" || scenario === "expired" || scenario === "snapshot hold") {
+        await db.update(heartbeatRuns).set({ controllerBootId: successor,
+          controllerLeaseExpiresAt: new Date(Date.now() + (scenario === "expired" ? -60_000 : 60_000)),
+          resultJson: ["late binding", "snapshot hold"].includes(scenario) ? binding : initial }).where(eq(heartbeatRuns.id, run.id));
+      }
+      const readRun = scenario === "unreadable" ? vi.fn(async () => { throw new Error("read failed"); }) : read;
+      const marker = await openCodeHeartbeatFailureHold({ run: owned, readRun });
+      if (scenario === "first start") { expect(marker).toBeNull(); return; }
+      expect(marker).toMatchObject({ executionRecovery: { providerWorkEvidence: "unverified",
+        reason: ["unverified", "snapshot hold"].includes(scenario) ? "outcome_unknown" : "heartbeat_exception_unverified" } });
+      if (["unverified", "snapshot hold"].includes(scenario)) expect(marker!.executionRecovery).toEqual(originalRecovery);
+      expect(await persistUnverifiedSharedOpenCode(db, { run: owned, resultJson: marker })).toBe(!["successor", "expired"].includes(scenario));
+      const latest = await read(run.id);
+      expect(latest).toMatchObject({ status: "running", controllerBootId: successor });
+      if (scenario === "successor" || scenario === "expired") expect(latest.resultJson).toEqual(initial);
+      if (scenario === "late binding") expect(latest.resultJson).toMatchObject(binding);
+    },
+  );
+
   it.each(["same owner", "successor"] as const)("holds late OpenCode recovery evidence after setup fails (%s)", async owner => {
     const { input, adapter, run } = await fixture();
     input.agent.adapterType = adapter.type = "opencode_local";

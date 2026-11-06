@@ -31,6 +31,28 @@ export function hasOpenCodeRecoveryHistory(input: {
   return !!params && typeof params === "object" && !Array.isArray(params) && Object.hasOwn(params, "narBinding");
 }
 
+/** A heartbeat failure cannot settle earlier work on the strength of local setup alone. */
+export async function openCodeHeartbeatFailureHold(input: {
+  run: typeof heartbeatRuns.$inferSelect;
+  readRun: (runId: string) => Promise<typeof heartbeatRuns.$inferSelect | null | undefined>;
+}): Promise<Record<string, unknown> | null> {
+  const adapterType = "opencode_local";
+  if (input.run.runtimeMode !== "legacy") return null;
+  const latest = await input.readRun(input.run.id).catch(() => null);
+  let recoveryRun = input.run;
+  if (latest && isUnverifiedSharedOpenCode({ run: latest, adapterType, resultJson: latest.resultJson })) recoveryRun = latest;
+  else if (!isUnverifiedSharedOpenCode({ run: input.run, adapterType, resultJson: input.run.resultJson }) &&
+      latest && hasOpenCodeRecoveryHistory({ run: latest, adapterType })) recoveryRun = latest;
+  const historyUncertain = !latest || latest.runtimeMode !== "legacy" || latest.status !== "running" ||
+    latest.controllerBootId !== input.run.controllerBootId ||
+    (!!input.run.controllerBootId && (!latest.controllerLeaseExpiresAt || latest.controllerLeaseExpiresAt.getTime() <= Date.now()));
+  if (!historyUncertain && !hasOpenCodeRecoveryHistory({ run: recoveryRun, adapterType })) return null;
+  const executionRecovery = isUnverifiedSharedOpenCode({ run: recoveryRun, adapterType, resultJson: recoveryRun.resultJson })
+    ? recoveryRun.resultJson!.executionRecovery
+    : { kind: "bootstrap", reason: "heartbeat_exception_unverified", providerWorkStarted: true, providerWorkEvidence: "unverified" };
+  return { executionRecovery };
+}
+
 export async function persistUnverifiedSharedOpenCode(db: Db, input: {
   run: typeof heartbeatRuns.$inferSelect;
   resultJson: Record<string, unknown> | null | undefined;

@@ -331,7 +331,7 @@ import {
 import { agentInstructionWorkingCopyService } from "./agent-instruction-working-copies.js";
 
 import fs from "node:fs/promises";
-import { isUnverifiedSharedOpenCode, persistUnverifiedSharedOpenCode } from "./heartbeat/opencode-unverified-hold.js";
+import { isUnverifiedSharedOpenCode, openCodeHeartbeatFailureHold, persistUnverifiedSharedOpenCode } from "./heartbeat/opencode-unverified-hold.js";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
@@ -1905,6 +1905,21 @@ export function heartbeatService(
     let legacyOpenCodeTerminalWriteOwned = false;
     let legacyOpenCodeProviderUnverified = false;
     const onLegacyOpenCodeTerminalWrite = () => { legacyOpenCodeTerminalWriteOwned = true; };
+
+    const holdOpenCodeFailure = async () => {
+      if (!legacyOpenCode || legacyOpenCodeTerminalWriteOwned) return false;
+      const resultJson = await openCodeHeartbeatFailureHold({ run, readRun: getRun });
+      if (!resultJson) return false;
+      // Set the local teardown guard before attempting the ownership-checked write.
+      legacyOpenCodeProviderUnverified = true;
+      const persisted = await persistUnverifiedSharedOpenCode(db, { run, resultJson }).catch(err => {
+        logger.error({ err, runId: run.id }, "failed to persist OpenCode heartbeat exception hold");
+        return false;
+      });
+      if (!persisted) logger.error({ runId: run.id }, "OpenCode heartbeat exception hold was not persisted; retaining local resources");
+      else logger.warn({ runId: run.id }, "holding OpenCode heartbeat failure without provider termination proof");
+      return true;
+    };
 
     const releaseInstructionCopy = createHeartbeatInstructionCopyRelease(run, instructionCopies, appendRunEvent);
 
@@ -3626,6 +3641,7 @@ export function heartbeatService(
           issueContext, onLog,
         }));
       } catch (err) {
+        if (await holdOpenCodeFailure()) return;
         await persistUsageCaptureFailure?.();
         if (err instanceof NativeStartupCleanupPendingError) {
           await requestStartupCleanup(err);
@@ -3771,6 +3787,7 @@ export function heartbeatService(
         });
       }
     } catch (outerErr) {
+      if (await holdOpenCodeFailure()) return;
       if (nativeStartupCleanupScheduled || nativeStartupCleanupError || outerErr instanceof NativeStartupCleanupPendingError) {
         const pending = outerErr instanceof NativeStartupCleanupPendingError ? outerErr : nativeStartupCleanupError;
         if (!nativeStartupCleanupScheduled && pending) await requestStartupCleanup(pending).catch(error => {
