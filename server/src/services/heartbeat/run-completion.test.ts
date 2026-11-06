@@ -184,6 +184,63 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
   }
   const read = (id: string) => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)).then(rows => rows[0]!);
 
+  it.each(["replaced", "expired", "missing"] as const)("holds OpenCode completion without a live original controller (%s)", async state => {
+    const boot = randomUUID();
+    const f = await fixture({ controllerBootId: state === "missing" ? null : boot,
+      controllerLeaseExpiresAt: new Date(Date.now() + 60_000) });
+    f.input.agent = { ...f.agent, adapterType: "opencode_local" };
+    if (state === "replaced") await db.update(heartbeatRuns).set({ controllerBootId: randomUUID() }).where(eq(heartbeatRuns.id, f.run.id));
+    if (state === "expired") await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: new Date(Date.now() - 1000) }).where(eq(heartbeatRuns.id, f.run.id));
+    await f.completion.completeRun(f.input);
+    expect((await read(f.run.id)).status).toBe("running");
+    expect(f.deps.releaseIssueExecutionAndPromote).not.toHaveBeenCalled();
+    expect(f.deps.finalizeAgentStatus).not.toHaveBeenCalled();
+    expect(f.deps.scheduleBoundedRetryForRun).not.toHaveBeenCalled();
+  });
+
+  it("allows OpenCode completion while its exact controller lease is live", async () => {
+    const f = await fixture({ controllerBootId: randomUUID(), controllerLeaseExpiresAt: new Date(Date.now() + 60_000) });
+    f.input.agent = { ...f.agent, adapterType: "opencode_local" };
+    await f.completion.completeRun(f.input);
+    expect((await read(f.run.id)).status).toBe("succeeded");
+  });
+
+  it("fences OpenCode completion when takeover occurs immediately before the terminal write", async () => {
+    const f = await fixture({ controllerBootId: randomUUID(), controllerLeaseExpiresAt: new Date(Date.now() + 60_000) });
+    f.input.agent = { ...f.agent, adapterType: "opencode_local" };
+    const successor = randomUUID();
+    const write = f.deps.setRunStatusIfRunning.getMockImplementation()!;
+    f.deps.setRunStatusIfRunning.mockImplementationOnce(async (...args) => {
+      await db.update(heartbeatRuns).set({ controllerBootId: successor }).where(eq(heartbeatRuns.id, f.run.id));
+      return write(...args);
+    });
+    await f.completion.completeRun(f.input);
+    expect(await read(f.run.id)).toMatchObject({ status: "running", controllerBootId: successor });
+    expect(f.deps.releaseIssueExecutionAndPromote).not.toHaveBeenCalled();
+  });
+
+  it("does not terminalize a late OpenCode adapter failure after a successor claims the run", async () => {
+    const f = await fixture({ controllerBootId: randomUUID(), controllerLeaseExpiresAt: new Date(Date.now() + 60_000) });
+    f.input.agent = { ...f.agent, adapterType: "opencode_local" };
+    const successor = randomUUID();
+    await db.update(heartbeatRuns).set({ controllerBootId: successor }).where(eq(heartbeatRuns.id, f.run.id));
+    await f.completion.failRun(f.failure(new Error("old controller failure")));
+    expect(await read(f.run.id)).toMatchObject({ status: "running", controllerBootId: successor });
+    expect(f.deps.releaseIssueExecutionAndPromote).not.toHaveBeenCalled();
+    expect(f.deps.finalizeAgentStatus).not.toHaveBeenCalled();
+  });
+
+  it("does not terminalize a late OpenCode setup failure after a successor claims the run", async () => {
+    const f = await fixture({ controllerBootId: randomUUID(), controllerLeaseExpiresAt: new Date(Date.now() + 60_000),
+      runnerProfileJson: { adapterDispatch: { adapterType: "opencode_local" } } });
+    const successor = randomUUID();
+    await db.update(heartbeatRuns).set({ controllerBootId: successor }).where(eq(heartbeatRuns.id, f.run.id));
+    await f.completion.failRunSetup(f.setup(new Error("old setup failure")));
+    expect(await read(f.run.id)).toMatchObject({ status: "running", controllerBootId: successor });
+    expect(f.deps.releaseIssueExecutionAndPromote).not.toHaveBeenCalled();
+    expect(f.deps.finalizeAgentStatus).not.toHaveBeenCalled();
+  });
+
   it.each(["ordinary", "stalled append", "object admission"] as const)("finishes accepted output before ordinary lease teardown without writing to a retired recorder (%s)", async mode => {
     const stalledAppend = mode === "stalled append", stalledAdmission = mode === "object admission";
     const f = await fixture({ runtimeMode: "native",

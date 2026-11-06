@@ -1185,7 +1185,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     status: string,
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
     failureReport?: RunFailureReportOptions,
-    options?: { setupFailure: true },
+    options?: { setupFailure?: true; expectedLegacyControllerBootId?: string | null },
   ) {
     return setRunStatusFromLive(runId, status, ["running"], patch, failureReport, undefined, options);
   }
@@ -1202,7 +1202,7 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     patch?: Partial<typeof heartbeatRuns.$inferInsert>,
     failureReport?: RunFailureReportOptions,
     cancellationCondition?: ReturnType<typeof nativeRetryCancellationCommitCondition>,
-    options?: { setupFailure: true },
+    options?: { setupFailure?: true; expectedLegacyControllerBootId?: string | null },
   ) {
     // fromStatuses can name a terminal status as its own source (for example,
     // an idempotent "still failed" patch), so the write below is not always a
@@ -1263,7 +1263,10 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
             patch,
             fromStatuses,
             reconcileIfNeeded: true,
-            writeConditions: [nativeRunnerOwnershipNotHeldCondition(), ...(cancellationCondition ? [cancellationCondition] : [])],
+            writeConditions: [nativeRunnerOwnershipNotHeldCondition(), ...(cancellationCondition ? [cancellationCondition] : []),
+              ...(options && "expectedLegacyControllerBootId" in options ? [options.expectedLegacyControllerBootId
+                ? sql`${heartbeatRuns.controllerBootId} = ${options.expectedLegacyControllerBootId} and ${heartbeatRuns.controllerLeaseExpiresAt} > clock_timestamp()`
+                : sql`false`] : [])],
           })
         : writer
             .update(heartbeatRuns)

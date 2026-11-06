@@ -719,10 +719,15 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       status,
       finalRunPatch,
       { adapterErrorMeta: adapterResult.errorMeta, secretValues: readFailureReportSecrets() },
+      run.runtimeMode === "legacy" && agent.adapterType === "opencode_local"
+        ? { expectedLegacyControllerBootId: run.controllerBootId } : undefined,
     ));
     let persistedRun: typeof heartbeatRuns.$inferSelect | null =
       persistedRunWrite.run;
     if (!persistedRunWrite.updated) {
+      // A successor may have claimed or completed the same run after this
+      // controller returned. Do not enrich or account its result here.
+      if (run.runtimeMode === "legacy" && agent.adapterType === "opencode_local") return;
       persistedRun = null;
       // Native reconciliation can commit and project the terminal status in
       // the narrow window between adapter completion and this live write.
@@ -1237,7 +1242,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       logBytes: logSummary?.bytes,
       logSha256: logSummary?.sha256,
       logCompressed: logSummary?.compressed ?? false,
-    }, { error: err, phase: "execute", secretValues: readFailureReportSecrets() }));
+    }, { error: err, phase: "execute", secretValues: readFailureReportSecrets() },
+    run.runtimeMode === "legacy" && agent.adapterType === "opencode_local"
+      ? { expectedLegacyControllerBootId: run.controllerBootId } : undefined));
     if (
       !failedRunWrite.updated &&
       !(
@@ -1250,7 +1257,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           attemptedStatus: "failed",
           currentStatus: failedRunWrite.run?.status ?? null,
         },
-        "skipping late adapter failure finalization because the run already left running state",
+        "skipping adapter failure finalization because the run is no longer writable by this controller",
       );
       return;
     }
@@ -1521,7 +1528,12 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         : setupFailureResultJson
           ? { resultJson: setupFailureResultJson }
           : {}),
-    }, { error: outerErr, phase: "setup", secretValues: readFailureReportSecrets() }, { setupFailure: true }).catch(() => ({ run: null, updated: false as const }));
+    }, { error: outerErr, phase: "setup", secretValues: readFailureReportSecrets() }, {
+      setupFailure: true,
+      ...(run.runtimeMode === "legacy" && (setupFailureAgent?.adapterType === "opencode_local" ||
+        parseObject(parseObject(run.runnerProfileJson).adapterDispatch).adapterType === "opencode_local")
+        ? { expectedLegacyControllerBootId: run.controllerBootId } : {}),
+    }).catch(() => ({ run: null, updated: false as const }));
     if (!setupFailureWrite.updated) {
       logger.info(
         {
@@ -1529,7 +1541,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           attemptedStatus: "failed",
           currentStatus: setupFailureWrite.run?.status ?? null,
         },
-        "skipping late setup failure finalization because the run already left running state",
+        "skipping setup failure finalization because the run is no longer writable by this controller",
       );
     } else {
       await setWakeupStatus(run.wakeupRequestId, "failed", {
