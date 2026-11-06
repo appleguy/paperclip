@@ -8,7 +8,7 @@ import { describeFailedAttachment } from "../native-runtime/remote-warm-session-
 import { usesNativeUsageDelivery } from "../native-runtime/native-usage-accounting.js";
 import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
 import { saveOpenCodeGoalCheckpoint } from "./opencode-shared-checkpoint.js";
-import { isUnverifiedSharedOpenCode } from "./opencode-unverified-hold.js";
+import { hasOpenCodeRecoveryHistory, isUnverifiedSharedOpenCode } from "./opencode-unverified-hold.js";
 import { randomUUID } from "node:crypto";
 import { nativeSha256 } from "../native-runtime/canonical.js";
 import { readRemoteWorkspaceAuthority, saveRemoteWorkspace } from "../remote-workspaces.js";
@@ -1176,6 +1176,21 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       await completeWorkspace();
     }
   } catch (adapterErr) {
+    if (hasOpenCodeRecoveryHistory({ run, adapterType: agent.adapterType })) {
+      // Failure in this controller's setup cannot settle an earlier shared
+      // turn. Return through the host hold path before releasing its resources.
+      preserveRunGatewayTokens = true;
+      preserveUnverifiedSharedResources = true;
+      logger.warn({ runId: run.id }, "OpenCode recovery execution failed; retaining unverified provider work");
+      const executionRecovery = isUnverifiedSharedOpenCode({ run, adapterType: agent.adapterType, resultJson: run.resultJson })
+        ? run.resultJson!.executionRecovery
+        : { kind: "bootstrap", reason: "recovery_setup_exception", providerWorkStarted: true, providerWorkEvidence: "unverified" };
+      return { dispatched: true, adapterResult: {
+        exitCode: 75, signal: null, timedOut: false,
+        errorMessage: "OpenCode recovery setup failed with provider work unverified",
+        resultJson: { executionRecovery },
+      } };
+    }
     if (adapterErr instanceof NativeCancellationPendingRecoveryError) {
       // Durable cancellation is settled by the outer recovery handler;
       // it does not imply a failed workspace or a persisted run result.

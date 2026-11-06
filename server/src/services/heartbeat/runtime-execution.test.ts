@@ -31,7 +31,7 @@ import { buildNativeExecutionInput } from "../native-runtime/native-execution-in
 import { nativeRuntimeContextFixture } from "../native-runtime/runtime-context.test-fixture.js";
 import { createHeartbeatRunState } from "./run-state.js";
 import { buildEffectiveRunSessionConfigMetadata } from "./workspaces.js";
-import { revokeHeartbeatRunGatewayTokens } from "./run-preparation.js";
+import { buildPaperclipRuntimeMcpServers, revokeHeartbeatRunGatewayTokens } from "./run-preparation.js";
 import { executeHeartbeatRuntime, type HeartbeatRuntimeExecutionInput } from "./runtime-execution.js";
 import { claimLegacyRestartController } from "./legacy-restart-claim.js";
 import { execute as executeOpenCode } from "../../../../packages/adapters/opencode-local/src/server/execute.js";
@@ -217,6 +217,42 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expect((await heartbeatService(db).reapOrphanedRuns()).runIds).not.toContain(run.id);
     expect(await read(run.id)).toMatchObject({ status: "running", resultJson: { earlySession, restartReattach: { count: 1 } } });
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run.id))).toHaveLength(0);
+  });
+
+  it.each([
+    { resultJson: { restartReattach: { count: 1 } }, reason: "recovery_setup_exception" },
+    { resultJson: { earlySession: { sessionId: "session-original", sessionParams: { narBinding: { messageId: "message-original" } } } }, reason: "recovery_setup_exception" },
+    { resultJson: { executionRecovery: { kind: "bootstrap", reason: "outcome_unknown", providerWorkStarted: false, providerWorkEvidence: "unverified" } }, reason: "outcome_unknown" },
+  ])("holds a recovered OpenCode run when runtime setup throws (%s)", async ({ resultJson, reason }) => {
+    const { input, adapter, run } = await fixture();
+    input.agent.adapterType = adapter.type = "opencode_local";
+    const [owned] = await db.update(heartbeatRuns).set({ controllerBootId: randomUUID(),
+      controllerLeaseExpiresAt: new Date(Date.now() + 60_000), resultJson }).where(eq(heartbeatRuns.id, run.id)).returning();
+    input.run = owned;
+    vi.mocked(buildPaperclipRuntimeMcpServers).mockRejectedValueOnce(new Error("synthetic setup failure"));
+    const result = await executeHeartbeatRuntime(db, input);
+    expect(result).toMatchObject({ dispatched: true, adapterResult: { resultJson: { executionRecovery: {
+      reason, providerWorkEvidence: "unverified",
+    } } } });
+    expect(adapter.execute).not.toHaveBeenCalled();
+    expect(revokeHeartbeatRunGatewayTokens).not.toHaveBeenCalled();
+    expect(input.instructions.releaseInstructionCopy).not.toHaveBeenCalled();
+    if (!result.dispatched) throw new Error("expected unverified hold");
+    const { isUnverifiedSharedOpenCode, persistUnverifiedSharedOpenCode } = await import("./opencode-unverified-hold.js");
+    expect(isUnverifiedSharedOpenCode({ run: owned, adapterType: "opencode_local", resultJson: result.adapterResult.resultJson })).toBe(true);
+    expect(await persistUnverifiedSharedOpenCode(db, { run: owned, resultJson: result.adapterResult.resultJson })).toBe(true);
+    expect(await read(run.id)).toMatchObject({ status: "running", resultJson: { ...resultJson,
+      executionRecovery: { reason, providerWorkEvidence: "unverified" } } });
+  });
+
+  it("keeps ordinary first-start setup failure handling without recovery evidence", async () => {
+    const { input, adapter } = await fixture();
+    input.agent.adapterType = adapter.type = "opencode_local";
+    vi.mocked(buildPaperclipRuntimeMcpServers).mockRejectedValueOnce(new Error("synthetic setup failure"));
+    await expect(executeHeartbeatRuntime(db, input)).rejects.toThrow("synthetic setup failure");
+    expect(adapter.execute).not.toHaveBeenCalled();
+    expect(revokeHeartbeatRunGatewayTokens).toHaveBeenCalledOnce();
+    expect(input.instructions.releaseInstructionCopy).toHaveBeenCalledOnce();
   });
 
   it.each([ { messageId: "message-original" }, null ])(

@@ -15,6 +15,22 @@ export function isUnverifiedSharedOpenCode(input: {
     (evidence.providerWorkStarted === true && ["shared_session_unverified", "stop_before_dispatch_unverified"].includes(String(evidence.reason))));
 }
 
+/** Prior re-entry evidence prevents a local setup failure from proving no work exists. */
+export function hasOpenCodeRecoveryHistory(input: {
+  run: typeof heartbeatRuns.$inferSelect;
+  adapterType: string;
+}): boolean {
+  if (input.run.runtimeMode !== "legacy" || input.adapterType !== "opencode_local") return false;
+  const result = input.run.resultJson;
+  if (!result || typeof result !== "object" || Array.isArray(result)) return false;
+  if (Object.hasOwn(result, "restartReattach") ||
+      isUnverifiedSharedOpenCode({ ...input, resultJson: result })) return true;
+  const session = result.earlySession;
+  if (!session || typeof session !== "object" || Array.isArray(session)) return false;
+  const params = (session as Record<string, unknown>).sessionParams;
+  return !!params && typeof params === "object" && !Array.isArray(params) && Object.hasOwn(params, "narBinding");
+}
+
 export async function persistUnverifiedSharedOpenCode(db: Db, input: {
   run: typeof heartbeatRuns.$inferSelect;
   resultJson: Record<string, unknown> | null | undefined;
