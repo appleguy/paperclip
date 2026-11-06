@@ -3468,6 +3468,7 @@ export function summarizeAcpxTurnUsage(input: {
   postStatus: AcpRuntimeStatus | null;
   eventBreakdown: AcpRuntimeUsageBreakdown | null;
   eventCostUsd: number | null;
+  peakContextTokens?: number;
 }): {
   usage: UsageSummary | null;
   usageDetail: Record<string, number> | null;
@@ -3498,6 +3499,7 @@ export function summarizeAcpxTurnUsage(input: {
         inputTokens: inputTokens + cachedWriteTokens,
         outputTokens,
         cachedInputTokens: cachedReadTokens,
+        ...(input.peakContextTokens ? { peakContextTokens: input.peakContextTokens } : {}),
       }
     : null;
   const usageDetail = breakdown
@@ -5021,6 +5023,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
       };
       let eventBreakdown: AcpRuntimeUsageBreakdown | null = null;
       let eventCostUsd: number | null = null;
+      // Largest context ACP reported this turn (usage_update `used`). The summed input
+      // re-counts the context every step, so the rotation gate needs the peak (T-69).
+      let peakContextTokens = 0;
       // Receipt persistence is fallible; retain the provider evidence before
       // calling the sink so the failure result can still return it to the host.
       let observedUsage: Pick<AdapterExecutionResult, "usage" | "usageBasis" | "costUsd" | "usageComplete"> = { usageComplete: false };
@@ -5316,9 +5321,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               flushOutputSegment();
             }
             if (event.type === "status" && event.tag === "usage_update") {
+              if (typeof event.used === "number" && Number.isSafeInteger(event.used) && event.used > 0) peakContextTokens = Math.max(peakContextTokens, event.used);
               eventBreakdown = event.breakdown ?? eventBreakdown;
               eventCostUsd = usdCostAmount(event.cost) ?? eventCostUsd;
-              const checkpoint = summarizeAcpxTurnUsage({ preStatus: preTurnStatus, postStatus: null, eventBreakdown, eventCostUsd });
+              const checkpoint = summarizeAcpxTurnUsage({ preStatus: preTurnStatus, postStatus: null, eventBreakdown, eventCostUsd, peakContextTokens });
               observedUsage = { usage: checkpoint.usage ?? undefined, costUsd: checkpoint.costUsd, usageBasis: "per_run", usageComplete: false };
               await ctx.onUsage?.({ ...billingFields, usage: checkpoint.usage ?? undefined, costUsd: checkpoint.costUsd,
                 model: accountingModel, usageBasis: "per_run", complete: false });
@@ -5419,6 +5425,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           postStatus: postTurnStatus,
           eventBreakdown,
           eventCostUsd,
+          peakContextTokens,
         });
         // An interrupted stream is provisional unless the runtime supplies its
         // post-terminal receipt. An in-stream usage_update alone cannot close it.

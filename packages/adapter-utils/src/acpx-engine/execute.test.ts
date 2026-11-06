@@ -1697,7 +1697,7 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(result.exitCode).toBe(0);
     expect(statusCalls).toBe(2);
     // Cache-write tokens count as input tokens; cached reads stay separate.
-    expect(result.usage).toEqual({ inputTokens: 150, outputTokens: 4500, cachedInputTokens: 900 });
+    expect(result.usage).toEqual({ inputTokens: 150, outputTokens: 4500, cachedInputTokens: 900, peakContextTokens: 5550 });
     expect(result.usageBasis).toBe("per_run");
     // Agent-reported cost is cumulative; this run pays the delta.
     expect(result.costUsd).toBeCloseTo(0.75);
@@ -1803,6 +1803,44 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(result.costUsd).toBeCloseTo(0.31);
     expect(result.provider).toBe("acpx");
     expect(result.billingType).toBe("unknown");
+  });
+
+  it("reports the peak usage_update context, not the summed step input (T-69)", async () => {
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => ({
+        ensureSession: async () => ({
+          backendSessionId: "backend-session",
+          agentSessionId: "agent-session",
+          runtimeSessionName: "runtime-session",
+        }),
+        startTurn: () => ({
+          events: (async function* () {
+            yield { type: "status", text: "usage", tag: "usage_update", used: 53954, size: 475000,
+              breakdown: { inputTokens: 20000, outputTokens: 900, cachedReadTokens: 150000 } };
+            yield { type: "status", text: "usage", tag: "usage_update", used: 55179, size: 475000,
+              breakdown: { inputTokens: 40614, outputTokens: 2475, cachedReadTokens: 337920 } };
+            yield { type: "done", stopReason: "end_turn" };
+          })(),
+          result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+          cancel: async () => {},
+        }),
+        close: async () => {},
+      }) as never,
+    });
+
+    const result = await execute({
+      runId: "run-usage-peak-context",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    expect(result.usage).toEqual({ inputTokens: 40614, outputTokens: 2475, cachedInputTokens: 337920, peakContextTokens: 55179 });
   });
 
   it.each(["failed", "cancelled"] as const)("keeps %s in-stream usage provisional without a final receipt", async (status) => {
