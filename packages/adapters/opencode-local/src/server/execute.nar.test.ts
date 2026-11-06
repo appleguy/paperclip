@@ -566,27 +566,26 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect(userMsgs().map((m) => m.id)).toEqual([other]);
   });
 
-  it("ends the run as verified-interrupted when the OpenCode server restarts mid-run (SCO-679)", async () => {
+  it("holds when the OpenCode server identity changes mid-run", async () => {
     autoComplete = false;
     const run = execute({ ...context("run-restart", { nativeRuntime: "nar" }, "issue-one"), signal: new AbortController().signal } as never);
     await vi.waitFor(() => expect(active.size).toBe(1));
     serverPid = 9999; // launchd restarted the server
     try {
       const out = await run;
-      expect(out.errorCode).toBe("cancelled");
-      expect(out.resultJson).toMatchObject({
-        executionCancellation: { state: "acknowledged", proof: "server_restarted" },
-        executionRecovery: { kind: "interrupted", sessionPreserved: true } });
+      expect(out.resultJson).toMatchObject({ executionRecovery: { providerWorkStarted: true, reason: "server_identity_changed" } });
+      expect(out.resultJson).not.toHaveProperty("executionCancellation.state", "acknowledged");
     } finally { serverPid = 4242; }
   }, 30_000);
 
-  it("ends the run as verified-interrupted when the session goes idle without settling (SCO-679)", async () => {
+  it("holds when the session goes idle without an outcome for the original message", async () => {
     autoComplete = false;
     const run = execute({ ...context("run-idle-dead", { nativeRuntime: "nar" }, "issue-one"), signal: new AbortController().signal } as never);
     await vi.waitFor(() => expect(active.size).toBe(1));
     active.clear(); // e.g. compaction.interrupted: idle, no outcome recorded
     const out = await run;
-    expect(out.resultJson).toMatchObject({ executionCancellation: { state: "acknowledged", proof: "session_idle" } });
+    expect(out.resultJson).toMatchObject({ executionRecovery: { providerWorkStarted: true, reason: "idle_outcome_unknown" } });
+    expect(out.resultJson).not.toHaveProperty("executionCancellation.state", "acknowledged");
   }, 120_000);
 
   it("preserves an in-flight provider turn on untagged shutdown for no-replay rejoin", async () => {

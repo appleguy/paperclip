@@ -452,8 +452,9 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
         } else {
           unreachableSince = null;
           if (hostPid !== null && pid !== hostPid) {
-            await onLog("stderr", `[paperclip] OpenCode server restarted (pid ${hostPid} -> ${pid}); ending run as interrupted\n`);
-            return interrupted("server restarted during run", "server_restarted", conversationId);
+            const m = "OpenCode server identity changed; original provider termination is unverified";
+            await onLog("stderr", `[paperclip] ${m}\n`);
+            return held(m, true, conversationId, "server_identity_changed");
           }
           let inflight: string | null | undefined;
           try { inflight = await driver.inflightMessage(conversationId); } catch { inflight = undefined; }
@@ -461,8 +462,9 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
           else {
             idleSince ??= Date.now();
             if (Date.now() - idleSince >= idleGraceMs) {
-              await onLog("stderr", "[paperclip] OpenCode session idle with no in-flight message; ending run as interrupted\n");
-              return interrupted("session idle without settling", "session_idle", conversationId);
+              const m = "OpenCode session idle without a verified outcome for the original message";
+              await onLog("stderr", `[paperclip] ${m}\n`);
+              return held(m, true, conversationId, "idle_outcome_unknown");
             }
           }
           // SCO-756: a rejoined message can stay in flight with nothing happening (run 2a483f33 sat 80 min on an idle
