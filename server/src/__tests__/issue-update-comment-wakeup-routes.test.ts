@@ -64,6 +64,10 @@ const mockRunnerGoalService = vi.hoisted(() => ({
   projection: vi.fn(async () => null),
   act: vi.fn(),
 }));
+const mockQueueLiveRunnerPrpCommand = vi.hoisted(() => vi.fn());
+vi.mock("../realtime/runner-prp-ws.js", () => ({
+  queueLiveRunnerPrpCommand: mockQueueLiveRunnerPrpCommand,
+}));
 
 vi.mock("../services/native-runtime/native-question-bridge.js", () => ({
   deliverNativeQuestionResponse: vi.fn(async () => "not_native"),
@@ -819,6 +823,44 @@ describe("issue update comment wakeups", () => {
         }),
       }),
     );
+  });
+
+  it("queues a comment received during an active native goal at the next turn boundary", async () => {
+    const existing = makeIssue({
+      assigneeAgentId: ASSIGNEE_AGENT_ID,
+      assigneeUserId: null,
+      status: "in_progress",
+    });
+    mockIssueService.getById.mockResolvedValue(existing);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-during-turn",
+      issueId: existing.id,
+      companyId: existing.companyId,
+      body: "Please also check the mobile layout.",
+    });
+    mockRunnerGoalService.projection.mockResolvedValue({
+      goal: { status: "active" },
+      workingNow: true,
+    } as never);
+    mockQueueLiveRunnerPrpCommand.mockReturnValue({
+      runId: "active-run",
+      completion: Promise.resolve(),
+    });
+
+    const res = await request(await createApp())
+      .post(`/api/issues/${existing.id}/comments`)
+      .send({ body: "Please also check the mobile layout." });
+
+    expect(res.status).toBe(201);
+    expect(mockQueueLiveRunnerPrpCommand).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        reason: "issue_commented",
+        payload: expect.objectContaining({ commentId: "comment-during-turn" }),
+        contextSnapshot: expect.objectContaining({ wakeCommentId: "comment-during-turn" }),
+      }),
+    ));
   });
 
   it.each(["post", "patch"] as const)("stores a %s operator comment on an assigned backlog issue without waking or promoting it", async (method) => {
