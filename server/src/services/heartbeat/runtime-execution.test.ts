@@ -516,6 +516,86 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     }
   });
 
+  it("documents the unfenced OpenCode submission after checkpoint ownership changes", async () => {
+    const { input, adapter, run } = await fixture();
+    const boot = randomUUID();
+    const successorBoot = randomUUID();
+    const sid = sessionIdFor({ agentId: input.agent.id, issueId: input.task.issueId! });
+    const messageId = messageIdFor(narOpIdFor(run.id));
+    let created = false;
+    let checkpointObserved = false;
+    let promptPosts = 0;
+    const submittedMessageIds: string[] = [];
+    let otherWrites = 0;
+    let url = "";
+    const server = createServer((req, res) => {
+      const p = new URL(req.url ?? "/", url).pathname;
+      const reply = (status: number, body: unknown) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(body)); };
+      if (req.method === "POST" && p === "/api/session") { created = true; return reply(200, { data: { id: sid } }); }
+      if (req.method === "POST" && p === `/api/session/${sid}/prompt`) {
+        promptPosts++;
+        let body = "";
+        req.setEncoding("utf8");
+        req.on("data", chunk => { body += chunk; });
+        req.on("end", () => { submittedMessageIds.push(JSON.parse(body).id); reply(503, {}); });
+        return;
+      }
+      if (req.method !== "GET") { otherWrites++; return reply(500, {}); }
+      if (p === "/api/info") return reply(200, { version: "2.2.5", pid: 4242, urls: [url] });
+      if (p === "/api/session/active") return reply(200, { data: {} });
+      if (p === `/api/session/${sid}`) return created ? reply(200, { data: { id: sid, location: { directory: home } } }) : reply(404, {});
+      if (p === `/api/session/${sid}/inbox` || p === `/api/session/${sid}/message`) return reply(200, { data: [] });
+      return reply(404, {});
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    try {
+      url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      const passwordFile = join(home, "after-checkpoint-password");
+      const configPath = join(home, "after-checkpoint-server.json");
+      const command = join(home, "after-checkpoint-cli");
+      await writeFile(passwordFile, "fixture-secret");
+      await writeFile(configPath, JSON.stringify({ url, passwordFile }));
+      await writeFile(command, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      await db.update(agents).set({ adapterType: "opencode_local" }).where(eq(agents.id, input.agent.id));
+      await db.update(heartbeatRuns).set({ controllerBootId: boot, controllerLeaseExpiresAt: new Date(Date.now() + 60_000), executionStage: "dispatching", resultJson: {} }).where(eq(heartbeatRuns.id, run.id));
+      input.run.controllerBootId = boot;
+      input.run.resultJson = {};
+      input.agent.adapterType = adapter.type = "opencode_local";
+      adapter.execute.mockImplementation(executeOpenCode);
+      input.config.runtimeConfig = { command, cwd: home, model: "openai/fixture", nativeRuntime: "nar", sharedServerRecoveryConfigPath: configPath };
+      input.output.onLog = async (_stream, chunk) => {
+        if (!checkpointObserved && chunk.includes("nar_prompt_dispatch")) {
+          expect(await read(run.id)).toMatchObject({ controllerBootId: boot, resultJson: { earlySession: {
+            sessionId: sid, sessionParams: { narBinding: { runId: run.id, messageId } },
+          } } });
+          checkpointObserved = true;
+          await db.update(heartbeatRuns).set({ controllerBootId: successorBoot, controllerLeaseExpiresAt: new Date(Date.now() + 60_000) }).where(eq(heartbeatRuns.id, run.id));
+        }
+      };
+      const result = await executeHeartbeatRuntime(db, input);
+      expect(checkpointObserved).toBe(true);
+      expect((await read(run.id)).controllerBootId).toBe(successorBoot);
+      // Known gap: the stale controller still reaches POST after ownership changed.
+      // Replace this assertion with zero once provider admission is atomically fenced.
+      expect(promptPosts).toBe(1);
+      expect(submittedMessageIds).toEqual([messageId]);
+      expect(result).toMatchObject({ dispatched: true, adapterResult: { resultJson: { executionRecovery: {
+        reason: "submit_outcome_unknown", providerWorkEvidence: "unverified",
+      } } } });
+      if (!result.dispatched) throw new Error("expected dispatched attempt");
+      const { persistUnverifiedSharedOpenCode } = await import("./opencode-unverified-hold.js");
+      expect(await persistUnverifiedSharedOpenCode(db, { run: input.run, resultJson: result.adapterResult.resultJson })).toBe(false);
+      expect(await read(run.id)).toMatchObject({ status: "running", controllerBootId: successorBoot, resultJson: {
+        earlySession: { sessionId: sid, sessionParams: { narBinding: { runId: run.id, messageId } } },
+      } });
+      expect(otherWrites).toBe(0);
+      expect(revokeHeartbeatRunGatewayTokens).not.toHaveBeenCalled();
+      expect(input.instructions.releaseInstructionCopy).not.toHaveBeenCalled();
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    }
+  });
+
   it("registers the plain OpenCode CLI controller when its child spawns", async () => {
     const { input, adapter, run } = await fixture();
     adapter.type = "opencode_local";
