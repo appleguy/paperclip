@@ -1769,8 +1769,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     // A server restart or a message/cleanup race can leave a deferred wake
     // after its owner has released the issue lock. Revisit it through the same
     // release admission, so recovery holds and operator Stops still apply.
-    const strandedQueues = await db.select({ wake: agentWakeupRequests })
+    const strandedQueues = await db.select({ wake: agentWakeupRequests, adapterType: agents.adapterType })
       .from(agentWakeupRequests)
+      .innerJoin(agents, and(eq(agents.id, agentWakeupRequests.agentId), eq(agents.companyId, agentWakeupRequests.companyId)))
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
         sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
         or(eq(issues.assigneeAgentId, agentWakeupRequests.agentId),
@@ -1783,7 +1784,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         or(and(
           sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
           sql`${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
-        ), sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`),
+        ), sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`, and(eq(agents.adapterType, "process"),
+          sql`${agentWakeupRequests.payload}->'executionWait' is null`)),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
         sql`NOT EXISTS (SELECT 1 FROM heartbeat_runs live_issue_run
           WHERE live_issue_run.company_id = ${issues.companyId}
@@ -1793,8 +1795,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
     const releasedNativeSources = new Set<string>();
-    for (const { wake } of strandedQueues) {
-      if (!queuedCommentIdsFromWakePayload(wake.payload).length &&
+    for (const { wake, adapterType } of strandedQueues) {
+      if (adapterType !== "process" && !queuedCommentIdsFromWakePayload(wake.payload).length &&
           !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
       const [latest] = await db.select({
         id: heartbeatRuns.id,
@@ -4197,6 +4199,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   wakeupRequestId: activeExecutionRun.wakeupRequestId,
                 },
                 allowRunCoalescing: isConversation(issue) ? false : opts.allowRunCoalescing,
+                deferRunningProcessWake: agent.adapterType === "process",
                 durableReceipt: receiptRequest
                   ? {
                       id: receiptRequest.id,
@@ -4689,10 +4692,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     const shouldQueueFollowupForRunningWake =
       Boolean(sameScopeRunningRun) &&
       !sameScopeQueuedRun &&
-      shouldQueueFollowupForRunningIssueWake({
+      (agent.adapterType === "process" || shouldQueueFollowupForRunningIssueWake({
         contextSnapshot: enrichedContextSnapshot,
         wakeCommentId,
-      });
+      }));
     // Unscoped manual wakes need their own receipt and execution identity too.
     const rawCoalescedTarget =
       opts.allowRunCoalescing === false || opts.manualUserWake
@@ -4746,6 +4749,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         runId: mergedRun.id,
         finishedAt: new Date(),
       });
+      if (agent.adapterType === "process" && mergedRun.status === "queued") {
+        await startNextQueuedRunForAgent(agent.id);
+      }
       return mergedRun;
     }
 
