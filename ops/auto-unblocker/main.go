@@ -113,14 +113,25 @@ type options struct {
 	concurrency      int
 	limit            int
 	cleanupDecisions bool
+	reviewed         map[string]reviewedTransition
+}
+
+type reviewedTransition struct {
+	Issue               string `json:"issue"`
+	BlockedTransitionAt string `json:"blockedTransitionAt"`
+	DescriptorAction    string `json:"descriptorAction"`
+	OwnerAgentPrefix    string `json:"ownerAgentPrefix"`
 }
 
 type row struct {
-	Issue   string `json:"issue"`
-	Action  string `json:"action"`
-	Cause   string `json:"cause"`
-	Applied bool   `json:"applied"`
-	Error   string `json:"error,omitempty"`
+	Issue               string `json:"issue"`
+	Action              string `json:"action"`
+	Cause               string `json:"cause"`
+	Applied             bool   `json:"applied"`
+	Error               string `json:"error,omitempty"`
+	BlockedTransitionAt string `json:"blockedTransitionAt,omitempty"`
+	DescriptorAction    string `json:"descriptorAction,omitempty"`
+	OwnerAgentPrefix    string `json:"ownerAgentPrefix,omitempty"`
 }
 
 type report struct {
@@ -135,12 +146,14 @@ type report struct {
 func main() {
 	var opts options
 	var olderThan string
+	var reviewFile string
 	flag.BoolVar(&opts.apply, "apply", false, "apply safe unblocks and route remaining work to agents or Board (default is dry-run)")
 	flag.BoolVar(&opts.jsonOutput, "json", false, "write a machine-readable report")
 	flag.StringVar(&olderThan, "older-than", "2h", "minimum blocked age (Go duration)")
 	flag.IntVar(&opts.concurrency, "concurrency", 1, "maximum concurrent live issue rechecks")
 	flag.IntVar(&opts.limit, "limit", 0, "optional maximum candidate count; zero checks all")
-	flag.BoolVar(&opts.cleanupDecisions, "cleanup-decisions", true, "inspect and cancel misrouted or stale auto-unblocker decisions")
+	flag.BoolVar(&opts.cleanupDecisions, "cleanup-decisions", false, "inspect misrouted or stale auto-unblocker decisions (dry-run only)")
+	flag.StringVar(&reviewFile, "review-file", "", "JSON array of Board-reviewed self-owned transitions (required for apply)")
 	flag.Parse()
 
 	duration, err := time.ParseDuration(olderThan)
@@ -156,6 +169,16 @@ func main() {
 	}
 	if opts.limit < 0 {
 		fatal("--limit must be zero or greater")
+	}
+	if opts.apply && (reviewFile == "" || opts.cleanupDecisions) {
+		fatal("--apply requires --review-file and cannot be combined with --cleanup-decisions")
+	}
+	if reviewFile != "" {
+		var err error
+		opts.reviewed, err = readReviewed(reviewFile)
+		if err != nil {
+			fatal("review file: " + err.Error())
+		}
 	}
 
 	apiBase := strings.TrimRight(os.Getenv("PAPERCLIP_API_URL"), "/")
@@ -213,6 +236,11 @@ func main() {
 		if item.Status != "blocked" {
 			continue
 		}
+		if opts.reviewed != nil {
+			if _, ok := opts.reviewed[item.Identifier]; !ok {
+				continue
+			}
+		}
 		blockedAt, ok := blockedSince(item)
 		if ok && asOf.Sub(blockedAt) > opts.olderThan {
 			candidates = append(candidates, item)
@@ -243,6 +271,17 @@ func main() {
 	}
 	close(jobs)
 	workers.Wait()
+	if opts.reviewed != nil {
+		seen := make(map[string]bool)
+		for _, item := range candidates {
+			seen[item.Identifier] = true
+		}
+		for id := range opts.reviewed {
+			if !seen[id] {
+				results = append(results, row{Issue: id, Action: "exception", Cause: "reviewed issue is absent, no longer blocked, too recent, or excluded by limit", Error: "reviewed transition not checked"})
+			}
+		}
+	}
 
 	counts := make(map[string]int)
 	hasError := false
@@ -302,6 +341,21 @@ func (c *client) process(ctx context.Context, initial issue, asOf time.Time, opt
 		result.Cause = "issue is no longer blocked"
 		return result
 	}
+	if reviewed, ok := opts.reviewed[initial.Identifier]; ok {
+		var descriptor unblockDescriptor
+		var owner struct {
+			AgentID string `json:"agentId"`
+		}
+		if current.Identifier != reviewed.Issue || current.BlockedTransitionAt != reviewed.BlockedTransitionAt ||
+			json.Unmarshal(current.UnblockDescriptor, &descriptor) != nil || json.Unmarshal(descriptor.Owner, &owner) != nil ||
+			descriptor.Action != reviewed.DescriptorAction || !strings.HasPrefix(owner.AgentID, reviewed.OwnerAgentPrefix) || current.AssigneeAgentID != owner.AgentID {
+			result.Action, result.Cause, result.Error = "exception", "reviewed transition, descriptor action, or assignee changed", "stale review"
+			return result
+		}
+	} else if opts.apply {
+		result.Action, result.Cause, result.Error = "exception", "issue was not reviewed", "missing review"
+		return result
+	}
 	blockedAt, ok := blockedSince(current)
 	if !ok || asOf.Sub(blockedAt) <= opts.olderThan {
 		result.Action = "skip_changed"
@@ -335,9 +389,16 @@ func (c *client) process(ctx context.Context, initial issue, asOf time.Time, opt
 		return result
 	}
 	attentionReason := initial.BlockedInboxAttention.Reason
+	approvalIDs := map[string]bool{}
 	if initial.BlockedInboxAttention.ApprovalID != "" {
+		approvalIDs[initial.BlockedInboxAttention.ApprovalID] = true
+	}
+	if current.BlockedInboxAttention.ApprovalID != "" {
+		approvalIDs[current.BlockedInboxAttention.ApprovalID] = true
+	}
+	for approvalID := range approvalIDs {
 		var currentApproval approval
-		approvalPath := "/api/approvals/" + url.PathEscape(initial.BlockedInboxAttention.ApprovalID)
+		approvalPath := "/api/approvals/" + url.PathEscape(approvalID)
 		if err := c.request(ctx, http.MethodGet, approvalPath, nil, &currentApproval); err != nil {
 			result.Action = "exception"
 			result.Cause = "could not recheck the existing approval"
@@ -353,7 +414,7 @@ func (c *client) process(ctx context.Context, initial issue, asOf time.Time, opt
 
 	cause := blockerCause(current, diagnostics)
 	if hasActive(current.UnblockDescriptor) {
-		return c.routeDescriptor(ctx, current, diagnostics, opts.apply)
+		return c.routeDescriptor(ctx, current, diagnostics, opts.apply, opts.reviewed != nil)
 	}
 	if dependencyReady(diagnostics) && !hasActive(current.UnblockDescriptor) {
 		if current.AssigneeAgentID == "" {

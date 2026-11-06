@@ -1,10 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"strings"
 	"time"
 )
 
@@ -13,7 +18,7 @@ type unblockDescriptor struct {
 	Action string          `json:"action"`
 }
 
-func (c *client) routeDescriptor(ctx context.Context, current issue, d blockerDiagnostics, apply bool) row {
+func (c *client) routeDescriptor(ctx context.Context, current issue, d blockerDiagnostics, apply, reviewed bool) row {
 	r := row{Issue: current.Identifier}
 	var descriptor unblockDescriptor
 	if err := json.Unmarshal(current.UnblockDescriptor, &descriptor); err != nil || descriptor.Action == "" {
@@ -46,6 +51,13 @@ func (c *client) routeDescriptor(ctx context.Context, current issue, d blockerDi
 		return r
 	}
 	if owner.AgentID == current.AssigneeAgentID {
+		r.BlockedTransitionAt = current.BlockedTransitionAt
+		r.DescriptorAction = descriptor.Action
+		if len(owner.AgentID) >= 8 {
+			r.OwnerAgentPrefix = owner.AgentID[:8]
+		} else {
+			r.OwnerAgentPrefix = owner.AgentID
+		}
 		if next := current.ExecutionPolicy.Monitor.NextCheckAt; next != "" {
 			when, err := time.Parse(time.RFC3339Nano, next)
 			if err != nil || when.After(time.Now()) {
@@ -57,11 +69,25 @@ func (c *client) routeDescriptor(ctx context.Context, current issue, d blockerDi
 			r.Action, r.Cause = "live_dependency", "self-owned descriptor has an unresolved or uncertain dependency"
 			return r
 		}
-		r.Action, r.Cause = "self_unblock", "self-owned descriptor has no unresolved dependency or pending decision"
+		r.Action, r.Cause = "self_review", "Board must verify that the descriptor action has cleared; dependency readiness alone is insufficient"
 		if !apply {
 			return r
 		}
-		body := map[string]string{"status": "todo", "comment": "Auto-unblocker: the unblock owner is the assignee and no live dependency or pending decision remains; resume the task and use a monitor for external waits."}
+		if !reviewed {
+			r.Error = "self-owned descriptor has no Board review"
+			return r
+		}
+		var latest issue
+		if err := c.request(ctx, http.MethodGet, "/api/issues/"+url.PathEscape(current.ID), nil, &latest); err != nil {
+			r.Error = "final issue recheck: " + err.Error()
+			return r
+		}
+		if current.UpdatedAt == "" || latest.UpdatedAt != current.UpdatedAt || latest.Status != "blocked" || latest.BlockedTransitionAt != current.BlockedTransitionAt || latest.AssigneeAgentID != current.AssigneeAgentID || !bytes.Equal(bytes.TrimSpace(latest.UnblockDescriptor), bytes.TrimSpace(current.UnblockDescriptor)) {
+			r.Error = "issue changed during gate checks; review again"
+			return r
+		}
+		r.Action = "self_unblock"
+		body := map[string]string{"status": "todo", "comment": "Auto-unblocker: Board reviewed this blocked transition and its descriptor action; the live dependency and decision gates were rechecked before resuming."}
 		var updated issueResult
 		if err := c.request(ctx, http.MethodPatch, "/api/issues/"+url.PathEscape(current.ID), body, &updated); err != nil {
 			r.Error = err.Error()
@@ -72,6 +98,10 @@ func (c *client) routeDescriptor(ctx context.Context, current issue, d blockerDi
 			return r
 		}
 		r.Applied = true
+		return r
+	}
+	if apply {
+		r.Action, r.Cause, r.Error = "exception", "review file permits self-owned transitions only", "not a self-owned transition"
 		return r
 	}
 	r.Action, r.Cause = "agent_redelivery", "redeliver to the other agent once for this blocked transition"
@@ -93,6 +123,39 @@ func (c *client) routeDescriptor(ctx context.Context, current issue, d blockerDi
 	}
 	r.Applied = true
 	return r
+}
+
+func readReviewed(path string) (map[string]reviewedTransition, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var entries []reviewedTransition
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&entries); err != nil {
+		return nil, err
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return nil, fmt.Errorf("expected one JSON array")
+	}
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("at least one reviewed transition is required")
+	}
+	result := make(map[string]reviewedTransition, len(entries))
+	for _, entry := range entries {
+		if entry.Issue == "" || strings.TrimSpace(entry.DescriptorAction) == "" || len(entry.OwnerAgentPrefix) != 8 {
+			return nil, fmt.Errorf("each entry requires issue, descriptorAction, and an eight-character ownerAgentPrefix")
+		}
+		if _, err := time.Parse(time.RFC3339Nano, entry.BlockedTransitionAt); err != nil {
+			return nil, fmt.Errorf("%s: invalid blockedTransitionAt", entry.Issue)
+		}
+		if _, exists := result[entry.Issue]; exists {
+			return nil, fmt.Errorf("duplicate issue %s", entry.Issue)
+		}
+		result[entry.Issue] = entry
+	}
+	return result, nil
 }
 
 func (c *client) routeBoard(ctx context.Context, current issue, cause string, apply bool) row {

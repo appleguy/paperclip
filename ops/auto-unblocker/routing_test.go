@@ -16,7 +16,7 @@ func TestDescriptorRouting(t *testing.T) {
 		name, owner, assignee, action, method string
 		ready                                 bool
 	}{
-		{"self", `{"agentId":"agent-a"}`, "agent-a", "self_unblock", "PATCH", true},
+		{"self", `{"agentId":"agent-a"}`, "agent-a", "self_review", "", true},
 		{"peer", `{"agentId":"agent-b"}`, "agent-a", "agent_redelivery", "POST", true},
 		{"board", `"board"`, "agent-a", "board_interaction", "POST", true},
 		{"user", `{"userId":"user-a"}`, "agent-a", "board_interaction", "POST", true},
@@ -53,11 +53,12 @@ func TestDescriptorRouting(t *testing.T) {
 			if tc.ready {
 				d = ready
 			}
-			got := c.routeDescriptor(context.Background(), item, d, true)
+			apply := false
+			got := c.routeDescriptor(context.Background(), item, d, apply, apply)
 			if got.Action != tc.action || got.Error != "" {
 				t.Fatalf("got %+v", got)
 			}
-			if (tc.method != "") != got.Applied || calls > 1 {
+			if (apply && tc.method != "") != got.Applied || calls > 1 {
 				t.Fatalf("applied=%v calls=%d", got.Applied, calls)
 			}
 		})
