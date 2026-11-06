@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { verifyOwned, jsonRequest, pauseOwned, selectStaleUnowned, reclaimOrphan,
-  interruptStaleUnowned, waitForRestartReady, retryHealthyIdentity } from "./deploy-drain.mjs";
+  interruptStaleUnowned, waitForRestartReady, retryHealthyIdentity, stableDeployOwner } from "./deploy-drain.mjs";
 
 const id = "11111111-1111-4111-8111-111111111111";
 const issue = "22222222-2222-4222-8222-222222222222";
@@ -18,6 +18,19 @@ const plan = (runs = [run], bindings = [binding], active = { [sid]: { type: "bus
   verifyOwned(runs, new Map([[agentId, agent]]), bindings, new Map([[url, active]]));
 
 describe("orphan deploy fence recovery", () => {
+  it("waits past the birth-time resolution and rejects a changed parent or birth", async () => {
+    let pid = 123;
+    let birth = "original";
+    let waited = 0;
+    const parent = () => pid;
+    const identity = processId => ({ pid: processId, birth });
+    const wait = async ms => { waited = ms; };
+    assert.deepEqual(await stableDeployOwner(parent, identity, wait), { pid: 123, birth: "original" });
+    assert.ok(waited > 1000);
+    await assert.rejects(stableDeployOwner(parent, identity, async () => { pid = 1; }), /shell changed/);
+    pid = 123;
+    await assert.rejects(stableDeployOwner(parent, identity, async () => { birth = "replacement"; }), /shell changed/);
+  });
   it("reclaims only a matching dead owner, retaining live, unrelated, and replaced fences", async () => {
     const dir = await fs.mkdtemp("/Volumes/NVM/AI_Agent_Runtime/tmp/sco1020-test-");
     const original = { draining: true, startedAt: "2020-01-01T00:00:00.000Z", serverPid: 123 };

@@ -182,6 +182,16 @@ export function deployOwner(pid) {
   return { pid, birth: "darwin:" + birth };
 }
 
+export async function stableDeployOwner(parentPid = () => process.ppid, identity = deployOwner, wait = sleep) {
+  const pid = parentPid();
+  const owner = identity(pid);
+  // ps reports birth only to the second. After a full second, a replacement
+  // process cannot share this birth time under a normally advancing clock.
+  await wait(1100);
+  ensure(parentPid() === pid && identity(pid).birth === owner.birth, "deploy shell changed before fencing");
+  return owner;
+}
+
 export async function releaseOwned(client, record) {
   const s = await status(client);
   if (!s.draining || s.serverPid !== record.serverPid || s.ownerId !== record.ownerId) return false;
@@ -554,7 +564,7 @@ async function main() {
     const before = await client.api("GET", "/api/instance/task-drain?upgradeReadiness=1");
     ensure(!before.draining && Number.isInteger(before.serverPid), "another task drain owns admission");
     const ownerId = randomUUID();
-    const owner = deployOwner(process.ppid);
+    const owner = await stableDeployOwner();
     const record = { schema: 1, ownerId, deployOwner: owner, serverPid: before.serverPid,
       manifestFile: file, phase: "starting", runs: [], orphans: [], createdAt: now(), evidence: [] };
     await writePrivate(file, record);
