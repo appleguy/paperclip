@@ -62,7 +62,8 @@ export async function runUsedConversationAdapter(db: Db, run: typeof heartbeatRu
   return adapterType !== null && isConversationAdapter(adapterType);
 }
 
-/** A local OpenCode no-submit observation does not fence another controller. */
+/** An unverified OpenCode observation does not fence another controller.
+ * Older holds predate providerWorkEvidence and can report started work instead. */
 export function unverifiedOpenCodeRecoveryActionPredicate() {
   return and(eq(issueRecoveryActions.cause, "legacy_execution_requires_reconciliation"), sql`exists (
     select 1 from ${heartbeatRuns}
@@ -71,7 +72,20 @@ export function unverifiedOpenCodeRecoveryActionPredicate() {
       and ${or(eq(heartbeatRuns.nativeIssueId, issueRecoveryActions.sourceIssueId),
         and(isNull(heartbeatRuns.nativeIssueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueRecoveryActions.sourceIssueId}::text`))}
       and ${heartbeatRuns.runtimeMode} = 'legacy'
-      and ${heartbeatRuns.resultJson}->'executionRecovery'->>'providerWorkEvidence' = 'unverified'
+      and (
+        ${heartbeatRuns.resultJson}->'executionRecovery'->>'providerWorkEvidence' = 'unverified'
+        or (
+          ${heartbeatRuns.resultJson}->'executionRecovery'->>'kind' = 'bootstrap'
+          and ${heartbeatRuns.resultJson}->'executionRecovery'->>'providerWorkStarted' = 'true'
+          and not coalesce((
+            coalesce(${heartbeatRuns.resultJson}->'executionRecovery'->>'reason', '') = 'unowned_turn_verified_idle'
+            and jsonb_typeof(${heartbeatRuns.resultJson}->'executionRecovery'->'providerSessionId') = 'string'
+            and length(${heartbeatRuns.resultJson}->'executionRecovery'->>'providerSessionId') > 0
+            and jsonb_typeof(${heartbeatRuns.resultJson}->'executionRecovery'->'providerMessageId') = 'string'
+            and length(${heartbeatRuns.resultJson}->'executionRecovery'->>'providerMessageId') > 0
+          ), false)
+        )
+      )
       and (coalesce(${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType', '') = 'opencode_local'
         or exists (select 1 from ${heartbeatRunEvents}
           where ${heartbeatRunEvents.companyId} = ${heartbeatRuns.companyId}

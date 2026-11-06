@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb, heartbeatRuns, issues, issueRecoveryActions } from "@paperclipai/db";
+import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issues, issueRecoveryActions } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
 import { settleUnrecoverableExecutions } from "./execution-recovery-resolution.js";
+import { terminalizeLegacyExecution } from "./legacy-execution-recovery.js";
 
 /** SCO-602: a resolved recovery action must not keep holding an issue the system can safely redispatch. */
 describe("stale resolved no-replay holds", () => {
@@ -82,6 +83,44 @@ describe("stale resolved no-replay holds", () => {
     expect(after.outcome).not.toBe("cancelled");
     expect((after.evidence.automaticRecovery as { replay: string }).replay).toBe("blocked");
     expect(await getExecutionBlocker(db, companyId, issueId)).not.toBeNull();
+  });
+
+  it("does not recreate and cancel a legacy OpenCode reattach hold without the newer evidence field", async () => {
+    const { companyId, issueId, action } = await seed("opencode_local", "adapter_failed", false, {
+      conversationContinuation: "continue_conversation_v1",
+      earlySession: { sessionId: "original-session", sessionParams: { narBinding: { messageId: "original-message" } } },
+      executionRecovery: { kind: "bootstrap", reason: "reattach_unavailable", providerWorkStarted: true },
+    });
+    await db.delete(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, action.evidence.runId as string));
+    await terminalizeLegacyExecution({ db, run, status: "failed", fromStatuses: ["failed"] });
+    const [first] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(first).toMatchObject({ status: "active", evidence: { runId: run.id } });
+    await settleUnrecoverableExecutions(db);
+    await terminalizeLegacyExecution({ db, run, status: "failed", fromStatuses: ["failed"] });
+    await settleUnrecoverableExecutions(db);
+    const after = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(after).toHaveLength(1);
+    expect(after[0]).toMatchObject({ id: first.id, evidence: { runId: run.id } });
+    expect(after[0].outcome).not.toBe("cancelled");
+    expect(await getExecutionBlocker(db, companyId, issueId)).not.toBeNull();
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0].resultJson).toEqual(run.resultJson);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toEqual([]);
+  });
+
+  it.each([
+    [{ providerSessionId: "session", providerMessageId: "message" }, "cancelled"],
+    [{ providerSessionId: "session" }, "blocked"],
+    [{ providerSessionId: "session", providerMessageId: "message", providerWorkEvidence: "unverified" }, "blocked"],
+  ] as const)("requires complete foreign-idle evidence before releasing a legacy OpenCode hold (%j)", async (details, outcome) => {
+    const { action } = await seed("opencode_local", "adapter_failed", false, {
+      conversationContinuation: "continue_conversation_v1",
+      executionRecovery: { kind: "bootstrap", reason: "unowned_turn_verified_idle", providerWorkStarted: true, ...details },
+    });
+    await settleUnrecoverableExecutions(db);
+    const [after] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(after.outcome).toBe(outcome);
   });
 
   it("releases resolved actions for other failures while retaining active recovery", async () => {
