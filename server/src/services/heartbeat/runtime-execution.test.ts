@@ -516,6 +516,86 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     }
   });
 
+  it("documents a stale OpenCode controller deleting the original queued message after takeover", async () => {
+    const { input, adapter, run } = await fixture();
+    const boot = randomUUID();
+    const successorBoot = randomUUID();
+    const sid = sessionIdFor({ agentId: input.agent.id, issueId: input.task.issueId! });
+    const messageId = messageIdFor(narOpIdFor(run.id));
+    const userMessage = { id: messageId, type: "user", time: { created: 1000 } };
+    let queued = true;
+    let deletes = 0;
+    let otherWrites = 0;
+    let tookOver = false;
+    let url = "";
+    const server = createServer((req, res) => {
+      const p = new URL(req.url ?? "/", url).pathname;
+      const reply = (status: number, body: unknown) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(body)); };
+      if (req.method === "DELETE" && p === `/api/session/${sid}/inbox/${messageId}`) {
+        deletes++; queued = false; res.writeHead(204); return res.end();
+      }
+      if (req.method !== "GET") { otherWrites++; return reply(500, {}); }
+      if (p === "/api/info") return reply(200, { version: "2.2.5", pid: 4242, urls: [url] });
+      if (p === "/api/session/active") return reply(200, { data: {} });
+      if (p === `/api/session/${sid}`) return reply(200, { data: { id: sid, location: { directory: home } } });
+      if (p === `/api/session/${sid}/inbox`) return reply(200, { data: queued ? [userMessage] : [] });
+      if (p === `/api/session/${sid}/message/${messageId}`) return reply(200, { data: userMessage });
+      if (p === `/api/session/${sid}/message`) return reply(200, { data: [userMessage] });
+      return reply(404, {});
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    try {
+      url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      const passwordFile = join(home, "stale-stop-password");
+      const configPath = join(home, "stale-stop-server.json");
+      const command = join(home, "stale-stop-cli");
+      await writeFile(passwordFile, "fixture-secret");
+      await writeFile(configPath, JSON.stringify({ url, passwordFile }));
+      await writeFile(command, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      const sessionParams = { sessionId: sid, cwd: home, narBinding: {
+        schema: "paperclip.opencode-binding.v1", runId: run.id, agentId: input.agent.id, taskId: input.task.issueId,
+        messageId, kind: "submit", hostPid: 4242, configPath, providerOrigin: url,
+      } };
+      const resultJson = { restartReattach: { count: 1 }, earlySession: { sessionId: sid, sessionParams },
+        executionRecovery: { kind: "bootstrap", reason: "aborted", providerWorkStarted: true, providerWorkEvidence: "unverified" } };
+      await db.update(agents).set({ adapterType: "opencode_local" }).where(eq(agents.id, input.agent.id));
+      await db.update(heartbeatRuns).set({ controllerBootId: boot, controllerLeaseExpiresAt: new Date(Date.now() + 60_000), resultJson }).where(eq(heartbeatRuns.id, run.id));
+      input.run.controllerBootId = boot;
+      input.run.resultJson = resultJson;
+      input.agent.adapterType = adapter.type = "opencode_local";
+      adapter.execute.mockImplementation(executeOpenCode);
+      input.config.runtimeConfig = { command, cwd: home, model: "openai/fixture", nativeRuntime: "nar", sharedServerRecoveryConfigPath: configPath };
+      input.runtime.runtimeForAdapter = { ...input.runtime.runtimeForAdapter, sessionId: sid, sessionParams, taskKey: input.task.issueId! };
+      input.output.onLog = async (_stream, chunk) => {
+        if (!tookOver && chunk.includes("nar_rejoin")) {
+          expect((await read(run.id)).controllerBootId).toBe(boot);
+          tookOver = true;
+          await db.update(heartbeatRuns).set({ controllerBootId: successorBoot, controllerLeaseExpiresAt: new Date(Date.now() + 60_000) }).where(eq(heartbeatRuns.id, run.id));
+          input.control.executionControl.controller.abort(Object.assign(new Error("synthetic stale Stop"), { code: "paperclip_explicit_run_stop" }));
+        }
+      };
+      const result = await executeHeartbeatRuntime(db, input);
+      expect(tookOver).toBe(true);
+      expect((await read(run.id)).controllerBootId).toBe(successorBoot);
+      // Known gap: the exact DELETE is not fenced against controller takeover.
+      // Replace this assertion with zero when atomic Stop authority exists.
+      expect(deletes).toBe(1);
+      expect(otherWrites).toBe(0);
+      expect(result).toMatchObject({ dispatched: true, adapterResult: { resultJson: { executionRecovery: { providerWorkEvidence: "unverified" } } } });
+      if (!result.dispatched) throw new Error("expected re-entry attempt");
+      const { persistUnverifiedSharedOpenCode } = await import("./opencode-unverified-hold.js");
+      expect(await persistUnverifiedSharedOpenCode(db, { run: input.run, resultJson: result.adapterResult.resultJson })).toBe(false);
+      expect(await read(run.id)).toMatchObject({ status: "running", controllerBootId: successorBoot, resultJson: {
+        earlySession: { sessionId: sid, sessionParams: { narBinding: { runId: run.id, messageId, kind: "rejoin" } } },
+        executionRecovery: { reason: "aborted", providerWorkEvidence: "unverified" },
+      } });
+      expect(revokeHeartbeatRunGatewayTokens).not.toHaveBeenCalled();
+      expect(input.instructions.releaseInstructionCopy).not.toHaveBeenCalled();
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    }
+  }, 45000);
+
   it("documents the unfenced OpenCode submission after checkpoint ownership changes", async () => {
     const { input, adapter, run } = await fixture();
     const boot = randomUUID();
