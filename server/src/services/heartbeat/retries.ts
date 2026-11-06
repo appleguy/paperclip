@@ -3,6 +3,7 @@ import { normalizeAgentNameKey } from "../agent-name-key.js";
 import { notifyStatusCardIssueChange } from "../status-card-notifications.js";
 import { notifyScheduledRetryDispatch } from "../run-dispatch-notifications.js";
 import { createHeartbeatRunState, deriveTaskKeyWithHeartbeatFallback } from "./run-state.js";
+import { coalescedWakeContext, findQueuedIssueRun } from "./queued-issue-run.js";
 import { infrastructureRetryDelayMs } from "../system-recovery-state.js";
 import {
   WORKSPACE_VALIDATION_FAILURE_CODE,
@@ -1073,6 +1074,20 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
           }
         }
 
+        if (issueId && retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON && !contextSnapshot.explicitUserContinuation) {
+          const queued = await findQueuedIssueRun(tx as unknown as Db, run.companyId, run.agentId, issueId);
+          if (queued) {
+            const [updated] = await tx.update(heartbeatRuns).set({
+              contextSnapshot: coalescedWakeContext(queued.contextSnapshot, wakeReason), updatedAt: now,
+            }).where(eq(heartbeatRuns.id, queued.id)).returning();
+            await tx.insert(agentWakeupRequests).values({
+              companyId: run.companyId, agentId: run.agentId, source: "automation", triggerDetail: "system",
+              reason: wakeReason, payload: { issueId, retryOfRunId: run.id, retryReason }, status: "coalesced",
+              runId: queued.id, requestedByActorType: "system", finishedAt: now, updatedAt: now,
+            });
+            return { outcome: "scheduled", run: updated!, reusedExisting: true };
+          }
+        }
         const scheduledRunId = randomUUID();
         if (contextSnapshot.explicitUserContinuation) {
           const continuation = issueId && (retryReason === "transient_failure" || retryReason === RUNNER_REVISION_WAIT_RETRY_REASON) ? await admitExplicitContinuationRetry({

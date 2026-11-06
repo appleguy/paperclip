@@ -1,4 +1,5 @@
 import { createHeartbeatTimerPolicy } from "./timer-policy.js";
+import { coalescedWakeContext, findQueuedIssueRun } from "./queued-issue-run.js";
 import { deliverOwnerCorrection, OWNER_CORRECTION_REASON } from "./owner-corrections.js";
 import { getStartupRecoveryState } from "../../startup-recovery-state.js";
 import { decideQueuedReceipt, reconcileQueuedReceipt, recordQueuedReason } from "./queued-reconciliation.js";
@@ -4111,6 +4112,23 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return { kind: "skipped" as const };
           }
           if (issueWakeDelta) payload = { ...(payload ?? {}), issueId, [ISSUE_WAKE_DELTA_KEY]: issueWakeDelta.fingerprint };
+
+          if (reason === "issue_recovery_action_restored" && !durableRequest && !executionBlocker && !reconciledSourceRunId) {
+            const queued = await findQueuedIssueRun(tx as unknown as Db, agent.companyId, agentId, issueId);
+            if (queued) {
+              const context: Record<string, unknown> = coalescedWakeContext({ ...enrichedContextSnapshot, ...queued.contextSnapshot,
+                wakeReason: queued.contextSnapshot?.wakeReason }, reason);
+              delete context.scheduledRetryAt;
+              const [updated] = await tx.update(heartbeatRuns).set({ contextSnapshot: context,
+                scheduledRetryAt: null, updatedAt: new Date() }).where(eq(heartbeatRuns.id, queued.id)).returning();
+              await tx.insert(agentWakeupRequests).values({ ...durableReceiptFields, companyId: agent.companyId,
+                agentId, source, triggerDetail, reason, payload, status: "coalesced", runId: queued.id,
+                requestedByActorType: opts.requestedByActorType ?? null, requestedByActorId: opts.requestedByActorId ?? null,
+                idempotencyKey: opts.idempotencyKey ?? null, finishedAt: new Date() });
+              await notifyRunDispatch(tx, { companyId: agent.companyId });
+              return { kind: "coalesced" as const, run: updated! };
+            }
+          }
 
           if (activeExecutionRun) {
             // The case ledger owns retry. Do not place its exact receipt in a

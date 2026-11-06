@@ -253,6 +253,38 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
   }
 
 
+  it.each(["retry first", "restore first"])("coalesces a queued transient retry and restore in either order: %s", async (order) => {
+    const runId = randomUUID(), companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+    const now = new Date();
+    await seedRetryFixture({ runId, companyId, agentId, now, errorCode: "adapter_failed" });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Queued recovery", status: "todo", assigneeAgentId: agentId });
+    await db.update(heartbeatRuns).set({ issueId, contextSnapshot: { issueId, wakeReason: "issue_assigned" } }).where(eq(heartbeatRuns.id, runId));
+    await db.insert(heartbeatRuns).values({ companyId, agentId, invocationSource: "automation", status: "running", startedAt: now });
+    const restore = () => heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system",
+      reason: "issue_recovery_action_restored", payload: { issueId }, contextSnapshot: { issueId } });
+    const retry = () => heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0 });
+    if (order === "retry first") {
+      const scheduled = await retry();
+      expect(scheduled.outcome).toBe("scheduled");
+      if (scheduled.outcome !== "scheduled") throw new Error("retry not scheduled");
+      await db.update(heartbeatRuns).set({ status: "queued" }).where(eq(heartbeatRuns.id, scheduled.run.id));
+      await restore();
+    } else {
+      await restore();
+      await retry();
+    }
+    const queued = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+      eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "queued")));
+    expect(queued).toHaveLength(1);
+    expect(queued[0]!.contextSnapshot?.coalescedWakeReasons).toEqual(expect.arrayContaining([
+      "transient_failure_retry", "issue_recovery_action_restored",
+    ]));
+    expect(queued[0]!.scheduledRetryAt).toBeNull();
+    const receipts = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, companyId),
+      eq(agentWakeupRequests.status, "coalesced"), eq(agentWakeupRequests.runId, queued[0]!.id)));
+    expect(receipts).toHaveLength(1);
+  });
+
   it("never schedules invalid provider definitions even when a caller supplies a retry policy", async () => {
     const runId = randomUUID(), companyId = randomUUID(), agentId = randomUUID();
     const now = new Date("2026-04-20T12:00:00.000Z");
