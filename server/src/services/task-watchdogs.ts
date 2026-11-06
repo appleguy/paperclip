@@ -28,6 +28,7 @@ import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { issueService } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { TASK_WATCHDOG_ORIGIN_KIND } from "./task-watchdog-scope.js";
+import { pendingInteractionSummary } from "./pending-interaction-summary.js";
 
 const TASK_WATCHDOG_STOP_FINGERPRINT_PREFIX = "task_watchdog_stop:";
 const TASK_WATCHDOG_SUBTREE_MAX_DEPTH = 100;
@@ -982,7 +983,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
               source: "task_watchdogs.pending_interaction", fallbackRecipient: "board",
               effectiveResolverPolicy: interaction.effectiveResolverPolicy,
               paperclipAgentMessage: { source: "task_watchdogs.pending_interaction",
-                text: `Pending interaction ${interaction.id} on issue ${issue.identifier ?? issue.id} (ID ${issue.id}) has no target. Review the card and route or answer it as authorized. Do not take over the issue or execute the assignee's work.` } };
+                text: `Pending interaction ${interaction.id} on issue ${issue.identifier ?? issue.id} (ID ${issue.id}, ${issue.title}) has no target. ${pendingInteractionSummary(interaction.payload)} Review the card and route or answer it as authorized. Do not take over the issue or execute the assignee's work.` } };
             await deps.enqueueWakeup(board.id, { source: "automation", triggerDetail: "system",
               reason: "interaction_pending", payload: context, contextSnapshot: context, idempotencyKey,
               requestedByActorType: "system", requestedByActorId: null });
