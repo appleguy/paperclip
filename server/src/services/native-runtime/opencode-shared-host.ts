@@ -27,7 +27,7 @@ function assertSessionModel(value: unknown, binding: Pick<OpenCodeSharedBinding,
 
 /** Start one isolated, host-owned v2 server. Never accepts URL or credentials
  * from a client. The returned handle is valid only while this process lives. */
-export async function startOpenCodeSharedHost(input: { executable: string; dataRoot: string; workspaceCwd?: string; provider?: { provider: string; model: string; baseURL: string; token: string }; providerBoundary?: { freeze(options: { timeoutMs: number; signal: AbortSignal }): Promise<{ id: string; requestSha256: string }>; resume(checkpoint: { id: string; requestSha256: string }): void; close(): void }; onShutdown?: () => Promise<void>; mcp?: {
+export async function startOpenCodeSharedHost(input: { executable: string; dataRoot: string; workspaceCwd?: string; provider?: { provider: string; model: string; baseURL: string; token: string }; providerTarget?: string; providerBoundary?: { freeze(options: { timeoutMs: number; signal: AbortSignal }): Promise<{ id: string; requestSha256: string }>; resume(checkpoint: { id: string; requestSha256: string }): void; close(): void }; onShutdown?: () => Promise<void>; mcp?: {
   tools: readonly Readonly<Record<string, unknown>>[];
   createHandler: (binding: OpenCodeSharedBinding) => (call: { tool: string; callId: string; arguments: unknown; signal: AbortSignal }) => Promise<unknown>;
 } }) {
@@ -136,6 +136,12 @@ export async function startOpenCodeSharedHost(input: { executable: string; dataR
   return Object.freeze({
     generation,
     shutdown,
+    async verifyProviderTarget(db: Db, binding: OpenCodeSharedBinding, target: string) {
+      if (!input.providerTarget || target !== input.providerTarget || binding.generation !== generation) throw new Error("opencode_provider_target_mismatch");
+      await withOpenCodeStopAuthority(db, binding, async host => {
+        if (host.pid !== pid || host.port !== port || !alive) throw new Error("opencode_host_binding_mismatch");
+      });
+    },
     async freezeProvider(db: Db, binding: OpenCodeSharedBinding, options: { timeoutMs: number; signal: AbortSignal }) {
       const boundary = input.providerBoundary;
       if (!boundary || binding.generation !== generation) throw new Error("opencode_provider_boundary_unavailable");
@@ -153,10 +159,11 @@ export async function startOpenCodeSharedHost(input: { executable: string; dataR
         return checkpoint;
       } catch (error) { boundary.close(); throw error; }
     },
-    async resumeProvider(db: Db, binding: OpenCodeSharedBinding, checkpoint: { id: string; requestSha256: string }) {
+    async resumeProvider(db: Db, binding: OpenCodeSharedBinding, checkpoint: { id: string; requestSha256: string }, signal?: AbortSignal) {
       const boundary = input.providerBoundary;
       if (!boundary || binding.generation !== generation) throw new Error("opencode_provider_boundary_unavailable");
       await withOpenCodeStopAuthority(db, binding, async host => {
+        signal?.throwIfAborted();
         if (host.pid !== pid || host.port !== port || !alive) throw new Error("opencode_host_binding_mismatch");
         boundary.resume(checkpoint);
       });

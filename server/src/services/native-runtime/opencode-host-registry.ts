@@ -37,9 +37,14 @@ export async function freezeOpenCodeManagedHost(db: Db, binding: OpenCodeSharedB
   return retained.admitted.port.freezeProvider(options);
 }
 
-export async function resumeOpenCodeManagedHost(db: Db, binding: OpenCodeSharedBinding, checkpoint: { id: string; requestSha256: string }) {
+export async function verifyOpenCodeManagedProviderTarget(db: Db, binding: OpenCodeSharedBinding, target: string) {
   const retained = await reconnectOpenCodeManagedHost(db, binding);
-  await retained.admitted.port.resumeProvider(checkpoint);
+  await retained.host.verifyProviderTarget(db, binding, target);
+}
+
+export async function resumeOpenCodeManagedHost(db: Db, binding: OpenCodeSharedBinding, checkpoint: { id: string; requestSha256: string }, signal?: AbortSignal) {
+  const retained = await reconnectOpenCodeManagedHost(db, binding);
+  await retained.admitted.port.resumeProvider(checkpoint, signal);
 }
 
 /** Called only after exact owned-child shutdown has completed. */
