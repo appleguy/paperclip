@@ -29,6 +29,8 @@ Manual local CLI mode (outside heartbeat runs): use `paperclipai agent local-cli
 
 **Run audit trail:** You MUST include `-H 'X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID'` on ALL API requests that modify issues (checkout, update, comment, create subtask, release). This links your actions to the current heartbeat run for traceability.
 
+**Status version guard:** `expectedStatusVersion` is only for a status-only backlog-to-todo promotion. A 422 for an incompatible guarded request is deterministic: do not repeat it or blindly remove the guard. Read the task and reconcile the intended action with its current status, review policy, and permissions. A 409 `issue_status_version_changed` means the snapshot is stale; read again and revalidate before at most one new attempt. Never replay a write whose outcome is uncertain.
+
 ## Conversation tasks
 
 When the task context says **Chat mode** (the issue has `conversationAgentId`),

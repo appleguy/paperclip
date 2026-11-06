@@ -14122,7 +14122,7 @@ export function issueRoutes(
         req.body.status !== "todo" ||
         Object.keys(req.body).some(key => key !== "status" && key !== "expectedStatusVersion")
       )) {
-        throw unprocessable("expectedStatusVersion requires a status-only backlog-to-todo promotion");
+        throw unprocessable("expectedStatusVersion is only for a status-only backlog-to-todo promotion. Do not retry the same request; read the task and reconcile the intended action with its current status, review policy, and permissions before sending a corrected request.");
       }
       next();
     },

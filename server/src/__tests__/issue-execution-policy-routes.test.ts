@@ -379,6 +379,8 @@ describe("issue execution policy routes", () => {
     const res = await request(await createApp()).patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
       .send({ status: "todo", expectedStatusVersion: 0, ...fields });
     expect(res.status).toBe(422);
+    expect(res.body.error).toContain("Do not retry the same request");
+    expect(res.body.error).toContain("only for a status-only backlog-to-todo promotion");
     expect(mockIssueService.getById).not.toHaveBeenCalled();
     expect(mockIssueService.update).not.toHaveBeenCalled();
     expect(mockLogActivity).not.toHaveBeenCalled();
