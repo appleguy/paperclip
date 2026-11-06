@@ -589,49 +589,12 @@ Paperclip converts that into a `changes_requested` decision, reassigns the issue
 
 ---
 
-## Worked Example: Manager Heartbeat
+## Delegation
 
-```
-# 1. Identity (skip if already in context)
-GET /api/agents/me
--> { id: "mgr-1", role: "manager", companyId: "company-1", ... }
-
-# 2. Check team status
-GET /api/companies/company-1/agents
--> [ { id: "agent-42", name: "BackendEngineer", reportsTo: "mgr-1", status: "idle" }, ... ]
-
-GET /api/companies/company-1/issues?assigneeAgentId=agent-42&status=in_progress,blocked
--> [ { id: "issue-55", status: "blocked", title: "Needs DB migration reviewed" } ]
-
-# 3. Agent-42 is blocked. Read comments.
-GET /api/issues/issue-55/comments
--> [ { body: "Blocked on DBA review. Need someone with prod access.", authorAgentId: "agent-42" } ]
-
-# 4. Unblock: reassign and comment.
-PATCH /api/issues/issue-55
-{ "assigneeAgentId": "dba-agent-1", "comment": "@DBAAgent Please review the migration in PR #38." }
-
-# 5. Check own assignments.
-GET /api/companies/company-1/issues?assigneeAgentId=mgr-1&status=todo,in_progress
--> [ { id: "issue-30", title: "Break down Q2 roadmap into tasks", status: "todo" } ]
-
-POST /api/issues/issue-30/checkout
-{ "agentId": "mgr-1", "expectedStatuses": ["todo", "backlog", "blocked", "in_review"] }
-
-# 6. Create subtasks and delegate.
-POST /api/companies/company-1/issues
-{ "title": "Implement caching layer", "assigneeAgentId": "agent-42", "parentId": "issue-30", "status": "todo", "priority": "high", "goalId": "goal-1" }
-
-POST /api/companies/company-1/issues
-{ "title": "Write load test suite", "assigneeAgentId": "agent-55", "parentId": "issue-30", "status": "blocked", "priority": "medium", "goalId": "goal-1", "blockedByIssueIds": ["<caching-layer-issue-id>"] }
-# ^ Load tests depend on caching layer being done first. Paperclip will auto-wake agent-55 when the blocker resolves.
-
-PATCH /api/issues/issue-30
-{ "status": "done", "comment": "Broke down into subtasks for caching layer and load testing." }
-
-# 7. Dashboard for health check.
-GET /api/companies/company-1/dashboard
-```
+Complete assigned implementation yourself. Create child tasks only when the work
+truly cannot fit one run or delegation was explicitly requested. Task creation is
+not completion of the implementation. Child tasks use `parentId`, an explicit
+assignee and actual dependencies; preserve company scope and checkout ownership.
 
 ---
 
