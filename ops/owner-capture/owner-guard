@@ -22,6 +22,11 @@ OWNER_JQ='def paperclip_envelope:
     | select(test("^\\s*<(channel|system-reminder|local-command|command-name|task-notification|pasted|conversation-checkpoint|cross-session-message)")|not)
     | select(test("^\\s*(From|To):|^\\s*\\{\"schema\"|^\\s*\\[Cross-session [a-z ]+notice\\]")|not) | select(test($auto)|not)
     | select(test("^\\s*(\\[Request interrupted|This session is being continued)")|not);'
+# Codex rollout provenance distinguishes injected instructions from owner text.
+# A peer-shaped envelope and client_authored=false do not identify an occurrence.
+CODEX_ORIGIN_JQ='def codex_injected:
+  ([.payload.internal_chat_message_metadata_passthrough.content_item_metadata[]?.provenance.type] as $p |
+    (($p | length) > 0 and all($p[]; . == "agents_md" or . == "harness")));'
 STATE=${OWNER_GUARD_STATE:-/Volumes/NVM/Paperclip/ops/owner-capture/state}
 API=/Volumes/NVM/Paperclip/bin/api
 mkdir -p "$STATE"
@@ -34,21 +39,45 @@ ocsess() { if ocv2 "$1"; then echo session_v2; else echo session; fi; }
 ocdb_of() { # SESSION_ID[@DB] -> db holding it
   case "$1" in *@*) printf "%s" "${1#*@}"; return;; esac
   for d in $(ocdbs); do [ -n "$(sqlite3 -readonly "$d" "select 1 from $(ocsess "$d") where id='$1'" 2>/dev/null)" ] && { printf "%s" "$d"; return; }; done; }
+# SCO-1080: NAR sets session.metadata.paperclip and submits msg_<26 hex>
+# (opencode-http-driver.ts messageIdFor). Native TUI messages use other IDs.
+# Do not exclude a whole managed session: owners can type into these seats.
+NAR_JQ='def nar_injected:
+  ((.message_id // "") | test("^msg_[0-9a-f]{26}$")) and
+  ((try (.session_metadata | fromjson | .paperclip) catch null) as $p |
+    ($p.agentId // "") != "" and ($p.issueId // "") != "");'
+ocmeta() { # Older/minimal v2 databases may lack session metadata.
+  if [ -n "$(sqlite3 -readonly "$1" "select 1 from pragma_table_info('session_v2') where name='metadata'")" ]; then
+    printf '%s' 's.metadata'
+  else printf '%s' "'{}'"; fi
+}
+oc_nar_receipt() ( # Hook lacks session metadata; join its identity to the durable DB.
+  sid=$(printf '%s' "$1" | jq -r '.session_id // empty')
+  case "$sid" in ''|*[!a-zA-Z0-9_-]*) return 1;; esac
+  db=$(ocdb_of "$sid"); [ -n "$db" ] && ocv2 "$db" || return 1
+  meta=$(ocmeta "$db")
+  sqlite3 -readonly -json "$db" "select m.id as message_id, $meta as session_metadata, json_extract(m.data,'\$.text') as text
+    from session_message m join session_v2 s on s.id=m.session_id where m.session_id='$sid' and m.type='user'" |
+    jq -e --argjson hook "$1" "$NAR_JQ"'any(.[]?; nar_injected and
+      ($hook.message_id // "") != "" and .message_id==$hook.message_id)' >/dev/null
+)
 scan_codex() { # rollout jsonl: plain user messages, minus injected context/envelopes
-  jq -c -n --arg auto "$AUTO" --arg from "${2:-0}" "$OWNER_JQ"'
+  jq -c -n --arg auto "$AUTO" --arg from "${2:-0}" "$OWNER_JQ$CODEX_ORIGIN_JQ"'
     def txt: [.[]?|select(.type=="input_text")|.text]|join("\n");
-    [inputs] as $all | select(($all[0].payload.source // "") != "exec") # codex exec is non-interactive, never owner-typed (SCO-899)
+    [inputs] as $all | select(($all[0].payload.source // "") as $s | ($s != "exec" and ((try $s.subagent.other catch null) != "guardian")))
     | ($all[0].payload.id // "codex") as $sid | ($all[0].payload.cwd // "") as $cwd | range(0;$all|length) as $i | $all[$i] as $r | ($i+1) as $ln
     | select($ln > ($from|tonumber))
     | select($r.type=="response_item" and $r.payload.type=="message" and $r.payload.role=="user")
+    | select($r | codex_injected | not)
     | ($r.payload.content|txt|owner) as $t
-    | select($t|test("^\\s*(<|# AGENTS.md)")|not)
+    | select($t|test("^\\s*<")|not)
     | {line:$ln, event:("message:"+($r.payload.id // ("line:"+($ln|tostring)))), ts:$r.timestamp, sid:$sid, cwd:$cwd, src:"codex", text:$t}' < "$1" | jq -c --arg tr "$1" '.+{transcript:$tr}'
 }
 scan_opencode() { # SESSION_ID[@DB] [FROM_N]: user text (n = ordinal within session, or seq on 2.2.x), minus compaction/synthetic/wakes
   db=$(ocdb_of "$1"); set -- "${1%%@*}" "${2:-0}"; [ -n "$db" ] || return 0
   if ocv2 "$db"; then # 2.2.x: session_message type=user (synthetic/compaction are their own types)
-    sqlite3 -readonly -json "$db" "select m.seq as line, 'message:'||m.id as event, m.time_created as ts, m.session_id as sid, coalesce(s.directory,'') as cwd, 'opencode' as src, json_extract(m.data,'\$.text') as text
+    meta=$(ocmeta "$db")
+    sqlite3 -readonly -json "$db" "select m.seq as line, 'message:'||m.id as event, m.time_created as ts, m.session_id as sid, coalesce(s.directory,'') as cwd, 'opencode' as src, m.id as message_id, $meta as session_metadata, json_extract(m.data,'\$.text') as text
       from session_message m left join session_v2 s on s.id=m.session_id where m.session_id='$1' and m.type='user' and json_extract(m.data,'\$.text') not like '{\"schema\"%'"
   else
   sqlite3 -readonly -json "$db" "select row_number() over (order by p.time_created,p.id) as line, 'message:'||m.id as event, p.time_created as ts, m.session_id as sid, coalesce(s.directory,'') as cwd, 'opencode' as src, json_extract(p.data,'\$.text') as text
@@ -56,7 +85,7 @@ scan_opencode() { # SESSION_ID[@DB] [FROM_N]: user text (n = ordinal within sess
     and coalesce(json_extract(p.data,'\$.synthetic'),0)=0 and json_extract(p.data,'\$.text') not like '{\"schema\"%'
     and not exists (select 1 from part q where q.message_id=m.id and json_extract(q.data,'\$.type')='compaction')"
   fi |
-  jq -c --arg auto "$AUTO" --arg from "${2:-0}" "$OWNER_JQ"'.[]? | select(.line > ($from|tonumber)) | (.text|owner) as $t | select($t|test("^\\s*<(conversation-checkpoint|shell|tool_result|tool-result)\\b|^\\s*Paperclip may post a short|^\\s*Paperclip access: use the paperclip-run MCP tools")|not)
+  jq -c --arg auto "$AUTO" --arg from "${2:-0}" "$OWNER_JQ$NAR_JQ"'.[]? | select(.line > ($from|tonumber)) | select(nar_injected|not) | del(.message_id,.session_metadata) | (.text|owner) as $t | select($t|test("^\\s*<(conversation-checkpoint|shell|tool_result|tool-result)\\b|^\\s*Paperclip may post a short|^\\s*Paperclip access: use the paperclip-run MCP tools")|not)
     | select(.text|test("^\\s*\"?(Respond with hello\\.?|Reply with the single word ok\\.?|Read probe\\.txt with the read tool|NAR live proof\\. Reply with exactly)")|not)' # adapter preamble + health probes
 }
 
@@ -96,7 +125,7 @@ OPEN=$STATE/open
 # current state per id: base record + holder (last adopter or capturer), its process, closed, escalated
 STATE_JQ='group_by(.id) | map(select(any(.[]; .text != null)) | . as $e | (map(select(.text != null))[0]) as $b | (map(select(.adopt != null))|last) as $a
   | ([range(0;length)|select($e[.].reopen != null)]|last // -1) as $ri # SCO-865: a reopen event after a close makes the record open again; escalation restarts after it
-  | $b + {holder: ($a.adopt // $b.sid), proc: ($a.proc // $b.proc // ""), closed: ((map(select(.close != null or .reopen != null))|last|.close) != null),
+  | $b + {holder: ($a.adopt // $b.sid), proc: ($a.proc // $b.proc // ""), closed: (any($e[]; .disposition == "non-owner") or ((map(select(.close != null or .reopen != null))|last|.close) != null)),
       escalated: ([range(0;length)|select(. > $ri and $e[.].escalated != null)|$e[.].escalated]|last), reopened: (map(select(.reopen != null))|last|.ts), why: (map(select(.reopen != null))|last|.reopen)})'
 nowz() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 lstart() { ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//;s/ /_/g'; }
@@ -111,7 +140,7 @@ proc_key() { # agent process identity pid@start: stable across /clear and compac
   [ -n "$p" ] && printf '%s@%s' "$p" "$(lstart "$p")"; return 0
 }
 alive() { case "$1" in ''|*@) return 1;; esac; [ "$(lstart "${1%%@*}")" = "${1#*@}" ]; }
-ledger_add() { # Identity is an occurrence, never prompt text. Aliases reconcile a receipt with its later transcript row.
+ledger_add() { # Identity is an occurrence, never prompt text.
   mkdir -p "$OPEN"
   while IFS= read -r m; do
     sid=$(printf '%s' "$m" | jq -r .sid); [ -n "$sid" ] && [ "$sid" != null ] || continue
@@ -121,45 +150,26 @@ ledger_add() { # Identity is an occurrence, never prompt text. Aliases reconcile
     id="$(printf %.8s "$sid"):$h"
     if [ -r "$f" ]; then
       jq -se --arg e "$event" 'any(.[]; .event==$e)' "$f" >/dev/null && continue
-      # A pre-append hook knows the transcript frontier, not the future message UUID.
-      # Bind only the first matching row after that frontier and before the next receipt.
-      alias=$(jq -sr --argjson m "$m" '
-        . as $all | if $m.line == null then empty else
-        [ .[] | select(.text != null and .after_line != null and .transcript==$m.transcript and .after_line < $m.line) ]
-        | sort_by(.after_line) | last
-        | select(. != null and .text==($m.text|.[0:4000]))
-        | . as $r | select(any($all[]; .id==$r.id and .reconciled==true)|not) | .id end' "$f")
-      if [ -n "$alias" ]; then
-        jq -nc --arg id "$alias" --arg event "$event" --arg ts "$(nowz)" '{id:$id,event:$event,reconciled:true,ts:$ts}' >> "$f"
-        continue
-      fi
     fi
     printf '%s' "$m" | jq -c --arg id "$id" --arg event "$event" --arg cwd "$1" '{id:$id,event:$event,transcript,after_line,line,ts:(.ts|if type=="number" then (./1000|floor|todate) else sub("\\.[0-9]+Z$";"Z") end),sid,
-      cwd:(if $cwd != "" then $cwd else (.cwd // "") end),proc:(.proc // ""),src:(.src // ""),text:(.text|.[0:4000])}' >> "$f"
+      cwd:(if $cwd != "" then $cwd else (.cwd // "") end),proc:(.proc // ""),agent:(.agent // ""),src:(.src // ""),text:(.text|.[0:4000])}' >> "$f"
   done
 }
 capture() { # UserPromptSubmit hook: record the owner prompt at receipt, before the model sees it
   case "${CLAUDE_CODE_ENTRYPOINT:-}" in sdk-*) exit 0;; esac # claude -p / SDK workers: never owner typing
   in=$(cat 2>/dev/null || true)
-  rt=$(printf '%s' "$in" | jq -r '.transcript_path // empty' 2>/dev/null) # codex exec: non-interactive, never owner typing (SCO-899)
-  case "$rt" in *rollout-*) [ -f "$rt" ] && [ "$(head -1 "$rt" | jq -r '.payload.source // empty' 2>/dev/null)" = exec ] && exit 0;; esac
-  m=$(printf '%s' "$in" | jq -c --arg auto "$AUTO" --arg ts "$(nowz)" --arg proc "$(proc_key)" --arg src "${OWNER_GUARD_SRC:-}" "$OWNER_JQ"' (.prompt|owner) as $t
-    | {ts:$ts,sid:.session_id,text:$t,event:((.event_id // .message_id // .turn_id // .prompt_id // .uuid // "")|if .=="" then null else "message:"+. end),cwd:(.cwd//""),proc:$proc,src:(if $src != "" then $src elif ((.transcript_path//"")|test("rollout-")) then "codex" else "claude" end)}' 2>/dev/null) || exit 0
+  if [ "${OWNER_GUARD_SRC:-}" = opencode ] && oc_nar_receipt "$in"; then exit 0; fi
+  rt=$(printf '%s' "$in" | jq -r '.transcript_path // empty' 2>/dev/null)
+  case "$rt" in *rollout-*)
+    if [ -f "$rt" ] && head -1 "$rt" | jq -e '.payload.source as $s | $s == "exec" or ((try $s.subagent.other catch null) == "guardian")' >/dev/null 2>&1; then exit 0; fi
+    # Only an exact transport occurrence can attribute an already persisted row.
+    eid=$(printf '%s' "$in" | jq -r '.event_id // .message_id // .turn_id // .prompt_id // .uuid // empty')
+    if [ -n "$eid" ] && [ -r "$rt" ] && jq -e --arg e "$eid" "$CODEX_ORIGIN_JQ"'select(.type=="response_item" and (.payload.id==$e or .payload.internal_chat_message_metadata_passthrough.turn_id==$e)) | select(codex_injected)' "$rt" >/dev/null; then exit 0; fi;; esac
+  m=$(printf '%s' "$in" | jq -c --arg auto "$AUTO" --arg ts "$(nowz)" --arg proc "$(proc_key)" --arg agent "${PAPERCLIP_AGENT_ID:-}" --arg src "${OWNER_GUARD_SRC:-}" "$OWNER_JQ"' (.prompt|owner) as $t
+    | {ts:$ts,sid:.session_id,text:$t,event:((.event_id // .message_id // .turn_id // .prompt_id // .uuid // "")|if .=="" then null else "message:"+. end),cwd:(.cwd//""),proc:$proc,agent:$agent,src:(if $src != "" then $src elif ((.transcript_path//"")|test("rollout-")) then "codex" else "claude" end)}' 2>/dev/null) || exit 0
   [ -n "$m" ] || exit 0
-  if [ -r "$rt" ] && [ "$(printf '%s' "$m" | jq -r '.event // empty')" = "" ]; then
-    frontier=$(wc -l < "$rt" | tr -d ' ')
-    last=$(tail -n 1 "$rt" | jq -c --argjson n "$frontier" --argjson m "$m" '
-      def txt: if type=="string" then . else [.[]?|select(.type=="text" or .type=="input_text")|.text]|join("\n") end;
-      select((.type=="user" and (.message.content|txt)==$m.text) or
-        (.type=="response_item" and .payload.type=="message" and .payload.role=="user" and (.payload.content|txt)==$m.text))
-      | {event:("message:"+(.uuid // .payload.id // ("line:"+($n|tostring))))}')
-    if [ -n "$last" ]; then
-      m=$(printf '%s' "$m" | jq -c --argjson last "$last" '.+{event:$last.event}')
-    else
-      prompt_hash=$(printf '%s' "$m" | jq -j .text | shasum -a 256 | cut -c1-16)
-      m=$(printf '%s' "$m" | jq -c --arg tr "$rt" --arg h "$prompt_hash" --argjson n "$frontier" '.+{event:("frontier:"+$tr+":"+($n|tostring)+":"+$h),transcript:$tr,after_line:$n}')
-    fi
-  fi
+  # Without a native occurrence ID, neither frontier nor matching text proves
+  # whether this is redelivery or another genuine owner turn. Retain both.
   printf '%s\n' "$m" | ledger_add ""
 }
 ledger_records() { # Read each JSONL line independently; never rewrite damaged originals.
@@ -185,7 +195,8 @@ note() { # SCO-747 Steering page: stdin = owner text typed there; SRC [CLOSE REA
 hookin() { in=$(cat 2>/dev/null || true); sid=$(printf '%s' "$in" | jq -r '.session_id // empty' 2>/dev/null); cwd=$(printf '%s' "$in" | jq -r '.cwd // empty' 2>/dev/null); }
 resume() { # SessionStart hook: stdout becomes session context. Bounded. Adopted records become this session's (gate covers them).
   hookin; me=$(proc_key)
-  sel=$(open_all | jq -c --arg sid "$sid" --arg cwd "$cwd" --arg me "$me" 'select(._ledger_unknown or (now-((.reopened // .ts)|fromdateiso8601))<604800)
+  sel=$(open_all | jq -c --arg sid "$sid" --arg cwd "$cwd" --arg me "$me" --arg agent "${PAPERCLIP_AGENT_ID:-}" 'select(._ledger_unknown or (now-((.reopened // .ts)|fromdateiso8601))<604800)
+    | select(._ledger_unknown or .holder==$sid or $agent=="" or ((.agent // "") != "" and .agent==$agent))
     | select(._ledger_unknown or .holder==$sid or ($me != "" and .proc==$me) or ($cwd != "" and .cwd==$cwd and .proc != ""))' | while IFS= read -r r; do
       h=$(printf '%s' "$r" | jq -r .holder); p=$(printf '%s' "$r" | jq -r .proc)
       if [ "$h" != "$sid" ] && { [ -z "$me" ] || [ "$p" != "$me" ]; } && alive "$p"; then continue; fi # another live seat's record
@@ -257,9 +268,23 @@ close() { # ID-or-prefix REASON...
     [ -z "$iss" ] || jq -nc --arg id "$full" --arg i "$iss" --arg ts "$(nowz)" '{id:$id,watch:$i,ts:$ts}' >> "$OPEN/$sid.jsonl"
   done
 }
-openlist() { # MIN: exceptions only, open records older than MIN minutes (default 60)
+correct_non_owner() { # exact ID REASON: append an explicit disposition; never rewrite prior events
+  [ "$#" -ge 2 ] && [ -n "$2" ] || { echo "usage: correct-non-owner FULL-ID REASON" >&2; return 2; }
+  id=$1; shift
+  hit=$(ledger_records | jq -rs --arg id "$id" '[.[] | select(.id==$id and .text != null and (._ledger_unknown|not))] | if length==1 then .[0].sid else empty end')
+  [ -n "$hit" ] || { echo "exact record not found or ambiguous: $id" >&2; return 1; }
+  case "$hit" in ''|*[!a-zA-Z0-9_-]*) echo "invalid ledger session" >&2; return 1;; esac
+  if ledger_records | jq -e --arg sid "$hit" 'select(._ledger_unknown and .sid==$sid)' >/dev/null; then echo "ledger state unknown; correction refused" >&2; return 1; fi
+  f="$OPEN/$hit.jsonl"
+  if jq -se --arg id "$id" 'any(.[]; .id==$id and .disposition=="non-owner")' "$f" >/dev/null; then return 0; fi
+  jq -nc --arg id "$id" --arg reason "$*" --arg ts "$(nowz)" --arg agent "${PAPERCLIP_AGENT_ID:-}" --arg run "${PAPERCLIP_RUN_ID:-}" '{id:$id,close:("dropped non-owner: "+$reason),unwatch:("non-owner: "+$reason),disposition:"non-owner",agent:$agent,run:$run,ts:$ts}' >> "$f"
+}
+# SCO-1080/1156: private persona records remain in the local ledger and session
+# continuity hooks, but never enter fleet reports or Board escalation payloads.
+REPORT_JQ='def reportable: ((.cwd // "")|test("/AI_Coding_Projects/zvoice(/|$)")|not);'
+openlist() { # MIN [fleet]: local open view by default; fleet applies the shared privacy boundary
   min=${1:-60}
-  r=$(open_all | jq -c --argjson m "$min" 'select((now-(.ts|fromdateiso8601))>$m*60)|{id,ts,src,holder:(.holder|.[0:8]),cwd:(.cwd|split("/")|last),escalated,text:(.text|.[0:120])}')
+  r=$(open_all | jq -c --argjson m "$min" --arg scope "${2:-local}" "$REPORT_JQ"'select($scope!="fleet" or reportable)|select((now-(.ts|fromdateiso8601))>$m*60)|{id,ts,src,holder:(.holder|.[0:8]),cwd:(.cwd|split("/")|last),escalated,text:(.text|.[0:120])}')
   [ -z "$r" ] && return 0
   printf '%s\n' "$r"; echo "owner-guard: $(printf '%s\n' "$r"|wc -l|tr -d ' ') open owner record(s) older than ${min}m" >&2; return 1
 }
@@ -267,7 +292,7 @@ openlist() { # MIN: exceptions only, open records older than MIN minutes (defaul
 # $STATE/escalate.url = webhook URL; $STATE/escalate.hdr = "Authorization: Bearer <secret>" (mode 600, never printed, curl -H @file).
 escalate() {
   min=${1:-${OWNER_ESCALATE_MIN:-60}}
-  r=$(open_all | jq -c --argjson m "$min" 'select(.escalated==null and (now-(.ts|fromdateiso8601))>$m*60)|{id,ts,src,sid,holder,cwd,text:(.text|.[0:1500])}')
+  r=$(open_all | jq -c --argjson m "$min" "$REPORT_JQ"'select(reportable)|select(.escalated==null and (now-(.ts|fromdateiso8601))>$m*60)|{id,ts,src,sid,holder,cwd,text:(.text|.[0:1500])}')
   [ -n "$r" ] || return 0
   n=$(printf '%s\n' "$r" | wc -l | tr -d ' ')
   [ -r "$STATE/escalate.url" ] && [ -r "$STATE/escalate.hdr" ] || { echo "owner-guard: $n record(s) due for escalation; webhook not configured" >&2; return 1; }
@@ -285,7 +310,7 @@ escalate() {
 # reopens the record when the issue is cancelled, or blocked/todo/in_progress with no update for OWNER_WATCH_STALE_MIN (default 120) and no
 # live external blocker (an unfinished blockedBy issue, assigneeUserId set = owner-gated, a pending board interaction). `done` ends the watch.
 # Prints one line per exception, nothing when healthy. Reopened = appended {reopen} event, so open/list/resume/gate/escalate show it again.
-watched() { ledger_records | jq -cs 'group_by(.id) | .[] | select(any(.[]; .text != null)) | (map(select(.watch != null or .unwatch != null or .reopen != null))|last) as $l
+watched() { ledger_records | jq -cs 'group_by(.id) | .[] | select(any(.[]; .text != null)) | select(any(.[]; .disposition == "non-owner")|not) | (map(select(.watch != null or .unwatch != null or .reopen != null or .close != null))|last) as $l
   | select($l.watch != null) | (map(select(.text != null))[0]) as $b | {id:$b.id,sid:$b.sid,issue:$l.watch,since:$l.ts,text:($b.text|gsub("\\s+";" ")|.[0:80])}'; }
 reopen_rec() { # ID SID ISSUE REASON WATCHJSON
   jq -nc --arg id "$1" --arg r "$3 $4" --arg ts "$(nowz)" '{id:$id,reopen:$r,ts:$ts}' >> "$OPEN/$2.jsonl"
@@ -352,7 +377,7 @@ sync() { # DAYS [NEWER_THAN]: catch-all for anything a receipt hook missed (Open
   done
 }
 fleet() { # exceptions only: sync, then ledger records open > OWNER_OPEN_MIN (one truth: the ledger)
-  sync "${1:-2}"; openlist "${OWNER_OPEN_MIN:-60}"
+  sync "${1:-2}"; openlist "${OWNER_OPEN_MIN:-60}" fleet
 }
 tick() { # launchd every 10 min: incremental sync + escalation; silent unless something is wrong
   st="$STATE/tick.stamp"; nx="$STATE/tick.next"; touch "$nx"
@@ -400,7 +425,10 @@ case "${1:-}" in
   resume) resume ;;
   gate) gate ;;
   close) shift; close "$@" ;;
-  watch-check) watch_check ;;
+  correct-non-owner) shift; exec /opt/homebrew/bin/flock -x -w 30 "$STATE/watch.lock" "$0" _correct-non-owner "$@" ;;
+  _correct-non-owner) shift; correct_non_owner "$@" ;;
+  watch-check) exec /opt/homebrew/bin/flock -x -w 30 "$STATE/watch.lock" "$0" _watch-check ;;
+  _watch-check) watch_check ;;
   open) shift; openlist "${1:-0}" ;;
   list) open_all ;;
   note) shift; note "$@" ;;

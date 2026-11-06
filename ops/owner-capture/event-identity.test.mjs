@@ -40,7 +40,7 @@ test('native turn identity dedupes replay even after closure, not repeated text'
 });
 
 for (const harness of ['claude', 'codex']) {
-  test(`${harness}: hook frontier, scan and actual sync reconcile once across closure`, () => {
+  test(`${harness}: unidentified hook occurrences survive frontier and scan replay`, () => {
     const f = fixture(`sync-${harness}`);
     const dir = path.join(f.home, harness === 'claude' ? '.claude/projects/fixture' : '.codex/sessions/fixture');
     mkdirSync(dir, { recursive: true });
@@ -53,20 +53,20 @@ for (const harness of ['claude', 'codex']) {
     writeFileSync(tr, harness === 'claude' ? '' : JSON.stringify({ type: 'session_meta', payload: {
       id: path.basename(f.state), source: 'vscode', cwd: f.state } }) + '\n');
     f.capture({ transcript_path: tr }); f.capture({ transcript_path: tr });
-    assert.equal(f.list().length, 1); f.close();
+    assert.equal(f.list().length, 2); f.close();
     appendFileSync(tr, row('first'));
-    f.run(['sync', '2']); assert.equal(f.list().length, 0);
+    f.run(['sync', '2']); assert.equal(f.list().length, 1);
     // Model output advances the frontier before a distinct identical owner turn.
     appendFileSync(tr, JSON.stringify({ type: 'assistant', message: { content: 'done' } }) + '\n');
-    f.capture({ transcript_path: tr }); assert.equal(f.list().length, 1);
+    f.capture({ transcript_path: tr }); assert.equal(f.list().length, 2);
     appendFileSync(tr, row('second'));
-    f.run(['sync', '2']); f.run(['sync', '2']); assert.equal(f.list().length, 1);
+    f.run(['sync', '2']); f.run(['sync', '2']); assert.equal(f.list().length, 3);
     // Resetting the sync cursor and replaying old rows preserves both closures.
     f.close(); writeFileSync(path.join(f.state, `${harness === 'claude' ? path.basename(f.state) : 'rollout-fixture'}.cursor`), '0');
     f.run(['sync', '2']); assert.equal(f.list().length, 0);
   });
 
-  test(`${harness}: scan-only repeated rows and post-append hook preserve occurrences`, () => {
+  test(`${harness}: scan-only repeats and unidentified post-append hook preserve occurrences`, () => {
     const f = fixture(`scan-${harness}`);
     const tr = path.join(f.state, harness === 'claude' ? 'transcript.jsonl' : 'rollout-fixture.jsonl');
     const row = (id) => JSON.stringify(harness === 'claude'
@@ -76,8 +76,8 @@ for (const harness of ['claude', 'codex']) {
     const sync = () => f.run(['_ledger_add', ''], f.run(['scan', tr]));
     sync(); f.close(); sync(); assert.equal(f.list().length, 0);
     appendFileSync(tr, row('two')); sync(); assert.equal(f.list().length, 1);
-    f.capture({ transcript_path: tr }); assert.equal(f.list().length, 1);
-    f.close(); f.capture({ transcript_path: tr }); assert.equal(f.list().length, 0);
+    f.capture({ transcript_path: tr }); assert.equal(f.list().length, 2);
+    f.close(); f.capture({ transcript_path: tr }); assert.equal(f.list().length, 1);
   });
 }
 

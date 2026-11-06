@@ -10,13 +10,18 @@ message identity (Claude UUID / OpenCode message ID) or an append-only row
 position for Codex rows lacking IDs. Repeated text is never a deduplication key.
 Existing records, close events and watches are retained without rewriting.
 
-For pre-append Claude/Codex hooks lacking a native ID, the transcript path and
-line frontier identify hook redelivery. A later scan binds the first matching
-row to that receipt by appending an identity alias; closure remains effective.
-A post-append hook can use the final user row directly. Different turns must
-advance the transcript or supply distinct native IDs. A call with neither a
-readable transcript nor an event ID is preserved as an independent occurrence:
-there is no evidence with which to distinguish a retry from a new owner turn.
+`owner-guard correct-non-owner FULL-ID REASON` appends an attributed disposition
+for an independently verified non-owner receipt, including one already closed.
+It ends the watch and remains effective against stale watch or reopen events.
+The exact ID and evidence-bearing reason are required; classification is manual.
+
+Without a native occurrence ID, neither matching text nor a transcript frontier
+identifies a hook occurrence. Each ambiguous receipt is retained independently,
+even if a later transcript scan creates another record. Peer-mail batch, thread
+and message IDs do not identify a pre-append Codex turn. Independently verified
+peer records can be corrected with the full-ID command above. OpenCode NAR
+receipts are excluded only when the managed-session metadata and native message
+ID identify the injection; an ID-less receipt remains eligible.
 
 `note SRC [REASON...]` generates a fresh Steering submission identity and prints
 its record ID. A retry-capable caller can set `OWNER_GUARD_EVENT_ID` to a stable
@@ -38,7 +43,12 @@ not authentication: an exact envelope without origin metadata is ambiguous.
 Run `node --test ops/owner-capture/quoted-markers.test.mjs` for receipt/scan parity,
 mixed owner-plus-payload cases and automated-envelope exclusions.
 
-Deployment: preserve a pre-change copy under the deployment's `archive/`, then
-copy the committed `owner-guard` and `opencode/owner-guard.js` to their matching
-deployment paths. No service restart or live session interruption is required.
-Rollback restores those two archived files; ledger history remains intact.
+The older shared text-based wake and automated-message exclusions above remain
+in this source. They can suppress an owner-authored exact envelope without
+trusted origin metadata and therefore do not yet meet the no-shape-only
+classification requirement. They require reconciliation before installation.
+
+Deployment belongs to the outside Platform Lead: recheck the actual source/live
+diff against the then-current live script and preserve any newer live protections
+before hot installation. Archive the live baseline; do not replace ledger files,
+restart sessions, or change hook trust.
