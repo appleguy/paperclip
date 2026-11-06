@@ -823,6 +823,29 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(activity).not.toContain("issue.monitor_triggered");
   });
 
+  it("retains exhausted recovery for a paused owner without retrying every tick", async () => {
+    const { issueId, agentId, nextCheckAt } = await seedFixture({
+      agentStatus: "paused", monitorAttemptCount: 1,
+      monitor: { maxAttempts: 1, recoveryPolicy: "wake_owner" },
+    });
+    const heartbeat = heartbeatService(db);
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+    await heartbeat.tickTimers(tickAt);
+    let [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue).toMatchObject({ monitorNextCheckAt: nextCheckAt, monitorWakeRequestedAt: tickAt, monitorAttemptCount: 1 });
+    await heartbeat.tickTimers(new Date(tickAt.getTime() + 30_000));
+    [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue!.monitorWakeRequestedAt).toEqual(tickAt);
+    const pausedRequests = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(pausedRequests.filter(request => request.status !== "skipped")).toHaveLength(0);
+    await db.update(agents).set({ status: "active" }).where(eq(agents.id, agentId));
+    await heartbeat.tickTimers(new Date(tickAt.getTime() + 5 * 60_000 + 1));
+    [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(issue!.monitorNextCheckAt).toBeNull();
+    const resumedRequests = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+    expect(resumedRequests.some(request => request.reason === "issue_monitor_recovery" && request.status !== "skipped")).toBe(true);
+  });
+
   it("clears timed-out monitors and creates a visible recovery issue when requested", async () => {
     const { issueId, companyId } = await seedFixture({
       monitor: {

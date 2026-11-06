@@ -494,6 +494,12 @@ export function createHeartbeatScheduling(
           return { outcome: "skipped" as const, reason: "monitor_recovery_deferred" };
         }
       } catch (error) {
+        if (input.activitySource === "scheduled" && error instanceof HttpError && error.status === 409 &&
+            parseObject(error.details).reason === "paused") {
+          // Keep the existing claim until its five-minute stale-claim deadline.
+          // The overdue monitor stays intact and can recover after the owner resumes.
+          return { outcome: "skipped" as const, reason: "monitor_recovery_owner_paused" };
+        }
         await releaseIssueMonitorWithDiagnostic(input.claimed, input, {
           action: "issue.monitor_dispatch_failed", reason: "monitor_recovery_failed",
         });
