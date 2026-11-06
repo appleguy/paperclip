@@ -357,6 +357,11 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
     await input.onBound?.({ sessionId: conversationId, messageId: msgId, kind: "submit", hostPid, providerOrigin: server.url });
     if (signal?.aborted) return held("OpenCode NAR stopped before sending a new prompt", false, conversationId, "aborted_pre_submit");
     await onLog("stdout", narEventLine("nar_prompt_dispatch", { sessionId: conversationId, clientMessageId: msgId, promptSha256: payloadSha256 }));
+    // Logging is asynchronous. A Stop or restart can arrive after the first
+    // check while the dispatch record is being written, before this process
+    // has sent its POST. Other controllers are not fenced by this local check.
+    if (signal?.aborted) return held("OpenCode NAR stopped at dispatch; provider work remains unverified", true,
+      conversationId, "stop_before_dispatch_unverified", undefined, "unverified");
     observedProviderWork = true; // Submission can reach the provider even if its response is lost.
     const sub = await driver.submit(host, conversationId, { opId, kind: "prompt", payloadSha256, text: input.prompt }, fence);
     if (sub.grade === "outcome_unknown") {

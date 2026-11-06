@@ -477,6 +477,28 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect(promptPosts).toBe(0);
   });
 
+  it.each([true, false])("holds without POST when cancellation arrives during dispatch logging (explicit Stop: %s)", async (explicit) => {
+    const controller = new AbortController();
+    let releaseLog!: () => void;
+    let reachedLog!: () => void;
+    const atLog = new Promise<void>((resolve) => { reachedLog = resolve; });
+    const logGate = new Promise<void>((resolve) => { releaseLog = resolve; });
+    const attempt = runNarOpenCodeAttempt({ configPath: cfg, agentId: scope.agentId, taskId: scope.issueId,
+      runId: "stop-during-log", cwd: root, model: "", prompt: "original", timeoutSec: 5,
+      signal: controller.signal, onLog: async (_stream, chunk) => {
+        if (chunk.includes("nar_prompt_dispatch")) { reachedLog(); await logGate; }
+      } });
+    try {
+      await atLog;
+      controller.abort(explicit ? Object.assign(new Error("Stop"), { code: "paperclip_explicit_run_stop" }) : new Error("Restart"));
+    } finally { releaseLog(); }
+    const result = await attempt;
+    expect(result.executionRecovery).toMatchObject({ providerWorkStarted: true, providerWorkEvidence: "unverified",
+      reason: "stop_before_dispatch_unverified" });
+    expect(promptPosts).toBe(0);
+    expect(interruptPosts).toBe(0);
+  });
+
   it("does not retry an absent message while the old controller is about to POST", async () => {
     let releasePost!: () => void;
     let reachedDispatch!: () => void;
