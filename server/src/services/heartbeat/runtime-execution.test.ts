@@ -355,7 +355,7 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     },
   );
 
-  it("re-enters the original OpenCode message through host execution and preserves resources on untagged shutdown", async () => {
+  it.each(["shutdown", "takeover"] as const)("retains the original OpenCode rejoin through host execution after %s", async scenario => {
     const { input, adapter, run } = await fixture();
     const [profile] = await db.insert(toolProfiles).values({ companyId: run.companyId, profileKey: "restart-fixture", name: "Restart fixture" }).returning();
     const [gateway] = await db.insert(toolMcpGateways).values({ companyId: run.companyId, name: "Restart fixture", slug: "restart-fixture", profileId: profile!.id }).returning();
@@ -408,19 +408,27 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
       input.config.runtimeConfig = { command, cwd: home, model: "openai/fixture", nativeRuntime: "nar", sharedServerRecoveryConfigPath: configPath };
       input.runtime.runtimeForAdapter = { ...input.runtime.runtimeForAdapter, sessionId: sid, sessionParams, taskKey: input.task.issueId! };
       let rejoined = false;
+      let tookOver = false;
+      const successorBoot = randomUUID();
       input.output.onLog = async (_stream, chunk) => {
+        if (scenario === "takeover" && !tookOver && chunk.includes("NAR OpenCode session")) {
+          tookOver = true;
+          await db.update(heartbeatRuns).set({ controllerBootId: successorBoot, controllerLeaseExpiresAt: new Date(Date.now() + 60_000) }).where(eq(heartbeatRuns.id, run.id));
+        }
         if (chunk.includes("nar_rejoin")) { rejoined = true; input.control.executionControl.controller.abort(new Error("Server shutting down")); }
       };
       const result = await executeHeartbeatRuntime(db, input);
-      expect(rejoined).toBe(true);
-      expect(result).toMatchObject({ dispatched: true, adapterResult: { resultJson: { executionRecovery: { reason: "aborted", providerWorkEvidence: "unverified" } } } });
+      expect(rejoined).toBe(scenario === "shutdown");
+      expect(tookOver).toBe(scenario === "takeover");
+      expect(result).toMatchObject({ dispatched: true, adapterResult: { resultJson: { executionRecovery: { reason: scenario === "shutdown" ? "aborted" : "reattach_unavailable", providerWorkEvidence: "unverified" } } } });
       if (!result.dispatched) throw new Error("expected re-entry dispatch");
       const { persistUnverifiedSharedOpenCode } = await import("./opencode-unverified-hold.js");
-      expect(await persistUnverifiedSharedOpenCode(db, { run: input.run, resultJson: result.adapterResult.resultJson })).toBe(true);
+      expect(await persistUnverifiedSharedOpenCode(db, { run: input.run, resultJson: result.adapterResult.resultJson })).toBe(scenario === "shutdown");
       expect(await read(run.id)).toMatchObject({ status: "running", resultJson: {
         executionRecovery: { reason: "aborted", providerWorkEvidence: "unverified" },
         earlySession: { sessionId: sid, sessionParams: { narBinding: { runId: run.id, messageId } } },
       } });
+      if (scenario === "takeover") expect((await read(run.id)).controllerBootId).toBe(successorBoot);
       expect(writes).toBe(0);
       expect(revokeHeartbeatRunGatewayTokens).not.toHaveBeenCalled();
       expect((await db.select().from(toolMcpGatewayTokens).where(eq(toolMcpGatewayTokens.id, token!.id)))[0]?.revokedAt).toBeNull();
