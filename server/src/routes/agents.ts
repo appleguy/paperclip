@@ -2199,13 +2199,33 @@ export function agentRoutes(
     return normalized;
   }
 
+  async function validateAdapterConfigForSave(
+    adapterType: string | null | undefined,
+    adapterConfig: Record<string, unknown>,
+    environmentId?: string | null,
+  ) {
+    const environment = environmentId ? await environmentsSvc.getById(environmentId) : null;
+    await findActiveServerAdapter(adapterType ?? "process")?.validateConfig?.(
+      adapterConfig, { localCwd: !environment || environment.driver === "local" },
+    );
+  }
+
   async function normalizeMediatedAdapterConfigForPersistence(input: {
     companyId: string;
     adapterType: string | null | undefined;
     adapterConfig: Record<string, unknown>;
     constraintAdapterConfig?: Record<string, unknown>;
     setupOnly?: boolean;
+    defaultEnvironmentId?: string | null;
   }): Promise<Record<string, unknown>> {
+    // Validate before secret normalization, which may itself persist bindings.
+    await validateAdapterConfigForSave(
+      input.adapterType,
+      input.constraintAdapterConfig
+        ? { ...input.constraintAdapterConfig, ...input.adapterConfig }
+        : input.adapterConfig,
+      input.defaultEnvironmentId,
+    );
     const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
       input.companyId,
       input.adapterConfig,
@@ -4360,6 +4380,9 @@ export function agentRoutes(
         : null,
     );
     const rollbackAdapterConfig = asRecord(rollbackConfig.adapterConfig) ?? {};
+    const rollbackEnvironmentId = hasOwn(rollbackConfig, "defaultEnvironmentId")
+      ? rollbackConfig.defaultEnvironmentId as string | null : existing.defaultEnvironmentId;
+    await validateAdapterConfigForSave(rollbackAdapterType, rollbackAdapterConfig, rollbackEnvironmentId);
     const existingRollbackProvider = asRecord(existing.adapterConfig)?.provider;
     if (rollbackAdapterType !== existing.adapterType || (rollbackAdapterType === "paperclip_runner"
       && rollbackAdapterConfig.provider !== existingRollbackProvider
@@ -4631,6 +4654,7 @@ export function agentRoutes(
       companyId,
       adapterType: hireInput.adapterType,
       adapterConfig: desiredSkillAssignment.adapterConfig,
+      defaultEnvironmentId: hireInput.defaultEnvironmentId,
     });
     const normalizedRuntimeConfig = await normalizeCreatedAgentRuntimeConfig(req, companyId, hireInput.adapterType, normalizedAdapterConfig, hireInput.runtimeConfig);
     const normalizedHireInput = {
@@ -4962,6 +4986,7 @@ export function agentRoutes(
       adapterType: createInput.adapterType,
       adapterConfig: desiredSkillAssignment.adapterConfig,
       setupOnly: Boolean(setupId),
+      defaultEnvironmentId: createInput.defaultEnvironmentId,
     });
     const normalizedRuntimeConfig = await normalizeCreatedAgentRuntimeConfig(req, companyId, createInput.adapterType, normalizedAdapterConfig, createInput.runtimeConfig);
     await assertAgentEnvironmentSelection(companyId, createInput.adapterType, createInput.defaultEnvironmentId);
@@ -5733,6 +5758,8 @@ export function agentRoutes(
         adapterType: requestedAdapterType,
         adapterConfig: effectiveAdapterConfig,
         setupOnly: existing.lifecycleHolds?.includes("setup"),
+        defaultEnvironmentId: hasOwn(patchData, "defaultEnvironmentId")
+          ? patchData.defaultEnvironmentId as string | null : existing.defaultEnvironmentId,
       });
       patchData.adapterConfig = syncInstructionsBundleConfigFromFilePath(existing, normalizedEffectiveAdapterConfig);
       assertExternalInstructionsAdmin(req, {
@@ -5741,6 +5768,9 @@ export function agentRoutes(
       });
     }
     const nextAiConfig = (patchData.adapterConfig ?? existing.adapterConfig) as Record<string, unknown>;
+    if (!touchesAdapterConfiguration && hasOwn(patchData, "defaultEnvironmentId")) {
+      await validateAdapterConfigForSave(requestedAdapterType, nextAiConfig, patchData.defaultEnvironmentId as string | null);
+    }
     if (existing.runtimeConfig.aiConnection && requestedRuntimeConfig && !requestedRuntimeConfig.aiConnection
       && !isAgentSetupDraft(existing)) {
       const existingBinding = aiRuntimeConnectionBindingSchema.safeParse(existing.runtimeConfig.aiConnection).data;

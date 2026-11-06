@@ -31,5 +31,11 @@ export type {
   ConfigFieldSchema,
   AdapterConfigSchema,
   AdapterRuntimeCommandSpec,
-  ServerAdapterModule,
 } from "@paperclipai/adapter-utils";
+
+import type { ServerAdapterModule as BaseServerAdapterModule } from "@paperclipai/adapter-utils";
+
+export type ServerAdapterModule = BaseServerAdapterModule & {
+  /** Save-time checks only: no provider calls or runtime startup. */
+  validateConfig?: (config: Record<string, unknown>, context?: { localCwd?: boolean }) => Promise<void> | void;
+};

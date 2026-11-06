@@ -144,6 +144,7 @@ import { processAdapter } from "./process/index.js";
 import { agyAdapter } from "./agy/index.js";
 import { claudeRcAdapter } from "./claude-rc/index.js";
 import { httpAdapter } from "./http/index.js";
+import { withConfigValidation } from "./config-validation/index.js";
 import {
   DEFAULT_OPENCODE_RUNNER_MODEL,
   PaperclipRunnerProviderProfileError,
@@ -1045,7 +1046,7 @@ function registerBuiltInAdapters() {
     processAdapter,
     httpAdapter,
   ]) {
-    adaptersByType.set(adapter.type, adapter);
+    adaptersByType.set(adapter.type, withConfigValidation(adapter));
   }
 }
 
@@ -1113,7 +1114,7 @@ const externalAdaptersReady: Promise<void> = (async () => {
       }
       adaptersByType.set(
         externalAdapter.type,
-        resolveExternalAdapterRegistration(externalAdapter),
+        withConfigValidation(resolveExternalAdapterRegistration(externalAdapter)),
       );
     }
   } catch (err) {
@@ -1139,7 +1140,7 @@ export function registerServerAdapter(adapter: ServerAdapterModule): void {
       builtinFallbacks.set(adapter.type, existing);
     }
   }
-  adaptersByType.set(adapter.type, adapter);
+  adaptersByType.set(adapter.type, withConfigValidation(adapter));
 }
 
 export function unregisterServerAdapter(type: string): void {

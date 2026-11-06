@@ -340,10 +340,50 @@ describe("agent routes adapter validation", () => {
     await unregisterTestAdapter(missingAdapterType);
   });
 
+  it.each(["agents", "agent-hires"])("rejects an invalid RC model before %s writes anything", async endpoint => {
+    const app = await createApp();
+    const response = await requestApp(app, base => request(base)
+      .post(`/api/companies/company-1/${endpoint}`)
+      .send({ name: "Invalid RC", adapterType: "claude_rc_local", adapterConfig: { model: "claude-fable-5" } }));
+    expect(response.status, JSON.stringify(response.body)).toBe(422);
+    expect(response.body.error).toContain("adapterConfig.model");
+    expect(mockAgentService.create).not.toHaveBeenCalled();
+    expect(mockSecretService.normalizeAdapterConfigForPersistence).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { model: "claude-fable-5" }, { effort: "ultra" }, { cwd: "/nonexistent-save-config-test" }, { timeoutSec: 3601 },
+  ])("rejects an invalid merged RC update without writing: %j", async adapterConfig => {
+    const existing = { ...(await mockAgentService.getById()), adapterType: "claude_rc_local",
+      adapterConfig: { model: "claude-opus-5-5", effort: "high", timeoutSec: 60 } };
+    mockAgentService.getById.mockResolvedValue(existing);
+    const app = await createApp();
+    const response = await requestApp(app, base => request(base).patch(`/api/agents/${existing.id}`).send({ adapterConfig }));
+    expect(response.status, JSON.stringify(response.body)).toBe(422);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+    expect(mockSecretService.normalizeAdapterConfigForPersistence).not.toHaveBeenCalled();
+    expect(mockLogActivity).not.toHaveBeenCalled();
+    expect(existing.adapterConfig).toEqual({ model: "claude-opus-5-5", effort: "high", timeoutSec: 60 });
+  });
+
+  it("accepts a valid merged RC update and leaves profile-only edits independent", async () => {
+    const existing = { ...(await mockAgentService.getById()), adapterType: "claude_rc_local",
+      adapterConfig: { model: "claude-opus-5-5", effort: "medium", timeoutSec: 60 } };
+    mockAgentService.getById.mockResolvedValue(existing);
+    const app = await createApp();
+    const response = await requestApp(app, base => request(base).patch(`/api/agents/${existing.id}`).send({ adapterConfig: { effort: "high" } }));
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(mockAgentService.update.mock.calls[0]?.[1].adapterConfig).toMatchObject({ model: "claude-opus-5-5", effort: "high", timeoutSec: 60 });
+    mockAgentService.getById.mockResolvedValue({ ...existing, adapterConfig: { model: "historical" } });
+    const profile = await requestApp(app, base => request(base).patch(`/api/agents/${existing.id}`).send({ name: "Renamed" }));
+    expect(profile.status, JSON.stringify(profile.body)).toBe(200);
+  });
+
   it("round-trips the protected YAML projection and forwards its revision to the write lock", async () => {
     const existing = {
       ...(await mockAgentService.getById()),
-      adapterConfig: { model: "old", removeMe: true, env: { DEMO_VALUE: "private-fixture" } },
+      adapterConfig: { model: "old", agentCommand: "codex-acp-rc", removeMe: true, env: { DEMO_VALUE: "private-fixture" } },
       metadata: { token: "private-metadata-fixture" },
     };
     mockAgentService.getById.mockResolvedValue(existing);
@@ -388,14 +428,14 @@ describe("agent routes adapter validation", () => {
   });
 
   it("routes narrow roster edits through authorization, config merging and audit history", async () => {
-    const existing = { ...(await mockAgentService.getById()), adapterConfig: { model: "old", cwd: "/workspace" }, runtimeConfig: { heartbeat: { intervalSec: 900 } } };
+    const existing = { ...(await mockAgentService.getById()), adapterConfig: { model: "old", agentCommand: "codex-acp-rc", cwd: process.cwd() }, runtimeConfig: { heartbeat: { intervalSec: 900 } } };
     mockAgentService.getById.mockResolvedValue(existing);
     const app = await createApp();
     const response = await requestApp(app, base => request(base).patch(`/api/agents/${existing.id}`).send({ runtimeSettings: {
       harness: "codex_local", model: "new", expected: { model: "old", aiConnection: null },
     } }));
     expect(response.status, JSON.stringify(response.body)).toBe(200);
-    expect(response.body.adapterConfig).toMatchObject({ model: "new", cwd: "/workspace" });
+    expect(response.body.adapterConfig).toMatchObject({ model: "new", cwd: process.cwd() });
     expect(response.body.runtimeConfig).toEqual(existing.runtimeConfig);
     expect(mockAgentService.update).toHaveBeenCalledWith(existing.id, expect.not.objectContaining({ runtimeSettings: expect.anything() }), expect.objectContaining({ expectedConfiguration: expect.objectContaining({ adapterConfig: existing.adapterConfig }), recordRevision: expect.anything() }));
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ action: "agent.updated", entityId: existing.id }));
@@ -573,7 +613,7 @@ describe("agent routes adapter validation", () => {
       request(baseUrl)
         .patch("/api/agents/11111111-1111-4111-8111-111111111111")
         .send({
-          adapterConfig: { model: "gpt-5.4" },
+          adapterConfig: { model: "gpt-5.4", agentCommand: "codex-acp-rc" },
         }),
     );
 
@@ -645,6 +685,7 @@ describe("agent routes adapter validation", () => {
         .patch(`/api/agents/${agentId}`)
         .send({
           adapterConfig: {
+            agentCommand: "codex-acp-rc",
             env: {
               OPENAI_API_KEY: "sk-test-key",
             },
@@ -822,7 +863,7 @@ describe("agent routes adapter validation", () => {
     const res = await requestApp(app, (baseUrl) =>
       request(baseUrl)
         .patch("/api/agents/11111111-1111-4111-8111-111111111111")
-        .send({ adapterType: "codex_local", adapterConfig: { model: "gpt-5.4" } }),
+        .send({ adapterType: "codex_local", adapterConfig: { model: "gpt-5.4", agentCommand: "codex-acp-rc" } }),
     );
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
@@ -922,7 +963,7 @@ describe("agent routes adapter validation", () => {
     vi.spyOn(selection, "resolveNewAgentRunnerForCompany").mockImplementation(async (_db, _companyId, input) =>
       selection.resolveNewAgentRunner({ ...input, target: { driver: "local", platform: "linux", architecture: "x64" } }));
     const app = await createApp();
-    const legacy = await requestApp(app, baseUrl => request(baseUrl).post("/api/companies/company-1/agents").send({ name: "Legacy", adapterType: "codex_local", runner: "legacy", adapterConfig: { extraArgs: ["--search"] } }));
+    const legacy = await requestApp(app, baseUrl => request(baseUrl).post("/api/companies/company-1/agents").send({ name: "Legacy", adapterType: "codex_local", runner: "legacy", adapterConfig: { agentCommand: "codex-acp-rc", extraArgs: ["--search"] } }));
     expect(legacy.status, JSON.stringify(legacy.body)).toBe(201);
     expect(mockAgentService.create.mock.calls.at(-1)?.[1]).toMatchObject({ adapterType: "codex_local", adapterConfig: { extraArgs: ["--search"] } });
     mockAgentService.create.mockClear();
@@ -1236,7 +1277,7 @@ describe("agent routes adapter validation", () => {
   });
   it("allows an operator to configure Dot attachment access separately", async () => {
     const app = await createApp();
-    const response = await requestApp(app, baseUrl => request(baseUrl).patch("/api/agents/11111111-1111-4111-8111-111111111111").send({ adapterConfig: { dotAttachmentAccess: true, dotWorkspaceAccess: false } }));
+    const response = await requestApp(app, baseUrl => request(baseUrl).patch("/api/agents/11111111-1111-4111-8111-111111111111").send({ adapterConfig: { agentCommand: "codex-acp-rc", dotAttachmentAccess: true, dotWorkspaceAccess: false } }));
     expect(response.status, JSON.stringify(response.body)).toBe(200);
     expect(mockAgentService.update).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ adapterConfig: expect.objectContaining({ dotAttachmentAccess: true, dotWorkspaceAccess: false }) }), expect.anything());
   });

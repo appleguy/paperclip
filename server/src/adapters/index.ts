@@ -11,7 +11,6 @@ export {
   requireServerAdapter,
 } from "./registry.js";
 export type {
-  ServerAdapterModule,
   AcpTargetDescriptor,
   AdapterExecutionContext,
   AdapterExecutionResult,
@@ -31,4 +30,5 @@ export type {
   AdapterAgent,
   AdapterRuntime,
 } from "@paperclipai/adapter-utils";
+export type { ServerAdapterModule } from "./types.js";
 export { runningProcesses } from "./utils.js";
