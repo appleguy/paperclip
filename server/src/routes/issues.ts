@@ -10067,6 +10067,7 @@ export function issueRoutes(
               }
               await notifyUnsafeWorkspaceExportRecovery(tx, { companyId: lockedIssue.companyId, issueId: lockedIssue.id });
               await notifyNativeRecoveryNotices(tx, { companyId: lockedIssue.companyId, issueId: lockedIssue.id });
+              await tx.update(issueRows).set({ statusVersion: sql`${issueRows.statusVersion} + 1` }).where(eq(issueRows.id, lockedIssue.id));
               const [reopened] = await tx
                 .update(issueRecoveryActions)
                 .set({ status: "active", outcome: null, resolvedAt: null })

@@ -11500,7 +11500,7 @@ export function issueService(db: Db) {
           // share lock taken by new interaction, approval-link and recovery
           // rows. Lock existing rows too: their statuses can change without
           // touching the issue or its version. Read every status, including
-          // settled rows that a concurrent writer might reactivate.
+          // settled interaction and approval rows that can be reactivated.
           const interactionGates = await tx.select({ status: issueThreadInteractions.status })
             .from(issueThreadInteractions)
             .where(and(eq(issueThreadInteractions.companyId, receiptExisting.companyId), eq(issueThreadInteractions.issueId, id)))
@@ -11512,7 +11512,8 @@ export function issueService(db: Db) {
             .for("update", { of: approvals });
           const recoveryGates = await tx.select({ status: issueRecoveryActions.status })
             .from(issueRecoveryActions)
-            .where(and(eq(issueRecoveryActions.companyId, receiptExisting.companyId), eq(issueRecoveryActions.sourceIssueId, id)))
+            .where(and(eq(issueRecoveryActions.companyId, receiptExisting.companyId), eq(issueRecoveryActions.sourceIssueId, id),
+              inArray(issueRecoveryActions.status, ["active", "escalated"])))
             .for("update");
           if (interactionGates.some((gate: { status: string }) => gate.status === "pending") ||
               approvalGates.some((gate: { status: string }) => ["pending", "revision_requested"].includes(gate.status)) ||
@@ -12127,9 +12128,16 @@ export function issueService(db: Db) {
         };
       };
 
-      const result = await (dbOrTx === db
-        ? db.transaction(runUpdate)
-        : runUpdate(dbOrTx));
+      let result;
+      try {
+        result = await (dbOrTx === db ? db.transaction(runUpdate) : runUpdate(dbOrTx));
+      } catch (error) {
+        const failure = error as { code?: string; cause?: { code?: string } } | null;
+        if (expectedBlockedTransition !== undefined && (failure?.code === "40P01" || failure?.cause?.code === "40P01")) {
+          throw conflict("The blocked task changed. Read and review it again.", { code: "blocked_transition_changed" });
+        }
+        throw error;
+      }
       if (dbOrTx === db && !postCommitActivityPublications) {
         for (const publication of ownedActivityPublications)
           publishActivity(publication);

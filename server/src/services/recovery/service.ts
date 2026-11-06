@@ -3625,8 +3625,13 @@ export function recoveryService(
       legacyEpisode: input.legacyEpisode,
     });
     const now = new Date();
-    await db
-      .update(issueRecoveryActions)
+    await db.transaction(async tx => {
+      // This can reactivate a settled action. Serialize with guarded unblock
+      // and invalidate the reviewed issue version in the same transaction.
+      await tx.update(issues).set({ statusVersion: sql`${issues.statusVersion} + 1` }).where(and(
+        eq(issues.companyId, input.issue.companyId), eq(issues.id, input.issue.id),
+      ));
+      await tx.update(issueRecoveryActions)
       .set({
         status: "active",
         ownerType: "board",
@@ -3660,6 +3665,7 @@ export function recoveryService(
           eq(issueRecoveryActions.companyId, input.issue.companyId),
         ),
       );
+    });
 
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",

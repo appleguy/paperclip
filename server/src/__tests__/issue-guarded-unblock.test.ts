@@ -6,6 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { agents, approvals, companies, createDb, issueApprovals, issueRecoveryActions, issueRelations, issues, issueThreadInteractions } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -98,6 +99,7 @@ const support = await getEmbeddedPostgresTestSupport();
       } else if (kind === "interaction-reactivation") {
         await tx.update(issueThreadInteractions).set({ status: "pending" }).where(eq(issueThreadInteractions.issueId, issue.id));
       } else if (kind === "recovery-reactivation") {
+        await tx.update(issues).set({ statusVersion: sql`${issues.statusVersion} + 1` }).where(eq(issues.id, issue.id));
         await tx.update(issueRecoveryActions).set({ status: "active" }).where(eq(issueRecoveryActions.sourceIssueId, issue.id));
       } else if (kind === "recovery" || kind === "escalated") {
         await tx.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issue.id, kind: "active_run_watchdog", status: kind === "escalated" ? "escalated" : "active", cause: "test", fingerprint: "test", nextAction: "test" });
@@ -124,6 +126,68 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await attempt).status).toBe(kind === "rollback" ? 200 : 409);
     const [saved] = await db.select().from(issues).where(eq(issues.id, issue.id));
     expect(saved!.status).toBe(kind === "rollback" ? "todo" : "blocked");
+  });
+  it("does not lock a settled recovery row", async () => {
+    const { app, issue, expected, companyId } = await fixture();
+    const [historical] = await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issue.id,
+      kind: "active_run_watchdog", status: "resolved", cause: "test", fingerprint: "historical", nextAction: "test" }).returning();
+    const holderDb = createDb(temporary.connectionString, { maxConnections: 1 });
+    let release!: () => void, ready!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const locked = new Promise<void>(resolve => { ready = resolve; });
+    const holder = holderDb.transaction(async tx => {
+      await tx.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, historical!.id)).for("update");
+      ready();
+      await gate;
+    });
+    await locked;
+    try {
+      const response = await Promise.race([send(app, issue.id, expected).then(r => r.status), new Promise<number>(resolve => setTimeout(() => resolve(0), 3000))]);
+      expect(response).toBe(200);
+    } finally { release(); await holder; }
+  });
+  it("takes the issue lock before superseding the recovery row", async () => {
+    const { issue, companyId } = await fixture();
+    const [old] = await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issue.id,
+      kind: "active_run_watchdog", status: "active", cause: "old", fingerprint: "old", nextAction: "test" }).returning();
+    const holderDb = createDb(temporary.connectionString, { maxConnections: 1 });
+    const probeDb = createDb(temporary.connectionString, { maxConnections: 1 });
+    let release!: () => void, ready!: () => void, holderPid = 0;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const locked = new Promise<void>(resolve => { ready = resolve; });
+    const holder = holderDb.transaction(async tx => {
+      await tx.select().from(issues).where(eq(issues.id, issue.id)).for("update");
+      holderPid = (await tx.execute<{ pid: number }>(sql`select pg_backend_pid() as pid`))[0]!.pid;
+      ready(); await gate;
+    });
+    await locked;
+    const supersede = issueRecoveryActionService(db).upsertSourceScoped({ companyId, sourceIssueId: issue.id,
+      kind: "active_run_watchdog", cause: "new", fingerprint: "new", nextAction: "test", supersedeOnIdentityChange: true });
+    let waiting = false;
+    try {
+      const deadline = Date.now() + 5000;
+      while (!waiting && Date.now() < deadline) {
+        const [row] = await probeDb.execute<{ waiting: boolean }>(sql`select exists (select 1 from pg_stat_activity where datname = current_database() and wait_event_type = 'Lock' and ${holderPid} = any(pg_blocking_pids(pid))) as waiting`);
+        waiting = row!.waiting;
+        if (!waiting) await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      expect(waiting).toBe(true);
+      await probeDb.transaction(async tx => { await tx.execute(sql`select id from issue_recovery_actions where id = ${old!.id} for update nowait`); });
+    } finally { release(); await holder; }
+    expect((await supersede).fingerprint).toBe("new");
+  });
+  it("maps a database deadlock on the guarded transaction to a stale conflict", async () => {
+    const { app, issue, expected } = await fixture();
+    await db.execute(sql`create function guarded_test_deadlock() returns trigger language plpgsql as $$ begin raise exception 'test deadlock' using errcode = '40P01'; end $$`);
+    await db.execute(sql`create trigger guarded_test_deadlock before update on issues for each row when (new.status = 'todo') execute function guarded_test_deadlock()`);
+    try {
+      const response = await send(app, issue.id, expected);
+      expect(response.status).toBe(409);
+      expect(response.body.code).toBe("blocked_transition_changed");
+    } finally {
+      await db.execute(sql`drop trigger guarded_test_deadlock on issues`);
+      await db.execute(sql`drop function guarded_test_deadlock()`);
+    }
   });
   it.each(["transition", "descriptor", "owner", "advanced", "dependency"])('rejects changed %s', async (kind) => {
     const { app, issue, expected, companyId } = await fixture();

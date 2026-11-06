@@ -6,7 +6,7 @@ import { writeExecutionControl } from "./execution-control-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { and, desc, eq, inArray, isNull, isNotNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { heartbeatRuns, issueRecoveryActions, workspaceOperations } from "@paperclipai/db";
+import { heartbeatRuns, issueRecoveryActions, issues, workspaceOperations } from "@paperclipai/db";
 import { isUuidLike } from "@paperclipai/shared";
 import type {
   IssueRecoveryAction,
@@ -335,6 +335,11 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
   ): Promise<IssueRecoveryAction> {
     try {
       const created = await db.transaction(async (tx) => {
+        // Match guarded unblock's issue-before-recovery lock order. The later
+        // FK check for the replacement otherwise locks these in reverse.
+        await tx.select({ id: issues.id }).from(issues).where(and(
+          eq(issues.companyId, input.companyId), eq(issues.id, input.sourceIssueId),
+        )).for("key share");
         await notifyAttentionRetentionWork(tx, { companyId: input.companyId });
         await notifyIssueRecovery(tx, { companyId: input.companyId });
         await notifyNativeRecoveryNotices(tx, { companyId: input.companyId, issueId: input.sourceIssueId });
