@@ -76,8 +76,9 @@ export class RunnerdAntigravityBackend implements NativeSessionBackend {
     }catch(error){
       let providerStopped = !providerLaunchAttempted;
       if(controller){try{await controller.closeOwned();providerStopped=true;}catch{/* retain admission until reconciled */}}
-      if(providerStopped)await releaseHost?.();
-      if(runner){runner.child.kill("SIGTERM");await runner.completion.catch(()=>{});}await core.stop();throw error;
+      try { if(providerStopped)await releaseHost?.(); }
+      finally { if(runner){runner.child.kill("SIGTERM");await runner.completion.catch(()=>{});}await core.stop(); }
+      throw error;
     }
   }
 }
