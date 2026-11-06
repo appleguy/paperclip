@@ -1,4 +1,5 @@
 import { createHeartbeatTimerPolicy } from "./timer-policy.js";
+import { deliverOwnerCorrection, OWNER_CORRECTION_REASON } from "./owner-corrections.js";
 import { getStartupRecoveryState } from "../../startup-recovery-state.js";
 import { decideQueuedReceipt, reconcileQueuedReceipt, recordQueuedReason } from "./queued-reconciliation.js";
 import { QUEUE_DRIVE_WAKE_REASON } from "./queue-drive.js";
@@ -2246,6 +2247,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
   }
 
   async function enqueueWakeup(agentId: string, opts: WakeupOptions = {}, executionWaitRequestId?: string) {
+    if (opts.reason === OWNER_CORRECTION_REASON) {
+      const agent = await getAgent(agentId);
+      if (!agent) throw notFound("Agent not found");
+      return deliverOwnerCorrection(db, agent, opts);
+    }
     const source = opts.source ?? "on_demand";
     const triggerDetail = opts.triggerDetail ?? null;
     const contextSnapshot: Record<string, unknown> = {

@@ -19,6 +19,7 @@ import { buildPaperclipWakePayload, ConfigurationIncompleteFailure, readHeartbea
 import { buildPaperclipTaskMarkdown } from "./task-markdown.js";
 import { deriveCommentId, extractWakeCommentIds } from "../../modules/run-dispatch/index.js";
 import { workspacePreferenceService } from "../workspace-preferences.js";
+import { ownerCorrectionContext } from "./owner-corrections.js";
 
 type RunPreparation = ReturnType<typeof createHeartbeatRunPreparation>;
 type IssueContext = NonNullable<Awaited<ReturnType<RunPreparation["getIssueExecutionContext"]>>>;
@@ -314,7 +315,9 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
     : null;
   if (workflowCase) context.paperclipCase = workflowCase;
   else delete context.paperclipCase;
-  const assignmentPrefix = liveVoiceTaskPrefix + caseExecutionMarkdown(workflowCase);
+  const corrections = issueRef ? await ownerCorrectionContext(db, agent.companyId, agent.id, issueRef.id) : { markdown: "", ids: [] };
+  context.ownerCorrectionIds = corrections.ids;
+  const assignmentPrefix = corrections.markdown + liveVoiceTaskPrefix + caseExecutionMarkdown(workflowCase);
   let taskMarkdown = assignmentPrefix + buildPaperclipTaskMarkdown({ ...taskMarkdownInput, taskPlan }) + chatCompletionInstruction(context);
   let taskMarkdownAssignment = assignmentPrefix + buildPaperclipTaskMarkdown({
     ...taskMarkdownInput,
