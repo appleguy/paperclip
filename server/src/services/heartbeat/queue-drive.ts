@@ -9,6 +9,7 @@ import type { HeartbeatQueueDependencies, createHeartbeatQueue } from "./queue.j
 import { parseHeartbeatPolicy } from "./timer-policy.js";
 import { parseObject } from "../../adapters/utils.js";
 import { CHAT_CONTROL_RECOVERY_STOP_CODE, CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE } from "../chat-control-recovery-stop.js";
+import { hasQueueDriveRecoveryHold } from "./queue-drive-history.js";
 
 export const QUEUE_DRIVE_WAKE_REASON = "issue_queue_drive";
 const COMPLETED_STATUSES = ["succeeded", "failed", "timed_out", "cancelled", "interrupted"];
@@ -89,6 +90,7 @@ export function createHeartbeatQueueDrive(db: Db, deps: QueueDriveDependencies) 
       if (attempted.has(receiptKey) || readiness.get(issue.id)?.isDependencyReady === false ||
           await deps.treeControlSvc.getActivePauseHoldGate(source.companyId, issue.id) ||
           await getExecutionBlocker(db, source.companyId, issue.id)) continue;
+      if (await hasQueueDriveRecoveryHold(db, { companyId: source.companyId, agentId: source.agentId, issueId: issue.id })) continue;
       // Per-issue history prevents alternating failing issues from resetting each other's bound.
       // A successful explicit/event-driven attempt resets the streak; other issues do not.
       const recent = await db.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode,

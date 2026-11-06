@@ -1,4 +1,5 @@
 import { createHeartbeatTimerPolicy } from "./timer-policy.js";
+import { hasQueueDriveRecoveryHold, QUEUE_DRIVE_HISTORY_HOLD_CODE } from "./queue-drive-history.js";
 import { coalescedWakeContext, findQueuedIssueRun } from "./queued-issue-run.js";
 import { deliverOwnerCorrection, OWNER_CORRECTION_REASON } from "./owner-corrections.js";
 import { getStartupRecoveryState } from "../../startup-recovery-state.js";
@@ -555,13 +556,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     const issueId = readNonEmptyString(
       parseObject(run.contextSnapshot).issueId,
     );
-    if (!issueId || run.invocationSource !== "automation") return onClear(db);
+    const queueDrive = parseObject(run.contextSnapshot).source === "heartbeat.queue_drive";
+    if (!issueId || (!queueDrive && run.invocationSource !== "automation")) return onClear(db);
     await options.beforeChatControlRecoveryCheck?.({
       runId: run.id,
       issueId,
       stage,
     });
-    if (stage === "dispatch" && nativeRecovery) {
+    if (stage === "dispatch" && nativeRecovery && !queueDrive) {
       // Protected historical/already-admitted owners did not previously take
       // this fence's locks. A fresh exact read keeps unrelated Board contention
       // from turning their recovery into a new admission failure.
@@ -644,7 +646,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           expectedAdmission !== "historical" && admission === "historical";
         if (
           stage === "dispatch" &&
-          nativeRecovery &&
+          nativeRecovery && !queueDrive &&
           !admissionLost &&
           (admission === "historical" || admission === "admitted")
         )
@@ -653,8 +655,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         // Those fields do not prove this run's turn was dispatched.
         // Exact admitted/historical recovery retains its existing ownership;
         // a marked, unadmitted bootstrap must earn admission even after crash.
-        const proof =
-          admission === "invalid" || admissionLost
+        const proof = queueDrive
+          ? (await hasQueueDriveRecoveryHold(tx as unknown as Db, { companyId: run.companyId, agentId: run.agentId, issueId }))
+            ? { kind: "queue_hold" as const } : { kind: "clear" as const }
+          : admission === "invalid" || admissionLost
             ? { kind: "unresolved" as const }
             : await readChatControlRecoveryStop(
                 tx as unknown as Db,
@@ -667,7 +671,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 true,
               );
         if (proof.kind === "clear") {
-          if (stage === "claim" || admission === "required")
+          if (!queueDrive && (stage === "claim" || admission === "required"))
             await tx
               .update(heartbeatRuns)
               .set({
@@ -690,11 +694,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         }
         if (proof.kind === "unresolved" && stage === "claim") return null;
         const now = new Date();
-        const stopped = proof.kind === "stopped";
-        const code = stopped
+        const stopped = proof.kind === "stopped" || proof.kind === "queue_hold";
+        const code = proof.kind === "queue_hold" ? QUEUE_DRIVE_HISTORY_HOLD_CODE : stopped
           ? CHAT_CONTROL_RECOVERY_STOP_CODE
           : CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE;
-        const error = stopped
+        const error = proof.kind === "queue_hold"
+          ? "Automatic queue drive is held by a prior stop or exhausted recovery. Send a fresh request to resume."
+          : stopped
           ? "Automatic continuation stopped by the committed chat conversation close. Send a new request in chat or on the Board to start fresh work."
           : "Automatic continuation source could not be verified before provider admission. Review the task and send a fresh request; this attempt will not automatically retry.";
         await notifyChatRunMilestones(tx, { companyId: current.companyId, issueId });
@@ -715,7 +721,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               automaticRecovery: {
                 code,
                 providerDispatched: false,
-                ...(stopped
+                ...(proof.kind === "stopped"
                   ? {
                       sourceRunId: proof.sourceRunId,
                       conversationId: proof.conversationId,

@@ -267,6 +267,28 @@ describe.skipIf(!postgres.supported)("queue drive persisted selection and deboun
     },
   );
 
+  it.each([
+    { status: "cancelled", errorCode: "chat_control_completed_source", resultJson: {} },
+    { status: "failed", errorCode: "chat_control_recovery_proof_unresolved", resultJson: {} },
+    { status: "cancelled", errorCode: null, resultJson: {} },
+    { status: "failed", errorCode: "process_lost", resultJson: {} },
+  ])("keeps $errorCode held across an automatic successor until a fresh Board cause", async outcome => {
+    const held = await issue();
+    const stopped = await attempt(held.id, outcome.status, 1_000);
+    await db.update(heartbeatRuns).set({ errorCode: outcome.errorCode, resultJson: outcome.resultJson }).where(eq(heartbeatRuns.id, stopped.id));
+    await attempt(held.id, "succeeded", 3_000);
+    await drive.wakeNextAssignedIssueAfterRun(source);
+    expect(deps.enqueueWakeup).not.toHaveBeenCalled();
+
+    const fresh = await attempt(held.id, "succeeded", 5_000);
+    await db.insert(agentWakeupRequests).values({ companyId: source.companyId, agentId: source.agentId,
+      source: "automation", reason: "issue_commented", status: "completed", runId: fresh.id,
+      requestedAt: new Date(5_000), requestedByActorType: "user", requestedByActorId: "responsible-user",
+      payload: { issueId: held.id } });
+    await drive.wakeNextAssignedIssueAfterRun(source);
+    expect(picked()).toBe(held.id);
+  });
+
   it("does not continue a running source", async () => {
     await issue();
     await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, source.id));

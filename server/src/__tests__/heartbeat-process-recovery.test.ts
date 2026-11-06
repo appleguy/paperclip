@@ -13505,6 +13505,33 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ).toBe("in_progress");
   });
 
+  it.each(["claim", "dispatch"] as const)(
+    "rechecks queue-drive stop history at the %s boundary",
+    async (boundary) => {
+      const { companyId, agentId, issueId } = await seedRunFixture({ agentStatus: "idle", runStatus: "failed" });
+      let checked = false;
+      const heartbeat = heartbeatService(db, {
+        beforeChatControlRecoveryCheck: async ({ stage }) => {
+          if (stage !== boundary || checked) return;
+          checked = true;
+          await db.insert(heartbeatRuns).values({ companyId, agentId, invocationSource: "automation",
+            status: "cancelled", errorCode: CHAT_CONTROL_RECOVERY_STOP_CODE,
+            contextSnapshot: { issueId }, finishedAt: new Date() });
+        },
+      });
+      const run = await heartbeat.wakeup(agentId, {
+        source: "assignment", triggerDetail: "system", reason: "issue_queue_drive",
+        requestedByActorType: "system", requestedByActorId: "heartbeat_queue_drive",
+        payload: { issueId }, contextSnapshot: { issueId, source: "heartbeat.queue_drive" },
+      });
+      expect(run).not.toBeNull();
+      await heartbeat.drainActiveRunExecutions();
+      expect(checked).toBe(true);
+      expect(await heartbeat.getRun(run!.id)).toMatchObject({ status: "cancelled", errorCode: "queue_drive_recovery_hold" });
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+    },
+  );
+
   it.each(["claim", "dispatch", "queued_comments"] as const)(
     "honors close committed at the %s boundary without a provider call",
     async (boundary) => {
