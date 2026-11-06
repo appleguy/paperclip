@@ -70,6 +70,15 @@ describe("NAR rejoin stall watchdog", () => {
     expect(res.executionRecovery).toMatchObject({ providerWorkStarted: true, reason: "unowned_turn_stalled" });
   });
 
+  it("does not accept a foreign turn's settled outcome as the retry's result", async () => {
+    d.inflight = messageIdFor(narOpIdFor("other-run"));
+    d.settleAfter = 1;
+    const { res } = await run({});
+    expect(d.interrupts).toBe(0);
+    expect(res.proc.exitCode).not.toBe(0);
+    expect(res.executionRecovery).toMatchObject({ providerWorkStarted: true, reason: "unowned_turn_settled" });
+  });
+
   it("holds an explicit stop of an observed foreign turn without interrupting it", async () => {
     d.inflight = messageIdFor(narOpIdFor("other-run"));
     const controller = new AbortController();

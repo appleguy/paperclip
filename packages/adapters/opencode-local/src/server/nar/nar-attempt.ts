@@ -517,6 +517,14 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
     };
   }
 
+  // A retry observing a different run's message has no authority to treat
+  // that message's result as its own. In particular its prompt and run handle
+  // were never delivered. Preserve the provider turn and hold its outcome
+  // for recovery instead of reporting a successful retry or replaying input.
+  if (!ownsMessage) {
+    return held("OpenCode NAR observed another run's settled turn; outcome is untrusted and held without replay", true, conversationId, "unowned_turn_settled");
+  }
+
   let out: Awaited<ReturnType<typeof collectOutcome>>;
   try {
     if (input.reattachOnly && await driver.hasSuccessor(conversationId, msgId))
