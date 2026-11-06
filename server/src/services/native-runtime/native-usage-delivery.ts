@@ -118,8 +118,15 @@ function createNativeUsageReceiver(db: Db, input: NativeUsageDeliveryInput, sour
   let observedUsage: Record<string, unknown> | null = null;
   let observedTurn: string | undefined;
   let activeProviderTurn: string | undefined;
+  let peakContextTokens = 0;
   const observe = (envelope: UsageReceiptEnvelope) => {
     const fact = envelope.producerEvent!;
+    if (input.provider.kind === "codex" && fact.usage) {
+      const context = fact.usage.context as Record<string, unknown> | undefined;
+      const last = fact.usage.last as Record<string, unknown> | undefined;
+      const used = context?.usedTokens ?? last?.totalTokens ?? (typeof last?.inputTokens === "number" && typeof last.outputTokens === "number" ? last.inputTokens + last.outputTokens : undefined);
+      if (typeof used === "number" && Number.isSafeInteger(used) && used > 0 && used <= 2_147_483_647) peakContextTokens = Math.max(peakContextTokens, used);
+    }
     if (fact.eventType === "turn.started") activeProviderTurn = fact.providerTurnId ?? fact.sourceEventId;
     const accountingTurn = fact.providerTurnId ?? activeProviderTurn ?? fact.turnId;
     const interpretedUsage = fact.usage ? { ...fact.usage, runDeltaComplete: fact.usage.runDeltaComplete === true
@@ -162,6 +169,8 @@ function createNativeUsageReceiver(db: Db, input: NativeUsageDeliveryInput, sour
       sourceEventId: event.sourceEventId, turnId: event.turnId, eventType: event.eventType,
       ...(typeof payload.providerTurnId === "string" ? { providerTurnId: payload.providerTurnId } : {}),
       ...(event.eventType === "usage.reported" ? { usage: { runDelta: payload.runDelta, runDeltaComplete: payload.runDeltaAvailable === true, runDeltaBasis: payload.runDeltaBasis,
+        ...(payload.context && typeof payload.context === "object" ? { context: payload.context } : {}),
+        ...(payload.last && typeof payload.last === "object" ? { last: payload.last } : {}),
         ...(payload.reconciliation && typeof payload.reconciliation === "object" ? { reconciliation: payload.reconciliation } : {}) } } : {}),
     };
     const previous = accepted.get(event.sourceEventId) ?? (pending?.producerEvent?.sourceEventId === event.sourceEventId ? pending : undefined);
@@ -175,7 +184,8 @@ function createNativeUsageReceiver(db: Db, input: NativeUsageDeliveryInput, sour
         runId: input.runId, adapterType: "paperclip_runner", sourceId, sequence: event.sourceSeq,
         receivedAt: event.emittedAt, producerEvent: fact, receipt: { complete: false } };
       const snapshot = observe(envelope);
-      const usage = normalizeNativeUsage(snapshot.usage, { inputIncludesCacheReads: input.provider.kind === "codex" });
+      const normalized = normalizeNativeUsage(snapshot.usage, { inputIncludesCacheReads: input.provider.kind === "codex" });
+      const usage = normalized && peakContextTokens > 0 ? { ...normalized, peakContextTokens } : normalized;
       envelope.receipt = priceAnthropicReceipt(priceCodexReceipt({ ...input.billing,
         model: input.provider.model ?? "unknown", usage, usageBasis: "per_run", complete: snapshot.complete && usage !== undefined,
         costUsd: usage ? nativeUsageCostUsd(snapshot.usage, input.provider) ?? null : null,

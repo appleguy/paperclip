@@ -59,6 +59,23 @@ describe("producer-owned native usage", () => {
     return { input, source, report, done };
   };
 
+  it("retains the largest Codex context after reconnect and a smaller report", async () => {
+    const input = await seed();
+    await db.update(heartbeatRuns).set({ runnerInstanceId: input.runnerInstanceId }).where(eq(heartbeatRuns.id, input.runId));
+    const first = await createNativeUsageDelivery(db, input);
+    const high = event(input, 1, "usage.reported");
+    high.payload = { ...high.payload, last: { inputTokens: 30000, outputTokens: 500 } };
+    await first.capture(high);
+    const { billing: _billing, ...source } = input;
+    const resumed = await createNativeUsageContinuationDelivery(db, source);
+    const low = event(input, 2, "usage.reported");
+    low.payload = { ...low.payload, context: { usedTokens: 20000, windowTokens: 200000 } };
+    await resumed.capture(low);
+    await resumed.capture(event(input, 3, "turn.completed"));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.runId));
+    expect(run!.usageJson).toMatchObject({ peakContextTokens: 30500 });
+  });
+
   it.each([
     { name: "a report whose terminal was already acknowledged", types: ["usage.reported"] },
     { name: "a report and its terminal", types: ["usage.reported", "turn.completed"] },
