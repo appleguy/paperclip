@@ -502,6 +502,22 @@ describe("shared ACPX engine runtime behavior", () => {
     },
   );
 
+  it("resumes a keepConversation seat's thread across a fingerprint change", async () => {
+    // SCO-1126: issue-scoped inputs change the fingerprint; the seat keeps one thread.
+    const root = await makeTempRoot();
+    const config = {
+      agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state"), cwd: root,
+      paperclipRuntimeSkills: [], paperclipSkillSync: { desiredSkills: [] },
+    };
+    const first = await runExecutor({ ...config, keepConversation: true });
+    const runtime = { sessionParams: first.result.sessionParams };
+    const kept = await runExecutor({ ...config, keepConversation: true, model: "test-model" }, { runtime });
+    expect(kept.result.sessionParams?.configFingerprint).not.toBe(first.result.sessionParams?.configFingerprint);
+    expect(kept.sessionInputs[0]?.resumeSessionId).toBe(first.result.sessionId);
+    const plain = await runExecutor({ ...config, model: "test-model" }, { runtime });
+    expect(plain.sessionInputs[0]?.resumeSessionId).toBeUndefined();
+  });
+
   it("integrates the env-free store while delivering current credentials and options to the provider", async () => {
     const root = await makeTempRoot();
     const stateDir = path.join(root, "state");

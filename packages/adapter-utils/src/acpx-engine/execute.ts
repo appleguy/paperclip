@@ -484,6 +484,8 @@ interface AcpxPreparedRuntime {
   sessionKey: string;
   tokenSessionGeneration: string;
   fingerprint: string;
+  /** A local keepConversation seat resumes its one thread across issue-scoped config changes. */
+  keepConversation: boolean;
   agentCommand: string | null;
   agentRegistry: AcpAgentRegistry;
   processSessionBridge: AdapterExecutionTargetProcessSessionBridgeHandle | null;
@@ -1596,10 +1598,17 @@ function buildCodexStartupConfig(input: {
 
 function isCompatibleSession(
   params: Record<string, unknown>,
-  runtime: Pick<AcpxPreparedRuntime, "fingerprint" | "sessionKey" | "cwd" | "mode" | "acpxAgent" | "remoteExecutionIdentity">,
+  runtime: Pick<AcpxPreparedRuntime, "fingerprint" | "sessionKey" | "cwd" | "mode" | "acpxAgent" | "remoteExecutionIdentity"> & { keepConversation?: boolean },
 ): boolean {
-  if (asString(params.configFingerprint, "") !== runtime.fingerprint) return false;
-  if (asString(params.sessionKey, "") !== runtime.sessionKey) return false;
+  if (runtime.keepConversation && !runtime.remoteExecutionIdentity) {
+    // The fingerprint folds in issue-scoped inputs (referenced projects, workspace
+    // env). A seat that keeps one thread still requires the same company and agent.
+    const owner = runtime.sessionKey.split(":").slice(0, 3).join(":") + ":";
+    if (!asString(params.sessionKey, "").startsWith(owner)) return false;
+  } else {
+    if (asString(params.configFingerprint, "") !== runtime.fingerprint) return false;
+    if (asString(params.sessionKey, "") !== runtime.sessionKey) return false;
+  }
   if (asString(params.agent, "") !== runtime.acpxAgent) return false;
   if (asString(params.mode, "") !== runtime.mode) return false;
   const savedCwd = asString(params.cwd, "");
@@ -2726,6 +2735,7 @@ async function buildRuntime(input: {
     sessionKey,
     fingerprint,
     tokenSessionGeneration,
+    keepConversation: config.keepConversation === true,
     agentCommand,
     agentRegistry,
     processSessionBridge,
