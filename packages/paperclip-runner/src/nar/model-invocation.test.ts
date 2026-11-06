@@ -67,3 +67,29 @@ it("bounds a caller after cancellation even if a provider does not settle, and n
     expect(invoke).toHaveBeenCalledTimes(1);
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
+
+it("allows at most one concurrent dispatch for the same operation", async () => {
+  const dir = await mkdtemp(join(root, "nar-model-journal-"));
+  const invoke = vi.fn(async () => ({ response: '{}' }));
+  const input = { request, operationId: "concurrent", journalDirectory: dir,
+    provider: { family: "luna" as const, invokeFreshToolsOff: invoke },
+    signal: new AbortController().signal, validateResponse: () => {} };
+  try {
+    const outcomes = await Promise.allSettled(Array.from({ length: 8 }, () => invokeIsolatedModel(input)));
+    expect(outcomes.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
+    expect(invoke).toHaveBeenCalledTimes(1);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+it("never replays an invocation whose response fails validation", async () => {
+  const dir = await mkdtemp(join(root, "nar-model-journal-"));
+  const invoke = vi.fn(async () => ({ response: 'not-json' }));
+  const input = { request, operationId: "invalid-result", journalDirectory: dir,
+    provider: { family: "luna" as const, invokeFreshToolsOff: invoke },
+    signal: new AbortController().signal, validateResponse: (response: string) => { JSON.parse(response); } };
+  try {
+    await expect(invokeIsolatedModel(input)).rejects.toThrow();
+    await expect(invokeIsolatedModel(input)).rejects.toThrow("reconcile");
+    expect(invoke).toHaveBeenCalledTimes(1);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
