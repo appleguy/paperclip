@@ -2387,8 +2387,9 @@ export async function executeNativeSession(
       await persistCheckpoint(snapshot, signal);
     };
     const recoveredSnapshot = await session.snapshot();
+    const zeroContext = "zeroContext" in input ? input.zeroContext : undefined;
     const restartContinuation = () => ({
-      message: { role: "user" as const, text: JSON.stringify({
+      message: { role: "user" as const, text: zeroContext ? (("continuationPrompt" in input && input.continuationPrompt) || input.task.prompt) : JSON.stringify({
         schema: "paperclip.native-continuation.v1",
         events: [
           "Paperclip restarted and restored this same conversation. The previous turn was interrupted.",
@@ -2633,7 +2634,7 @@ export async function executeNativeSession(
           let modelEnvelope = recovered
             ? buildNativeModelEnvelope(input, { resumedSession: true })
             : buildNativeModelEnvelope(input);
-          if (!recovered && options.getFreshSessionHandoff && "task" in modelEnvelope) {
+          if (!zeroContext && !recovered && options.getFreshSessionHandoff && "task" in modelEnvelope) {
             const handoff = await options.getFreshSessionHandoff();
             if (handoff) modelEnvelope.task.prompt = `${handoff}\n\n${modelEnvelope.task.prompt}`;
           }
@@ -2652,7 +2653,7 @@ export async function executeNativeSession(
                   sourceInstanceId: options.runnerInstanceId,
                 })
               : false;
-          if (dispositionOnlyRecovery && !effectFreeInitialAcpxTurn) {
+          if (!zeroContext && dispositionOnlyRecovery && !effectFreeInitialAcpxTurn) {
             modelEnvelope = buildNativeModelEnvelope(input);
             // Source references cannot resolve after replacing the task prompt.
             modelEnvelope.completionContract = structuredClone(input.completionContract.contract);
@@ -2664,15 +2665,19 @@ export async function executeNativeSession(
               "Use the existing session context to invoke exactly one paperclip_finish or paperclip_block with the accurate current disposition, then stop without additional user-facing prose.",
             ].join("\n");
           }
-          if (!(dispositionOnlyRecovery && !effectFreeInitialAcpxTurn) && "requestedSkills" in modelEnvelope && options.backend.preparedTaskConstraints) {
+          if (!zeroContext && !(dispositionOnlyRecovery && !effectFreeInitialAcpxTurn) && "requestedSkills" in modelEnvelope && options.backend.preparedTaskConstraints) {
             modelEnvelope.constraints = [...options.backend.preparedTaskConstraints];
           }
           if ("workspace" in modelEnvelope && modelEnvelope.workspace && recoveredSnapshot.workingDirectory) {
             modelEnvelope.workspace.cwd = recoveredSnapshot.workingDirectory;
           }
           await session.startTurn({
-            message: { role: "user", text: JSON.stringify(modelEnvelope) },
-            ...(recovered && modelEnvelope.schema === "paperclip.native-continuation.v1"
+            message: { role: "user", text: zeroContext
+              ? (dispositionOnlyRecovery
+                  ? JSON.stringify({ schema: "paperclip.zero-recovery-facts.v1", priorRunId: persistedSession?.identity.runId.slice(0, 8), priorTurnId: persistedSession?.terminalTurns?.at(-1)?.turnId, instruction: zeroContext })
+                  : recovered && "continuationPrompt" in input && input.continuationPrompt != null ? input.continuationPrompt : input.task.prompt)
+              : JSON.stringify(modelEnvelope) },
+            ...(zeroContext || (recovered && modelEnvelope.schema === "paperclip.native-continuation.v1")
               ? { continuation: true as const } : {}),
             requestedCollaborationMode:
               // Paperclip planning remains in the envelope and tool authority.

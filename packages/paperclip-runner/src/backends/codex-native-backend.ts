@@ -147,7 +147,8 @@ function createTransportBackedNativeSessionBackend(
     "executionMode" in input &&
     input.executionMode === "plan";
   const claudeAcpx = input.provider.kind === "acpx" && input.provider.agent === "claude";
-  const constraints = [
+  const zero = "zeroContext" in input && input.zeroContext !== undefined;
+  const constraints = zero ? [] : [
     ...(planMode
       ? [
           "Use native plan collaboration mode and do not modify workspace files.",
@@ -163,7 +164,7 @@ function createTransportBackedNativeSessionBackend(
     ...nativeTaskConstraints(input),
   ];
 
-  const baseInstructions = options.retainedSystemInstructions ?? nativeSystemInstructions(input);
+  const baseInstructions = zero ? "" : options.retainedSystemInstructions ?? nativeSystemInstructions(input);
   const transportFactory = options.transportFactory;
   const backend = new HarnessDriverBackend(
     new CodexAppServerDriver({
@@ -180,9 +181,10 @@ function createTransportBackedNativeSessionBackend(
           ? (input.provider.approvalPolicy ?? "never")
           : "never",
       baseInstructions,
-      instructionWorkingCopyRoot: "runtimeContext" in input ? input.runtimeContext.instructions.workingCopy?.rootPath : undefined,
-      includeSkillInstructions: isCodex && "runtimeContext" in input,
-      skillInputs: isCodex
+      instructionWorkingCopyRoot: !zero && "runtimeContext" in input ? input.runtimeContext.instructions.workingCopy?.rootPath : undefined,
+      includeSkillInstructions: !zero && isCodex && "runtimeContext" in input,
+      ...(zero ? { includeCollaborationModeInstructions: false } : {}),
+      skillInputs: !zero && isCodex
         ? nativeTaskSkillInputs(
             input.task.description,
             "runtimeContext" in input ? input.runtimeContext : null,

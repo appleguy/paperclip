@@ -185,6 +185,7 @@ export const parseCodexTurnDiff = runner.parseCodexTurnDiff;
 export const parseHarnessRuntimeRequestResolution =
   runner.parseHarnessRuntimeRequestResolution;
 export const parseNativeExecutionInput = runner.parseNativeExecutionInput;
+export const zeroRecoveryContextItem = (runner as RunnerModule & { zeroRecoveryContextItem: () => { revision: string; text: string; digest: string } }).zeroRecoveryContextItem;
 export const buildNativeModelEnvelope = runner.buildNativeModelEnvelope;
 export const isProviderMode = runner.isProviderMode;
 export const codexUsageBaselineForNextRun = runner.codexUsageBaselineForNextRun;

@@ -8881,12 +8881,15 @@ export async function executePaperclipNativeSession(input: {
       };
       const stagedPrompt = renderNativeRunnerStagedAttachmentPrompt(
         attachmentStage.attachments,
+        "zeroContext" in input.execution && input.execution.zeroContext !== undefined,
       );
       if (nativeSha256(input.execution) !== admissionSha256) throw new Error("native_attachment_admission_changed");
       if (stagedPrompt) {
         const preparedExecution = parseNativeExecutionInput({
           ...input.execution,
           task: { ...input.execution.task, prompt: `${input.execution.task.prompt}\n\n${stagedPrompt}` },
+          ...("zeroContext" in input.execution && input.execution.zeroContext && "continuationPrompt" in input.execution && input.execution.continuationPrompt != null
+            ? { continuationPrompt: `${input.execution.continuationPrompt}\n\n${stagedPrompt}` } : {}),
         });
         preparedInput = {
           ...preparedInput,

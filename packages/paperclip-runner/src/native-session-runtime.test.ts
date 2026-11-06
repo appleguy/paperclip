@@ -9,6 +9,7 @@ import { OpenCodeSharedNativeBackend } from "./drivers/opencode/shared-native-ba
 
 import type { ControlPlanePort } from "./contracts/control-plane-port.js";
 import type { NativeExecutionInputV1, NativeExecutionInputV5 } from "./contracts/native-execution.js";
+import { zeroRecoveryContextItem } from "./contracts/native-execution.js";
 import type { NativeRunIdentity } from "./contracts/types.js";
 import type {
   NativeSession,
@@ -6762,11 +6763,12 @@ describe("executeNativeSession recovery", () => {
   });
 
   it.each([
-    { preparedMode: false, interrupted: false },
-    { preparedMode: true, interrupted: false },
-    { preparedMode: false, interrupted: true },
-    { preparedMode: true, interrupted: true },
-  ])("replaces a failed provider with full task context (prepared: $preparedMode, interrupted: $interrupted)", async ({ preparedMode, interrupted }) => {
+    { preparedMode: false, interrupted: false, zero: false },
+    { preparedMode: true, interrupted: false, zero: false },
+    { preparedMode: false, interrupted: true, zero: false },
+    { preparedMode: true, interrupted: true, zero: false },
+    { preparedMode: true, interrupted: true, zero: true },
+  ])("replaces a failed provider with full task context (prepared: $preparedMode, interrupted: $interrupted, zero: $zero)", async ({ preparedMode, interrupted, zero }) => {
     const digest = "0".repeat(64);
     const skill = {
       key: "company/recovery-skill",
@@ -6792,6 +6794,7 @@ describe("executeNativeSession recovery", () => {
     const executionInput = preparedMode
       ? {
           ...prepared,
+          ...(zero ? { zeroContext: zeroRecoveryContextItem() } : {}),
           task: {
             ...prepared.task,
             description: "Complete after recovery with $recovery-skill.",
@@ -6932,9 +6935,12 @@ describe("executeNativeSession recovery", () => {
       }),
     ).resolves.toMatchObject({ providerSessionId: "provider-replacement" });
 
-    expect(getFreshSessionHandoff).toHaveBeenCalledOnce();
+    expect(getFreshSessionHandoff).toHaveBeenCalledTimes(zero ? 0 : 1);
     expect(recoverSession).toHaveBeenCalledTimes(interrupted ? 1 : 0);
     expect(openReplacementSession).toHaveBeenCalledOnce();
+    if (zero) {
+      expect(startTurn.mock.calls[0]![0].message.text).toBe(executionInput.task.prompt);
+    } else {
     const replacementEnvelope = JSON.parse(
       startTurn.mock.calls[0]![0].message.text,
     ) as {
@@ -6954,6 +6960,7 @@ describe("executeNativeSession recovery", () => {
     else expect(replacementEnvelope).not.toHaveProperty("requestedSkills");
     expect(JSON.stringify(replacementEnvelope)).not.toContain("ONLY_NEW_COMMENT");
     expect(startTurn.mock.calls[0]![0]).not.toHaveProperty("continuation");
+    }
     expect(onContinuityBreak).toHaveBeenCalledWith({
       reason: interrupted ? "provider thread is unavailable" : "provider session ended with a failed terminal",
       previousDriverSessionId: "driver-failed",
@@ -6963,8 +6970,8 @@ describe("executeNativeSession recovery", () => {
     });
   });
 
-  it.each([false, true])("only replays the original ACPX envelope for a proven effect-free initial turn (prepared: %s)", async (prepared) => {
-    const executionInput = prepared ? preparedInput() : input;
+  it.each([{ prepared: false, zero: false }, { prepared: true, zero: false }, { prepared: true, zero: true }])("only replays a proven effect-free initial turn (prepared: $prepared, zero: $zero)", async ({ prepared, zero }) => {
+    const executionInput = zero ? { ...preparedInput(), zeroContext: zeroRecoveryContextItem() } : prepared ? preparedInput() : input;
     const checkpoint: PersistedNativeSession = {
       backendKind: "mock",
       driverKind: "acpx_runtime",
@@ -7161,8 +7168,11 @@ describe("executeNativeSession recovery", () => {
     const recoveryEnvelope = JSON.parse(
       startTurn.mock.calls[0]![0].message.text,
     ) as { task: { prompt: string } };
-    expect(recoveryEnvelope.task.prompt).toBe(executionInput.task.prompt);
-    if (prepared) {
+    if (zero) {
+      expect(recoveryEnvelope).toEqual({ schema: "paperclip.zero-recovery-facts.v1", priorRunId: identity.runId.slice(0, 8), priorTurnId: "turn-work", instruction: zeroRecoveryContextItem() });
+      expect(JSON.stringify(recoveryEnvelope)).not.toContain(executionInput.task.prompt);
+    } else expect(recoveryEnvelope.task.prompt).toBe(executionInput.task.prompt);
+    if (prepared && !zero) {
       expect(recoveryEnvelope).toMatchObject({
         schema: "paperclip.native-model-envelope.v3",
         constraints: ["Retain the original workspace rule."],
@@ -7205,6 +7215,11 @@ describe("executeNativeSession recovery", () => {
     const dispositionEnvelope = JSON.parse(
       startTurn.mock.calls[0]![0].message.text,
     ) as { task: { prompt: string } };
+    if (zero) {
+      expect(dispositionEnvelope).toEqual({ schema: "paperclip.zero-recovery-facts.v1", priorRunId: identity.runId.slice(0, 8), priorTurnId: "turn-work", instruction: zeroRecoveryContextItem() });
+      expect(JSON.stringify(dispositionEnvelope)).not.toContain(executionInput.task.prompt);
+      expect(JSON.stringify(dispositionEnvelope)).not.toContain("semantic-result recovery");
+    } else {
     expect(dispositionEnvelope.task.prompt).toContain(
       "semantic-result recovery for a prior completed provider turn",
     );
@@ -7216,6 +7231,7 @@ describe("executeNativeSession recovery", () => {
     expect(dispositionEnvelope).toHaveProperty("completionContract", input.completionContract.contract);
     expect(dispositionEnvelope).not.toHaveProperty("constraints");
     if (prepared) expect(dispositionEnvelope).toHaveProperty("requestedSkills", []);
+    }
 
     checkpoint.dispositionOnlyRecoveryTurnId = undefined;
     recoveredSnapshot.dispositionOnlyRecoveryTurnId = undefined;

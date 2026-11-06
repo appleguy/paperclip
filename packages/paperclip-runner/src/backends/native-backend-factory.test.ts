@@ -1,11 +1,11 @@
 import { QUALIFIED_ACPX_PROFILES, resolveQualifiedAcpxProfile } from "../drivers/acpx/qualified-profiles.js";
-import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, rmSync, copyFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import * as codexSecurity from "../drivers/codex/codex-security-config.js";
 
-import { buildNativeModelEnvelope, parseNativeExecutionInput, type NativeExecutionInput } from "../contracts/native-execution.js";
+import { buildNativeModelEnvelope, parseNativeExecutionInput, zeroRecoveryContextItem, type NativeExecutionInput } from "../contracts/native-execution.js";
 import { NATIVE_RUNTIME_ASSET_SCHEMA, PAPERCLIP_EXECUTION_PROMPT, PAPERCLIP_EXECUTION_PROMPT_REVISION, nativeRuntimePromptDigest, canonicalNativeRuntimeContextDigest, composeNativeSystemInstructions } from "../contracts/runtime-context.js";
 
 const contextRoots: string[] = [];
@@ -839,5 +839,42 @@ describe("native backend factory", () => {
         expect.stringContaining("Obtain one accepted result"),
       ]),
     );
+  });
+  it("removes default provider instructions and constraints for zero mode", async () => {
+    const codexInput = { ...preparedExecution(execution()), zeroContext: zeroRecoveryContextItem() } as NativeExecutionInput;
+    const transport = new FakeCodexTransport();
+    let instructions: string | undefined;
+    const codex = createCodexNativeSessionBackend(codexInput, {
+      transportFactory: context => { instructions = context.baseInstructions; return transport; },
+      workingDirectoryAuthority: "remote_runner", environment: { PAPERCLIP_WORKSPACE_CWD: WORKSPACE },
+    });
+    const session = await codex.openSession({ identity: { companyId: "company", agentId: "agent", runId: "run", sessionId: "session" }, workingDirectory: WORKSPACE });
+    expect(instructions).toBe("");
+    expect(codex.preparedTaskConstraints).toEqual([]);
+    transport.turnStartResponse = Promise.resolve({ turn: { id: "zero-turn", status: "inProgress", items: [] } });
+    await session.startTurn({ message: { role: "user", text: "Zero facts" }, continuation: true });
+    expect(transport.calls.find(call => call.method === "turn/start")?.params.input).toEqual([{ type: "text", text: "Zero facts", text_elements: [] }]);
+    await session.close({ reason: "test-completed" });
+    const opencode = createOpenCodeNativeSessionBackend({ ...preparedExecution(opencodeExecution()), zeroContext: zeroRecoveryContextItem() } as NativeExecutionInput, { runtimeDirectory: "/tmp/paperclip-opencode-zero-factory" });
+    expect(opencode.preparedTaskConstraints).toEqual([]);
+  });
+  it("sends zero OpenCode facts without system guidance or a task wrapper", async () => {
+    const root = mkdtempSync(join(tmpdir(), "paperclip-zero-opencode-"));
+    contextRoots.push(root);
+    const command = join(root, "opencode.mjs");
+    copyFileSync("test/fixtures/fake-opencode-server.mjs", command);
+    chmodSync(command, 0o755);
+    const submitted: Record<string, unknown>[] = [];
+    const backend = createOpenCodeNativeSessionBackend({ ...preparedExecution(opencodeExecution()), zeroContext: zeroRecoveryContextItem() } as NativeExecutionInput, {
+      runtimeDirectory: root, command, environment: { PATH: process.env.PATH, OPENROUTER_API_KEY: "fixture-key" },
+      fetch: async (url, init) => { if (String(url).endsWith("/prompt_async")) submitted.push(JSON.parse(String(init?.body))); return fetch(url, init); },
+    });
+    const session = await backend.openSession({ identity: { companyId: "company", agentId: "agent", runId: "run", sessionId: "session" }, workingDirectory: WORKSPACE });
+    try {
+      await session.startTurn({ message: { role: "user", text: "Zero facts" } });
+      for await (const event of session.events()) if (event.eventType === "turn.completed") break;
+      expect(submitted[0]?.system).toBe("");
+      expect(submitted[0]?.parts).toEqual([{ type: "text", text: "Zero facts" }]);
+    } finally { await session.close({ reason: "test-completed" }); }
   });
 });

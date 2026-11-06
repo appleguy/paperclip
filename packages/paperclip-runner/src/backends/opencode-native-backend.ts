@@ -16,12 +16,13 @@ export function createOpenCodeNativeSessionBackend(
   const preparedContext = input.schema === NATIVE_EXECUTION_INPUT_SCHEMA
     || input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V7
     || input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V9 || input.schema === NATIVE_EXECUTION_INPUT_SCHEMA_V10;
-  const constraints = nativeTaskConstraints(input);
+  const zero = "zeroContext" in input && input.zeroContext !== undefined;
+  const constraints = zero ? [] : nativeTaskConstraints(input);
 
   return new HarnessDriverBackend(new OpenCodeServerDriver({
     ...options,
-    systemInstructions: nativeSystemInstructions(input),
-    runtimeContext: "runtimeContext" in input ? input.runtimeContext : null,
+    systemInstructions: zero ? "" : nativeSystemInstructions(input),
+    runtimeContext: !zero && "runtimeContext" in input ? input.runtimeContext : null,
     model: input.provider.model,
     permissionMode: input.provider.permissionMode ?? "allow",
     taskEnvelope: createCodexTaskEnvelope({

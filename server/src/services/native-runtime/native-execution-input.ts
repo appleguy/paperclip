@@ -34,6 +34,7 @@ import type {
 } from "../../vendor/paperclip-runner/index.js";
 import {
   parseNativeExecutionInput,
+  zeroRecoveryContextItem,
   resolveQualifiedAcpxProfile,
 } from "../../vendor/paperclip-runner/index.js";
 import {
@@ -315,6 +316,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
         workflowCase,
       }),
     } : {}),
+    ...(input.zero ? { zeroContext: zeroRecoveryContextItem() } : {}),
     executionMode,
     planningContext: input.planningContext ?? null,
     binding: {

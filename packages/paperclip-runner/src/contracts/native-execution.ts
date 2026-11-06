@@ -236,6 +236,12 @@ export interface NativeExecutionInputV4 extends Omit<NativeExecutionInputV3, "sc
   continuationPrompt?: string | null;
   /** Restored only when starting a fresh provider session, never on a resume. */
   initialCommunicationGuidance?: string | null;
+  zeroContext?: { revision: string; text: string; digest: string };
+}
+
+export const ZERO_RECOVERY_INSTRUCTION = "This task's previous turn completed; do not repeat its work unless the facts below show it is unfinished.";
+export function zeroRecoveryContextItem() {
+  return { revision: "paperclip.zero-recovery.v1", text: ZERO_RECOVERY_INSTRUCTION, digest: createHash("sha256").update(ZERO_RECOVERY_INSTRUCTION).digest("hex") };
 }
 
 /** Identity and content revision supplied by the builder that owns the source. */
@@ -512,7 +518,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
     "credentialBindings",
     ...(isV2 ? ["executionMode", "planningContext"] : []),
     ...(isV3 ? ["runtimeContext"] : []),
-    ...(isV4 ? ["continuationPrompt", "initialCommunicationGuidance"] : []),
+    ...(isV4 ? ["continuationPrompt", "initialCommunicationGuidance", "zeroContext"] : []),
     ...(isV5 ? ["completionSources"] : []),
     ...(isV7 ? ["homeMode"] : []),
   ], "input");
@@ -996,6 +1002,7 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
     ...withRuntimeContext,
     ...(input.continuationPrompt !== undefined ? { continuationPrompt: nullableText(input.continuationPrompt, "input.continuationPrompt") } : {}),
     ...(input.initialCommunicationGuidance !== undefined ? { initialCommunicationGuidance: nullableText(input.initialCommunicationGuidance, "input.initialCommunicationGuidance") } : {}),
+    ...(input.zeroContext !== undefined ? { zeroContext: parseZeroContext(input.zeroContext) } : {}),
     provider: parsedProvider as NativeProviderConfigV4,
   };
   if (!isV5) return { ...withPermissions, schema: NATIVE_EXECUTION_INPUT_SCHEMA_V4 };
@@ -1015,6 +1022,14 @@ export function parseNativeExecutionInput(value: unknown): NativeExecutionInput 
     provider: parsedProvider as NativeProviderConfigV5,
     ...(input.completionSources !== undefined ? { completionSources: parseCompletionSources(input.completionSources) } : {}),
   };
+}
+
+function parseZeroContext(value: unknown) {
+  const item = record(value, "input.zeroContext");
+  exactKeys(item, ["revision", "text", "digest"], "input.zeroContext");
+  const expected = zeroRecoveryContextItem();
+  if (item.revision !== expected.revision || item.text !== expected.text || item.digest !== expected.digest) throw new NativeExecutionInputError("input.zeroContext is invalid");
+  return expected;
 }
 
 function parseCompletionSources(value: unknown): NativeCompletionSources {

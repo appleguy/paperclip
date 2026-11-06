@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { buildNativeExecutionInput, renderZeroFactsInput, type BuildNativeExecutionInput } from "./native-execution-input.js";
 import { nativeRuntimeContextFixture } from "./runtime-context.test-fixture.js";
+import { createHash } from "node:crypto";
+import { parseNativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
 
 const args: BuildNativeExecutionInput = {
   companyId: "10000000-0000-4000-8000-000000000001", agentId: "30000000-0000-4000-8000-000000000003", runId: "50000000-0000-4000-8000-000000000005",
@@ -32,6 +34,13 @@ describe("native zero facts", () => {
     const options = { ...args, initialCommunicationGuidance: "Communication guidance", freshSessionHandoff: "Handoff" };
     expect(buildNativeExecutionInput({ ...options, zero: true })).not.toHaveProperty("initialCommunicationGuidance");
     expect(buildNativeExecutionInput(options).initialCommunicationGuidance).toBe("Communication guidance\n\nHandoff");
+  });
+  it("persists and validates the versioned recovery context digest", () => {
+    const input = buildNativeExecutionInput({ ...args, zero: true }) as ReturnType<typeof buildNativeExecutionInput> & { zeroContext: { revision: string; text: string; digest: string } };
+    expect(input.zeroContext.revision).toBe("paperclip.zero-recovery.v1");
+    expect(input.zeroContext.digest).toBe(createHash("sha256").update(input.zeroContext.text).digest("hex"));
+    expect(parseNativeExecutionInput(input)).toEqual(input);
+    expect(() => parseNativeExecutionInput({ ...input, zeroContext: { ...input.zeroContext, digest: "0".repeat(64) } })).toThrow();
   });
   it("retains the default prompt", () => {
     const normal = buildNativeExecutionInput(args);
