@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { AntigravityInteractiveControl } from "./interactive-control.js";
@@ -32,6 +32,12 @@ describe("Antigravity interactive Runner port", () => {
       await writeFile(path.join(stateDir, "active.json"), JSON.stringify({ runId: "other" }));
       await expect(port.dispatch(event)).rejects.toThrow(/checkpoint/);
       await writeFile(path.join(stateDir, "active.json"), JSON.stringify({ runId: "run-1" }));
+      const otherDir = path.join(stateDir, "other-seat");
+      await mkdir(otherDir, { mode: 0o700 });
+      await writeFile(path.join(otherDir, "active.json"), JSON.stringify({ runId: "other" }));
+      const otherControl = await AntigravityInteractiveControl.attach({ socket: "socket", session: "seat", stateDir: otherDir, tmux, authorize: () => admitted });
+      const wrongSeat = new RunnerdAntigravityInteractivePort({ ...binding, stateDir, control: otherControl, admit: () => admitted });
+      await expect(wrongSeat.dispatch(event)).rejects.toThrow(/ownership/);
       expect(await port.dispatch(event)).toEqual({ disposition: "written_consumption_unknown" });
       await expect(port.dispatch(event)).rejects.toThrow();
       expect(calls.filter(args => args[0] === "send-keys")).toHaveLength(1);

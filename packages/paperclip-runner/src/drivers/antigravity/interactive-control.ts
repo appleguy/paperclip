@@ -162,9 +162,10 @@ export class AntigravityInteractiveControl {
     return new AntigravityInteractiveControl({ ...input, tmux, paneId: match[1]!, panePid: match[2]! }, remoteControlUrl);
   }
 
-  async submit(operationId: string, message: string): Promise<{ disposition: "written_consumption_unknown" }> {
+  async submit(operationId: string, message: string, runId: string): Promise<{ disposition: "written_consumption_unknown" }> {
     if (!operationId || !message || /[\r\n]/.test(message) || message.startsWith("/") || !this.input.authorize(operationId))
       throw new Error("Antigravity interactive submission denied");
+    await this.assertRunOwner(runId);
     const sessionTarget = ["-t", `=${this.input.session}:`];
     const target = ["-t", this.input.paneId];
     const identity = (await this.input.tmux(["display-message", "-p", ...sessionTarget, "#{pane_id} #{pane_pid} #{pane_current_command}"])).trim();
@@ -187,6 +188,7 @@ export class AntigravityInteractiveControl {
     const buffer = `paperclip-agy-${randomUUID()}`;
     try {
       if (!this.input.authorize(operationId)) throw new Error("Antigravity interactive admission revoked");
+      await this.assertRunOwner(runId);
       await fs.writeFile(file, message, { flag: "wx", mode: 0o600 });
       await this.input.tmux(["load-buffer", "-b", buffer, file]);
       await this.input.tmux(["paste-buffer", "-p", "-r", "-d", "-b", buffer, ...target]);

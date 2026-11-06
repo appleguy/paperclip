@@ -47,13 +47,14 @@ describe("Antigravity interactive seat", () => {
       return "";
     };
     try {
+      await writeFile(path.join(stateDir, "active.json"), JSON.stringify({ runId: "run-1" }));
       const control = await AntigravityInteractiveControl.attach({ socket: "socket", session: "seat", stateDir,
         expectedRemoteControlUrl: "https://antigravity.google.com/r/seat-1", authorize: () => true, tmux });
       expect(control.remoteControlUrl).toBe("https://antigravity.google.com/r/seat-1");
-      await expect(control.submit("turn-1", "work on this issue")).resolves.toEqual({ disposition: "written_consumption_unknown" });
+      await expect(control.submit("turn-1", "work on this issue", "run-1")).resolves.toEqual({ disposition: "written_consumption_unknown" });
       expect(input).toBe("work on this issue");
       expect(calls.find(args => args[0] === "send-keys")).toEqual(["send-keys", "-t", "%42", "Enter"]);
-      await expect(control.submit("turn-1", "work on this issue")).rejects.toThrow();
+      await expect(control.submit("turn-1", "work on this issue", "run-1")).rejects.toThrow();
       expect((await readdir(stateDir)).filter(name => name.startsWith("input-"))).toHaveLength(0);
     } finally { await rm(stateDir, { recursive: true, force: true }); }
   });
@@ -64,18 +65,19 @@ describe("Antigravity interactive seat", () => {
     const authorize = vi.fn(() => true);
     const tmux = async (args: string[]) => args[0] === "display-message" ? pane : args[0] === "capture-pane" ? content : "";
     try {
+      await writeFile(path.join(stateDir, "active.json"), JSON.stringify({ runId: "run-1" }));
       await expect(AntigravityInteractiveControl.attach({ socket: "socket", session: "seat", stateDir,
         expectedRemoteControlUrl: "https://antigravity.google.com/r/wrong", authorize, tmux })).rejects.toThrow(/identity/);
       const control = await AntigravityInteractiveControl.attach({ socket: "socket", session: "seat", stateDir, authorize, tmux });
       pane = "%43 456 agy";
-      await expect(control.submit("one", "work")).rejects.toThrow(/identity changed/);
+      await expect(control.submit("one", "work", "run-1")).rejects.toThrow(/identity changed/);
       pane = "%42 123 agy";
       content = screen.replace(">", "> draft");
-      await expect(control.submit("two", "work")).rejects.toThrow(/input guard/);
+      await expect(control.submit("two", "work", "run-1")).rejects.toThrow(/input guard/);
       content = screen;
       authorize.mockReturnValue(false);
-      await expect(control.submit("three", "work")).rejects.toThrow(/denied/);
-      expect(await readdir(stateDir)).toHaveLength(0);
+      await expect(control.submit("three", "work", "run-1")).rejects.toThrow(/denied/);
+      expect(await readdir(stateDir)).toEqual(["active.json"]);
     } finally { await rm(stateDir, { recursive: true, force: true }); }
   });
 
@@ -88,10 +90,11 @@ describe("Antigravity interactive seat", () => {
       return "";
     };
     try {
+      await writeFile(path.join(stateDir, "active.json"), JSON.stringify({ runId: "run-1" }));
       const control = await AntigravityInteractiveControl.attach({ socket: "socket", session: "seat", stateDir, authorize: () => true, tmux });
-      await expect(control.submit("uncertain", "work")).rejects.toThrow(/connection lost/);
+      await expect(control.submit("uncertain", "work", "run-1")).rejects.toThrow(/connection lost/);
       expect((await readdir(stateDir)).filter(name => name.endsWith(".reservation"))).toHaveLength(1);
-      await expect(control.submit("uncertain", "work")).rejects.toThrow();
+      await expect(control.submit("uncertain", "work", "run-1")).rejects.toThrow();
     } finally { await rm(stateDir, { recursive: true, force: true }); }
   });
 

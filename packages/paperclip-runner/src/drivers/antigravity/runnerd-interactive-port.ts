@@ -25,6 +25,6 @@ export class RunnerdAntigravityInteractivePort {
       !this.input.admit(event.sourceEventId)) throw new Error("Antigravity interactive dispatch denied");
     const checkpoint = JSON.parse(await readFile(path.join(this.input.stateDir, "active.json"), "utf8")) as { runId?: unknown };
     if (checkpoint.runId !== this.input.runId || !this.input.admit(event.sourceEventId)) throw new Error("Antigravity interactive checkpoint ownership changed");
-    return this.input.control.submit(event.sourceEventId, event.payload.text);
+    return this.input.control.submit(event.sourceEventId, event.payload.text, this.input.runId);
   }
 }
