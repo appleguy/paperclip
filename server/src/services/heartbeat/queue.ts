@@ -8,7 +8,7 @@ import { notifyExecutionRunWork } from "../execution-control-notifications.js";
 import { PersistedExecutionWaitRefusal, writeDeferredExecutionWait } from "../deferred-execution-wait.js";
 import { notifyDeferredExecutionWork } from "../deferred-execution-notifications.js";
 import type { DeferredReceiptRecoveryOptions } from "../deferred-execution-notifications.js";
-import { notifyRunDispatch } from "../run-dispatch-notifications.js";
+import { notifyRunDispatch, notifyScheduledRetryDispatch } from "../run-dispatch-notifications.js";
 import { notifyStatusCardIssueChange } from "../status-card-notifications.js";
 import { notifyRoutineExecutionStatus } from "../routine-execution-status-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
@@ -4119,8 +4119,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               const context: Record<string, unknown> = coalescedWakeContext({ ...enrichedContextSnapshot, ...queued.contextSnapshot,
                 wakeReason: queued.contextSnapshot?.wakeReason }, reason);
               delete context.scheduledRetryAt;
+              // A parked retry is made due now (the retry-now path); the promoter only picks up due rows.
+              const parked = queued.status === "scheduled_retry";
               const [updated] = await tx.update(heartbeatRuns).set({ contextSnapshot: context,
-                scheduledRetryAt: null, updatedAt: new Date() }).where(eq(heartbeatRuns.id, queued.id)).returning();
+                scheduledRetryAt: parked ? new Date() : null, updatedAt: new Date() }).where(eq(heartbeatRuns.id, queued.id)).returning();
+              if (parked) await notifyScheduledRetryDispatch(tx, { companyId: agent.companyId });
               await tx.insert(agentWakeupRequests).values({ ...durableReceiptFields, companyId: agent.companyId,
                 agentId, source, triggerDetail, reason, payload, status: "coalesced", runId: queued.id,
                 requestedByActorType: opts.requestedByActorType ?? null, requestedByActorId: opts.requestedByActorId ?? null,

@@ -285,6 +285,25 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(receipts).toHaveLength(1);
   });
 
+  it("coalesces a restore into a transient retry that is still parked", async () => {
+    const runId = randomUUID(), companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+    const now = new Date();
+    await seedRetryFixture({ runId, companyId, agentId, now, errorCode: "adapter_failed" });
+    await db.insert(issues).values({ id: issueId, companyId, title: "Parked recovery", status: "todo", assigneeAgentId: agentId });
+    await db.update(heartbeatRuns).set({ issueId, contextSnapshot: { issueId, wakeReason: "issue_assigned" } }).where(eq(heartbeatRuns.id, runId));
+    await db.insert(heartbeatRuns).values({ companyId, agentId, invocationSource: "automation", status: "running", startedAt: now });
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => 0 });
+    if (scheduled.outcome !== "scheduled") throw new Error("retry not scheduled");
+    expect(scheduled.run.status).toBe("scheduled_retry");
+    await heartbeat.wakeup(agentId, { source: "automation", triggerDetail: "system",
+      reason: "issue_recovery_action_restored", payload: { issueId }, contextSnapshot: { issueId } });
+    const pending = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
+      eq(heartbeatRuns.agentId, agentId), inArray(heartbeatRuns.status, ["queued", "scheduled_retry"])));
+    expect(pending.map(run => run.id)).toEqual([scheduled.run.id]);
+    expect(pending[0]!.contextSnapshot?.coalescedWakeReasons).toEqual(expect.arrayContaining(["issue_recovery_action_restored"]));
+    expect(pending[0]!.scheduledRetryAt!.getTime()).toBeLessThanOrEqual(Date.now());
+  });
+
   it("never schedules invalid provider definitions even when a caller supplies a retry policy", async () => {
     const runId = randomUUID(), companyId = randomUUID(), agentId = randomUUID();
     const now = new Date("2026-04-20T12:00:00.000Z");
