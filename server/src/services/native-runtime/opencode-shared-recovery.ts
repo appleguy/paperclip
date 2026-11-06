@@ -208,7 +208,9 @@ export async function isOpenCodeSemanticCallReserved(db: Db, binding: OpenCodeSh
   });
 }
 
-/** Atomically fence a single automated prompt; a reserved operation is never replayed. */
+/** Atomically reserve one automated prompt in the database; unresolved
+ * reservations block later managed prompts. This does not fence the provider
+ * send against a lease change after the reservation check. */
 export async function transitionOpenCodeMutation(db: Db, binding: OpenCodeSharedBinding, input: { id: string; digest: string; transition: "reserve" | "check" | "acknowledge" }): Promise<void> {
   if (!/^msg_[A-Za-z0-9_-]+$/.test(input.id) || !/^[a-f0-9]{64}$/.test(input.digest)) throw new Error("opencode_mutation_identity_invalid");
   await withLockedSession(db, binding, async (tx, session, params, native) => {
