@@ -25,13 +25,13 @@ import {
   environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions,
   issues, nativeRunFinalizations, nativeRunResults, type Db,
 } from "@paperclipai/db";
-import { executionContinuationSourcePredicate, getExecutionBlocker, hasPendingRunCleanup, nativeExecutionRecoveryActionPredicate, restoreHoldReleasedForCurrentOwnerPredicate } from "./execution-blocker.js";
+import { executionBlockerPredicate, executionContinuationSourcePredicate, getExecutionBlocker, hasPendingRunCleanup, nativeExecutionRecoveryActionPredicate, restoreHoldReleasedForCurrentOwnerPredicate } from "./execution-blocker.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
 import { adapterExecutionControls } from "./adapter-execution-control.js";
 import { persistActivity } from "./activity-log.js";
 import { activeIssueInteractionCondition } from "./issue-question-context.js";
 
-import { historicalAdapterType, isConversationAdapter } from "./conversation-continuation.js";
+import { historicalAdapterType, isConversationAdapter, unverifiedOpenCodeRecoveryActionPredicate } from "./conversation-continuation.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 
 type Run = Pick<typeof heartbeatRuns.$inferSelect,
@@ -224,6 +224,12 @@ export async function admitExplicitNativeContinuation(input: {
     : response?.comment.createdAt ?? comment?.createdAt ?? retryWake?.requestedAt ?? new Date();
   if (!input.dryRun) await preserveTaskRemoteWorkspaceWriter(db, companyId, issueId);
   const blocker = await getExecutionBlocker(db, companyId, issueId);
+  // A stopped host process is not proof that its OpenCode provider turn ended.
+  const [openCodeHold] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
+    executionBlockerPredicate(), unverifiedOpenCodeRecoveryActionPredicate(),
+  )).limit(1).for("update");
+  if (openCodeHold) return blocked("provider_work_unverified", "The previous provider turn needs reconciliation before continuing.");
   const [boundary] = await db.select({ createdAt: issueComments.createdAt }).from(issues).innerJoin(issueComments, and(
     eq(issueComments.companyId, issues.companyId), eq(issueComments.issueId, issues.id),
     eq(issueComments.id, issues.conversationBoundaryCommentId),

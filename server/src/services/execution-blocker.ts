@@ -285,9 +285,14 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
       sql`${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema' = ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}`,
     ),
   )).orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
+  // A context reset cannot establish that an orphaned provider turn stopped.
+  const [openCodeHold] = await db.select().from(issueRecoveryActions).where(and(
+    eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.sourceIssueId, issueId),
+    executionBlockerPredicate(), unverifiedOpenCodeRecoveryActionPredicate(),
+  )).orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id)).limit(1);
   // A persisted user /new is an ordered context command, not a retry of uncertain work.
   // The normal issue execution lock still serializes it behind any active turn.
-  if (!restoreHold && conversation?.agentId && options?.conversationResetCommentId) {
+  if (!restoreHold && !openCodeHold && conversation?.agentId && options?.conversationResetCommentId) {
     const [command] = await db.select().from(issueComments).where(and(
       eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
       eq(issueComments.id, options.conversationResetCommentId),
@@ -302,7 +307,7 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
 
   const ownership = await getConversationOwnershipBlocker(db, companyId, issueId);
   if (ownership) return { ...ownership, recoveryActionId: null };
-  const [action] = restoreHold ? [restoreHold] : await db.select().from(issueRecoveryActions).where(and(
+  const [action] = restoreHold ? [restoreHold] : openCodeHold ? [openCodeHold] : await db.select().from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, companyId),
     eq(issueRecoveryActions.sourceIssueId, issueId),
     executionBlockerPredicate(),

@@ -594,6 +594,62 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
     } finally { await settings.updateExperimental(previous); }
   });
 
+  it.each(["reset", "boundary", "message"])("retains an unverified OpenCode hold during %s", async scenario => {
+    const f = await seed();
+    await db.update(agents).set({ adapterType: "opencode_local" }).where(eq(agents.id, f.agentId));
+    await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.sourceRunId));
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy", nativeIssueId: null, issueId: f.issueId,
+      errorCode: "process_lost", runnerProfileJson: { adapterDispatch: { adapterType: "opencode_local" } },
+      resultJson: { conversationContinuation: "continue_conversation_v1" },
+    }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    await db.update(issueRecoveryActions).set({ cause: "legacy_execution_requires_reconciliation",
+      createdAt: new Date("2026-09-11T09:00:00Z") }).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "board", conversationState: "active",
+      conversationBoundaryCommentId: scenario === "boundary" ? f.commentId : null }).where(eq(issues.id, f.issueId));
+    if (scenario === "reset") await db.update(issueComments).set({ body: "/new" }).where(eq(issueComments.id, f.commentId));
+    const blocker = await getExecutionBlocker(db, f.companyId, f.issueId,
+      scenario === "reset" ? { conversationResetCommentId: f.commentId } : undefined);
+    expect(blocker).toMatchObject({ runId: f.sourceRunId });
+    const result = await db.transaction(tx => admitExplicitNativeContinuation({ ...f, db: tx as unknown as typeof db }));
+    expect(result).toBeNull();
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    expect(action.evidence).not.toHaveProperty("explicitUserContinuation");
+    expect(action.evidence.automaticRecovery).toMatchObject({ replay: "blocked" });
+    if (scenario !== "boundary") {
+      const settings = instanceSettingsService(db), previous = await settings.getExperimental();
+      await settings.updateExperimental({ enableAgentChat: true });
+      try {
+        // Keep any erroneously admitted turn queued instead of starting a provider.
+        await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+        const wake = await heartbeatService(db).wakeup(f.agentId, { source: "on_demand", triggerDetail: "manual",
+          reason: "issue_commented", requestedByActorType: "user", requestedByActorId: "board",
+          payload: { issueId: f.issueId, commentId: f.commentId },
+          contextSnapshot: { source: "issue.comment", issueId: f.issueId, wakeCommentId: f.commentId },
+        });
+        expect(wake).toBeNull();
+        expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+          eq(heartbeatRuns.status, "queued")))).toEqual([]);
+        const [held] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+        expect(held.evidence.automaticRecovery).toMatchObject({ replay: "blocked" });
+        expect(held.evidence).not.toHaveProperty("explicitUserContinuation");
+      } finally { await settings.updateExperimental(previous); }
+    }
+  });
+
+  it("does not retain the OpenCode hold when no provider submission was recorded", async () => {
+    const f = await seed();
+    await db.update(agents).set({ adapterType: "opencode_local" }).where(eq(agents.id, f.agentId));
+    await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.sourceRunId));
+    await db.update(heartbeatRuns).set({ runtimeMode: "legacy", nativeIssueId: null, issueId: f.issueId,
+      errorCode: "process_lost", runnerProfileJson: { adapterDispatch: { adapterType: "opencode_local" } },
+      resultJson: { conversationContinuation: "continue_conversation_v1",
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+    }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    await db.update(issueRecoveryActions).set({ cause: "legacy_execution_requires_reconciliation" })
+      .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+  });
+
   it("a durable queue interrupt authorizes older legacy messages but still requires the provider to stop", async () => {
     const f = await seed();
     await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, f.agentId));
