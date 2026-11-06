@@ -9,7 +9,7 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { agents, budgetPolicies, companies, completionContracts, nativeRunResults, costEvents, agentWakeupRequests, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issues, executionWorkspaces, nativeRunFinalizations, runUsageReceipts, workspaceOperations, toolProfiles, toolMcpGateways, toolMcpGatewayTokens, type Db } from "@paperclipai/db";
+import { agents, budgetPolicies, companies, completionContracts, nativeRunResults, costEvents, agentWakeupRequests, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issueRecoveryActions, issues, executionWorkspaces, nativeRunFinalizations, runUsageReceipts, workspaceOperations, toolProfiles, toolMcpGateways, toolMcpGatewayTokens, type Db } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { trace } from "@opentelemetry/api";
@@ -438,6 +438,77 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
       // Verify that the seeded record is actually subject to the real revoker.
       await actualPreparation.revokeHeartbeatRunGatewayTokens({ db, companyId: run.companyId, runId: run.id });
       expect((await db.select().from(toolMcpGatewayTokens).where(eq(toolMcpGatewayTokens.id, token!.id)))[0]?.revokedAt).toBeInstanceOf(Date);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    }
+  });
+
+  it("holds a first-start OpenCode run after losing ownership before its binding checkpoint", async () => {
+    const { input, adapter, run } = await fixture();
+    const boot = randomUUID();
+    const successorBoot = randomUUID();
+    const sid = sessionIdFor({ agentId: input.agent.id, issueId: input.task.issueId! });
+    let created = false;
+    let promptPosts = 0;
+    let otherWrites = 0;
+    let tookOver = false;
+    let url = "";
+    const server = createServer((req, res) => {
+      const p = new URL(req.url ?? "/", url).pathname;
+      const reply = (status: number, body: unknown) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(body)); };
+      if (req.method === "POST" && p === "/api/session") { created = true; return reply(200, { data: { id: sid } }); }
+      if (req.method !== "GET") { if (p.endsWith("/prompt")) promptPosts++; else otherWrites++; return reply(500, {}); }
+      if (p === "/api/info") return reply(200, { version: "2.2.5", pid: 4242, urls: [url] });
+      if (p === "/api/session/active") return reply(200, { data: {} });
+      if (p === `/api/session/${sid}`) return created ? reply(200, { data: { id: sid, location: { directory: home } } }) : reply(404, {});
+      if (p === `/api/session/${sid}/inbox` || p === `/api/session/${sid}/message`) return reply(200, { data: [] });
+      return reply(404, {});
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    try {
+      url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      const passwordFile = join(home, "first-start-fixture-password");
+      const configPath = join(home, "first-start-fixture-server.json");
+      const command = join(home, "first-start-fixture-cli");
+      await writeFile(passwordFile, "fixture-secret");
+      await writeFile(configPath, JSON.stringify({ url, passwordFile }));
+      await writeFile(command, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      await db.update(agents).set({ adapterType: "opencode_local", status: "paused" }).where(eq(agents.id, input.agent.id));
+      await db.update(heartbeatRuns).set({ controllerBootId: boot, controllerLeaseExpiresAt: new Date(Date.now() + 60_000), executionStage: "dispatching", resultJson: {} }).where(eq(heartbeatRuns.id, run.id));
+      input.run.controllerBootId = boot;
+      input.run.resultJson = {};
+      input.agent.adapterType = adapter.type = "opencode_local";
+      adapter.execute.mockImplementation(executeOpenCode);
+      input.config.runtimeConfig = { command, cwd: home, model: "openai/fixture", nativeRuntime: "nar", sharedServerRecoveryConfigPath: configPath };
+      input.output.onLog = async (_stream, chunk) => {
+        if (!tookOver && chunk.includes("NAR OpenCode session")) {
+          tookOver = true;
+          await db.update(heartbeatRuns).set({ controllerBootId: successorBoot, controllerLeaseExpiresAt: new Date(Date.now() + 60_000) }).where(eq(heartbeatRuns.id, run.id));
+        }
+      };
+      const result = await executeHeartbeatRuntime(db, input);
+      expect(created).toBe(true);
+      expect(tookOver).toBe(true);
+      expect(result).toMatchObject({ dispatched: true, adapterResult: { resultJson: { executionRecovery: {
+        reason: "pre_submit", providerWorkStarted: false, providerWorkEvidence: "unverified",
+      } } } });
+      if (!result.dispatched) throw new Error("expected unverified hold");
+      const { persistUnverifiedSharedOpenCode } = await import("./opencode-unverified-hold.js");
+      expect(await persistUnverifiedSharedOpenCode(db, { run: input.run, resultJson: result.adapterResult.resultJson })).toBe(false);
+      expect(await read(run.id)).toMatchObject({ status: "running", controllerBootId: successorBoot, resultJson: {} });
+      expect(promptPosts).toBe(0);
+      expect(otherWrites).toBe(0);
+      expect(revokeHeartbeatRunGatewayTokens).not.toHaveBeenCalled();
+      expect(input.instructions.releaseInstructionCopy).not.toHaveBeenCalled();
+      await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: sql`clock_timestamp() - interval '1 second'` }).where(eq(heartbeatRuns.id, run.id));
+      const { heartbeatService } = await import("../heartbeat.js");
+      expect((await heartbeatService(db).reapOrphanedRuns()).runIds).not.toContain(run.id);
+      expect(await read(run.id)).toMatchObject({ status: "running", resultJson: {} });
+      expect((await read(run.id)).controllerBootId).not.toBe(successorBoot);
+      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, input.task.issueId!))).toEqual(
+        expect.arrayContaining([expect.objectContaining({ cause: "opencode_controller_lost_provider_unverified", evidence: expect.objectContaining({ runId: run.id }) })]),
+      );
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run.id))).toHaveLength(0);
     } finally {
       await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     }
