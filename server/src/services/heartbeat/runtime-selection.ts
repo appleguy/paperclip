@@ -900,6 +900,10 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
           agentId: agent.id,
           issueId: issueRef.id,
           projectId: currentProjectId,
+          provider: nativeExecution.provider.kind,
+          candidateRunId: candidateNativeRun?.id ?? null,
+          selectedSourceRunId: nativeResumeCheckpoint ? previousNativeRun?.id ?? null : null,
+          normalizedSessionId: nativeExecutionWithCheckpoint.normalizedSessionId,
           selection: nativeResumeCheckpoint ? "resume_checkpoint" : "fresh",
           reason: nativeResumeCheckpoint ? "checkpoint_validated"
             : !candidateNativeRun ? "no_candidate"

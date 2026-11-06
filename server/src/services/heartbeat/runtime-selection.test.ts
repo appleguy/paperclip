@@ -226,11 +226,18 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     if (sameProject) {
       expect(selected.nativeExecution.session.normalizedSessionId).toBe(sessionId);
       expect(selected.nativeExecution.workspace.cwd).toBe(sameSession ? logicalCwd : workspace!.cwd);
+      expect(input.onAdapterEvent).toHaveBeenCalledWith(expect.objectContaining({
+        eventType: "session.mapping.selected",
+        payload: expect.objectContaining({ selection: "resume_checkpoint", candidateRunId: run.id,
+          selectedSourceRunId: run.id, normalizedSessionId: sessionId, provider: selected.nativeExecution.provider.kind }),
+      }));
     } else {
       expect(selected.nativeExecution.session.normalizedSessionId).not.toBe(sessionId);
       expect(input.onAdapterEvent).toHaveBeenCalledWith(expect.objectContaining({
         eventType: "session.mapping.selected",
-        payload: expect.objectContaining({ selection: "fresh", reason: "project_unverified_or_changed", issueId: issue.id, projectId: project!.id }),
+        payload: expect.objectContaining({ selection: "fresh", reason: "project_unverified_or_changed", issueId: issue.id, projectId: project!.id,
+          candidateRunId: run.id, selectedSourceRunId: null, normalizedSessionId: selected.nativeExecution.session.normalizedSessionId,
+          provider: selected.nativeExecution.provider.kind }),
       }));
     }
     expect((await read(nextRun!.id)).runnerProfileJson?.nativeExecutionInput).toEqual(selected.nativeExecution);
