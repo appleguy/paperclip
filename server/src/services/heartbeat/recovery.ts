@@ -2416,13 +2416,12 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
 
   async function surfaceHeldOpenCodeRun(run: HeartbeatRun, requireExpiredController = false, pendingStop = true) {
     const issueId = run.issueId ?? readNonEmptyString(parseObject(run.contextSnapshot).issueId);
-    if (!issueId) return;
     await db.transaction(async tx => {
-      const [task] = await tx.select().from(issues).where(and(
+      const [task] = issueId ? await tx.select().from(issues).where(and(
         eq(issues.id, issueId), eq(issues.companyId, run.companyId),
-      )).for("update");
-      if (!task) return;
-      const [held] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+      )).for("update") : [];
+      const [held] = await tx.select({ id: heartbeatRuns.id, resultJson: heartbeatRuns.resultJson,
+        issueId: heartbeatRuns.issueId, contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
         eq(heartbeatRuns.status, "running"), eq(heartbeatRuns.runtimeMode, "legacy"),
         ...(pendingStop ? [sql`${heartbeatRuns.resultJson}->'executionCancellation'->>'state' = 'requested'`] : []),
@@ -2432,6 +2431,24 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         ] : []),
       )).for("update");
       if (!held) return;
+      // The issue may have changed since the recovery scan; leave that case
+      // to the next sweep rather than assigning its hold to a stale source.
+      const heldIssueId = held.issueId ?? readNonEmptyString(parseObject(held.contextSnapshot).issueId);
+      if (heldIssueId !== issueId) return;
+      if (!task || !issueId) {
+        const result = parseObject(held.resultJson);
+        const previous = parseObject(result.openCodeOrphanRecovery);
+        const cause = pendingStop ? "opencode_stop_provider_unverified" : "opencode_controller_lost_provider_unverified";
+        if (previous.schema === "paperclip.opencode-orphan-recovery.v1" && previous.cause === cause) return;
+        // Issue recovery actions require a source issue. Keep a durable,
+        // run-scoped Board marker for the census when no source exists.
+        await tx.update(heartbeatRuns).set({ resultJson: { ...result, openCodeOrphanRecovery: {
+          schema: "paperclip.opencode-orphan-recovery.v1", ownerType: "board", cause,
+          providerTermination: "unverified", firstDetectedAt: previous.firstDetectedAt ?? new Date().toISOString(),
+          nextAction: "Inspect the original OpenCode provider turn; preserve the run and resources until termination and ownership are verified.",
+        } } }).where(eq(heartbeatRuns.id, held.id));
+        return;
+      }
       await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
         companyId: run.companyId, sourceIssueId: issueId,
         kind: "active_run_watchdog", ownerType: "board",

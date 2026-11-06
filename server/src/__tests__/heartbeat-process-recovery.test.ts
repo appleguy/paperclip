@@ -3422,6 +3422,37 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(mockTerminateLocalService).not.toHaveBeenCalled();
   });
 
+  it.each([false, true])("marks an issue-less OpenCode hold for Board (pending Stop: %s)", async pendingStop => {
+    const { runId, agentId } = await seedRunFixture({ adapterType: "opencode_local", runtimeMode: "legacy",
+      agentStatus: "paused", includeIssue: false, ...(pendingStop ? { processPid: process.pid } : {}) });
+    await db.update(heartbeatRuns).set({ controllerBootId: randomUUID(),
+      controllerLeaseExpiresAt: new Date(Date.now() - 60_000), executionStage: "dispatching",
+      resultJson: { preserved: "value", ...(pendingStop ? { executionCancellation: { state: "requested" } } : {}) } })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+    await heartbeat.reapOrphanedRuns();
+    const first = await heartbeat.getRun(runId);
+    expect(first).toMatchObject({ status: "running", resultJson: { preserved: "value", openCodeOrphanRecovery: {
+      schema: "paperclip.opencode-orphan-recovery.v1", ownerType: "board", providerTermination: "unverified",
+      cause: pendingStop ? "opencode_stop_provider_unverified" : "opencode_controller_lost_provider_unverified",
+      firstDetectedAt: expect.any(String),
+    } } });
+    await heartbeat.reapOrphanedRuns();
+    expect((await heartbeat.getRun(runId))?.resultJson).toEqual(first?.resultJson);
+    expect(await selectRecoveryRunsByAgent(agentId)).toHaveLength(1);
+    expect(mockTerminateLocalService).not.toHaveBeenCalled();
+  });
+
+  it("does not mark an issue-less OpenCode Stop while its controller lease is live", async () => {
+    const { runId } = await seedRunFixture({ adapterType: "opencode_local", runtimeMode: "legacy",
+      includeIssue: false, processPid: process.pid });
+    await db.update(heartbeatRuns).set({ controllerBootId: randomUUID(),
+      controllerLeaseExpiresAt: new Date(Date.now() + 60_000),
+      resultJson: { executionCancellation: { state: "requested" } } }).where(eq(heartbeatRuns.id, runId));
+    await heartbeatService(db).reapOrphanedRuns();
+    expect((await heartbeatService(db).getRun(runId))?.resultJson).toEqual({ executionCancellation: { state: "requested" } });
+  });
+
   it("does not surface an OpenCode Stop while its controller lease is live", async () => {
     const { runId, companyId, issueId } = await seedRunFixture({
       adapterType: "opencode_local", runtimeMode: "legacy", processPid: process.pid,
