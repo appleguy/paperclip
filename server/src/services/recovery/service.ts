@@ -1773,6 +1773,29 @@ export function recoveryService(
       .then((rows) => Boolean(rows[0]));
   }
 
+  // An operator already settled the escalation for this exact failed run and put the
+  // issue back in todo; that restore is a new decision, not another lost wake.
+  async function wasLatestRunFailureAlreadySettled(
+    issue: RecoveryIssue,
+    latestRun: LatestIssueRun,
+  ) {
+    if (issue.status !== "todo" || !latestRun) return false;
+    return db
+      .select({ id: issueRecoveryActions.id })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, issue.companyId),
+          eq(issueRecoveryActions.sourceIssueId, issue.id),
+          eq(issueRecoveryActions.kind, "stranded_assigned_issue"),
+          inArray(issueRecoveryActions.status, ["resolved", "cancelled"]),
+          sql`${issueRecoveryActions.evidence} ->> 'latestRunId' = ${latestRun.id}`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => Boolean(rows[0]));
+  }
+
   async function hasQueuedIssueWake(
     companyId: string,
     issueId: string,
@@ -5427,6 +5450,33 @@ export function recoveryService(
           !(await wasTodoHandedBackDuringOrAfterLatestRun(issue, latestRun))
         ) {
           recordSkip(issue, "todo_successful_run");
+          continue;
+        }
+
+        // Without this, every restore of an escalated issue was re-blocked for the same
+        // old failed run (SCO-377 was blocked four times for one timed-out run).
+        if (
+          didAutomaticRecoveryFail(latestRun, "assignment_recovery") &&
+          (await wasLatestRunFailureAlreadySettled(issue, latestRun))
+        ) {
+          if (
+            (await hasQueuedIssueWake(issue.companyId, issue.id)) ||
+            (await hasActiveExecutionPath(issue.companyId, issue.id, null))
+          ) {
+            recordSkip(issue, "todo_restored_after_escalation");
+            continue;
+          }
+          if (await isInvocationBudgetBlocked(issue, agentId)) {
+            recordSkip(issue, "todo_budget");
+            continue;
+          }
+          const queued = await enqueueInitialAssignedTodoDispatch(issue, agentId);
+          if (queued) {
+            result.assignmentDispatched += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            recordSkip(issue, "todo_initial_admission");
+          }
           continue;
         }
 

@@ -11944,6 +11944,33 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ).toBe(true);
   });
 
+  it("dispatches once instead of re-blocking when an operator restored the escalation for that run", async () => {
+    const { companyId, agentId, issueId, runId } =
+      await seedStrandedIssueFixture({
+        status: "todo",
+        runStatus: "timed_out",
+        retryReason: "assignment_recovery",
+      });
+    // SCO-377: the escalation for this run was settled and the issue put back in todo.
+    await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId,
+      kind: "stranded_assigned_issue", cause: "stranded_assigned_issue", fingerprint: `settled:${runId}`,
+      status: "resolved", outcome: "restored", resolvedAt: new Date(), nextAction: "Board restored.",
+      evidence: { latestRunId: runId } });
+    const heartbeat = heartbeatService(db);
+    const wakesBefore = (await selectRecoveryWakesByAgent(agentId)).length;
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(0);
+    expect(result.assignmentDispatched).toBe(1);
+    expect((await selectRecoveryIssueById(issueId))?.status).toBe("todo");
+    expect(await selectRecoveryWakesByAgent(agentId)).toHaveLength(wakesBefore + 1);
+
+    // The restore buys one dispatch, not a loop: a queued wake is a live path.
+    const again = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(again.assignmentDispatched).toBe(0);
+    expect(again.escalated).toBe(0);
+  });
+
   it("blocks an already stranded recovery issue without creating a recovery child", async () => {
     const { companyId, issueId } = await seedStrandedIssueFixture({
       status: "todo",
