@@ -341,6 +341,19 @@ describePostgres("heartbeat retry module database wiring", () => {
     return refused!;
   }
 
+  it("does not schedule a continuation for an unverified OpenCode reattach", async () => {
+    const f = await fixture();
+    const [source] = await db.update(heartbeatRuns).set({ errorCode: "adapter_failed",
+      runnerProfileJson: { adapterDispatch: { adapterType: "opencode_local" } },
+      resultJson: { conversationContinuation: "continue_conversation_v1",
+        executionRecovery: { kind: "bootstrap", reason: "reattach_message_unknown", providerWorkStarted: true } },
+    }).where(eq(heartbeatRuns.id, f.run.id)).returning();
+    const result = await boundRetries().retries.scheduleBoundedRetryForRun(source, f.agent, { now });
+    expect(result).toMatchObject({ outcome: "not_scheduled", errorCode: "legacy_execution_requires_reconciliation" });
+    const pending = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "scheduled_retry")));
+    expect(pending).toHaveLength(0);
+  });
+
   it.each(["process_lost", "server_shutdown_interrupted"])("resumes the recorded session after %s", async errorCode => {
     const f = await fixture();
     const [source] = await db.update(heartbeatRuns).set({ status: errorCode === "process_lost" ? "failed" : "interrupted", errorCode, sessionIdAfter: "thread-1", resultJson: {
