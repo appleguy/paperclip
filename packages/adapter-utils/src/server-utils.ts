@@ -3118,7 +3118,13 @@ function renderPaperclipWakePromptBody(
     lines.push("");
   }
 
-  if (normalized.continuationSummary) {
+  // The same saved summary can also arrive as completedWork in the fenced
+  // continuation evidence. Render exact duplicates once, retaining that trust
+  // boundary; distinct or truncated summaries remain visible.
+  const summaryAlreadyInEvidence = normalized.continuationSummary &&
+    !normalized.continuationSummary.bodyTruncated &&
+    normalized.executionContinuation?.completedWork === normalized.continuationSummary.body;
+  if (normalized.continuationSummary && !summaryAlreadyInEvidence) {
     lines.push(
       "",
       "Issue continuation summary:",

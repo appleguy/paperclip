@@ -3947,6 +3947,24 @@ describe("wake continuation comment ownership", () => {
     expect(prompt).not.toContain('"completedActions":[]');
   });
 
+  it("renders an identical continuation summary only once without dropping distinct or truncated summaries", () => {
+    const summary = { key: "summary", title: "Summary", body: "Unique saved summary", updatedAt: "2026-09-21T00:00:00.000Z", bodyTruncated: false };
+    const wake = {
+      reason: "issue_commented",
+      issue: { id: "issue-1", identifier: "PAP-1", title: "Task" },
+      continuationSummary: summary,
+      executionContinuation: { ...continuation([]), completedWork: summary.body },
+    };
+    const exact = renderPaperclipWakePrompt(wake, { resumedSession: true });
+    expect(exact.match(/Unique saved summary/g)).toHaveLength(1);
+    expect(exact).toContain("### Untrusted continuation evidence");
+    const distinct = renderPaperclipWakePrompt({ ...wake, continuationSummary: { ...summary, body: "Different summary" } }, { resumedSession: true });
+    expect(distinct).toContain("Different summary");
+    expect(distinct).toContain("Unique saved summary");
+    const truncated = renderPaperclipWakePrompt({ ...wake, continuationSummary: { ...summary, bodyTruncated: true } }, { resumedSession: true });
+    expect(truncated.match(/Unique saved summary/g)).toHaveLength(2);
+  });
+
   it.each([
     { interactionOutcomes: [{ interactionId: "answer-1", outcome: "accepted" }] },
     { completedActions: [{ receiptId: "receipt-1", result: "done" }] },
