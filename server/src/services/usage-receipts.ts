@@ -630,6 +630,8 @@ export async function createRunUsageRecorder(db: Db, input: { companyId: string;
     const previous = attempts.get(attempt);
     const priced = priceAnthropicReceipt(priceCodexReceipt({ ...parsed, usage: parsed.usage ?? previous?.usage,
       complete: parsed.complete && !(previous?.usage && !parsed.usage) }));
+    const peak = Math.max(parsed.usage?.peakContextTokens ?? 0, previous?.usage?.peakContextTokens ?? 0);
+    if (peak > 0 && priced.usage) priced.usage = { ...priced.usage, peakContextTokens: peak };
     priced.pricingProvenance ??= {
       source: priced.costUsd != null || priced.costUsdExact != null || priced.cacheAdjustedCostUsd != null ? "provider_reported" : "unknown",
       version: "accounting-receipt/v1",
@@ -702,7 +704,9 @@ export async function createRunUsageRecorder(db: Db, input: { companyId: string;
         const finalPrice = final.cacheAdjustedCostUsd ?? final.costUsdExact ?? final.costUsd;
         const previousPrice = previous.cacheAdjustedCostUsd ?? previous.costUsdExact ?? previous.costUsd;
         const moreCost = finalPrice != null && (previousPrice == null || usdToUnits(finalPrice) > usdToUnits(previousPrice));
-        if (!moreTokens && !moreCost) return capture({ ...previous, ...runUsageMetadataSchema.parse(final) });
+        if (!moreTokens && !moreCost && (previous.usage || !final.usage?.peakContextTokens)) return capture({ ...previous, ...runUsageMetadataSchema.parse(final),
+          usage: previous.usage && { ...previous.usage, ...((final.usage?.peakContextTokens ?? 0) > (previous.usage.peakContextTokens ?? 0)
+            ? { peakContextTokens: final.usage!.peakContextTokens } : {}) } });
       }
       return capture(final);
     }),

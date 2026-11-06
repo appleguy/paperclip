@@ -1,14 +1,22 @@
 /** Qualified agy headless NDJSON boundary; this is not interactive RC.
  * https://antigravity.google/docs/cli/headless/
  */
+export type NativeStepUsage = { inputTokens: number; outputTokens: number; cacheReadTokens: number };
 export type NativeEvent =
   | { kind: "init"; conversationId: string; cwd: string; permissionMode: string }
-  | { kind: "step"; conversationId: string; index: number; state: string; stepType: string; toolName?: string; textDelta?: string }
+  | { kind: "step"; conversationId: string; index: number; state: string; stepType: string; toolName?: string; textDelta?: string; usage?: NativeStepUsage }
   | { kind: "result"; conversationId: string; status: string; response?: string; numTurns?: number };
 
 const object = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 const nonempty = (value: unknown): value is string => typeof value === "string" && value.length > 0;
+const stepUsage = (value: unknown): NativeStepUsage | undefined => {
+  if (!object(value)) return undefined;
+  const { input_tokens, output_tokens, cache_read_tokens } = value;
+  if (![input_tokens, output_tokens, cache_read_tokens].every(v => Number.isSafeInteger(v) && (v as number) >= 0)
+    || !Number.isSafeInteger((input_tokens as number) + (cache_read_tokens as number))) return undefined;
+  return { inputTokens: input_tokens as number, outputTokens: output_tokens as number, cacheReadTokens: cache_read_tokens as number };
+};
 
 /** One instance per actual stdout stream. Caller owns process and generation verification. */
 export class AntigravityHeadlessStream {
@@ -59,7 +67,8 @@ export class AntigravityHeadlessStream {
     if (!object(payload) || payload.conversation_id !== this.conversationId) throw new Error("Conversation mismatch");
     if (value.event === "step_update") {
       if (!Number.isSafeInteger(payload.step_index) || (payload.step_index as number) < 0 || !nonempty(payload.state) || !nonempty(payload.step_type)) throw new Error("Invalid step");
-      return { kind: "step", conversationId: this.conversationId, index: payload.step_index as number, state: payload.state, stepType: payload.step_type, ...(typeof payload.tool_name === "string" ? { toolName: payload.tool_name } : {}), ...(typeof payload.text_delta === "string" ? { textDelta: payload.text_delta } : {}) };
+      const usage = stepUsage(payload.usage);
+      return { kind: "step", conversationId: this.conversationId, index: payload.step_index as number, state: payload.state, stepType: payload.step_type, ...(typeof payload.tool_name === "string" ? { toolName: payload.tool_name } : {}), ...(typeof payload.text_delta === "string" ? { textDelta: payload.text_delta } : {}), ...(usage ? { usage } : {}) };
     }
     if (!nonempty(payload.status)) throw new Error("Invalid result");
     return { kind: "result", conversationId: this.conversationId, status: payload.status, ...(typeof payload.response === "string" ? { response: payload.response } : {}), ...(Number.isSafeInteger(payload.num_turns) && (payload.num_turns as number) >= 0 ? { numTurns: payload.num_turns as number } : {}) };

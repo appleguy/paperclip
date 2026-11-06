@@ -35,6 +35,20 @@ describe("agy documented headless stream", () => {
     other.push(line(init));
     expect(() => other.push(line({ event: "control_request" }))).toThrow();
   });
+  it("reads complete per-step usage without treating cumulative result usage as a step", () => {
+    const parser = new AntigravityHeadlessStream("1.5.1");
+    parser.push(line(init));
+    const events = parser.push(Buffer.concat([
+      line({ ...step, step_update: { ...step.step_update, usage: { input_tokens: 278, output_tokens: 4, cache_read_tokens: 30214 } } }),
+      line({ ...step, step_update: { ...step.step_update, usage: { input_tokens: 100 } } }),
+      line({ ...result, result: { ...result.result, usage: { input_tokens: 100 } } }),
+    ]));
+    expect(events).toEqual([
+      { kind: "step", conversationId: "conversation-1", index: 1, state: "DONE", stepType: "tool", toolName: "run_command", usage: { inputTokens: 278, outputTokens: 4, cacheReadTokens: 30214 } },
+      { kind: "step", conversationId: "conversation-1", index: 1, state: "DONE", stepType: "tool", toolName: "run_command" },
+      { kind: "result", conversationId: "conversation-1", status: "SUCCESS", response: "ok", numTurns: 1 },
+    ]);
+  });
   it("encodes only documented user input and rejects slash commands", () => {
     expect(JSON.parse(encodeAntigravityUserMessage("hello"))).toEqual({ event: "user", message: { content: "hello" } });
     expect(() => encodeAntigravityUserMessage("/model")).toThrow();

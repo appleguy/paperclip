@@ -75,4 +75,30 @@ describe.skipIf(!support.supported)("Codex quota receipt and cost projection", (
     expect(rows.some(row => row.runId === foreign.runId)).toBe(false);
     expect(await listRunUsage(db, owner.companyId, { from: new Date("2000-01-01"), to: new Date("2000-01-02") })).toEqual([]);
   });
+
+  it("persists the highest observed context across checkpoints, attempts, and a native recorder rejoin", async () => {
+    const owner = await seed();
+    await db.update(heartbeatRuns).set({ runtimeMode: "native" }).where(eq(heartbeatRuns.id, owner.runId));
+    const input = { ...owner, adapterType: "paperclip_runner" };
+    let recorder = await createRunUsageRecorder(db, input, directory);
+    const usage = { inputTokens: 100, outputTokens: 10 };
+    await recorder.capture({ complete: false, usage });
+    let [stored] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, owner.runId));
+    expect(stored.usageJson?.peakContextTokens ?? null).toBeNull();
+    await recorder.capture({ complete: true, usage: { ...usage, peakContextTokens: 80 } });
+    await recorder.capture({ complete: true, usage: { ...usage, peakContextTokens: 30 } });
+    [stored] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, owner.runId));
+    expect(stored.usageJson?.peakContextTokens).toBe(80);
+    recorder = await createRunUsageRecorder(db, input, directory);
+    await recorder.capture({ complete: true, usage });
+    [stored] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, owner.runId));
+    expect(stored.usageJson?.peakContextTokens).toBe(80);
+    await recorder.capture({ attemptId: randomUUID(), complete: true, usage: { ...usage, peakContextTokens: 90 } });
+    await recorder.complete({ exitCode: 0, signal: null, timedOut: false, usageComplete: false,
+      usage: { ...usage, peakContextTokens: 110 } });
+    [stored] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, owner.runId));
+    expect(stored.usageJson?.peakContextTokens).toBe(110);
+    const [receipt] = await db.select().from(runUsageReceipts).where(eq(runUsageReceipts.id, stored.usageJson!.accountingReceiptId as string));
+    expect(receipt.receiptJson).toMatchObject({ receipt: { usage: { peakContextTokens: 110 } } });
+  });
 });
