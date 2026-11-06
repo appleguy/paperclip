@@ -65,6 +65,12 @@ export function legacyExecutionNeedsReconciliation(
   if (run.status === "cancelled" && isSuppressedLegacyDispositionRepair(run)) return false;
   // A fresh model turn cannot repair or verify unrestored files.
   if (run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive" || hasRequiredWorkspaceRecovery(run.resultJson)) return true;
+  // A shared OpenCode turn may survive its lost controller. A generic
+  // conversation-continuation marker does not prove that turn stopped.
+  const lossRecovery = run.resultJson?.executionRecovery as Record<string, unknown> | undefined;
+  if (run.status === "failed" && run.errorCode === "process_lost" &&
+      claimedAdapterType({ runnerProfileJson: run.runnerProfileJson ?? null }) === "opencode_local" &&
+      !(lossRecovery?.kind === "bootstrap" && lossRecovery.providerWorkStarted === false)) return true;
   // A fresh conversation turn lets the agent decide what remains. The retry
   // scheduler, not an action-outcome hold, owns the automatic attempt limit.
   if (hasConversationContinuationPolicy(run.resultJson)) return false;

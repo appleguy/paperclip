@@ -79,6 +79,16 @@ it("retains the hold until the provider actually acknowledges cancellation", () 
   }
 });
 
+it("holds a lost OpenCode controller despite generic conversation continuation", () => {
+  const run = { runtimeMode: "legacy", status: "failed", errorCode: "process_lost",
+    runnerProfileJson: { adapterDispatch: { adapterType: "opencode_local" } },
+    resultJson: { conversationContinuation: "continue_conversation_v1" } };
+  expect(legacyExecutionNeedsReconciliation(run)).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...run, resultJson: { ...run.resultJson,
+    executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } })).toBe(false);
+  expect(legacyExecutionNeedsReconciliation({ ...run, runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } } })).toBe(false);
+});
+
 it("retries a busy AI subscription only when no provider work started", () => {
    const waiting = { runtimeMode: "legacy", status: "cancelled", errorCode: "ai_connection_busy", scheduledRetryAttempt: 10,
      resultJson: { executionRecovery: { kind: "ai_connection_wait", providerWorkStarted: false } } };
