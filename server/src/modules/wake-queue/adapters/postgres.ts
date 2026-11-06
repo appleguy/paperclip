@@ -53,7 +53,7 @@ import {
   queuedCommentIdsFromRunContext,
   withQueuedCommentIdsInWakePayload,
 } from "../../../services/issue-queued-comment-queue.js";
-import { CHAT_CONVERSATION_ID_KEY, extractWakeCommentIds } from "../../run-dispatch/index.js";
+import { CHAT_CONVERSATION_ID_KEY, extractWakeCommentIds, isVerifiedPendingCardWake } from "../../run-dispatch/index.js";
 import { hasInteractionContinuationWakeContext } from "../domain/context.js";
 import { decidePreDrain, type PreDrainFacts } from "../domain/policy.js";
 import {
@@ -531,7 +531,10 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       // transfers. The lock-clearing step earlier in this transaction
       // already set `executionRunId` to null for this issue, so the `is
       // null` guard only protects against taking the lock twice.
-      await tx
+      if (!await isVerifiedPendingCardWake(tx, {
+        companyId: input.companyId, issueId: input.issue.id, agentId: input.deferredAgent.id,
+        runId: newRun.id, wakeupRequestId: input.wakeId, contextSnapshot: input.contextSnapshot,
+      })) await tx
         .update(issues)
         .set({
           executionRunId: newRun.id,

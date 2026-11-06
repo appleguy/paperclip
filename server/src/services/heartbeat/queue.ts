@@ -163,7 +163,7 @@ import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
 } from "../execution-workspace-policy.js";
 import { readContinuationAttempt } from "../recovery/index.js";
-import { allowsIssueInteractionWake, wakeChatConversationsConflict } from "../../modules/run-dispatch/index.js";
+import { allowsIssueInteractionWake, isVerifiedPendingCardWake, wakeChatConversationsConflict } from "../../modules/run-dispatch/index.js";
 import { withAgentStartLock } from "../agent-start-lock.js";
 import { agentCapacityPool, resolvePoolLimit } from "./capacity-pools.js";
 import {
@@ -935,6 +935,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     }
 
     const issueId = readNonEmptyString(context.issueId);
+    const verifiedPendingCardWake = issueId ? await isVerifiedPendingCardWake(db, {
+      companyId: run.companyId, issueId, agentId: run.agentId, runId: run.id,
+      wakeupRequestId: run.wakeupRequestId, contextSnapshot: context,
+    }) : false;
+    if (context.wakeReason === "interaction_pending" && !verifiedPendingCardWake) {
+      await cancelRunInternal(run.id, "Cancelled because the pending card wake is no longer valid");
+      return null;
+    }
     if (issueId && activeRunExecutions.size > 0) {
       // Native finalization publishes success before workspace synchronization,
       // provider suspension, and lease release finish. A queued comment must
@@ -1005,6 +1013,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const unresolvedBlockerCount = readiness?.unresolvedBlockerCount ?? 0;
       if (
         unresolvedBlockerCount > 0 &&
+        !verifiedPendingCardWake &&
         !allowsIssueInteractionWake(
           context,
           ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
@@ -1068,7 +1077,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       }).from(issues).where(and(
         eq(issues.id, issueId), eq(issues.companyId, run.companyId),
       )).for("update") : [];
-      const ownsIssue = owner?.assigneeAgentId === run.agentId &&
+      const ownsIssue = !verifiedPendingCardWake && owner?.assigneeAgentId === run.agentId &&
         context.wakeReason !== "source_scoped_recovery_action";
       const [handoff] = issueId ? await tx.select().from(caseHandoffs).where(and(eq(caseHandoffs.companyId, run.companyId), eq(caseHandoffs.issueId, issueId),
         inArray(caseHandoffs.state, ["awaiting_release", "pending_dispatch"]))).limit(1) : [];
@@ -1556,7 +1565,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     const claimedIssueId = readNonEmptyString(claimedContext.issueId);
     const claimedWakeReason = readNonEmptyString(claimedContext.wakeReason);
     if (
-      !nativeReviewContext && claimedIssueId &&
+      !nativeReviewContext && !verifiedPendingCardWake && claimedIssueId &&
       claimedWakeReason !== "source_scoped_recovery_action"
     ) {
       const claimedAgent = await getAgent(claimed.agentId);
@@ -2273,6 +2282,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       triggerDetail,
       payload,
     });
+    if (reason === "interaction_pending" && source === "automation" && opts.requestedByActorType === "system" &&
+        enrichedContextSnapshot.source === "task_watchdogs.pending_interaction" &&
+        typeof payload?.interactionId === "string" &&
+        opts.idempotencyKey === `interaction-pending:${payload.interactionId}:board-fallback`) {
+      enrichedContextSnapshot.interactionId = payload.interactionId;
+      if (typeof payload.interactionKind === "string") enrichedContextSnapshot.interactionKind = payload.interactionKind;
+    }
     const hasIndependentConversationWakeCause = () => Boolean(
       wakeCommentId || opts.taskRetryRequestId ||
       hasInteractionContinuationWakeContext(enrichedContextSnapshot) ||
@@ -3246,6 +3262,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             });
             return { kind: "skipped" as const };
           }
+          const pendingCardWake = await isVerifiedPendingCardWake(tx as unknown as Db, {
+            companyId: agent.companyId, issueId: issue.id, agentId, contextSnapshot: enrichedContextSnapshot,
+            admission: { source, actorType: opts.requestedByActorType ?? null, idempotencyKey: opts.idempotencyKey ?? null },
+          });
 
           // Completion can settle the conversation while admission is outside
           // the issue lock. Recheck the current state before persisting a wake.
@@ -3688,6 +3708,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
           if (
             activeExecutionRun &&
+            !pendingCardWake &&
             !manualExecutionHold &&
             !EXECUTION_PATH_HEARTBEAT_RUN_STATUSES.includes(
               activeExecutionRun.status as (typeof EXECUTION_PATH_HEARTBEAT_RUN_STATUSES)[number],
@@ -3698,6 +3719,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
           if (
             activeExecutionRun &&
+            !pendingCardWake &&
             (await cancelStaleScheduledRetry(activeExecutionRun))
           ) {
             activeExecutionRun = null;
@@ -3720,6 +3742,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // normally against the now-running holder.
           if (
             activeExecutionRun &&
+            !pendingCardWake &&
             !manualExecutionHold &&
             activeExecutionRun.status !== "running" &&
             issue.assigneeAgentId &&
@@ -3770,7 +3793,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             }
           }
 
-          if (!activeExecutionRun && issue.executionRunId) {
+          if (!pendingCardWake && !activeExecutionRun && issue.executionRunId) {
             await notifyNativeStatusReassessment(tx, { companyId: issue.companyId, issueId: issue.id });
             await notifyUnsafeWorkspaceExportRecovery(tx, { companyId: issue.companyId, issueId: issue.id });
             await tx
@@ -3805,27 +3828,29 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               .then((rows) => rows[0] ?? null);
 
             if (legacyRun) {
-              if (await cancelStaleScheduledRetry(legacyRun)) {
+              if (!pendingCardWake && await cancelStaleScheduledRetry(legacyRun)) {
                 activeExecutionRun = null;
               } else {
                 activeExecutionRun = legacyRun;
-                const legacyAgent = await tx
-                  .select({ name: agents.name })
-                  .from(agents)
-                  .where(eq(agents.id, legacyRun.agentId))
-                  .then((rows) => rows[0] ?? null);
-                await notifyStatusCardIssueChange(tx, issue.companyId);
-                await tx
-                  .update(issues)
-                  .set({
-                    executionRunId: legacyRun.id,
-                    executionAgentNameKey: normalizeAgentNameKey(
-                      legacyAgent?.name,
-                    ),
-                    executionLockedAt: new Date(),
-                    updatedAt: new Date(),
-                  })
-                  .where(eq(issues.id, issue.id));
+                if (!pendingCardWake) {
+                  const legacyAgent = await tx
+                    .select({ name: agents.name })
+                    .from(agents)
+                    .where(eq(agents.id, legacyRun.agentId))
+                    .then((rows) => rows[0] ?? null);
+                  await notifyStatusCardIssueChange(tx, issue.companyId);
+                  await tx
+                    .update(issues)
+                    .set({
+                      executionRunId: legacyRun.id,
+                      executionAgentNameKey: normalizeAgentNameKey(
+                        legacyAgent?.name,
+                      ),
+                      executionLockedAt: new Date(),
+                      updatedAt: new Date(),
+                    })
+                    .where(eq(issues.id, issue.id));
+                }
               }
             }
           }
@@ -3840,10 +3865,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           const blockedInteractionWake =
             dependencyReadiness &&
             !dependencyReadiness.isDependencyReady &&
-            allowsIssueInteractionWake(
+            (allowsIssueInteractionWake(
               enrichedContextSnapshot,
               ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
-            );
+            ) || pendingCardWake);
 
           if (blockedInteractionWake) {
             enrichedContextSnapshot.dependencyBlockedInteraction = true;

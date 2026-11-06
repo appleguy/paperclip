@@ -92,6 +92,7 @@ import type {
 } from "../application/types.js";
 import { RunDispatchApplicationError } from "../application/types.js";
 import { parkWorkspaceBusyRetryInTx } from "./workspace-busy-wait.js";
+import { isVerifiedPendingCardWake } from "./pending-card.js";
 
 type HeartbeatRun = typeof heartbeatRuns.$inferSelect;
 type LoadGateFactsInput = {
@@ -112,6 +113,7 @@ type LoadStalenessFactsInput = {
   responsibleUserId: string | null;
   conversationContinuation: boolean;
   runId: string;
+  wakeupRequestId: string | null;
   companyId: string;
   agentId: string;
   issueId: string;
@@ -590,6 +592,7 @@ export function createPostgresRunDispatchAdapter(
       context,
       ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
     );
+    const isPendingCardWake = await isVerifiedPendingCardWake(dbOrTx, { ...input, contextSnapshot: context });
     const resumeIntent = context.resumeIntent === true || context.followUpRequested === true;
     const wakeReason = readNonEmptyString(context.wakeReason);
     const retryReason =
@@ -666,6 +669,7 @@ export function createPostgresRunDispatchAdapter(
       isConnectionContinuation: (isResolvedInteractionContinuation && context.interactionKind === "connection_intent")
         || context.source === "connection_tools.refreshed",
       isInteractionWake,
+      isPendingCardWake,
       isAuthorizedSourceScopedRecovery,
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
       resumeIntent,
@@ -1227,6 +1231,7 @@ export function createPostgresRunDispatchAdapter(
     const facts = await loadStalenessFacts(
       {
         runId: run.id,
+        wakeupRequestId: run.wakeupRequestId,
         companyId: run.companyId,
         agentId: run.agentId,
         responsibleUserId: run.responsibleUserId,
@@ -1468,7 +1473,7 @@ export function createPostgresRunDispatchAdapter(
           // These facts read current issue authority. The reconstruction/source
           // coordinator validation remains in the accounting phase, avoiding a
           // source coordinator lock after issue/run in this final phase.
-          const facts = await loadStalenessFacts({ runId: run.id, companyId: run.companyId, agentId: run.agentId,
+          const facts = await loadStalenessFacts({ runId: run.id, wakeupRequestId: run.wakeupRequestId, companyId: run.companyId, agentId: run.agentId,
             responsibleUserId: run.responsibleUserId,
             conversationContinuation: run.runtimeMode === "legacy" && hasConversationContinuationPolicy(run.resultJson),
             issueId, contextSnapshot, scheduledRetryReason: run.scheduledRetryReason }, input.now, tx);

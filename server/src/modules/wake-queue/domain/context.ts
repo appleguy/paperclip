@@ -94,6 +94,12 @@ function normalizeInteractionContinuationWakeContext(
   payload: Record<string, unknown> | null | undefined,
 ): void {
   if (isInteractionResolutionWakePayload(payload)) return;
+  if (contextSnapshot.wakeReason === "interaction_pending" && contextSnapshot.source === "task_watchdogs.pending_interaction" &&
+      readNonEmptyString(payload?.interactionId)) {
+    contextSnapshot.interactionId = payload!.interactionId;
+    if (readNonEmptyString(payload!.interactionKind)) contextSnapshot.interactionKind = payload!.interactionKind;
+    return;
+  }
   for (const key of INTERACTION_CONTINUATION_CONTEXT_KEYS) {
     delete contextSnapshot[key];
   }

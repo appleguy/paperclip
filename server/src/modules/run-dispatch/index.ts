@@ -56,6 +56,7 @@ export { RunDispatchApplicationError } from "./application/types.js";
 
 export type { WorkspaceBusyWait } from "./domain/wake-context.js";
 export { wakeWorkspaceBusyWaitersInTx } from "./adapters/workspace-busy-wait.js";
+export { isVerifiedPendingCardWake } from "./adapters/pending-card.js";
 
 export type RunDispatchDeps = {
   /** Overrides the Postgres adapter; a test builds its module against a fake instead. */

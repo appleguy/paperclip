@@ -997,6 +997,17 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     expect(wake).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps a deferred card receipt as the outstanding delivery across checks", async () => {
+    const card = await pendingCard();
+    await seedAgent(card.companyId, { name: "Board", status: "idle" });
+    const { service, wake } = pendingService();
+    await service.reconcilePendingInteraction({ companyId: card.companyId, interactionId: card.id });
+    await db.update(agentWakeupRequests).set({ status: "deferred_issue_execution" })
+      .where(eq(agentWakeupRequests.idempotencyKey, `interaction-pending:${card.id}:board-fallback`));
+    await service.reconcilePendingInteraction({ companyId: card.companyId, interactionId: card.id });
+    expect(wake).toHaveBeenCalledTimes(1);
+  });
+
   it("retries a failed enqueue without losing the card", async () => {
     const card = await pendingCard();
     await seedAgent(card.companyId, { name: "Board", status: "idle" });

@@ -2,6 +2,22 @@ import { describe, expect, it } from "vitest";
 import { enrichPromotedWakeContext } from "./context.js";
 
 describe("enrichPromotedWakeContext", () => {
+  it("preserves the pending card on promotion without retaining unrelated interaction fields", () => {
+    const contextSnapshot = { issueId: "issue-1", interactionId: "card-1", interactionKind: "ask_user_questions",
+      wakeReason: "interaction_pending", source: "task_watchdogs.pending_interaction" };
+    expect(enrichPromotedWakeContext({ contextSnapshot, reason: "issue_execution_deferred", source: "automation",
+      triggerDetail: "system", payload: { issueId: "issue-1", interactionId: "card-1" } }).contextSnapshot)
+      .toMatchObject(contextSnapshot);
+    expect(enrichPromotedWakeContext({ contextSnapshot: { issueId: "issue-1", wakeReason: "interaction_pending",
+      source: "task_watchdogs.pending_interaction" }, reason: "issue_execution_deferred", source: "automation",
+      triggerDetail: "system", payload: { issueId: "issue-1", interactionId: "card-1", interactionKind: "ask_user_questions" } }).contextSnapshot)
+      .toMatchObject({ interactionId: "card-1", interactionKind: "ask_user_questions" });
+    const unrelated = enrichPromotedWakeContext({ contextSnapshot: { ...contextSnapshot, wakeReason: "issue_assigned" },
+      reason: "issue_execution_deferred", source: "automation", triggerDetail: null,
+      payload: { issueId: "issue-1", interactionId: "card-1" } }).contextSnapshot;
+    expect(unrelated.interactionId).toBeUndefined();
+    expect(unrelated.interactionKind).toBeUndefined();
+  });
   it("clears stale derived comment projections when the canonical id list is empty, but keeps an independent interaction continuation", () => {
     const contextSnapshot: Record<string, unknown> = {
       // Normalization already dropped the canonical wake comment ids upstream

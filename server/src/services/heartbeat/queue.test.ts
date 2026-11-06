@@ -1,6 +1,6 @@
 import { claimNativeSessionResumptions } from "../native-runtime/native-finalization-reconciler.js";
 import type { Db } from "@paperclipai/db";
-import { authUsers, agents, agentWakeupRequests, caseHandoffs, cases, chatCompletionDeliveries, companies, companyMemberships, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, heartbeatRuns, issueComments, issueThreadInteractions, issues, nativeRunFinalizations } from "@paperclipai/db";
+import { authUsers, agents, agentWakeupRequests, caseHandoffs, cases, chatCompletionDeliveries, companies, companyMemberships, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, environmentLeases, heartbeatRuns, issueComments, issueRelations, issueThreadInteractions, issues, nativeRunFinalizations } from "@paperclipai/db";
 import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
@@ -9,11 +9,14 @@ import { createPostgresWakeQueueAdapter } from "../../modules/wake-queue/adapter
 import { createReleaseIssueExecution } from "../../modules/wake-queue/application/use-cases.js";
 import { createHeartbeatQueue, shouldDeferFollowupWakeForSameIssue, shouldQueueFollowupForRunningIssueWake, type HeartbeatQueueDependencies } from "./queue.js";
 import { createWakeQueue } from "../../modules/wake-queue/index.js";
-import { mergeCoalescedContextSnapshot } from "./run-preparation.js";
+import { buildPaperclipWakePayload, mergeCoalescedContextSnapshot } from "./run-preparation.js";
+import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { withQueuedCommentIdsInWakePayload, withQueuedCommentIdsInRunContext } from "../issue-queued-comment-queue.js";
 import { settleConversationTurn } from "../agent-conversations.js";
 import { chatCompletionDeliveryService, recordChatCompletion, recordChatHandoff } from "../chat-completion-delivery.js";
 import { instanceSettingsService } from "../instance-settings.js";
+import { issueService } from "../issues.js";
+import { isVerifiedPendingCardWake } from "../../modules/run-dispatch/index.js";
 import { createHeartbeatRunControl } from "./run-control.js";
 import { callbacks as runControlCallbacks } from "./__tests__/run-control-fixtures.js";
 
@@ -268,6 +271,76 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     await db.update(issues).set({ executionRunId: run.id, executionAgentNameKey: agent.name, executionLockedAt: new Date() }).where(eq(issues.id, issue.id));
     return { company, agent, issue, wake, run };
   }
+
+  it.each(["running", "scheduled_retry"])("delivers a deferred pending card behind a %s lock on a dependency-blocked issue", async status => {
+    const f = await fixture(status);
+    const [board] = await db.insert(agents).values({ companyId: f.company.id, name: "Board", role: "engineer",
+      status: "idle", adapterType: "process", adapterConfig: {} }).returning();
+    const [blocker] = await db.insert(issues).values({ companyId: f.company.id, title: "Blocker", status: "todo" }).returning();
+    await db.insert(issueRelations).values({ companyId: f.company.id, issueId: blocker.id, relatedIssueId: f.issue.id, type: "blocks" });
+    await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, f.issue.id));
+    const [card] = await db.insert(issueThreadInteractions).values({ companyId: f.company.id, issueId: f.issue.id,
+      kind: "ask_user_questions", status: "pending", payload: { version: 1, questions: [{ id: "scope", prompt: "Which scope?",
+        selectionMode: "single", options: [{ id: "observe", label: "Observe routing" }] }] } }).returning();
+    const context = { issueId: f.issue.id, taskId: f.issue.id, interactionId: card.id, interactionKind: card.kind,
+      wakeReason: "interaction_pending", source: "task_watchdogs.pending_interaction", fallbackRecipient: "board",
+      paperclipAgentMessage: { source: "task_watchdogs.pending_interaction",
+        text: `Pending interaction ${card.id} on issue ${f.issue.id} has no target. Review the card without executing the assignee's work.` } };
+    const deps = callbacks(db);
+    deps.getAgent.mockResolvedValue(board);
+    deps.canStartNewExternalBotWork.mockResolvedValue(false);
+    deps.instanceSettings.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: false, enableNativeRunner: false } as Awaited<ReturnType<typeof deps.instanceSettings.getExperimental>>);
+    deps.issuesSvc.listDependencyReadiness.mockImplementation(issueService(db).listDependencyReadiness);
+    const queueDeps = { resolveResponsibleUserId: async () => "queue-test-user",
+      getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+      resolveSessionBeforeForWakeup: async () => null };
+    const admission = createWakeQueue(db, { ...queueDeps,
+      wakeAdmissionHelpers: { filterZombieCoalesceTarget: deps.filterZombieCoalesceTarget,
+        mergeCoalescedContextSnapshot, shouldDeferFollowupWakeForSameIssue, shouldQueueFollowupForRunningIssueWake },
+      recovery: { escalateStrandedAssignedIssue: async () => undefined, escalateStrandedRecoveryIssueInPlace: async () => undefined } });
+    deps.wakeQueue.createAdmissionTransactionScope.mockImplementation(admission.createAdmissionTransactionScope);
+    deps.wakeQueue.admitWakeBehindIssueExecution.mockImplementation(admission.admitWakeBehindIssueExecution);
+    const queue = createHeartbeatQueue(db, deps);
+    await queue.enqueueWakeup(board.id, { source: "automation", triggerDetail: "system", reason: "interaction_pending",
+      requestedByActorType: "system", idempotencyKey: `interaction-pending:${card.id}:board-fallback`,
+      payload: context, contextSnapshot: context });
+    const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, board.id));
+    expect(receipt).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.run.id)))[0].status).toBe(status);
+    expect(receipt.payload?._paperclipWakeContext).toMatchObject({ interactionId: card.id });
+    const oldContext = { ...context } as Record<string, unknown>;
+    delete oldContext.interactionId;
+    delete oldContext.interactionKind;
+    await db.update(agentWakeupRequests).set({ payload: { ...receipt.payload, _paperclipWakeContext: oldContext } })
+      .where(eq(agentWakeupRequests.id, receipt.id));
+    expect((await db.select().from(issues).where(eq(issues.id, f.issue.id)))[0].executionRunId).toBe(f.run.id);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.run.id));
+    const release = createReleaseIssueExecution({ issueLock: createPostgresWakeQueueAdapter(db, queueDeps),
+      recovery: { escalateStrandedAssignedIssue: async () => undefined, escalateStrandedRecoveryIssueInPlace: async () => undefined } });
+    const result = await release({ companyId: f.company.id, runId: f.run.id, now: new Date() });
+    expect(result.outcome.kind).toBe("promoted");
+    const [promotedReceipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.id));
+    const [promoted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, promotedReceipt.runId!));
+    expect(promoted.contextSnapshot).toMatchObject({ issueId: f.issue.id, interactionId: card.id, wakeReason: "interaction_pending" });
+    const prompt = renderPaperclipWakePrompt(await buildPaperclipWakePayload({ db, companyId: f.company.id, agentId: board.id,
+      contextSnapshot: promoted.contextSnapshot! }));
+    expect(prompt).toContain(card.id);
+    expect(prompt).toContain(f.issue.id);
+    expect((await db.select().from(issues).where(eq(issues.id, f.issue.id)))[0]).toMatchObject({ assigneeAgentId: f.agent.id, executionRunId: null });
+    const verification = { companyId: f.company.id, issueId: f.issue.id, agentId: board.id, runId: promoted.id,
+      wakeupRequestId: receipt.id, contextSnapshot: promoted.contextSnapshot! };
+    expect(await isVerifiedPendingCardWake(db, verification)).toBe(true);
+    expect(await isVerifiedPendingCardWake(db, { ...verification, agentId: f.agent.id })).toBe(false);
+    expect(await isVerifiedPendingCardWake(db, { ...verification, contextSnapshot: { ...verification.contextSnapshot, wakeReason: "issue_assigned" } })).toBe(false);
+    await db.update(issueThreadInteractions).set({ addresseeUserId: "someone" }).where(eq(issueThreadInteractions.id, card.id));
+    expect(await isVerifiedPendingCardWake(db, verification)).toBe(false);
+    await db.update(issueThreadInteractions).set({ addresseeUserId: null }).where(eq(issueThreadInteractions.id, card.id));
+    deps.canStartNewExternalBotWork.mockResolvedValue(true);
+    expect(await queue.claimQueuedRun(promoted)).toMatchObject({ id: promoted.id, agentId: board.id, status: "running" });
+    expect((await db.select().from(issues).where(eq(issues.id, f.issue.id)))[0]).toMatchObject({ assigneeAgentId: f.agent.id, executionRunId: null });
+    expect(deps.cancelRunInternal).not.toHaveBeenCalled();
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, board.id))).toHaveLength(1);
+  });
 
   async function pendingPredecessorFixture() {
     const f = await fixture("queued");
