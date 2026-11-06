@@ -6,6 +6,8 @@ import { startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded
 import { getExecutionBlocker } from "./execution-blocker.js";
 import { settleUnrecoverableExecutions } from "./execution-recovery-resolution.js";
 import { terminalizeLegacyExecution } from "./legacy-execution-recovery.js";
+import { createAgentLifecycle } from "./agent-lifecycle.js";
+import { heartbeatService } from "./heartbeat.js";
 
 /** SCO-602: a resolved recovery action must not keep holding an issue the system can safely redispatch. */
 describe("stale resolved no-replay holds", () => {
@@ -129,6 +131,33 @@ describe("stale resolved no-replay holds", () => {
     expect(await getExecutionBlocker(db, companyId, issueId)).not.toBeNull();
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0].resultJson).toEqual(run.resultJson);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toEqual([]);
+  });
+
+  it("retains a process-lost OpenCode recovery blocker when the agent is paused", async () => {
+    const { companyId, issueId, agentId, action } = await seed("opencode_local", "process_lost", false, {
+      conversationContinuation: "continue_conversation_v1",
+      earlySession: { sessionId: "original-session", sessionParams: { narBinding: { messageId: "original-message" } } },
+    });
+    await db.delete(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, action.evidence.runId as string));
+    await terminalizeLegacyExecution({ db, run, status: "failed", fromStatuses: ["failed"] });
+    const [original] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+
+    await createAgentLifecycle(db).pauseAgent(agentId);
+    expect(await heartbeatService(db).cancelActiveForAgent(agentId)).toBe(0);
+    await settleUnrecoverableExecutions(db);
+
+    const [paused] = await db.select().from(agents).where(eq(agents.id, agentId));
+    expect(paused.status).toBe("paused");
+    const after = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(after).toHaveLength(1);
+    expect(after[0]).toMatchObject({ id: original.id, evidence: { runId: run.id } });
+    expect(after[0].outcome).not.toBe("cancelled");
+    expect(await getExecutionBlocker(db, companyId, issueId)).not.toBeNull();
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]).toMatchObject({ id: run.id, status: "failed", errorCode: "process_lost", resultJson: run.resultJson });
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toEqual([]);
   });
 
