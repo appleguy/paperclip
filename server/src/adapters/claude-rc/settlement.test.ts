@@ -1,9 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
+import type { ActivityEvent, IssueExecutionState } from "@paperclipai/shared";
 import { receiptFilePath } from "../agy/execute.js";
 import { isReviewContinuation, reconcileForeignSettlement, settleOutcome } from "./settlement.js";
+import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy } from "../../services/issue-execution-policy.js";
+import { buildIssueChanges } from "../../services/issue-change-receipt.js";
 
 const sourceRunId = "11111111-1111-4111-8111-111111111111";
 const receipt = { runId: sourceRunId, issueId: "original", status: "done", summary: "Original work complete",
@@ -13,8 +17,11 @@ let dir: string;
 let activePath: string;
 let report: { body: string; latestRevisionId: string } | null;
 let status: string;
+let executionState: IssueExecutionState | null;
+let activity: Partial<ActivityEvent>[];
 let failAt: string | null;
 let calls: string[];
+let requestRunId: string;
 let fetchMock: Mock<(url: string, init: RequestInit) => Promise<Response>>;
 const ctx = (issueId = "original") => ({
   runId: "22222222-2222-4222-8222-222222222222", agent: { id: "seat" }, context: { issueId },
@@ -27,13 +34,14 @@ beforeEach(async () => {
   await fs.writeFile(activePath, JSON.stringify({ runId: sourceRunId, issueId: "original", rcUrl: "https://claude.ai/code/original",
     receiptPath: receiptFilePath(dir, sourceRunId) }));
   await fs.writeFile(receiptFilePath(dir, sourceRunId), JSON.stringify(receipt));
-  report = null; status = "in_progress"; failAt = null; calls = [];
+  report = null; status = "in_progress"; executionState = null; activity = []; failAt = null; calls = []; requestRunId = ctx().runId;
   fetchMock = vi.fn(async (url: string, init: RequestInit) => {
     const route = new URL(url).pathname;
     const call = `${init.method} ${route}`;
     calls.push(call);
-    expect((init.headers as Record<string, string>)["X-Paperclip-Run-Id"]).toBe(ctx().runId);
+    expect((init.headers as Record<string, string>)["X-Paperclip-Run-Id"]).toBe(requestRunId);
     if (failAt === call) throw new Error("simulated process/transport interruption");
+    if (route.endsWith("/activity")) return Response.json(activity);
     if (route === "/api/agents/seat/wakeup") return Response.json({ status: "queued" }, { status: 202 });
     if (route.endsWith("/documents/report")) {
       if (init.method === "PUT") {
@@ -42,8 +50,24 @@ beforeEach(async () => {
       }
       return report ? Response.json(report) : Response.json({ error: "absent" }, { status: 404 });
     }
-    if (init.method === "PATCH") status = JSON.parse(init.body as string).status;
-    return Response.json({ id: "original", status });
+    if (init.method === "PATCH") {
+      const body = JSON.parse(init.body as string);
+      status = body.status;
+      if (executionState?.status === "pending") {
+        expect(body.comment).toContain(receipt.summary);
+        expect(body.comment).toContain(sourceRunId);
+        expect(body.comment).toContain(executionState.currentStageId);
+        const previous = structuredClone(executionState);
+        executionState = { ...executionState, status: "completed", currentStageId: null,
+          currentStageType: null, currentParticipant: null,
+          completedStageIds: [...executionState.completedStageIds, executionState.currentStageId!],
+          lastDecisionId: "decision", lastDecisionOutcome: "approved" };
+        activity.push({ action: "issue.updated", entityType: "issue", entityId: "original", actorType: "agent",
+          actorId: "seat", agentId: "seat", runId: ctx().runId,
+          details: { executionState, changes: { executionState: { from: previous, to: executionState } } } });
+      }
+    }
+    return Response.json({ id: "original", status, assigneeAgentId: "seat", executionState });
   });
   vi.stubGlobal("fetch", fetchMock);
 });
@@ -56,7 +80,160 @@ afterEach(async () => {
 const retained = async () => expect(await fs.readFile(activePath, "utf8")).toContain(sourceRunId);
 const noForeignDelivery = () => expect(calls.every(call => call === "POST /api/agents/seat/wakeup")).toBe(true);
 
+function assignedReview(stageType: "review" | "approval" = "review") {
+  status = "in_review";
+  executionState = { status: "pending", currentStageId: "review", currentStageIndex: 0,
+    currentStageType: stageType, currentParticipant: { type: "agent", agentId: "seat" },
+    returnAssignee: { type: "agent", agentId: "worker" }, reviewRequest: null,
+    completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null };
+}
+
+function nextReviewStage() {
+  status = "in_review";
+  executionState = { ...executionState!, status: "pending", currentStageId: "next-review", currentStageIndex: 1,
+    currentStageType: "approval", currentParticipant: { type: "agent", agentId: "seat" } };
+  const details = activity.at(-1)!.details!;
+  details.executionState = executionState;
+  (details.changes as { executionState: { to: IssueExecutionState } }).executionState.to = executionState;
+}
+
 describe("F07 durable receipt settlement", () => {
+  it.each(["review", "approval"] as const)("submits the assigned %s participant's first receipt once, even though the issue starts in review", async stageType => {
+    assignedReview(stageType);
+    expect(await isReviewContinuation(ctx(), dir, sourceRunId, "original", receipt)).toBe(false);
+    await expect(settleOutcome(ctx(), dir, sourceRunId, "original", outcome)).resolves.toMatchObject({ status: "done" });
+    await settleOutcome(ctx(), dir, sourceRunId, "original", outcome);
+    expect(calls.filter(c => c.startsWith("PATCH"))).toHaveLength(1);
+    expect(executionState).toMatchObject({ status: "completed", lastDecisionOutcome: "approved" });
+  });
+  it("repairs an old in-review marker that never attempted the reviewer's decision", async () => {
+    assignedReview();
+    report = { body: receipt.report, latestRevisionId: "revision" };
+    await fs.writeFile(path.join(dir, `settled-${sourceRunId}.json`), JSON.stringify({ version: 1,
+      agentId: "seat", runId: sourceRunId, issueId: "original", outcome,
+      fingerprint: createHash("sha256").update(JSON.stringify(outcome)).digest("hex"),
+      status: "in_review", reportRevisionId: "revision" }));
+    expect(await isReviewContinuation(ctx(), dir, sourceRunId, "original", receipt)).toBe(false);
+    await expect(settleOutcome(ctx(), dir, sourceRunId, "original", outcome)).resolves.toMatchObject({ status: "done" });
+    expect(calls.filter(c => c.startsWith("PATCH"))).toHaveLength(1);
+  });
+  it("verifies the actual policy transition and activity change contract", async () => {
+    const reviewer = sourceRunId;
+    const policy = normalizeIssueExecutionPolicy({ stages: [
+      { type: "review", participants: [{ type: "agent", agentId: reviewer }] },
+    ] })!;
+    assignedReview();
+    executionState = { ...executionState!, currentStageId: policy.stages[0].id,
+      currentParticipant: { type: "agent", agentId: reviewer }, returnAssignee: { type: "agent", agentId: ctx().runId } };
+    const handler = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url: string, init: RequestInit) => {
+      if (new URL(url).pathname !== "/api/issues/original") return handler(url, init);
+      calls.push(`${init.method} /api/issues/original`);
+      const issue = { status, assigneeAgentId: reviewer, executionPolicy: policy, executionState };
+      if (init.method !== "PATCH") return Response.json(issue);
+      const body = JSON.parse(init.body as string);
+      const transition = applyIssueExecutionPolicyTransition({ issue, policy, requestedStatus: body.status,
+        requestedAssigneePatch: {}, actor: { agentId: reviewer }, commentBody: body.comment });
+      expect(transition.decision).toMatchObject({ stageId: policy.stages[0].id, outcome: "approved", body: body.comment });
+      executionState = { ...transition.patch.executionState as IssueExecutionState, lastDecisionId: ctx().runId };
+      status = typeof transition.patch.status === "string" ? transition.patch.status : body.status;
+      const updated = { ...issue, status, executionState };
+      activity = [{ actorType: "agent", actorId: reviewer, agentId: reviewer, runId: ctx().runId,
+        action: "issue.updated", entityType: "issue", entityId: "original",
+        details: { ...transition.patch, executionState, changes: buildIssueChanges(issue, updated) } }];
+      return Response.json(updated);
+    });
+    await expect(settleOutcome({ ...ctx(), agent: { ...ctx().agent, id: reviewer } }, dir, sourceRunId, "original", outcome))
+      .resolves.toMatchObject({ status: "done", reviewDecisionId: ctx().runId });
+    expect(calls.filter(c => c.startsWith("PATCH"))).toHaveLength(1);
+  });
+  it.each(["participant", "assignee", "stage"])("retains a first review receipt without the current authorized %s", async mismatch => {
+    assignedReview();
+    if (mismatch === "participant") executionState!.currentParticipant = { type: "agent", agentId: "other" };
+    if (mismatch === "stage") executionState!.currentStageId = null;
+    const handler = fetchMock.getMockImplementation()!;
+    if (mismatch === "assignee") fetchMock.mockImplementation(async (url: string, init: RequestInit) => {
+      const response = await handler(url, init);
+      return new URL(url).pathname === "/api/issues/original"
+        ? Response.json({ ...await response.json(), assigneeAgentId: "other" }) : response;
+    });
+    await expect(settleOutcome(ctx(), dir, sourceRunId, "original", outcome)).rejects.toThrow("assigned current reviewer");
+    expect(calls.filter(c => c.startsWith("PATCH"))).toHaveLength(0);
+    expect(await isReviewContinuation(ctx(), dir, sourceRunId, "original", receipt)).toBe(false);
+    await retained();
+  });
+  it.each(["transport", "", "{", "null", "{}"])("reconciles a stage-bound approval after lost/invalid acknowledgement %j without approving the next stage", async ack => {
+    assignedReview();
+    const handler = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url: string, init: RequestInit) => {
+      const response = await handler(url, init);
+      if (init.method === "PATCH") {
+        nextReviewStage(); // The same agent also owns the next stage.
+        if (ack === "transport") throw new Error("lost approval acknowledgement");
+        return new Response(ack);
+      }
+      return response;
+    });
+    await expect(settleOutcome(ctx(), dir, sourceRunId, "original", outcome)).rejects.toThrow();
+    expect(await isReviewContinuation(ctx(), dir, sourceRunId, "original", receipt)).toBe(false);
+    const recovery = { ...ctx(), runId: "recovery-run" };
+    requestRunId = recovery.runId;
+    await expect(settleOutcome(recovery, dir, sourceRunId, "original", outcome)).resolves.toMatchObject({
+      status: "in_review", reviewDecisionId: "decision",
+    });
+    expect(await isReviewContinuation(ctx(), dir, sourceRunId, "original", receipt)).toBe(true);
+    await settleOutcome(recovery, dir, sourceRunId, "original", outcome);
+    expect(executionState).toMatchObject({ currentStageId: "next-review", status: "pending" });
+    expect(calls.filter(c => c.startsWith("PATCH"))).toHaveLength(1);
+    expect(calls.filter(c => c.startsWith("PUT"))).toHaveLength(1);
+    await retained();
+    status = "done";
+    await settleOutcome(recovery, dir, sourceRunId, "original", outcome);
+    await reconcileForeignSettlement(ctx("next"), dir, activePath);
+    await expect(fs.stat(activePath)).rejects.toThrow();
+    expect(calls.filter(c => c.startsWith("PATCH"))).toHaveLength(1);
+  });
+  it.each(["missing", "run", "actor", "stage", "previousDecision", "outcome", "decisionId"])("does not infer a review decision from unrelated or incomplete %s evidence", async mismatch => {
+    assignedReview();
+    const handler = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url: string, init: RequestInit) => {
+      const response = await handler(url, init);
+      if (init.method === "PATCH") {
+        nextReviewStage();
+        const event = activity[0];
+        const change = (event.details!.changes as { executionState: { from: IssueExecutionState; to: IssueExecutionState } }).executionState;
+        if (mismatch === "missing") activity = [];
+        if (mismatch === "run") event.runId = sourceRunId;
+        if (mismatch === "actor") event.actorId = "other";
+        if (mismatch === "stage") change.from.currentStageId = "unrelated-stage";
+        if (mismatch === "previousDecision") change.from.lastDecisionId = "unrelated-decision";
+        if (mismatch === "outcome") change.to.lastDecisionOutcome = "changes_requested";
+        if (mismatch === "decisionId") change.to.lastDecisionId = null;
+        throw new Error("lost approval acknowledgement");
+      }
+      return response;
+    });
+    await expect(settleOutcome(ctx(), dir, sourceRunId, "original", outcome)).rejects.toThrow("lost approval");
+    await expect(settleOutcome(ctx(), dir, sourceRunId, "original", outcome)).rejects.toThrow("review decision not verified");
+    expect(calls.filter(c => c.startsWith("PATCH"))).toHaveLength(1);
+    expect(await isReviewContinuation(ctx(), dir, sourceRunId, "original", receipt)).toBe(false);
+    await retained();
+  });
+  it("retains an attempted review whose acknowledgement did not record a decision", async () => {
+    assignedReview();
+    const handler = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url: string, init: RequestInit) => {
+      if (init.method === "PATCH") {
+        calls.push("PATCH /api/issues/original");
+        return Response.json({ status: "in_review", executionState });
+      }
+      return handler(url, init);
+    });
+    await expect(settleOutcome(ctx(), dir, sourceRunId, "original", outcome)).rejects.toThrow("review decision not verified");
+    await expect(settleOutcome(ctx(), dir, sourceRunId, "original", outcome)).rejects.toThrow("review decision not verified");
+    expect(calls.filter(c => c.startsWith("PATCH"))).toHaveLength(1);
+    expect(await isReviewContinuation(ctx(), dir, sourceRunId, "original", receipt)).toBe(false);
+  });
   it("retains a valid receipt written before delivery and requests only a scoped recovery", async () => {
     await expect(reconcileForeignSettlement(ctx("next"), dir, activePath)).rejects.toThrow("previous task unresolved");
     await retained(); noForeignDelivery();
@@ -152,6 +329,21 @@ describe("F07 durable receipt settlement", () => {
     expect(calls.filter(c => c.startsWith("PATCH"))).toHaveLength(1);
     await reconcileForeignSettlement(ctx("next"), dir, activePath);
     await expect(fs.stat(activePath)).rejects.toThrow();
+  });
+  it("preserves legacy worker-to-review continuation with its matching durable transition intent", async () => {
+    const handler = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation(async (url: string, init: RequestInit) => {
+      const response = await handler(url, init);
+      if (init.method === "PATCH") status = "in_review";
+      return response;
+    });
+    await settleOutcome(ctx(), dir, sourceRunId, "original", outcome);
+    const file = path.join(dir, `settling-${sourceRunId}.json`);
+    const { agentId: _agent, deliveryRunId: _run, ...legacy } = JSON.parse(await fs.readFile(file, "utf8"));
+    await fs.writeFile(file, JSON.stringify(legacy));
+    expect(await isReviewContinuation(ctx(), dir, sourceRunId, "original", receipt)).toBe(true);
+    await settleOutcome(ctx(), dir, sourceRunId, "original", outcome);
+    expect(calls.filter(c => c.startsWith("PATCH"))).toHaveLength(1);
   });
   it("keeps same-issue adoption on the existing operation", async () => {
     await reconcileForeignSettlement(ctx(), dir, activePath);

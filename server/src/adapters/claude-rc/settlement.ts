@@ -3,15 +3,61 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
+import type { ActivityEvent, IssueExecutionState } from "@paperclipai/shared";
 import { adoptableActive, parseReceipt, type Receipt } from "../agy/execute.js";
 
 type Outcome = { kind: "done"; receipt: Receipt } | { kind: "block"; reason: string };
 type Settlement = {
   version: 1; agentId: string; runId: string; issueId: string; outcome: Outcome; fingerprint: string;
   status: "done" | "blocked" | "in_review"; reportRevisionId: string | null;
+  reviewDecisionId?: string;
 };
+type Intent = {
+  version: 1; runId: string; issueId: string; fingerprint: string; status: "done" | "blocked";
+  agentId?: string; deliveryRunId?: string;
+  review?: { stageId: string; stageType: "review" | "approval"; previousDecisionId: string | null };
+};
+type IssueStatus = { status?: unknown; assigneeAgentId?: unknown; executionState?: IssueExecutionState | null };
 const fingerprint = (outcome: Outcome) => createHash("sha256").update(JSON.stringify(outcome)).digest("hex");
 const markerPath = (stateDir: string, runId: string) => path.join(stateDir, `settled-${runId}.json`);
+const intentPath = (stateDir: string, runId: string) => path.join(stateDir, `settling-${runId}.json`);
+
+async function readIntent(stateDir: string, runId: string, issueId: string, agentId: string, hash: string): Promise<Intent | null> {
+  const raw = await fs.readFile(intentPath(stateDir, runId), "utf8").catch(error => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (raw === null) return null;
+  const intent = JSON.parse(raw) as Intent;
+  if (intent?.version !== 1 || intent.runId !== runId || intent.issueId !== issueId || intent.fingerprint !== hash
+    || (intent.status !== "done" && intent.status !== "blocked") || (intent.agentId !== undefined && intent.agentId !== agentId)
+    || (intent.review && (intent.agentId !== agentId || !intent.deliveryRunId || !intent.review.stageId
+      || !["review", "approval"].includes(intent.review.stageType)
+      || (intent.review.previousDecisionId !== null && typeof intent.review.previousDecisionId !== "string"))))
+    throw new Error("Claude RC status intent does not match the source operation; scoped reconciliation required");
+  return intent;
+}
+
+/** Review state alone is not evidence: the recorded update must identify our exact stage decision. */
+async function verifiedReviewDecision(invoke: ReturnType<typeof localApi>, route: string, intent: Intent): Promise<string> {
+  const activity = await invoke("GET", `${route}/activity`) as ActivityEvent[];
+  if (Array.isArray(activity)) for (const event of activity) {
+    if (event.action !== "issue.updated" || event.entityType !== "issue" || event.entityId !== intent.issueId
+      || event.actorType !== "agent" || event.actorId !== intent.agentId || event.agentId !== intent.agentId
+      || event.runId !== intent.deliveryRunId) continue;
+    const change = (event.details?.changes as Record<string, unknown> | undefined)?.executionState as
+      { from?: IssueExecutionState; to?: IssueExecutionState } | undefined;
+    const before = change?.from;
+    const after = change?.to;
+    if (before?.status === "pending" && before.currentStageId === intent.review!.stageId
+      && before.currentStageType === intent.review!.stageType && before.currentParticipant?.type === "agent"
+      && before.currentParticipant.agentId === intent.agentId && before.lastDecisionId === intent.review!.previousDecisionId
+      && after?.completedStageIds?.includes(intent.review!.stageId) && after.lastDecisionOutcome === "approved"
+      && typeof after.lastDecisionId === "string" && after.lastDecisionId && after.lastDecisionId !== before.lastDecisionId)
+      return after.lastDecisionId;
+  }
+  throw new Error("Claude RC review decision not verified for the source stage; scoped reconciliation required");
+}
 
 async function durableWrite(file: string, value: unknown): Promise<void> {
   const temp = `${file}.${process.pid}.tmp`;
@@ -31,6 +77,12 @@ async function readSettlement(stateDir: string, runId: string, issueId: string, 
       const receipt = parseReceipt(JSON.stringify(s.outcome.receipt), runId, issueId);
       // Normalize to the exact validated receipt fields when comparing persisted evidence.
       if ((s.status !== "done" && s.status !== "in_review") || typeof s.reportRevisionId !== "string" || !s.reportRevisionId || !receipt) return null;
+      if (s.status === "in_review") {
+        const intent = await readIntent(stateDir, runId, issueId, agentId, s.fingerprint);
+        // Older F3 markers were written without ever attempting a transition.
+        // Legacy worker-to-review markers do have a matching durable intent.
+        if (!intent || intent.status !== "done" || (intent.review && !s.reviewDecisionId)) return null;
+      }
     } else if (s.outcome.kind !== "block" || s.status !== "blocked"
       || typeof s.outcome.reason !== "string" || !s.outcome.reason.trim()) return null;
     return s.fingerprint === fingerprint(s.outcome) ? s : null;
@@ -53,7 +105,7 @@ function localApi(ctx: AdapterExecutionContext) {
   };
 }
 
-/** The done gate already accepted this exact receipt before review started. */
+/** The done gate and this exact receipt's transition were already accepted. */
 export async function isReviewContinuation(
   ctx: AdapterExecutionContext, stateDir: string, sourceRunId: string, issueId: string, receipt: Receipt,
 ): Promise<boolean> {
@@ -96,31 +148,41 @@ export async function settleOutcome(
     reportRevisionId = report.latestRevisionId;
   }
   const status = outcome.kind === "done" ? "done" : "blocked";
-  let issue = await invoke("GET", route) as { status?: unknown } | null;
+  let issue = await invoke("GET", route) as IssueStatus | null;
   if (typeof issue?.status !== "string") throw new Error("Claude RC issue response missing status");
-  if (issue.status !== status && !(outcome.kind === "done" && issue.status === "in_review")) {
-    const intentPath = path.join(stateDir, `settling-${sourceRunId}.json`);
-    const intent = await fs.readFile(intentPath, "utf8").catch(error => {
-      if (error.code === "ENOENT") return null;
-      throw error;
-    });
+  let intent = await readIntent(stateDir, sourceRunId, issueId, ctx.agent.id, fingerprint(outcome));
+  let reviewDecisionId = prior?.reviewDecisionId;
+  if (!prior && !intent && issue.status !== status) {
+    const state = issue.executionState;
+    const reviewing = outcome.kind === "done" && issue.status === "in_review";
+    if (reviewing && (issue.assigneeAgentId !== ctx.agent.id || state?.status !== "pending"
+      || state.currentParticipant?.type !== "agent" || state.currentParticipant.agentId !== ctx.agent.id
+      || !state.currentStageId || (state.currentStageType !== "review" && state.currentStageType !== "approval")))
+      throw new Error("Claude RC first review receipt requires the assigned current reviewer and stage; checkpoint retained");
+    intent = { version: 1, runId: sourceRunId, issueId, fingerprint: fingerprint(outcome), status,
+      agentId: ctx.agent.id, deliveryRunId: ctx.runId,
+      ...(reviewing ? { review: { stageId: state!.currentStageId!, stageType: state!.currentStageType as "review" | "approval",
+        previousDecisionId: state!.lastDecisionId } } : {}) };
     // A PATCH may have advanced a review stage even when it did not produce the
     // requested status. Never repeat an uncertain transition as another approval.
-    if (intent !== null) throw new Error("Claude RC status transition already attempted; scoped reconciliation required");
-    await durableWrite(intentPath, { version: 1, runId: sourceRunId, issueId, fingerprint: fingerprint(outcome), status });
+    await durableWrite(intentPath(stateDir, sourceRunId), intent);
     // The blocker comment and transition share one issue update, avoiding duplicate comments on recovery.
     const patched = await invoke("PATCH", route, { status, ...(outcome.kind === "block" ? {
       comment: `Claude Remote Control blocked: ${outcome.reason}`,
       unblockDescriptor: { owner: { agentId: ctx.agent.id }, action: `Resolve the worker-reported blocker, then reassign or reopen:\n${outcome.reason}`.slice(0, 2000) },
-    } : {}) }) as { status?: unknown } | null;
+    } : intent.review && outcome.kind === "done" ? {
+      comment: `Approved: ${outcome.receipt.summary}\n\nClaude Remote Control source run ${sourceRunId}; stage ${intent.review.stageId}.`,
+    } : {}) }) as IssueStatus | null;
     if (typeof patched?.status !== "string") throw new Error("Claude RC status acknowledgement missing status; checkpoint retained");
-    issue = await invoke("GET", route) as { status?: unknown } | null;
+    issue = await invoke("GET", route) as IssueStatus | null;
   }
+  if (intent?.review && !reviewDecisionId) reviewDecisionId = await verifiedReviewDecision(invoke, route, intent);
   if (issue?.status !== status && !(outcome.kind === "done" && issue?.status === "in_review"))
     throw new Error(`Claude RC outcome remains ${String(issue?.status)}; checkpoint retained`);
   const settlement: Settlement = {
     version: 1, agentId: ctx.agent.id, runId: sourceRunId, issueId, outcome, fingerprint: fingerprint(outcome),
     status: issue.status as Settlement["status"], reportRevisionId,
+    ...(reviewDecisionId ? { reviewDecisionId } : {}),
   };
   await durableWrite(markerPath(stateDir, sourceRunId), settlement);
   return settlement;
