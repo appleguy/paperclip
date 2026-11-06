@@ -62,6 +62,25 @@ export async function runUsedConversationAdapter(db: Db, run: typeof heartbeatRu
   return adapterType !== null && isConversationAdapter(adapterType);
 }
 
+/** A local OpenCode no-submit observation does not fence another controller. */
+export function unverifiedOpenCodeRecoveryActionPredicate() {
+  return and(eq(issueRecoveryActions.cause, "legacy_execution_requires_reconciliation"), sql`exists (
+    select 1 from ${heartbeatRuns}
+    where ${heartbeatRuns.companyId} = ${issueRecoveryActions.companyId}
+      and ${heartbeatRuns.id} = ${canonicalExecutionUuid(sql`${issueRecoveryActions.evidence}->>'runId'`)}
+      and ${or(eq(heartbeatRuns.nativeIssueId, issueRecoveryActions.sourceIssueId),
+        and(isNull(heartbeatRuns.nativeIssueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueRecoveryActions.sourceIssueId}::text`))}
+      and ${heartbeatRuns.runtimeMode} = 'legacy'
+      and ${heartbeatRuns.resultJson}->'executionRecovery'->>'providerWorkEvidence' = 'unverified'
+      and (coalesce(${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType', '') = 'opencode_local'
+        or exists (select 1 from ${heartbeatRunEvents}
+          where ${heartbeatRunEvents.companyId} = ${heartbeatRuns.companyId}
+            and ${heartbeatRunEvents.runId} = ${heartbeatRuns.id}
+            and ${heartbeatRunEvents.eventType} = 'adapter.invoke'
+            and ${heartbeatRunEvents.payload}->>'adapterType' = 'opencode_local'))
+  )`);
+}
+
 /** Only immutable run evidence can retire a historical conversation hold.
  * An agent's current adapter can differ from the one that executed this run.
  * Missing evidence retains the hold; the current agent is never a fallback.
@@ -69,6 +88,7 @@ export async function runUsedConversationAdapter(db: Db, run: typeof heartbeatRu
 export function conversationRecoveryActionPredicate() {
   return and(
     eq(issueRecoveryActions.cause, "legacy_execution_requires_reconciliation"),
+    sql`not (${unverifiedOpenCodeRecoveryActionPredicate()})`,
     sql`exists (
       select 1 from ${heartbeatRuns}
       where ${heartbeatRuns.companyId} = ${issueRecoveryActions.companyId}

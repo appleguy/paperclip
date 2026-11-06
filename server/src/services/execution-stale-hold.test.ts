@@ -30,7 +30,7 @@ describe("stale resolved no-replay holds", () => {
       evidence: { runId, automaticRecovery: { policy: "preserve_without_replay_v1", runId, replay: "blocked", actionOutcome: "unknown" },
         ...(reconciled ? { executionReconciliation: { runId } } : {}) },
     }).returning();
-    return { companyId, issueId, action };
+    return { companyId, issueId, agentId, action };
   }
 
   it("releases the hold of a deploy-interrupted claude_rc run, idempotently", async () => {
@@ -54,6 +54,34 @@ describe("stale resolved no-replay holds", () => {
     const unverified = await seed("opencode_local", "cancelled", false, { executionRecovery: { kind: "interrupted" } });
     await settleUnrecoverableExecutions(db);
     expect(await getExecutionBlocker(db, unverified.companyId, unverified.issueId)).toBeNull();
+  });
+
+  it.each([false, true])("preserves an unverified OpenCode conversation action when local started is %s", async (started) => {
+    const { companyId, issueId, action } = await seed("opencode_local", "process_lost", false, {
+      conversationContinuation: "continue_conversation_v1",
+      executionRecovery: { kind: "bootstrap", providerWorkStarted: started, providerWorkEvidence: "unverified",
+        reason: "reattach_message_missing", providerSessionId: "session-original", providerMessageId: "message-original" },
+    });
+    expect(await getExecutionBlocker(db, companyId, issueId)).not.toBeNull();
+    await settleUnrecoverableExecutions(db);
+    const [after] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(after.outcome).toBe("blocked");
+    expect(after.evidence).toEqual(action.evidence);
+    expect(await getExecutionBlocker(db, companyId, issueId)).not.toBeNull();
+  });
+
+  it("does not settle an active unverified OpenCode action as a conversation continuation", async () => {
+    const { companyId, issueId, agentId, action } = await seed("opencode_local", "process_lost", false, {
+      conversationContinuation: "continue_conversation_v1",
+      executionRecovery: { kind: "bootstrap", providerWorkStarted: false, providerWorkEvidence: "unverified",
+        reason: "reattach_message_missing", providerSessionId: "session-original", providerMessageId: "message-original" },
+    });
+    await db.update(issueRecoveryActions).set({ status: "active", outcome: null, resolvedAt: null, returnOwnerAgentId: agentId }).where(eq(issueRecoveryActions.id, action.id));
+    await settleUnrecoverableExecutions(db);
+    const [after] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(after.outcome).not.toBe("cancelled");
+    expect((after.evidence.automaticRecovery as { replay: string }).replay).toBe("blocked");
+    expect(await getExecutionBlocker(db, companyId, issueId)).not.toBeNull();
   });
 
   it("releases resolved actions for other failures while retaining active recovery", async () => {

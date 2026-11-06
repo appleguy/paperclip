@@ -100,6 +100,19 @@ it("holds OpenCode reattach failures with possible provider work despite convers
   expect(legacyExecutionNeedsReconciliation({ ...run, runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } } })).toBe(false);
 });
 
+it.each([false, true])("holds explicit unverified OpenCode work when local started is %s", (started) => {
+  for (const errorCode of ["adapter_failed", "process_lost"]) {
+    expect(legacyExecutionNeedsReconciliation({
+      runtimeMode: "legacy", status: "failed", errorCode,
+      runnerProfileJson: { adapterDispatch: { adapterType: "opencode_local" } },
+      resultJson: { conversationContinuation: "continue_conversation_v1", executionRecovery: {
+        kind: "bootstrap", reason: "unowned_turn_verified_idle", providerWorkStarted: started,
+        providerWorkEvidence: "unverified", providerSessionId: "session-original", providerMessageId: "message-original",
+      } },
+    })).toBe(true);
+  }
+});
+
 it("retries a busy AI subscription only when no provider work started", () => {
    const waiting = { runtimeMode: "legacy", status: "cancelled", errorCode: "ai_connection_busy", scheduledRetryAttempt: 10,
      resultJson: { executionRecovery: { kind: "ai_connection_wait", providerWorkStarted: false } } };

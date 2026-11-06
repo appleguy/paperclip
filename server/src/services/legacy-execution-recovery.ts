@@ -54,7 +54,8 @@ export const legacyReconciliationRunFields = {
 export function isVerifiedForeignOpenCodeTurn(run: Partial<Pick<Run, "runnerProfileJson" | "resultJson">>): boolean {
   const recovery = run.resultJson?.executionRecovery as Record<string, unknown> | undefined;
   return claimedAdapterType({ runnerProfileJson: run.runnerProfileJson ?? null }) === "opencode_local" &&
-    recovery?.kind === "bootstrap" && recovery.providerWorkStarted === true && recovery.reason === "unowned_turn_verified_idle" &&
+    recovery?.kind === "bootstrap" && recovery.providerWorkEvidence !== "unverified" &&
+    recovery.providerWorkStarted === true && recovery.reason === "unowned_turn_verified_idle" &&
     typeof recovery.providerSessionId === "string" && recovery.providerSessionId.length > 0 &&
     typeof recovery.providerMessageId === "string" && recovery.providerMessageId.length > 0;
 }
@@ -76,6 +77,11 @@ export function legacyExecutionNeedsReconciliation(
   // A shared OpenCode turn may survive its lost controller. A generic
   // conversation-continuation marker does not prove that turn stopped.
   const lossRecovery = run.resultJson?.executionRecovery as Record<string, unknown> | undefined;
+  // A local no-submit observation cannot establish that another controller
+  // did not submit. Preserve an explicit unverified marker even for a
+  // terminal row or a generic conversation-continuation policy.
+  if (claimedAdapterType({ runnerProfileJson: run.runnerProfileJson ?? null }) === "opencode_local" &&
+      lossRecovery?.kind === "bootstrap" && lossRecovery.providerWorkEvidence === "unverified") return true;
   // A foreign OpenCode turn is never the retry's result. The adapter may
   // release the hold only after checking that exact message, idle state and
   // absence of a successor; the next wake must inspect retained history.

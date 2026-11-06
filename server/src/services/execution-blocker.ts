@@ -2,7 +2,7 @@ import { isPreDispatchReviewWait, neverStartedDispatchCancellationPredicate } fr
 import { canonicalExecutionUuid } from "./execution-identity.js";
 import { preDispatchExecutionWaitRecoveryActionPredicate } from "./pre-dispatch-execution-wait.js";
 import { and, desc, eq, gt, inArray, not, or, sql, type SQL } from "drizzle-orm";
-import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker } from "./conversation-continuation.js";
+import { conversationRecoveryActionPredicate, getConversationOwnershipBlocker, unverifiedOpenCodeRecoveryActionPredicate } from "./conversation-continuation.js";
 import { z } from "zod";
 import { agents, agentWakeupRequests, chatConversations, chatEndpoints, environmentLeases, heartbeatRunEvents, heartbeatRuns, issueComments, issues, issueRecoveryActions, nativeRunFinalizations, nativeRunResults, toolConnections, workspaceOperations, type Db } from "@paperclipai/db";
 import { canContinueCancelledRun, readRunCancellation } from "./run-cancellation.js";
@@ -113,7 +113,10 @@ export function executionContinuationSourcePredicate() {
 }
 
 function executionRecoveryActionPredicate(includeResolvedSources: boolean) {
-  return and(
+  return or(and(unverifiedOpenCodeRecoveryActionPredicate(), or(
+    inArray(issueRecoveryActions.status, ["active", "escalated"]),
+    and(eq(issueRecoveryActions.status, "resolved"), sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`),
+  )), and(
     not(conversationRecoveryActionPredicate()!),
     not(preDispatchExecutionWaitRecoveryActionPredicate()),
     // A deploy-interrupted claude_rc run leaves its TUI and checkpoint intact: nothing to reconcile, including
@@ -164,7 +167,7 @@ function executionRecoveryActionPredicate(includeResolvedSources: boolean) {
           ),
         )),
     )),
-  );
+  ));
 }
 
 export function nativeExecutionRecoveryActionPredicate() {
