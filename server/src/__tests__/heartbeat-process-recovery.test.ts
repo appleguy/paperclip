@@ -1,5 +1,6 @@
 import { persistHeartbeatRunProcessMetadata } from "../services/heartbeat/run-lifecycle.js";
 import { createHeartbeatQueueDrive } from "../services/heartbeat/queue-drive.js";
+import { hasQueueDriveRecoveryHold } from "../services/heartbeat/queue-drive-history.js";
 import { createHeartbeatRunState } from "../services/heartbeat/run-state.js";
 import { evaluateAgentInvokabilityFromDb } from "../services/agent-invokability.js";
 import { issueTreeControlService } from "../services/issue-tree-control.js";
@@ -3633,6 +3634,33 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     );
     // Terminal run cleanup releases the checkout lock so future checkout 409s only mean a live owner exists.
     expect(checkoutReleasedIssue?.checkoutRunId).toBeNull();
+  });
+
+  it("clears the process-loss hold after its actual scheduled retry succeeds", async () => {
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({ agentStatus: "idle", processPid: 999_999_999 });
+    const heartbeat = heartbeatService(db);
+    await heartbeat.reapOrphanedRuns();
+    const retry = (await selectRecoveryRunsByAgent(agentId)).find(row => row.retryOfRunId === runId);
+    expect(retry?.status).toBe("scheduled_retry");
+    const scope = { companyId, agentId, issueId };
+    expect(await hasQueueDriveRecoveryHold(db, scope)).toBe(true);
+    expect(retry?.scheduledRetryAt).toBeInstanceOf(Date);
+    await heartbeat.promoteDueScheduledRetries(retry!.scheduledRetryAt!);
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+    expect((await heartbeat.getRun(retry!.id))?.status).toBe("succeeded");
+    expect(await hasQueueDriveRecoveryHold(db, scope)).toBe(false);
+  });
+
+  it("holds an eligible process loss when completion ownership prevents scheduling a retry", async () => {
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({ agentStatus: "idle", processPid: 999_999_999,
+      contextSnapshot: { wakeReason: "chat_task_completed", chatCompletionDeliveryIds: [randomUUID()] } });
+    const heartbeat = heartbeatService(db);
+    await heartbeat.reapOrphanedRuns();
+    const failed = await heartbeat.getRun(runId);
+    expect(failed?.resultJson?.processLossDiagnostic).toMatchObject({ retryEligible: true });
+    expect((await selectRecoveryRunsByAgent(agentId)).filter(row => row.retryOfRunId === runId)).toHaveLength(0);
+    expect(await hasQueueDriveRecoveryHold(db, { companyId, agentId, issueId })).toBe(true);
   });
 
   it("requires reconciliation for a lost monitor whose provider outcomes are unknown", async () => {
@@ -13471,6 +13499,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(
       (await readChatControlRecoveryStop(db, chatStopScope(source))).kind,
     ).toBe("clear");
+    const [stopped] = await db.insert(heartbeatRuns).values({ companyId: source.companyId, agentId: source.agentId,
+      invocationSource: "assignment", status: "cancelled", resultJson: { cancelledByActorType: "user" },
+      contextSnapshot: { issueId: source.issueId }, finishedAt: source.closedAt }).returning();
+    const scope = { companyId: source.companyId, agentId: source.agentId, issueId: source.issueId };
+    expect(await hasQueueDriveRecoveryHold(db, scope)).toBe(false);
+    await db.update(agentWakeupRequests).set({ runId: stopped!.id }).where(eq(agentWakeupRequests.id, actionId));
+    expect(await hasQueueDriveRecoveryHold(db, scope)).toBe(true);
   });
 
   it("follows exact automatic ancestry despite rewritten context and stops only that unused child", async () => {
@@ -13556,6 +13591,46 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await heartbeat.drainActiveRunExecutions();
     expect(published).toBe(true);
     expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
+
+  it("holds queue-drive dispatch when the chat source loses its inbound binding", async () => {
+    const source = await seedCommittedChatControlStop();
+    await db.update(chatPublications).set({ state: "pending" }).where(eq(chatPublications.id, source.publicationId));
+    let invalidated = false;
+    const heartbeat = heartbeatService(db, { beforeChatControlRecoveryCheck: async ({ stage }) => {
+      if (stage !== "dispatch" || invalidated) return;
+      invalidated = true;
+      await db.delete(chatMessageLinks).where(eq(chatMessageLinks.deliveryId, source.sourceDeliveryId));
+    } });
+    const run = await heartbeat.wakeup(source.agentId, { source: "assignment", triggerDetail: "system", reason: "issue_queue_drive",
+      requestedByActorType: "system", requestedByActorId: "heartbeat_queue_drive", payload: { issueId: source.issueId },
+      contextSnapshot: { issueId: source.issueId, source: "heartbeat.queue_drive" } });
+    expect(run).not.toBeNull();
+    await heartbeat.drainActiveRunExecutions();
+    expect(invalidated).toBe(true);
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+    const fresh = await heartbeat.wakeup(source.agentId, { source: "on_demand", triggerDetail: "manual", manualUserWake: true,
+      reason: "issue_commented", requestedByActorType: "user", requestedByActorId: "responsible-user",
+      payload: { issueId: source.issueId }, contextSnapshot: { issueId: source.issueId } });
+    expect(fresh).not.toBeNull();
+    await heartbeat.drainActiveRunExecutions();
+    expect(mockAdapterExecute).toHaveBeenCalled();
+    expect(await hasQueueDriveRecoveryHold(db, { companyId: source.companyId, agentId: source.agentId, issueId: source.issueId })).toBe(false);
+  });
+
+  it("orders a fresh Board wake against a close at PostgreSQL microsecond precision", async () => {
+    const source = await seedCommittedChatControlStop();
+    await db.execute(sql`update chat_publications set published_at = ${source.closedAt.toISOString()}::timestamptz + interval '500 microseconds' where id = ${source.publicationId}::uuid`);
+    const [newRun] = await db.insert(heartbeatRuns).values({ companyId: source.companyId, agentId: source.agentId,
+      invocationSource: "on_demand", status: "succeeded", contextSnapshot: { issueId: source.issueId }, finishedAt: new Date() }).returning();
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId: source.companyId, agentId: source.agentId,
+      source: "on_demand", status: "completed", runId: newRun!.id, requestedByActorType: "user", requestedByActorId: "responsible-user",
+      payload: { issueId: source.issueId } }).returning();
+    const scope = { companyId: source.companyId, agentId: source.agentId, issueId: source.issueId };
+    await db.execute(sql`update agent_wakeup_requests set requested_at = ${source.closedAt.toISOString()}::timestamptz + interval '400 microseconds' where id = ${wake!.id}::uuid`);
+    expect(await hasQueueDriveRecoveryHold(db, scope)).toBe(true);
+    await db.execute(sql`update agent_wakeup_requests set requested_at = ${source.closedAt.toISOString()}::timestamptz + interval '600 microseconds' where id = ${wake!.id}::uuid`);
+    expect(await hasQueueDriveRecoveryHold(db, scope)).toBe(false);
   });
 
   it.each(["operator stop", "chat close"])("allows fresh Board work after a %s and then drives the remaining assigned issue", async (stopKind) => {

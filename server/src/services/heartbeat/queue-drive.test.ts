@@ -3,7 +3,7 @@ import {
   agents, agentWakeupRequests, approvals, companies, createDb, heartbeatRuns,
   issueApprovals, issueRelations, issueThreadInteractions, issueTreeHolds, issues, type Db,
 } from "@paperclipai/db";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
@@ -11,6 +11,7 @@ import { issueService } from "../issues.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { createHeartbeatRunState } from "./run-state.js";
 import { createHeartbeatQueueDrive, QUEUE_DRIVE_WAKE_REASON } from "./queue-drive.js";
+import { hasQueueDriveRecoveryHold } from "./queue-drive-history.js";
 
 type Dependencies = Parameters<typeof createHeartbeatQueueDrive>[1];
 
@@ -241,9 +242,49 @@ describe.skipIf(!postgres.supported)("queue drive persisted selection and deboun
     const lost = await attempt(ready.id, "failed", 1_000);
     await db.update(heartbeatRuns).set({ errorCode: "process_lost", processLossRetryCount: 0,
       resultJson: { processLossDiagnostic: { retryEligible: true } } }).where(eq(heartbeatRuns.id, lost.id));
-    await attempt(ready.id, "succeeded", 3_000);
+    const retry = await attempt(ready.id, "succeeded", 3_000);
+    await db.update(heartbeatRuns).set({ retryOfRunId: lost.id }).where(eq(heartbeatRuns.id, retry.id));
     await drive.wakeNextAssignedIssueAfterRun(source);
     expect(picked()).toBe(ready.id);
+  });
+
+  it("holds an eligible process loss without its own successful retry", async () => {
+    const held = await issue({ priority: "critical" });
+    const lost = await attempt(held.id, "failed", 1_000);
+    await db.update(heartbeatRuns).set({ errorCode: "process_lost", processLossRetryCount: 0,
+      resultJson: { processLossDiagnostic: { retryEligible: true } } }).where(eq(heartbeatRuns.id, lost.id));
+    await attempt(held.id, "succeeded", 3_000);
+    const ready = await issue({ priority: "low" });
+    await drive.wakeNextAssignedIssueAfterRun(source);
+    expect(picked()).toBe(ready.id);
+  });
+
+  it.each([
+    ["2020-01-01 00:00:00.123400+00", true],
+    ["2020-01-01 00:00:00.123600+00", false],
+  ])("compares wake and stop at database precision: %s", async (requestedAt, expectedHold) => {
+    const target = await issue();
+    const stopped = await attempt(target.id, "cancelled", 1_000);
+    await db.update(heartbeatRuns).set({ resultJson: { cancelledByActorType: "user" },
+      finishedAt: sql`'2020-01-01 00:00:00.123500+00'::timestamptz` }).where(eq(heartbeatRuns.id, stopped.id));
+    const admitted = await attempt(target.id, "succeeded", 3_000);
+    await db.insert(agentWakeupRequests).values({ companyId: source.companyId, agentId: source.agentId,
+      source: "on_demand", status: "completed", runId: admitted.id, requestedByActorType: "user",
+      requestedByActorId: "user", payload: { issueId: target.id }, requestedAt: sql`${requestedAt}::timestamptz` });
+    expect(await hasQueueDriveRecoveryHold(db, { companyId: source.companyId, agentId: source.agentId, issueId: target.id })).toBe(expectedHold);
+  });
+
+  it("does not turn a synthetic hold into a newer stop boundary", async () => {
+    const target = await issue();
+    const stopped = await attempt(target.id, "cancelled", 1_000);
+    await db.update(heartbeatRuns).set({ resultJson: { cancelledByActorType: "user" } }).where(eq(heartbeatRuns.id, stopped.id));
+    const admitted = await attempt(target.id, "succeeded", 3_000);
+    await db.insert(agentWakeupRequests).values({ companyId: source.companyId, agentId: source.agentId,
+      source: "on_demand", status: "completed", runId: admitted.id, requestedByActorType: "user", requestedByActorId: "user",
+      requestedAt: new Date(5_000), payload: { issueId: target.id } });
+    const synthetic = await attempt(target.id, "cancelled", 6_000);
+    await db.update(heartbeatRuns).set({ errorCode: "queue_drive_recovery_hold" }).where(eq(heartbeatRuns.id, synthetic.id));
+    expect(await hasQueueDriveRecoveryHold(db, { companyId: source.companyId, agentId: source.agentId, issueId: target.id })).toBe(false);
   });
 
   it.each(["chat_control_completed_source", "chat_control_recovery_proof_unresolved"])(
