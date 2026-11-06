@@ -4,7 +4,9 @@ import { createNativeUsageDelivery } from "../native-runtime/native-usage-delive
 import { flushBudgetEvaluationWork } from "../budgets.js";
 import type { PrpEvent } from "../../vendor/paperclip-runner/index.js";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { mkdtemp, rm, readFile, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { agents, budgetPolicies, companies, completionContracts, nativeRunResults, costEvents, agentWakeupRequests, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issues, executionWorkspaces, nativeRunFinalizations, runUsageReceipts, workspaceOperations, type Db } from "@paperclipai/db";
@@ -32,6 +34,9 @@ import { buildEffectiveRunSessionConfigMetadata } from "./workspaces.js";
 import { revokeHeartbeatRunGatewayTokens } from "./run-preparation.js";
 import { executeHeartbeatRuntime, type HeartbeatRuntimeExecutionInput } from "./runtime-execution.js";
 import { claimLegacyRestartController } from "./legacy-restart-claim.js";
+import { execute as executeOpenCode } from "../../../../packages/adapters/opencode-local/src/server/execute.js";
+import { sessionIdFor, messageIdFor } from "../../../../packages/adapters/opencode-local/src/server/nar/opencode-http-driver.js";
+import { narOpIdFor } from "../../../../packages/adapters/opencode-local/src/server/nar/nar-attempt.js";
 
 import { prepareNativeHeartbeatRun } from "../native-runtime/prepare-native-run.js";
 import { buildNativeCompletionContract } from "../native-runtime/completion-contracts.js";
@@ -190,6 +195,76 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expect(reaped.runIds).not.toContain(run.id);
     expect(await read(run.id)).toMatchObject({ status: "running", resultJson: {} });
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run.id))).toHaveLength(0);
+  });
+
+  it("re-enters the original OpenCode message through host execution and preserves resources on untagged shutdown", async () => {
+    const { input, adapter, run } = await fixture();
+    const boot = randomUUID();
+    const sid = sessionIdFor({ agentId: input.agent.id, issueId: input.task.issueId! });
+    const messageId = messageIdFor(narOpIdFor(run.id));
+    const userMessage = { id: messageId, type: "user", time: { created: 1000 } };
+    let writes = 0;
+    let url = "";
+    const server = createServer((req, res) => {
+      const p = new URL(req.url ?? "/", url).pathname;
+      const reply = (status: number, body: unknown) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(body)); };
+      if (req.method !== "GET") { writes++; return reply(500, {}); }
+      if (p === "/api/info") return reply(200, { version: "2.2.5", pid: 4242, urls: [url] });
+      if (p === "/api/session/active") return reply(200, { data: { [sid]: { type: "running" } } });
+      if (p === `/api/session/${sid}`) return reply(200, { data: { id: sid, location: { directory: home } } });
+      if (p === `/api/session/${sid}/inbox`) return reply(200, { data: [] });
+      if (p === `/api/session/${sid}/message/${messageId}`) return reply(200, { data: userMessage });
+      if (p === `/api/session/${sid}/message`) return reply(200, { data: [userMessage] });
+      return reply(404, {});
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    try {
+      url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      const passwordFile = join(home, "restart-fixture-password");
+      const configPath = join(home, "restart-fixture-server.json");
+      const command = join(home, "restart-fixture-cli");
+      const workspaceFile = join(home, "restart-fixture-workspace");
+      await writeFile(passwordFile, "fixture-secret");
+      await writeFile(configPath, JSON.stringify({ url, passwordFile }));
+      await writeFile(command, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      await writeFile(workspaceFile, "original workspace");
+      const sessionParams = { sessionId: sid, cwd: home, narBinding: {
+        schema: "paperclip.opencode-binding.v1", runId: run.id, agentId: input.agent.id, taskId: input.task.issueId,
+        messageId, kind: "submit", hostPid: 4242, configPath, providerOrigin: url,
+      } };
+      const resultJson = { restartReattach: { count: 1 }, earlySession: { sessionId: sid, sessionParams },
+        executionRecovery: { kind: "bootstrap", reason: "aborted", providerWorkStarted: true, providerWorkEvidence: "unverified" } };
+      await db.update(agents).set({ adapterType: "opencode_local" }).where(eq(agents.id, input.agent.id));
+      await db.update(heartbeatRuns).set({ controllerBootId: boot, controllerLeaseExpiresAt: new Date(Date.now() + 60_000), resultJson }).where(eq(heartbeatRuns.id, run.id));
+      input.run.controllerBootId = boot;
+      input.run.resultJson = resultJson;
+      input.agent.adapterType = "opencode_local";
+      adapter.type = "opencode_local";
+      adapter.execute.mockImplementation(executeOpenCode);
+      input.config.runtimeConfig = { command, cwd: home, model: "openai/fixture", nativeRuntime: "nar", sharedServerRecoveryConfigPath: configPath };
+      input.runtime.runtimeForAdapter = { ...input.runtime.runtimeForAdapter, sessionId: sid, sessionParams, taskKey: input.task.issueId! };
+      let rejoined = false;
+      input.output.onLog = async (_stream, chunk) => {
+        if (chunk.includes("nar_rejoin")) { rejoined = true; input.control.executionControl.controller.abort(new Error("Server shutting down")); }
+      };
+      const result = await executeHeartbeatRuntime(db, input);
+      expect(rejoined).toBe(true);
+      expect(result).toMatchObject({ dispatched: true, adapterResult: { resultJson: { executionRecovery: { reason: "aborted", providerWorkEvidence: "unverified" } } } });
+      if (!result.dispatched) throw new Error("expected re-entry dispatch");
+      const { persistUnverifiedSharedOpenCode } = await import("./opencode-unverified-hold.js");
+      expect(await persistUnverifiedSharedOpenCode(db, { run: input.run, resultJson: result.adapterResult.resultJson })).toBe(true);
+      expect(await read(run.id)).toMatchObject({ status: "running", resultJson: {
+        executionRecovery: { reason: "aborted", providerWorkEvidence: "unverified" },
+        earlySession: { sessionId: sid, sessionParams: { narBinding: { runId: run.id, messageId } } },
+      } });
+      expect(writes).toBe(0);
+      expect(revokeHeartbeatRunGatewayTokens).not.toHaveBeenCalled();
+      expect(input.instructions.releaseInstructionCopy).not.toHaveBeenCalled();
+      expect(await readFile(configPath, "utf8")).toContain(url);
+      expect(await readFile(workspaceFile, "utf8")).toBe("original workspace");
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    }
   });
 
   it("registers the plain OpenCode CLI controller when its child spawns", async () => {
