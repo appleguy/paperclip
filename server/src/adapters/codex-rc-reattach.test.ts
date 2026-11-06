@@ -68,6 +68,17 @@ describe("codex RC restart reattach", () => {
     expect(c.logs.join("")).toContain("Rejoined Codex Remote Control turn turn-1");
   });
 
+  it("stops watching without an interrupt when another restart detaches it", async () => {
+    const daemon = await fakeDaemon(["inProgress"]);
+    const c = ctx();
+    c.value.runId = "run-redetached";
+    const watching = reattachCodexRcTurn(c.value, { socketPath: daemon.socketPath, pollMs: 5 });
+    await new Promise(r => setTimeout(r, 30));
+    markCodexRunDetachedForRestart("run-redetached");
+    expect(await watching).toMatchObject({ errorCode: "codex_rc_reattach_detached" });
+    expect(daemon.calls).not.toContain("turn/interrupt");
+  });
+
   it("finalizes a turn that completed while the server was down", async () => {
     const daemon = await fakeDaemon(["completed"]);
     const result = await reattachCodexRcTurn(ctx().value, { socketPath: daemon.socketPath, pollMs: 5 });

@@ -124,6 +124,8 @@ export async function reattachCodexRcTurn(
     const turnId = turn.id;
     await ctx.onLog("stdout", `[paperclip] Rejoined Codex Remote Control turn ${turnId} on thread ${threadId} after a server restart; waiting for it to finish.\n`);
     while (turn.status === "inProgress") {
+      // Another hot restart detached this run: stop watching without an interrupt; the hold keeps it running.
+      if (detachedRunIds.has(ctx.runId)) return failure("codex_rc_reattach_detached", "Detached for another server restart");
       if (ctx.signal?.aborted) {
         await connection.rpc("turn/interrupt", { threadId, turnId }).catch(() => undefined);
         return { exitCode: null, signal: "SIGTERM", timedOut: false, errorCode: "cancelled", errorMessage: "Run cancelled while rejoined to its Codex turn", ...sessionFields,

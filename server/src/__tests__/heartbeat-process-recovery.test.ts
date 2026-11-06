@@ -4111,6 +4111,33 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("detaches a rejoined Codex RC run again without signalling its stale bridge pid (SCO-1098)", async () => {
+    const bystander = spawnAliveProcess();
+    childProcesses.add(bystander);
+    const { agentId, runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: bystander.pid ?? null,
+      processGroupId: null,
+      contextSnapshot: { executionEngine: "acp", processTopology: "server_stdio" },
+    });
+    await db.update(agents).set({ adapterConfig: { agentCommand: "/Volumes/NVM/Paperclip/ops/codex-remote-control/codex-acp-rc" } }).where(eq(agents.id, agentId));
+    await db.update(heartbeatRuns).set({ resultJson: { earlySession: { sessionId: "thread-1", sessionParams: {} }, restartReattach: { count: 1 } } }).where(eq(heartbeatRuns.id, runId));
+
+    await withTempPaperclipHome(async () => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: new Date("2026-08-04T00:05:00.000Z"),
+        preflightActiveRunIds: [runId],
+      });
+      const heartbeat = heartbeatService(db);
+      await expect(heartbeat.prepareHotRestartShutdown("SIGTERM", new Date("2026-08-04T00:06:00.000Z")))
+        .resolves.toMatchObject({ mode: "hot_restart", skipDrain: true, activeRunIds: [runId] });
+      expect(bystander.exitCode).toBeNull();
+      expect(bystander.signalCode).toBeNull();
+    });
+  });
+
   it("snapshots and drains a server-stdio ACP run before embedded database shutdown", async () => {
     const child = spawnAliveProcess();
     childProcesses.add(child);

@@ -587,7 +587,9 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       typeof run.processPid === "number" && run.processPid > 0);
     for (const { run } of detachableCodexRuns) {
       markCodexRunDetachedForRestart(run.id);
-      try { process.kill(run.processPid!, "SIGKILL"); } catch { /* already gone; the daemon still owns the turn */ }
+      // A re-entered run's recorded pid is the bridge an earlier restart already killed; it may be reused.
+      const reentered = typeof parseObject(parseObject(run.resultJson).restartReattach).count === "number";
+      if (!reentered) try { process.kill(run.processPid!, "SIGKILL"); } catch { /* already gone; the daemon still owns the turn */ }
       await appendRunEvent(run, {
         eventType: "lifecycle",
         stream: "system",
@@ -846,9 +848,10 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         const prior = parseObject(parseObject(run.resultJson).restartReattach);
         const count = typeof prior.count === "number" ? prior.count : 0;
         // agy restart re-entry is fenced to the original run's checkpoint and
-        // fails closed if it is missing or foreign. A long turn can span more
-        // than five deployments; exhausting an arbitrary count would orphan it.
-        if (count >= MAX_RESTART_REATTACHES && adapterType !== "agy_local") {
+        // fails closed if it is missing or foreign; codex_local re-entry only
+        // watches the run's own daemon turn. A long turn can span more than
+        // five deployments; exhausting an arbitrary count would orphan it.
+        if (count >= MAX_RESTART_REATTACHES && adapterType !== "agy_local" && adapterType !== "codex_local") {
           classify(candidate, "skipped", "restart_reattach_budget_exhausted", patch);
           continue;
         }

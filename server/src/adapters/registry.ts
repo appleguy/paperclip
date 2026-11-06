@@ -368,9 +368,9 @@ const codexLocalAdapter: ServerAdapterModule = {
   type: "codex_local",
   runtimeToolDelivery: "native_mcp",
   // SCO-1098: a hot restart re-enters the same run and waits for its daemon turn.
-  execute: (ctx) => ctx.context.paperclipRestartReattach === true
+  execute: (ctx) => holdIfDetachedForRestart(ctx.runId, ctx.context.paperclipRestartReattach === true
     ? reattachCodexRcTurn(ctx)
-    : holdIfDetachedForRestart(ctx.runId, codexExecute(ctx)),
+    : codexExecute(ctx)),
   supportsRestartReattach: isCodexRcConfig,
   testEnvironment: codexTestEnvironment,
   acp: {
