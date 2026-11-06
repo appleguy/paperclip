@@ -958,7 +958,15 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
           eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
           notInArray(agentWakeupRequests.status, ["skipped", "failed", "cancelled"]),
         )).limit(1);
-        if (!delivered) {
+        // A skipped, failed or dispatch-cancelled attempt (for example issue_assignee_changed) is
+        // retried once per report window, never every check (SCO-1029 wake loop).
+        const [attempt] = delivered ? [] : await tx.select({ createdAt: agentWakeupRequests.createdAt })
+          .from(agentWakeupRequests).where(and(
+            eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.idempotencyKey, idempotencyKey),
+          )).orderBy(desc(agentWakeupRequests.createdAt)).limit(1);
+        const retryAt = attempt ? attempt.createdAt.getTime() + PENDING_INTERACTION_REPORT_MS : 0;
+        if (!delivered && now < retryAt) nextCheckAt = Math.min(nextCheckAt, retryAt);
+        else if (!delivered) {
           const boards = await tx.select().from(agents).where(and(
             eq(agents.companyId, input.companyId), sql`lower(${agents.name}) = 'board'`,
           )).limit(2);

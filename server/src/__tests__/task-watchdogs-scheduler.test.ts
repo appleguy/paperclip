@@ -987,6 +987,22 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     expect(wake).toHaveBeenCalledTimes(2);
   });
 
+  it("retries a dispatch-cancelled Board wake once per report window, not every check", async () => {
+    const card = await pendingCard();
+    await seedAgent(card.companyId, { name: "Board", status: "idle" });
+    const { service, wake } = pendingService();
+    await service.reconcilePendingInteraction({ companyId: card.companyId, interactionId: card.id });
+    const key = `interaction-pending:${card.id}:board-fallback`;
+    await db.update(agentWakeupRequests).set({ status: "cancelled" }).where(eq(agentWakeupRequests.idempotencyKey, key));
+    const result = await service.reconcilePendingInteraction({ companyId: card.companyId, interactionId: card.id });
+    expect(wake).toHaveBeenCalledTimes(1);
+    expect(result.nextCheckAt).toBeGreaterThan(Date.now() + 29 * 60_000);
+    await db.update(agentWakeupRequests).set({ createdAt: new Date(Date.now() - 31 * 60_000) })
+      .where(eq(agentWakeupRequests.idempotencyKey, key));
+    await service.reconcilePendingInteraction({ companyId: card.companyId, interactionId: card.id });
+    expect(wake).toHaveBeenCalledTimes(2);
+  });
+
   it("reports overdue cards with issue and age, rate-limits across restarts, and schedules the next check", async () => {
     const card = await pendingCard({ createdAt: new Date(Date.now() - 31 * 60_000) });
     const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
