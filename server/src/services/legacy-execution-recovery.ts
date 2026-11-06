@@ -68,6 +68,11 @@ export function legacyExecutionNeedsReconciliation(
   // A shared OpenCode turn may survive its lost controller. A generic
   // conversation-continuation marker does not prove that turn stopped.
   const lossRecovery = run.resultJson?.executionRecovery as Record<string, unknown> | undefined;
+  // An OpenCode reattach can fail after provider work may have started. A
+  // generic conversation continuation is not proof that the original turn
+  // ended, even if the adapter surfaced this as an ordinary failure.
+  if (claimedAdapterType({ runnerProfileJson: run.runnerProfileJson ?? null }) === "opencode_local" &&
+      lossRecovery?.kind === "bootstrap" && lossRecovery.providerWorkStarted === true) return true;
   if (run.status === "failed" && run.errorCode === "process_lost" &&
       claimedAdapterType({ runnerProfileJson: run.runnerProfileJson ?? null }) === "opencode_local" &&
       !(lossRecovery?.kind === "bootstrap" && lossRecovery.providerWorkStarted === false)) return true;
