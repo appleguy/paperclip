@@ -32,6 +32,7 @@ const apiPrefixes: Record<string, string> = {
   "agent-observability.ts": "/api",
   "fast-responses.ts": "/api",
   "prompt-injection-prevention.ts": "/api",
+  "answers.ts": "/api",
   "attention.ts": "/api",
   "approvals.ts": "/api",
   "assets.ts": "/api",

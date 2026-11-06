@@ -1431,6 +1431,8 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/issues/{id}/pending-questions",
   "GET /api/issues/{id}/decision-receipts",
   "GET /api/issues/{id}/chat-handoffs",
+  "GET /api/companies/{companyId}/answers",
+  "GET /api/companies/{companyId}/attention/answers",
   "GET /api/companies/{companyId}/attention/history",
   "GET /api/companies/{companyId}/attention/summary",
   "GET /api/companies/{companyId}/attention/tasks",
@@ -6269,6 +6271,54 @@ for (const [projection, responseSchema] of [
 }
 
 // ─── Decisions ──────────────────────────────────────────────────────────────
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/answers",
+  tags: ["inbox"],
+  summary: "List past owner questions and answers",
+  description: "Returns past answered question cards for the company with keyword search.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      search: z.string().trim().max(200).optional(),
+      limit: z.coerce.number().int().min(1).max(100).optional(),
+      cursor: z.string().max(1000).optional(),
+      projectId: z.string().uuid().optional(),
+      issueId: z.string().uuid().optional(),
+    }).strict(),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/attention/answers",
+  tags: ["inbox"],
+  summary: "List past owner questions and answers",
+  description: "Returns past answered question cards for the company with keyword search.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      search: z.string().trim().max(200).optional(),
+      limit: z.coerce.number().int().min(1).max(100).optional(),
+      cursor: z.string().max(1000).optional(),
+      projectId: z.string().uuid().optional(),
+      issueId: z.string().uuid().optional(),
+    }).strict(),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
 
 registry.registerPath({
   method: "get",
