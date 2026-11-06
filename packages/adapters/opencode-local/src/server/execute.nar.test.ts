@@ -390,7 +390,7 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect(resumed).toMatchObject({ sessionId: sessionIdFor(scope, 1) });
   });
 
-  it("a retry run after a mid-run Paperclip restart rejoins the in-flight message instead of re-prompting", async () => {
+  it("holds a foreign in-flight turn after rejoining without attributing its outcome", async () => {
     // Interrupted run-1 left its prompt running in the per-issue session (provider not interrupted).
     const sid = sessionIdFor(scope);
     const orphan = messageIdFor(narOpIdFor("run-1"));
@@ -414,7 +414,9 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect(gate).not.toHaveBeenCalled();
     expect(userMsgs().map((m) => m.id)).toEqual([orphan]);
     expect(saved).toMatchObject([{ sessionParams: { narBinding: { runId: "run-1-retry", messageId: orphan, kind: "rejoin" } } }]);
-    expect(retry).toMatchObject({ exitCode: 0, summary: "orphan finished", sessionId: sid, costUsd: 0.25 });
+    expect(interruptPosts).toBe(0);
+    expect(retry).toMatchObject({ exitCode: 75, summary: "", sessionId: sid, costUsd: null,
+      resultJson: { executionRecovery: { providerWorkStarted: true, reason: expect.stringMatching(/^unowned_turn_(verified_idle|settled)$/) } } });
   }, 15_000);
 
   it("holds a restart before the prompt POST when no durable no-dispatch proof is available", async () => {
@@ -468,7 +470,7 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect(promptPosts).toBe(0);
   });
 
-  it("reattaches to its persisted rejoined message, without taking Stop ownership", async () => {
+  it("holds a persisted rejoined foreign message without taking Stop ownership", async () => {
     const sid = sessionIdFor(scope);
     const orphan = messageIdFor(narOpIdFor("original-run"));
     sessions.set(sid, { info: { id: sid, location: { directory: root }, time: { created: clock++ } },
@@ -488,7 +490,8 @@ describe("OpenCode adapter nativeRuntime nar", () => {
         }
       },
     } as never);
-    expect(retry).toMatchObject({ exitCode: 0, summary: "done" });
+    expect(retry).toMatchObject({ exitCode: 75, summary: "", resultJson: { executionRecovery: {
+      providerWorkStarted: true, reason: expect.stringMatching(/^unowned_turn_(verified_idle|settled)$/) } } });
     expect(promptPosts).toBe(0);
     expect(interruptPosts).toBe(0);
   });
@@ -550,7 +553,7 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect(await driver.progressMessages(sid, "target")).toEqual([{ id: "own", content: [{ type: "text", text: "own work" }] }]);
   });
 
-  it("rejoins a long in-flight turn whose user prompt is older than one page of messages", async () => {
+  it("finds and holds a foreign in-flight turn whose prompt is older than one page", async () => {
     // A turn that has run for hours: hundreds of assistant messages sit after the single user prompt, so the
     // newest page holds no user message. A retry run used to fail with "active session has no user message".
     messagePageSize = 2;
@@ -568,12 +571,16 @@ describe("OpenCode adapter nativeRuntime nar", () => {
       s.info.outcome = "succeeded";
       active.delete(sid);
     };
+    const saved: unknown[] = [];
     const retry = await execute({ ...context("run-1-retry", { nativeRuntime: "nar" }),
+      onSession: async (session: unknown) => { saved.push(session); },
       onLog: async (_stream: string, chunk: string) => { if (chunk.includes("nar_rejoin")) finish(); } } as never);
     expect(promptPosts).toBe(0);
     expect(interruptPosts).toBe(0);
     expect(userMsgs().map((m) => m.id)).toEqual([orphan]);
-    expect(retry).toMatchObject({ exitCode: 0, sessionId: sid });
+    expect(saved).toMatchObject([{ sessionParams: { narBinding: { messageId: orphan, kind: "rejoin" } } }]);
+    expect(retry).toMatchObject({ exitCode: 75, sessionId: sid, summary: "",
+      resultJson: { executionRecovery: { providerWorkStarted: true, reason: expect.stringMatching(/^unowned_turn_(verified_idle|settled)$/) } } });
   }, 15_000);
 
   it("holds an explicit pause when the active turn cannot be interrupted atomically", async () => {
@@ -652,6 +659,21 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect(interruptPosts).toBe(0);
     expect(active.has(sid)).toBe(true);
     expect(promptPosts).toBe(1);
+
+    const resumed = await execute({ ...context("run-shutdown", { nativeRuntime: "nar" }),
+      context: { taskId: scope.issueId, paperclipRestartReattach: true },
+      onLog: async (_stream: string, chunk: string) => {
+        if (chunk.includes("nar_rejoin")) {
+          const session = sessions.get(sid)!;
+          session.msgs.push({ id: "msg_resumed_done", type: "assistant", time: { created: clock++, completed: clock++ },
+            content: [{ type: "text", text: "owned turn finished" }] });
+          session.info.time.idle = clock++; session.info.outcome = "succeeded"; active.delete(sid);
+        }
+      },
+    } as never);
+    expect(resumed).toMatchObject({ exitCode: 0, summary: "owned turn finished", sessionId: sid });
+    expect(promptPosts).toBe(1);
+    expect(interruptPosts).toBe(0);
   });
 
   it("does not send an interrupt to an already-idle session or a different message", async () => {
