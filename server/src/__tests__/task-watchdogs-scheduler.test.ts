@@ -27,6 +27,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { taskWatchdogService } from "../services/task-watchdogs.ts";
+import { buildPaperclipWakePayload, enrichWakeContextSnapshot } from "../services/heartbeat/run-preparation.js";
 import { logger } from "../middleware/logger.js";
 
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
@@ -975,6 +976,25 @@ describeEmbeddedPostgres("task watchdog scheduler", () => {
     expect(restarted.wake).not.toHaveBeenCalled();
     expect((await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, card.id)))[0])
       .toMatchObject({ addresseeAgentId: null, addresseeUserId: null, effectiveResolverPolicy: "human_only", status: "pending" });
+  });
+
+  it("keeps the card reference in Board's prompt and treats a completed wake as delivered", async () => {
+    const card = await pendingCard();
+    const boardId = await seedAgent(card.companyId, { name: "Board", status: "idle" });
+    const { service, wake } = pendingService();
+    await service.reconcilePendingInteraction({ companyId: card.companyId, interactionId: card.id });
+    const opts = wake.mock.calls[0][1];
+    const normalized = enrichWakeContextSnapshot({ contextSnapshot: { ...opts.contextSnapshot }, payload: opts.payload,
+      reason: opts.reason, source: opts.source, triggerDetail: opts.triggerDetail });
+    const wakePayload = await buildPaperclipWakePayload({ db, companyId: card.companyId, agentId: boardId,
+      contextSnapshot: normalized.contextSnapshot });
+    const prompt = renderPaperclipWakePrompt(wakePayload);
+    expect(prompt).toContain(card.id);
+    expect(prompt).toContain(card.issueId);
+    await db.update(agentWakeupRequests).set({ status: "completed", createdAt: new Date(Date.now() - 31 * 60_000) })
+      .where(eq(agentWakeupRequests.idempotencyKey, opts.idempotencyKey));
+    await service.reconcilePendingInteraction({ companyId: card.companyId, interactionId: card.id });
+    expect(wake).toHaveBeenCalledTimes(1);
   });
 
   it("retries a failed enqueue without losing the card", async () => {

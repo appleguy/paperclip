@@ -267,6 +267,12 @@ describe("decideScheduledRetryGate", () => {
 });
 
 describe("decideQueuedRunStaleness", () => {
+  it("does not treat an unverified pending-card wake as ownership of an assignee's issue", () => {
+    expect(decideQueuedRunStaleness({ ...baseStalenessFacts(), runAgentId: "board",
+      issueAssigneeAgentId: "assignee", issueExecutionRunId: "assignee-run",
+      issueStatus: "in_review", wakeReason: "interaction_pending" }, NOW))
+      .toMatchObject({ stale: true, errorCode: "issue_assignee_changed" });
+  });
   it("is not stale when every rule passes", () => {
     expect(decideQueuedRunStaleness(baseStalenessFacts(), NOW)).toEqual({
       stale: false,

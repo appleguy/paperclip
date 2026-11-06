@@ -980,7 +980,9 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
             const context = { issueId: issue.id, taskId: issue.id, interactionId: interaction.id,
               interactionKind: interaction.kind, wakeReason: "interaction_pending",
               source: "task_watchdogs.pending_interaction", fallbackRecipient: "board",
-              effectiveResolverPolicy: interaction.effectiveResolverPolicy };
+              effectiveResolverPolicy: interaction.effectiveResolverPolicy,
+              paperclipAgentMessage: { source: "task_watchdogs.pending_interaction",
+                text: `Pending interaction ${interaction.id} on issue ${issue.identifier ?? issue.id} (ID ${issue.id}) has no target. Review the card and route or answer it as authorized. Do not take over the issue or execute the assignee's work.` } };
             await deps.enqueueWakeup(board.id, { source: "automation", triggerDetail: "system",
               reason: "interaction_pending", payload: context, contextSnapshot: context, idempotencyKey,
               requestedByActorType: "system", requestedByActorId: null });
