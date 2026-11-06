@@ -2506,6 +2506,7 @@ export function recoveryService(
     previousStatus: StrandedPreviousStatus;
     recoveryCause?: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
+    assigneeInvokabilityReason?: string;
   }, database: DbOrTransaction = db) {
     const recoveryCause = resolveStrandedRecoveryCause(
       input.latestRun,
@@ -2547,6 +2548,9 @@ export function recoveryService(
           recoveryCause,
           successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
         }),
+        ...(input.assigneeInvokabilityReason
+          ? { assigneeInvokabilityReason: input.assigneeInvokabilityReason }
+          : {}),
         failureSummary:
           summarizeRunFailureForIssueComment(input.latestRun)?.trim() ?? null,
       },
@@ -3989,6 +3993,7 @@ export function recoveryService(
     notice?: StrandedRecoveryNoticeSeed | null;
     recoveryCause?: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
+    assigneeInvokabilityReason?: string;
   }) {
     // SCO-648: a claude_rc conversation that is still writing/busy is working, not stranded.
     if (input.previousStatus === "in_progress" && input.issue.assigneeAgentId) {
@@ -4070,6 +4075,7 @@ export function recoveryService(
       latestRun: input.latestRun,
       recoveryCause,
       successfulRunHandoffEvidence: input.successfulRunHandoffEvidence,
+      assigneeInvokabilityReason: input.assigneeInvokabilityReason,
     }, tx);
     const isProviderQuotaWait =
       recoveryCause === "provider_quota" &&
@@ -4677,10 +4683,11 @@ export function recoveryService(
         recordSkip(issue, "agent_setup");
         continue;
       }
-      const agentInvokable =
+      const invokability =
         agent && agent.companyId === issue.companyId
-          ? await isAgentInvokable(agent)
-          : false;
+          ? await evaluateAgentInvokabilityFromDb(db, agent)
+          : { invokable: false as const, reason: "missing" as const };
+      const agentInvokable = invokability.invokable;
       if (
         agent?.status === "paused" &&
         agent.companyId === issue.companyId &&
@@ -4720,6 +4727,7 @@ export function recoveryService(
             issue,
             previousStatus: issue.status as StrandedPreviousStatus,
             latestRun,
+            assigneeInvokabilityReason: invokability.invokable ? undefined : invokability.reason,
             comment:
               "Paperclip cannot safely continue automatic recovery because the original assignee is not invokable. " +
               "The source assignment is unchanged and the board must choose the next action.",

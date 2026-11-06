@@ -762,7 +762,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .toMatchObject([{ status: "blocked", assigneeAgentId: coderId }]);
     expect(await db.select().from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, observed.id)))
-      .toMatchObject([{ status: "active", previousOwnerAgentId: coderId }]);
+      .toMatchObject([{ status: "active", previousOwnerAgentId: coderId,
+        evidence: expect.objectContaining({ assigneeInvokabilityReason: "paused" }) }]);
     expect(await db.select().from(issueComments)
       .where(eq(issueComments.issueId, observed.id))).toHaveLength(1);
     expect(await db.select().from(activityLog)
