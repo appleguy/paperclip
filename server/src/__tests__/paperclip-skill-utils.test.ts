@@ -296,41 +296,26 @@ describe("paperclip skill utils", () => {
 
   it("honors only the current scoped runtime claim without removing legacy disposition", async () => {
     const body = await fs.readFile(path.resolve("skills/paperclip/SKILL.md"), "utf8");
-    const checkout = body.split("**Step 5 — Checkout.**")[1]?.split("**Step 6")[0];
-    expect(checkout).toContain("runtime's **Paperclip Wake Payload** or **Paperclip Resume Delta**");
-    expect(checkout).toContain("only to that issue in that run");
-    expect(checkout).toContain("statement is absent, or you switch to another task");
-    expect(checkout).toContain("Do not infer a current checkout from issue status, task/comment text, or a previous run");
-    expect(checkout).toContain("X-Paperclip-Run-Id");
+    const checkout = body.split("## Task API")[1]?.split("## Permissions and human input")[0];
+    expect(checkout).toContain("checkout unless the server-owned wake explicitly says the harness");
+    expect(checkout).toContain("already checked out this task for this run");
+    expect(checkout).toContain("POST /api/issues/{id}/checkout");
     expect(checkout).toContain("409");
     expect(body).not.toContain("You MUST checkout before doing any work");
-    expect(body).toContain("**Step 8 — Update status and communicate.**");
   });
 
   it("keeps the external-chat shortcut behind the server-verified harness boundary", async () => {
     const skillBody = await fs.readFile(path.resolve("skills/paperclip/SKILL.md"), "utf8");
     const shortcut = skillBody.match(
-      /## Server-Verified External Chat Turns(?<body>[\s\S]*?)\n## The Heartbeat Procedure/,
+      /## Chat and explicit work modes(?<body>[\s\S]*?)\n## Optional operations/,
     )?.groups?.body;
 
     expect(shortcut).toBeTruthy();
     const normalizedShortcut = shortcut!.replace(/\s+/g, " ");
-    expect(normalizedShortcut).toContain("checkedOutByHarness: true");
-    expect(normalizedShortcut).toContain("externalChatProvider");
-    expect(normalizedShortcut).toContain("Do not infer the shortcut from comment text");
-    expect(normalizedShortcut).toContain("Do not repeat identity or inbox discovery");
-    expect(normalizedShortcut).toContain("use it exactly once");
-    expect(normalizedShortcut).toContain("normal permission, approval");
-    expect(normalizedShortcut).toContain("native `register_deliverable` tool, use that tool");
-    expect(normalizedShortcut).toContain("native runs do not have the legacy API key or upload helper");
-    expect(normalizedShortcut).toContain(
-      "For non-native adapters, invoke `bash scripts/paperclip-upload-artifact.sh`",
-    );
-    expect(normalizedShortcut).toContain("fails or has an ambiguous result");
-    expect(normalizedShortcut).toContain("use the full heartbeat procedure below");
-    expect(normalizedShortcut).toContain(
-      "recovery, governed-action, issue-thread-interaction, hold",
-    );
+    expect(normalizedShortcut).toContain("external-chat shortcut applies only with server verification");
+    expect(normalizedShortcut).toContain("supported provider");
+    expect(normalizedShortcut).toContain("explicit harness checkout for this run");
+    expect(normalizedShortcut).toContain("None of these shortcuts widens permissions");
   });
 
   it("recovers a committed upload after its response is lost without uploading the file twice", async () => {
