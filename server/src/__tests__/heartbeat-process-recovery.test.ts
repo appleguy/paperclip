@@ -3544,6 +3544,17 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(await heartbeatService(db).getRun(runId)).toMatchObject({ status: "running" });
   });
 
+  it("holds queue drive while a real user Stop intent awaits provider acknowledgement", async () => {
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({ adapterType: "opencode_local", runtimeMode: "legacy", agentStatus: "running" });
+    const heartbeat = heartbeatService(db);
+    await expect(heartbeat.cancelRun(runId, "Operator Stop", { resultJson: { cancelledByActorType: "user", cancelledByUserId: "responsible-user" } }))
+      .rejects.toThrow("Stop is recorded");
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("running");
+    expect(run?.resultJson?.executionCancellation).toMatchObject({ state: "requested" });
+    expect(await hasQueueDriveRecoveryHold(db, { companyId, agentId, issueId })).toBe(true);
+  });
+
   it("schedules one conversation continuation after losing the provider", async () => {
     const { agentId, runId, issueId } = await seedRunFixture({
       agentStatus: "idle",
@@ -13616,6 +13627,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await heartbeat.drainActiveRunExecutions();
     expect(mockAdapterExecute).toHaveBeenCalled();
     expect(await hasQueueDriveRecoveryHold(db, { companyId: source.companyId, agentId: source.agentId, issueId: source.issueId })).toBe(false);
+  });
+
+  it("does not treat a Board wake before a later close as fresh when chat proof is unresolved", async () => {
+    const source = await seedCommittedChatControlStop();
+    await db.delete(chatMessageLinks).where(eq(chatMessageLinks.deliveryId, source.sourceDeliveryId));
+    const [boardRun] = await db.insert(heartbeatRuns).values({ companyId: source.companyId, agentId: source.agentId,
+      invocationSource: "on_demand", status: "succeeded", contextSnapshot: { issueId: source.issueId }, finishedAt: source.closedAt }).returning();
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId: source.companyId, agentId: source.agentId,
+      source: "on_demand", status: "completed", runId: boardRun!.id, requestedByActorType: "user", requestedByActorId: "responsible-user",
+      requestedAt: new Date(source.closedAt.getTime() - 1000), payload: { issueId: source.issueId } }).returning();
+    const scope = { companyId: source.companyId, agentId: source.agentId, issueId: source.issueId };
+    expect(await hasQueueDriveRecoveryHold(db, scope)).toBe(true);
+    await db.update(agentWakeupRequests).set({ requestedAt: new Date(source.closedAt.getTime() + 1000) }).where(eq(agentWakeupRequests.id, wake!.id));
+    expect(await hasQueueDriveRecoveryHold(db, scope)).toBe(false);
   });
 
   it("orders a fresh Board wake against a close at PostgreSQL microsecond precision", async () => {
