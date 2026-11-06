@@ -30,12 +30,12 @@
     {
       "path": "schemas/command-v2.schema.json",
       "id": "https://paperclip.dev/schemas/prp/v2/command.schema.json",
-      "sha256": "5ea414476adc807d13eace485fb28dc2d72159522b2e48148463a43c2881e3e3"
+      "sha256": "a755d74458de7cb2969b6685edd1771282ca0c64a8d64ce35d3235929120ff42"
     },
     {
       "path": "schemas/command-v3.schema.json",
       "id": "https://paperclip.dev/schemas/prp/v3/command.schema.json",
-      "sha256": "981aa31b952eb4bedb54500602ee7b9dafd1489289c997e192364b7ffab0e7ff"
+      "sha256": "f866cf3280ad50978f15d6ded32aa083b717aeb64573a718a23b7c4be45ffafb"
     },
     {
       "path": "schemas/command.schema.json",

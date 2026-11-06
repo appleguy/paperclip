@@ -142,6 +142,7 @@ fn runner_selector_recovers_only_matching_lease() {
         runner_digest: "sha256:test".into(),
         acpx_launch_profile: None,
         opencode_launch_profile: None,
+        cursor_cloud_launch_profile: None,
         max_outbox_bytes: 1024 * 1024,
         p0_reserve_bytes: 64 * 1024,
         max_frame_bytes: 1024 * 1024,
@@ -286,6 +287,27 @@ fn tool_observation_is_bound_redacted_and_never_terminal() {
         written,
     ))
     .unwrap();
+    let mut usage = json!({"action":"antigravity.usage_observation","bindingId":"b","bindingGeneration":1,"runId":"r","environmentLeaseId":"lease","normalizedSessionId":"s","turnId":"t","conversationId":"native","processGeneration":"g","dispatchEventId":"foreign","stepIndex":1,"usage":{"inputTokens":100,"cacheReadTokens":200,"outputTokens":4}});
+    assert!(e
+        .execute(&command(
+            "native_controller.observation",
+            "usage",
+            usage.clone()
+        ))
+        .is_err());
+    usage["dispatchEventId"] = json!("dispatch");
+    let report = e
+        .execute(&command(
+            "native_controller.observation",
+            "usage",
+            usage.clone(),
+        ))
+        .unwrap();
+    assert_eq!(report.events[0].2["code"], "antigravity_step_usage");
+    usage["usage"]["inputTokens"] = json!(-1);
+    assert!(e
+        .execute(&command("native_controller.observation", "usage", usage))
+        .is_err());
     payload["dispatchEventId"] = json!("foreign");
     assert!(e
         .execute(&command(

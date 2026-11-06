@@ -319,6 +319,50 @@ impl CommandExecutor for AntigravityDispatchExecutor {
                         json!({"status":"written_consumption_unknown"}),
                     ));
                 }
+                if p["action"] == "antigravity.usage_observation" {
+                    let fields = [
+                        "action",
+                        "bindingId",
+                        "bindingGeneration",
+                        "runId",
+                        "environmentLeaseId",
+                        "normalizedSessionId",
+                        "turnId",
+                        "conversationId",
+                        "processGeneration",
+                        "dispatchEventId",
+                        "stepIndex",
+                        "usage",
+                    ];
+                    let usage = &p["usage"];
+                    let names = ["inputTokens", "outputTokens", "cacheReadTokens"];
+                    if self.state.phase != "dispatched"
+                        || p["dispatchEventId"].as_str() != self.state.dispatch_event_id.as_deref()
+                        || p.as_object().map_or(true, |o| {
+                            o.len() != fields.len()
+                                || o.keys().any(|k| !fields.contains(&k.as_str()))
+                        })
+                        || !p["stepIndex"]
+                            .as_u64()
+                            .is_some_and(|v| v <= 9_007_199_254_740_991)
+                        || usage.as_object().map_or(true, |o| {
+                            o.len() != names.len() || o.keys().any(|k| !names.contains(&k.as_str()))
+                        })
+                        || names
+                            .iter()
+                            .any(|name| !usage[*name].as_u64().is_some_and(|v| v <= 2_147_483_647))
+                    {
+                        return Err(invalid("Antigravity usage observation invalid"));
+                    }
+                    return Ok(CommandExecution {
+                        result: json!({"status":"provider_usage_recorded"}),
+                        events: vec![(
+                            "harness.diagnostic".into(),
+                            EventPriority::P1,
+                            json!({"code":"antigravity_step_usage", "stepIndex":p["stepIndex"], "usage":usage}),
+                        )],
+                    });
+                }
                 if p["action"] == "antigravity.tool_observation" {
                     let fields = [
                         "action",
