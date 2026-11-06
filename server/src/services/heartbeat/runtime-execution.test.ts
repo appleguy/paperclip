@@ -190,6 +190,35 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     });
     await executeHeartbeatRuntime(db, input);
   });
+  it.each(["current", "missing", "expired", "replaced", "native", "stop"] as const)(
+    "checks legacy OpenCode binding authority at the checkpoint write (%s)", async scenario => {
+      const { input, adapter, run } = await fixture();
+      adapter.type = "opencode_local";
+      input.agent.adapterType = "opencode_local";
+      const bootId = randomUUID();
+      const [claimed] = await db.update(heartbeatRuns).set({
+        controllerBootId: scenario === "missing" ? null : bootId,
+        controllerLeaseExpiresAt: new Date(Date.now() + 60_000),
+      }).where(eq(heartbeatRuns.id, run.id)).returning();
+      input.run = claimed;
+      if (scenario === "expired") await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: new Date(0) }).where(eq(heartbeatRuns.id, run.id));
+      if (scenario === "replaced") await db.update(heartbeatRuns).set({ controllerBootId: randomUUID() }).where(eq(heartbeatRuns.id, run.id));
+      if (scenario === "native") await db.update(heartbeatRuns).set({ runtimeMode: "native" }).where(eq(heartbeatRuns.id, run.id));
+      if (scenario === "stop") await db.update(heartbeatRuns).set({ resultJson: { executionCancellation: { state: "requested" } } }).where(eq(heartbeatRuns.id, run.id));
+      adapter.execute.mockImplementationOnce(async ctx => {
+        const checkpoint = ctx.onSession!({ sessionId: "ses_owned", sessionParams: { sessionId: "ses_owned",
+          narBinding: { schema: "paperclip.opencode-binding.v1", messageId: "msg_owned" },
+        } });
+        if (scenario === "current") await expect(checkpoint).resolves.toBeUndefined();
+        else await expect(checkpoint).rejects.toThrow("Session checkpoint lost run ownership");
+        const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+        expect(saved.sessionIdAfter).toBe(scenario === "current" ? "ses_owned" : null);
+        if (scenario === "stop") expect(saved.resultJson).toMatchObject({ executionCancellation: { state: "requested" } });
+        return { exitCode: 0, signal: null, timedOut: false };
+      });
+      await executeHeartbeatRuntime(db, input);
+    },
+  );
   it("preserves a checkpoint and Stop written after the hot-restart scan", async () => {
     const { run } = await fixture();
     const oldBoot = randomUUID();
