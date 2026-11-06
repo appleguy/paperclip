@@ -83,6 +83,7 @@ export { runnerBinaryTarget } from "./live/runner-binary.js";
 export * from "./drivers/opencode/opencode-server-driver.js";
 export * from "./drivers/opencode/mcp-bridge.js";
 export { OpenCodeV2Shared } from "./drivers/opencode/opencode-v2-shared.js";
+export { OpenCodeProviderBoundary } from "./drivers/opencode/provider-boundary.js";
 export { ClaudeInteractiveNativeBackend } from "./drivers/claude/native-interactive-backend.js";
 export type { ClaudeInteractiveNativePort } from "./drivers/claude/native-interactive-backend.js";
 export { OpenCodeSharedNativeBackend } from "./drivers/opencode/shared-native-backend.js";

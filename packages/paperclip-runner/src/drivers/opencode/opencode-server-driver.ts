@@ -1,4 +1,5 @@
 import { isOpenRouterUrl, OPENROUTER_ATTRIBUTION_HEADERS } from "../openrouter-attribution.js";
+import { OpenCodeProviderBoundary } from "./provider-boundary.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { resolveCompletionContinuation } from "../completion-continuation.js";
 import { createHash, randomBytes } from "node:crypto";
@@ -2316,7 +2317,7 @@ class OpenCodeHarnessSession implements HarnessSession {
 }
 
 /** Retain the reusable gateway key in the runner; the harness gets a session-scoped capability. */
-export async function startOpenCodeProviderProxy(baseUrl: string, key: string, model: string, environment: NodeJS.ProcessEnv, restore?: { port: number; token: string }) {
+export async function startOpenCodeProviderProxy(baseUrl: string, key: string, model: string, environment: NodeJS.ProcessEnv, restore?: { port: number; token: string }, boundary?: OpenCodeProviderBoundary) {
   const upstreamUrl = new URL(`${baseUrl.replace(/\/+$/, "")}/chat/completions`);
   if (restore && (!Number.isSafeInteger(restore.port) || restore.port < 1 || restore.port > 65535 || !/^[A-Za-z0-9_-]{43}$/.test(restore.token))) throw new Error("Invalid OpenCode provider proxy restoration");
   const token = restore?.token ?? randomBytes(32).toString("base64url");
@@ -2340,6 +2341,7 @@ export async function startOpenCodeProviderProxy(baseUrl: string, key: string, m
   const controllers = new Set<AbortController>();
   const server = createHttpServer((request, response) => {
     const controller = new AbortController();
+    let releaseBoundary: (() => void) | undefined;
     controllers.add(controller);
     response.once("close", () => controller.abort());
     void (async () => {
@@ -2373,6 +2375,7 @@ export async function startOpenCodeProviderProxy(baseUrl: string, key: string, m
         response.writeHead(400).end();
         return;
       }
+      releaseBoundary = await boundary?.enter(body, payload, controller.signal);
       const upstream = await new Promise<IncomingMessage>((resolve, reject) => {
         const outgoing = (upstreamUrl.protocol === "https:" ? requestHttps : requestHttp)(upstreamUrl, {
           method: "POST",
@@ -2399,7 +2402,7 @@ export async function startOpenCodeProviderProxy(baseUrl: string, key: string, m
     })().catch(() => {
       if (!response.headersSent) response.writeHead(502).end("Provider request failed");
       else response.destroy();
-    }).finally(() => controllers.delete(controller));
+    }).finally(() => { releaseBoundary?.(); controllers.delete(controller); });
   });
   try {
     await new Promise<void>((resolve, reject) => {
@@ -2417,6 +2420,7 @@ export async function startOpenCodeProviderProxy(baseUrl: string, key: string, m
     baseURL: `http://127.0.0.1:${address.port}/v1`,
     token,
     close: async () => {
+      boundary?.close();
       for (const controller of controllers) controller.abort();
       agent.destroy();
       await new Promise<void>((resolve) => { server.close(() => resolve()); server.closeAllConnections(); });
