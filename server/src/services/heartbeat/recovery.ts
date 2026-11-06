@@ -2401,7 +2401,9 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         issueId: heartbeatRuns.issueId, contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
         eq(heartbeatRuns.status, "running"), eq(heartbeatRuns.runtimeMode, "legacy"),
-        ...(pendingStop ? [sql`${heartbeatRuns.resultJson}->'executionCancellation'->>'state' = 'requested'`] : []),
+        ...(pendingStop
+          ? [sql`${heartbeatRuns.resultJson}->'executionCancellation'->>'state' = 'requested'`]
+          : [sql`coalesce(${heartbeatRuns.resultJson}->'executionCancellation'->>'state', '') <> 'requested'`]),
         ...(requireExpiredController ? [
           run.controllerBootId ? eq(heartbeatRuns.controllerBootId, run.controllerBootId) : isNull(heartbeatRuns.controllerBootId),
           or(isNull(heartbeatRuns.controllerLeaseExpiresAt), lte(heartbeatRuns.controllerLeaseExpiresAt, sql`clock_timestamp()`)),
@@ -2665,6 +2667,13 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       if ((processPidAlive || processGroupAlive) && openCodeLegacyRun &&
           parseObject(parseObject((await getRun(run.id))?.resultJson).executionCancellation).state === "requested") {
         await surfaceHeldOpenCodeRun(run, true);
+        scope.onDeferredDeadline?.(Date.now() + 60_000);
+        continue;
+      }
+      if ((processPidAlive || processGroupAlive) && openCodeLegacyRun) {
+        // An orphaned child is still not evidence that the shared provider is
+        // idle. Give the retained run an owner without touching its process.
+        await surfaceHeldOpenCodeRun(run, true, false);
         scope.onDeferredDeadline?.(Date.now() + 60_000);
         continue;
       }

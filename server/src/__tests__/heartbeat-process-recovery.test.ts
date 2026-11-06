@@ -3439,6 +3439,45 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(mockTerminateLocalService).not.toHaveBeenCalled();
   });
 
+  it.each([false, true])("surfaces an OpenCode orphan with a live child and no Stop (issue linked: %s)", async includeIssue => {
+    const { runId, agentId, companyId, issueId } = await seedRunFixture({
+      adapterType: "opencode_local", runtimeMode: "legacy", agentStatus: "paused", processPid: process.pid, includeIssue,
+    });
+    const controllerBootId = randomUUID();
+    await db.update(heartbeatRuns).set({ controllerBootId, controllerLeaseExpiresAt: new Date(Date.now() - 60_000),
+      resultJson: { preserved: "value" } }).where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+    await heartbeat.reapOrphanedRuns();
+    const first = await heartbeat.getRun(runId);
+    expect(first).toMatchObject({ status: "running", processPid: process.pid, controllerBootId, resultJson: { preserved: "value" } });
+    if (includeIssue) {
+      expect(await selectRecoveryActionForIssue(companyId, issueId)).toMatchObject({
+        ownerType: "board", returnOwnerAgentId: agentId, cause: "opencode_controller_lost_provider_unverified",
+        evidence: { runId, providerTermination: "unverified" },
+      });
+    } else {
+      expect(first?.resultJson).toMatchObject({ openCodeOrphanRecovery: {
+        ownerType: "board", cause: "opencode_controller_lost_provider_unverified", providerTermination: "unverified",
+      } });
+    }
+    await heartbeat.reapOrphanedRuns();
+    if (includeIssue) expect(await selectRecoveryActionsForIssue(issueId)).toHaveLength(1);
+    else expect((await heartbeat.getRun(runId))?.resultJson).toEqual(first?.resultJson);
+    expect(mockTerminateLocalService).not.toHaveBeenCalled();
+  });
+
+  it("does not surface an OpenCode orphan with a live controller lease", async () => {
+    const { runId, companyId, issueId } = await seedRunFixture({
+      adapterType: "opencode_local", runtimeMode: "legacy", processPid: process.pid,
+    });
+    await db.update(heartbeatRuns).set({ controllerBootId: randomUUID(),
+      controllerLeaseExpiresAt: new Date(Date.now() + 60_000) }).where(eq(heartbeatRuns.id, runId));
+    await heartbeatService(db).reapOrphanedRuns();
+    expect(await selectRecoveryActionForIssue(companyId, issueId)).toBeNull();
+    expect(await heartbeatService(db).getRun(runId)).toMatchObject({ status: "running", processPid: process.pid });
+    expect(mockTerminateLocalService).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])("marks an issue-less OpenCode hold for Board (pending Stop: %s)", async pendingStop => {
     const { runId, agentId } = await seedRunFixture({ adapterType: "opencode_local", runtimeMode: "legacy",
       agentStatus: "paused", includeIssue: false, ...(pendingStop ? { processPid: process.pid } : {}) });
