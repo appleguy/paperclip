@@ -10,9 +10,9 @@ import { expect, it } from "vitest";
 import { OpenCodeProviderBoundary } from "./provider-boundary.js";
 import { startOpenCodeProviderProxy } from "./opencode-server-driver.ts";
 
-it("holds a real qualified OpenCode streaming tool turn through an inference restart", async () => {
-  const executable = resolve("node_modules/opencode-ai/bin/opencode.exe");
-  expect(execFileSync(executable, ["--version"], { encoding: "utf8" }).trim()).toBe("1.18.34");
+it.each(["v1", "v2"])("holds a real qualified OpenCode %s streaming tool turn through an inference restart", async version => {
+  const executable = version === "v1" ? resolve("node_modules/opencode-ai/bin/opencode.exe") : "/opt/homebrew/bin/opencode";
+  expect(execFileSync(executable, ["--version"], { encoding: "utf8" }).trim()).toBe(version === "v1" ? "1.18.34" : "opencode v2.2.5");
   const root = await mkdtemp(join(tmpdir(), "opencode-freeze-"));
   const workspace = join(root, "workspace");
   await mkdir(workspace);
@@ -34,7 +34,11 @@ it("holds a real qualified OpenCode streaming tool turn through an inference res
         chunk({ role: "assistant", content: "FINAL_MARKER" }, null);
         chunk({}, "stop");
       } else {
-        chunk({ role: "assistant", tool_calls: [{ index: 0, id: "call_read_fixture", type: "function", function: { name: "read", arguments: JSON.stringify({ filePath: join(workspace, "fixture.txt") }) } }] }, null);
+        const readTool = data.tools?.find((tool: any) => /(^|[._-])read$/i.test(tool.function?.name ?? ""));
+        const name = readTool?.function?.name ?? "read";
+        const properties = readTool?.function?.parameters?.properties ?? {};
+        const args = Object.hasOwn(properties, "filePath") ? { filePath: join(workspace, "fixture.txt") } : { path: join(workspace, "fixture.txt") };
+        chunk({ role: "assistant", tool_calls: [{ index: 0, id: "call_read_fixture", type: "function", function: { name, arguments: JSON.stringify(args) } }] }, null);
         chunk({}, "tool_calls");
       }
       response.end("data: [DONE]\n\n");
@@ -47,8 +51,10 @@ it("holds a real qualified OpenCode streaming tool turn through an inference res
   const boundary = new OpenCodeProviderBoundary();
   const proxy = await startOpenCodeProviderProxy(`http://127.0.0.1:${port}/v1`, "", "qualification", {}, undefined, boundary);
   const config = join(root, "opencode.json");
-  await writeFile(config, JSON.stringify({ model: "openrouter/qualification", small_model: "openrouter/qualification", share: "disabled", autoupdate: false, plugin: [], enabled_providers: ["openrouter"], provider: { openrouter: { options: { baseURL: proxy.baseURL, apiKey: proxy.token }, models: { qualification: { name: "qualification", limit: { context: 10000, output: 1000 } } } } }, permission: { "*": "allow" } }));
-  const child = spawn(executable, ["serve", "--hostname", "127.0.0.1", "--port", "0"], { cwd: workspace, env: { PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, HOME: root, XDG_CONFIG_HOME: join(root, "config"), XDG_DATA_HOME: join(root, "data"), XDG_CACHE_HOME: join(root, "cache"), OPENCODE_CONFIG: config, OPENCODE_DISABLE_PROJECT_CONFIG: "true", OPENCODE_DISABLE_MODELS_FETCH: "true", OPENCODE_DISABLE_DEFAULT_PLUGINS: "true", OPENCODE_SERVER_USERNAME: "paperclip", OPENCODE_SERVER_PASSWORD: "fixture" }, stdio: ["ignore", "pipe", "pipe"], detached: true });
+  const v1config = { model: "openrouter/qualification", small_model: "openrouter/qualification", share: "disabled", autoupdate: false, plugin: [], enabled_providers: ["openrouter"], provider: { openrouter: { options: { baseURL: proxy.baseURL, apiKey: proxy.token }, models: { qualification: { name: "qualification", limit: { context: 10000, output: 1000 } } } } }, permission: { "*": "allow" } };
+  const v2config = { providers: { paperclip: { package: "@opencode/ai/providers/openai-compatible", name: "paperclip", settings: { baseURL: proxy.baseURL, apiKey: "{env:PAPERCLIP_PROVIDER_TOKEN}" }, models: { qualification: { name: "qualification" } } } } };
+  await writeFile(config, JSON.stringify(version === "v1" ? v1config : v2config));
+  const child = spawn(executable, ["serve", "--hostname", "127.0.0.1", "--port", "0"], { cwd: workspace, env: { PATH: `${dirname(process.execPath)}:/usr/bin:/bin`, HOME: root, XDG_CONFIG_HOME: join(root, "config"), XDG_DATA_HOME: join(root, "data"), XDG_CACHE_HOME: join(root, "cache"), XDG_STATE_HOME: join(root, "state"), OPENCODE_CONFIG: config, ...(version === "v2" ? { OPENCODE_CONFIG_CONTENT: JSON.stringify(v2config) } : {}), PAPERCLIP_PROVIDER_TOKEN: proxy.token, OPENCODE_PASSWORD: "fixture", OPENCODE_DISABLE_PROJECT_CONFIG: "true", OPENCODE_DISABLE_MODELS_FETCH: "true", OPENCODE_DISABLE_DEFAULT_PLUGINS: "true", OPENCODE_SERVER_USERNAME: "paperclip", OPENCODE_SERVER_PASSWORD: "fixture" }, stdio: ["ignore", "pipe", "pipe"], detached: true });
   const exited = once(child, "exit");
   let output = "";
   for (const stream of [child.stdout, child.stderr]) stream.on("data", chunk => { output = (output + chunk).slice(-16_384); });
@@ -56,15 +62,16 @@ it("holds a real qualified OpenCode streaming tool turn through an inference res
     let origin: string | undefined;
     for (let i = 0; i < 150 && !origin; i++) { origin = output.match(/http:\/\/127\.0\.0\.1:\d+/)?.[0]; if (!origin) await delay(100); }
     expect(origin, output).toBeTruthy();
-    const headers = { authorization: `Basic ${Buffer.from("paperclip:fixture").toString("base64")}`, "content-type": "application/json" };
+    const headers = { authorization: `Basic ${Buffer.from(`${version === "v1" ? "paperclip" : "opencode"}:fixture`).toString("base64")}`, "content-type": "application/json" };
     const api = async (path: string, init: RequestInit = {}) => {
       const response = await fetch(`${origin}${path}`, { ...init, headers, signal: AbortSignal.timeout(10_000) });
       if (!response.ok) throw new Error(`${path}: ${response.status} ${await response.text()}`);
       return response;
     };
-    const session = await (await api("/session", { method: "POST", body: JSON.stringify({ title: "freeze fixture" }) })).json() as { id: string };
+    const created = await (await api(version === "v1" ? "/session" : "/api/session", { method: "POST", body: JSON.stringify(version === "v1" ? { title: "freeze fixture" } : { id: "ses_freeze_fixture", model: { providerID: "paperclip", id: "qualification" }, location: { directory: workspace } }) })).json() as any;
+    const session = version === "v1" ? created : created.data;
     const freeze = boundary.freeze({ timeoutMs: 30_000, signal: new AbortController().signal });
-    await api(`/session/${session.id}/prompt_async`, { method: "POST", body: JSON.stringify({ providerID: "openrouter", modelID: "qualification", parts: [{ type: "text", text: "Read fixture.txt." }] }) });
+    await api(version === "v1" ? `/session/${session.id}/prompt_async` : `/api/session/${session.id}/prompt`, { method: "POST", body: JSON.stringify(version === "v1" ? { providerID: "openrouter", modelID: "qualification", parts: [{ type: "text", text: "Read fixture.txt." }] } : { id: "msg_freeze_fixture", text: "Read fixture.txt." }) });
     const checkpoint = await freeze;
     const before = requests.length;
     expect(before).toBeGreaterThan(0);
@@ -73,11 +80,12 @@ it("holds a real qualified OpenCode streaming tool turn through an inference res
     boundary.resume(checkpoint);
     let messages: any[] = [];
     for (let i = 0; i < 150; i++) {
-      messages = await (await api(`/session/${session.id}/message`)).json() as any[];
-      if (messages.some(message => message.parts?.some((part: any) => part.text === "FINAL_MARKER"))) break;
+      const result = await (await api(version === "v1" ? `/session/${session.id}/message` : `/api/session/${session.id}/message`)).json() as any;
+      messages = version === "v1" ? result : result.data;
+      if (messages.some(message => (message.parts ?? message.content)?.some((part: any) => part.text === "FINAL_MARKER"))) break;
       await delay(100);
     }
-    expect(messages.some(message => message.parts?.some((part: any) => part.text === "FINAL_MARKER")), JSON.stringify(messages)).toBe(true);
+    expect(messages.some(message => (message.parts ?? message.content)?.some((part: any) => part.text === "FINAL_MARKER")), JSON.stringify(messages)).toBe(true);
     const resumed = requests[before]!;
     expect(createHash("sha256").update(resumed).digest("hex")).toBe(checkpoint.requestSha256);
     const resumedBody = JSON.parse(resumed);
