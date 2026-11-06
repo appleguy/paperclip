@@ -126,6 +126,23 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     };
     return { input, adapter, run };
   }
+  it.each([
+    [undefined, "plain_cli"],
+    ["/shared/config.json", "shared"],
+  ] as const)("captures the effective OpenCode mode before dispatch", async (sharedConfig, expected) => {
+    const { input, adapter } = await fixture();
+    adapter.type = "opencode_local";
+    input.config.runtimeConfig.sharedServerRecoveryConfigPath = sharedConfig;
+    expect(input.control.executionControl.getOpenCodeExecutionMode()).toBe("unknown");
+    adapter.execute.mockImplementationOnce(async () => {
+      expect(input.control.executionControl.getOpenCodeExecutionMode()).toBe(expected);
+      input.config.runtimeConfig.sharedServerRecoveryConfigPath = sharedConfig ? undefined : "/changed.json";
+      expect(input.control.executionControl.getOpenCodeExecutionMode()).toBe(expected);
+      return { exitCode: 0, signal: null, timedOut: false };
+    });
+    await executeHeartbeatRuntime(db, input);
+  });
+
   it("persists a provider session while the legacy adapter is still running and fences late callbacks", async () => {
     const { input, adapter, run } = await fixture();
     adapter.execute.mockImplementationOnce(async ctx => {

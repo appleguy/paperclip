@@ -5,11 +5,22 @@ import { createAdapterExecutionPhaseTracker } from "./adapter-execution-phase.js
 export function createAdapterExecutionControl() {
   const controller = new AbortController();
   const phases = createAdapterExecutionPhaseTracker();
+  let openCodeExecutionMode: "unknown" | "plain_cli" | "shared" = "unknown";
   let finish!: () => void;
   const settled = new Promise<void>((resolve) => {
     finish = resolve;
   });
-  return { controller, settled, phases, finish: () => { phases.finish(); finish(); } };
+  return {
+    controller, settled, phases,
+    getOpenCodeExecutionMode: () => openCodeExecutionMode,
+    setOpenCodeExecutionMode: (mode: "plain_cli" | "shared") => {
+      if (openCodeExecutionMode !== "unknown" && openCodeExecutionMode !== mode) {
+        throw new Error("OpenCode execution mode changed during a run");
+      }
+      openCodeExecutionMode = mode;
+    },
+    finish: () => { phases.finish(); finish(); },
+  };
 }
 
 export const adapterExecutionControls = new Map<

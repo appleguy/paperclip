@@ -158,12 +158,13 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
     expect(deps.startNextQueuedRunForAgent).not.toHaveBeenCalled();
   });
 
-  it.each(["missing", "unbound"] as const)("holds OpenCode Stop with a live child and %s controller", async ownership => {
+  it.each(["missing", "unbound", "shared"] as const)("holds OpenCode Stop with a live child and %s controller", async ownership => {
     const { company, agent } = await fixture();
     await db.update(agents).set({ adapterType: "opencode_local" }).where(eq(agents.id, agent.id));
     const run = await liveRun(company.id, agent.id);
     const execution = createAdapterExecutionControl();
-    if (ownership === "unbound") adapterExecutionControls.set(run.id, execution);
+    if (ownership !== "missing") adapterExecutionControls.set(run.id, execution);
+    if (ownership === "shared") execution.setOpenCodeExecutionMode("shared");
     const deps = callbacks(db);
     try {
       await expect(createHeartbeatRunControl(db, deps).cancelRunInternal(run.id, "Operator Stop"))
@@ -174,6 +175,25 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
       expect(deps.setRunStatusFromLive).not.toHaveBeenCalled();
       expect(deps.envOrchestrator.releaseForRun).not.toHaveBeenCalled();
       expect(deps.startNextQueuedRunForAgent).not.toHaveBeenCalled();
+    } finally {
+      adapterExecutionControls.delete(run.id);
+    }
+  });
+
+  it("stops the owned plain OpenCode CLI child without a NAR binding", async () => {
+    const { company, agent } = await fixture();
+    await db.update(agents).set({ adapterType: "opencode_local" }).where(eq(agents.id, agent.id));
+    const run = await liveRun(company.id, agent.id);
+    const execution = createAdapterExecutionControl();
+    execution.setOpenCodeExecutionMode("plain_cli");
+    adapterExecutionControls.set(run.id, execution);
+    const deps = callbacks(db);
+    try {
+      vi.mocked(waitForAdapterStop).mockRejectedValueOnce(new AdapterStopTimeoutError(60_000, { runId: run.id }));
+      await expect(createHeartbeatRunControl(db, deps).cancelRunInternal(run.id, "Operator Stop"))
+        .rejects.toMatchObject({ status: 409 });
+      expect(execution.controller.signal.aborted).toBe(true);
+      expect(terminateLocalService).toHaveBeenCalledWith({ pid: 424242, processGroupId: 424242 }, expect.objectContaining({ forceAfterMs: 4000 }));
     } finally {
       adapterExecutionControls.delete(run.id);
     }

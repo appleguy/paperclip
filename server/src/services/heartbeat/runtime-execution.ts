@@ -903,6 +903,12 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               markDispatchStarted();
               return Promise.resolve(quotaPause);
             }
+            if (adapter.type === "opencode_local") {
+              // Freeze the effective per-run config, not mutable agent settings,
+              // before Stop can rely on this controller to own a plain CLI.
+              const sharedConfig = runtimeConfig.sharedServerRecoveryConfigPath;
+              executionControl.setOpenCodeExecutionMode(typeof sharedConfig === "string" && sharedConfig.trim() ? "shared" : "plain_cli");
+            }
             input.effects.onLegacyAdapterEntered();
             return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
               getFreshSessionHandoff,

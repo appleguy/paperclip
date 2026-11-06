@@ -1368,8 +1368,9 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     const openCodeBinding = parseObject(parseObject(parseObject(run.resultJson?.earlySession).sessionParams).narBinding);
     const ownedNarBinding = openCodeBinding.schema === "paperclip.opencode-binding.v1" &&
       openCodeBinding.runId === run.id && openCodeBinding.agentId === run.agentId;
-    if (run.runtimeMode === "legacy" && run.status === "running" && (!control || !ownedNarBinding) &&
-        (agent?.adapterType === "opencode_local" || parseObject(run.runnerProfileJson?.adapterDispatch).adapterType === "opencode_local")) {
+    if (run.runtimeMode === "legacy" && run.status === "running" &&
+        (agent?.adapterType === "opencode_local" || parseObject(run.runnerProfileJson?.adapterDispatch).adapterType === "opencode_local") &&
+        (!control || (!ownedNarBinding && control.getOpenCodeExecutionMode?.() !== "plain_cli"))) {
       let held: { id: string } | undefined;
       try {
         [held] = await db.update(heartbeatRuns).set({
