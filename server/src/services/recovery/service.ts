@@ -3021,7 +3021,7 @@ export function recoveryService(
     const waitingOn = formatIssueLinksForComment([
       ...openChildren,
       ...existingBlockers,
-    ]);
+    ], await getCompanyIssuePrefix(issue.companyId));
     await issuesSvc.addComment(
       issue.id,
       `This task is waiting on ${waitingOn} to finish. ` +
