@@ -126,11 +126,3 @@ function pathValues(json: string): string[] {
   try { walk(JSON.parse(json)); } catch { /* unreadable input names nothing */ }
   return out;
 }
-
-// Nested agents and skills write through tools this transcript does not record.
-const UNRECORDED_WRITERS = new Set(["Agent", "Task", "Skill"]);
-
-/** Whether every opaque input can be checked for the files it writes. */
-export function attributable(inputs: OpaqueInput[]): boolean {
-  return inputs.every(({ tool, text }) => tool === "Bash" ? text.trim() !== "" : !UNRECORDED_WRITERS.has(tool));
-}

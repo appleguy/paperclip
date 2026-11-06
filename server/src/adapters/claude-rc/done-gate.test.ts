@@ -152,20 +152,27 @@ describe("run mutation attribution (SCO-973 / S7 F01)", () => {
   const ts = "2026-11-05T02:00:00Z";
   const tool = (name: string, input: unknown, cwd?: string) => JSON.stringify({ timestamp: ts, cwd, message: { content: [{ type: "tool_use", name, input }] } });
 
-  it("returns unknown for shell and unrecognized tool write sets, even with commit prose", async () => {
+  it("accepts finished work with a warning when a tool write set is unknown (SCO-1111)", async () => {
     for (const name of ["Bash", "mcp__shell", "Agent"]) {
       const record = editedPaths(tool(name, { command: "sed -i '' s/a/b/ ui/page.ts" }), 1);
-      const v = await evaluate({ commits: [sha1] }, record, deps());
-      expect(v).toMatchObject({ ok: false, evidence: "unknown" });
+      expect(record.unknown).toEqual([`write set unavailable for tool ${name}`]);
+      const v = await evaluate({}, record, deps());
+      expect(v).toMatchObject({ ok: true, notes: expect.arrayContaining([expect.stringContaining("write set partly unknown")]) });
     }
   });
 
-  it("resolves relative targets from the transcript cwd or preserves unknown", async () => {
+  it("treats every Paperclip bridge tool as runtime-only (SCO-1111)", () => {
+    const jsonl = ["paperclip_finish", "paperclip_block", "paperclip_comment"].map(n => tool(`mcp__pcbridge__${n}`, { summary: "done" })).join("\n");
+    expect(editedPaths(jsonl, 1)).toEqual({ paths: [], unknown: [] });
+  });
+
+  it("resolves relative targets from the transcript cwd or warns when it cannot", async () => {
     const resolved = editedPaths(tool("Edit", { file_path: "ui/page.ts" }, M), 1);
     expect(resolved).toEqual({ paths: [`${M}/ui/page.ts`], unknown: [] });
     expect((await evaluateDoneGate({}, resolved, deps())).ok).toBe(false);
     const unresolved = editedPaths(tool("Edit", { file_path: "ui/page.ts" }), 1);
-    expect(await evaluate({}, unresolved, deps())).toMatchObject({ ok: false, evidence: "unknown" });
+    expect(unresolved.unknown).toEqual(["relative mutation path has no absolute cwd: ui/page.ts"]);
+    expect(await evaluate({}, unresolved, deps())).toMatchObject({ ok: true, notes: expect.arrayContaining([expect.stringContaining("no absolute cwd")]) });
   });
 
   it("permits normal read-only work and excludes earlier timestamped mutations", async () => {
@@ -175,7 +182,7 @@ describe("run mutation attribution (SCO-973 / S7 F01)", () => {
   });
 
   it("does not interpret malformed or incomplete mutation records as no edits", async () => {
-    for (const jsonl of ["", "{", "null", tool("Write", {}), tool("Read", {}) + "\n{"]) {
+    for (const jsonl of ["", "{", "null", tool("Read", {}) + "\n{"]) {
       expect(await evaluate({}, editedPaths(jsonl, 1), deps())).toMatchObject({ ok: false, evidence: "unknown" });
     }
   });
@@ -206,7 +213,8 @@ describe("run mutation attribution (SCO-973 / S7 F01)", () => {
     const transcript = path.join(scratch, "run.jsonl");
     for (const record of [tool("Bash", { command: "shell edit" }, alias), tool("Edit", { file_path: "ui/page.ts" }, alias), tool("Write", { file_path: path.join(alias, "ui/page.ts") })]) {
       await fs.writeFile(transcript, record);
-      expect((await gateReceiptRaw("{}", transcript, 1, realDeps)).ok).toBe(false);
+      // SCO-1111: a shell command that names nothing is a warning; recorded edits still refuse.
+      expect((await gateReceiptRaw("{}", transcript, 1, realDeps)).ok).toBe(record.includes('"Bash"'));
     }
     // A deleted target still resolves through its aliased parent.
     const deleted = editedPaths(tool("Edit", { file_path: path.join(alias, "ui/deleted.ts") }), 1);
@@ -285,8 +293,9 @@ describe("done gate", () => {
     } satisfies GateDeps;
     const v = await evaluateDoneGate({ commits: [sha1] }, [`${Z}/go/a.go`], both);
     expect(v.ok).toBe(true);
-    expect(v.notes.join()).toContain("live");
-    expect(v.notes.join()).not.toContain(`on ${Z}`);
+    const notes = v.ok ? v.notes.join() : "";
+    expect(notes).toContain("live");
+    expect(notes).not.toContain(`on ${Z}`);
   });
   it("maps a file to its deepest repo", () => {
     expect(repoOf(`${Z}/go/a.go`, [M, Z])).toBe(Z);

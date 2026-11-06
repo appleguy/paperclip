@@ -39,14 +39,18 @@ it("settles shell, agent and MCP writes from dispatch Git evidence and rejects d
     await fs.writeFile(transcript, JSON.stringify({ timestamp: "2026-11-05T02:00:00Z", message: { content: [{ type: "tool_use", name, input: {} }] } }));
     // Captured preexisting dirt can be excluded, even for read-only shell work.
     expect((await check([])).ok).toBe(true);
-    expect(await gateReceiptRaw('{"runId":"run"}', transcript, 100, deps)).toMatchObject({ ok: false, evidence: "unknown" });
+    // SCO-1111: without a baseline an unknown write set is a warning, not a refusal.
+    expect(await gateReceiptRaw('{"runId":"run"}', transcript, 100, deps)).toMatchObject({ ok: true, notes: expect.arrayContaining([expect.stringContaining("write set partly unknown")]) });
   }
   await fs.writeFile(path.join(repo, "own.ts"), "shell mutation\n");
   // An input-checkable tool that names nothing leaves the change unattributed (SCO-1003).
   expect(await check([])).toMatchObject({ ok: true, notes: expect.arrayContaining([expect.stringContaining("own.ts")]) });
-  // A nested agent's writes are unrecorded, so every dispatch delta stays its own.
+  // SCO-1111: a nested agent whose input names nothing leaves the change unattributed;
+  // one that names the file owns it.
   await fs.writeFile(transcript, JSON.stringify({ timestamp: "2026-11-05T02:00:00Z", message: { content: [{ type: "tool_use", name: "Agent", input: {} }] } }));
-  expect((await check([old], ["peer.ts", "own.ts"])).ok).toBe(false);
+  expect(await check([])).toMatchObject({ ok: true, notes: expect.arrayContaining([expect.stringContaining("own.ts")]) });
+  await fs.writeFile(transcript, JSON.stringify({ timestamp: "2026-11-05T02:00:00Z", message: { content: [{ type: "tool_use", name: "Agent", input: { target: path.join(repo, "own.ts") } }] } }));
+  expect((await check([old], ["peer.ts"])).ok).toBe(false);
   expect((await check([])).ok).toBe(false);
   const own = await commit();
   expect((await check([own])).ok).toBe(true);
@@ -65,9 +69,12 @@ it("settles shell, agent and MCP writes from dispatch Git evidence and rejects d
   expect((await check([old])).ok).toBe(false);
   expect((await check([own], [])).ok).toBe(true); // unchanged dirt is fingerprinted
   const legacy = { ...baseline, repos: baseline.repos.map(({ repo, head }) => ({ repo, head })) };
-  expect((await check([own], ["peer.ts"], legacy)).ok).toBe(false);
+  // SCO-1111: notMine is honored for a nested agent too; the receipt commit covers own.ts.
+  expect((await check([own], ["peer.ts"], legacy)).ok).toBe(true);
   await fs.writeFile(path.join(repo, "own.ts"), "uncommitted after valid commit\n");
-  expect((await check([own], ["peer.ts", "own.ts"])).ok).toBe(false);
+  // The receipt's notMine claim outranks an opaque writer, as for shell (SCO-1003); without it the change refuses.
+  expect((await check([own], ["peer.ts", "own.ts"])).ok).toBe(true);
+  expect((await check([own], ["peer.ts"])).ok).toBe(false);
   // Baseline dirt exemptions never override an explicit tool mutation.
   await fs.writeFile(transcript, JSON.stringify({ timestamp: "2026-11-05T02:00:00Z", cwd: repo, message: { content: [
     { type: "tool_use", name: "Bash", input: {} },

@@ -17,7 +17,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { baselineMutationPaths, validateCompletionProvenance, type GateBaseline } from "./done-gate-provenance.js";
 import { statusPaths } from "./done-gate-worktree.js";
-import { attributable, nonmutatingShell, opaqueWriterOf, type OpaqueInput } from "./done-gate-shell.js";
+import { nonmutatingShell, opaqueWriterOf, type OpaqueInput } from "./done-gate-shell.js";
 
 const run = promisify(execFile);
 
@@ -41,8 +41,8 @@ export type GateDeps = {
 // Only tools with a known nonmutating contract may establish read-only work.
 // Shell, nested agents and new tools remain unknown until a durable write set exists.
 const READ_ONLY_TOOLS = new Set(["Read", "Grep", "Glob", "WebFetch", "WebSearch", "TodoWrite", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode"]);
-// Bridge completion writes runtime state, not canonical source repositories.
-const RUNTIME_ONLY_TOOLS = new Set(["mcp__pcbridge__paperclip_finish"]);
+// Paperclip bridge tools (finish, block, comment) write runtime state, not source repositories.
+const isRuntimeOnlyTool = (name: string) => name.startsWith("mcp__pcbridge__");
 
 /** Run mutation record from the durable Claude transcript; keep incomplete evidence. */
 export function editedPaths(jsonl: string, sinceMs: number): MutationRecord {
@@ -94,7 +94,7 @@ export function editedPaths(jsonl: string, sinceMs: number): MutationRecord {
         unknown.add("tool record has no run timestamp");
         continue;
       }
-      if (READ_ONLY_TOOLS.has(c.name ?? "") || RUNTIME_ONLY_TOOLS.has(c.name ?? "")) continue;
+      if (READ_ONLY_TOOLS.has(c.name ?? "") || isRuntimeOnlyTool(c.name ?? "")) continue;
       if (c.name === "Bash" && nonmutatingShell(c.input?.command)) continue;
       if (!["Edit", "Write", "NotebookEdit", "MultiEdit"].includes(c.name ?? "")) {
         unknown.add(`write set unavailable for tool ${c.name ?? "unnamed"}`);
@@ -152,24 +152,25 @@ export async function evaluateDoneGate(receipt: GateReceipt, edited: string[] | 
   const gitFailure = (repo: string, command: string, result: GitEvidence) =>
     unknownEvidence(`Git evidence unknown: git ${command} in ${repo} failed (exit ${result.code}${result.error ? `; ${result.error}` : ""}). Restore Git access and retry; empty output is not proof of a clean checkout.`);
   const record = Array.isArray(edited) ? { paths: edited, unknown: [] } : edited;
-  if (record.unknown.length && (!baseline || record.unknown.some(reason => reason.startsWith("transcript ")))) return { ok: false, evidence: "unknown", reasons: [`mutation evidence unknown: ${record.unknown.join("; ")}. A complete run-owned mutation record or baseline is required; commit prose cannot establish the write set.`] };
+  // An unreadable transcript leaves nothing to check; refuse that alone.
+  if (record.unknown.some(reason => reason.startsWith("transcript "))) return { ok: false, evidence: "unknown", reasons: [`mutation evidence unknown: ${record.unknown.join("; ")}. A readable run transcript is required; commit prose cannot establish the write set.`] };
   let candidates = record.paths;
   const notes: string[] = [];
+  // SCO-1111: an unknown tool write set is a warning, not a refusal. The gate refuses
+  // only on positive evidence: recorded or attributable writes the receipt leaves unlanded.
+  if (record.unknown.length) notes.push(`write set partly unknown (${record.unknown.join("; ")}); checked recorded writes and receipt commits only`);
   if (record.unknown.length && baseline) {
-    // SCO-1003: with only opaque tools unknown, a dispatch delta is this run's
-    // when one of those tools could have written it. Other runs' dirt on the
-    // shared checkout is noted, never refused. Nested agents, skills and other
-    // unknowns keep every delta.
-    const opaqueOnly = record.unknown.every(reason => reason.startsWith("write set unavailable for tool "))
-      && attributable(record.opaque ?? []);
+    // SCO-1003: a dispatch delta is this run's when it was recorded or one of the
+    // opaque tools could have written it. Other runs' dirt on the shared checkout
+    // is noted, never refused.
     const notMine = new Set(strings(receipt.notMine));
     const unattributed: string[] = [];
     const explicitPaths = new Set(record.paths);
-    const attribute = opaqueOnly ? (absolute: string, rel: string) => {
+    const attribute = (absolute: string, rel: string) => {
       const own = explicitPaths.has(absolute) || (!notMine.has(rel) && !notMine.has(absolute) && opaqueWriterOf(record.opaque ?? [], absolute, rel));
       if (!own) unattributed.push(rel);
       return own;
-    } : undefined;
+    };
     try { candidates = [...new Set([...candidates, ...await baselineMutationPaths(receipt, { ...deps, git }, baseline, record.observedCommits, attribute)])]; }
     catch (error) { return unknownEvidence(`mutation baseline evidence unknown: ${error instanceof Error ? error.message : "Git evidence unavailable"}`); }
     if (unattributed.length) notes.push(`${unattributed.length} checkout changes since dispatch not attributed to this run: ${unattributed.slice(0, 8).join(", ")}`);

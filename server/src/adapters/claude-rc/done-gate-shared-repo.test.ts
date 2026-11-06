@@ -44,29 +44,34 @@ it("separates concurrent commits, unchanged dirt, changed baseline dirt and omit
   expect(record.observedCommits).toEqual([own.slice(0, 7)]);
   expect(editedPaths(transcript.replace("git commit -m fixture", "git commit -qm fixture && git log --oneline -1")
     .replace(`[main ${own.slice(0, 7)}] fixture`, `${own.slice(0, 7)} fixture`), 1).observedCommits).toEqual([own.slice(0, 7)]);
-  // A nested agent's writes are unrecorded: every dispatch delta stays this run's.
+  // SCO-1111: a nested agent whose input names nothing does not claim a later change.
   const unrecorded = editedPaths(transcript + "\n" + JSON.stringify({ timestamp: "2026-11-05T02:00:00Z",
     message: { content: [{ type: "tool_use", name: "Agent", input: {} }] } }), 1);
   const check = (commits = [own], notMine: string[] = []) => evaluateDoneGate({ runId: "run", commits, notMine }, unrecorded, deps, baseline);
   expect(await check()).toMatchObject({ ok: true });
   await fs.writeFile(path.join(nested, "file.ts"), "changed nested content\n");
-  expect(await check()).toMatchObject({ ok: false });
+  expect(await check()).toMatchObject({ ok: true, notes: expect.arrayContaining([expect.stringContaining("not attributed")]) });
   // SCO-1003: a shell command that names nothing does not claim a concurrent run's change.
   expect(await evaluateDoneGate({ runId: "run", commits: [own] }, record, deps, baseline))
     .toMatchObject({ ok: true, notes: expect.arrayContaining([expect.stringContaining("not attributed")]) });
   await fs.writeFile(path.join(nested, "file.ts"), "nested original\n");
   expect(await check()).toMatchObject({ ok: true });
   expect(await check([])).toMatchObject({ ok: false });
-  // Changed existing dirt cannot be exempted with notMine in a new snapshot.
+  // SCO-1111: changed existing dirt that no tool of this run names is noted, not refused.
   await fs.writeFile(path.join(repo, "old-dirt"), "shell overwrote original\n");
-  expect(await check([own], ["old-dirt"])).toMatchObject({ ok: false });
+  expect(await check([own], ["old-dirt"])).toMatchObject({ ok: true, notes: expect.arrayContaining([expect.stringContaining("not attributed")]) });
+  // A shell write that names it is positive evidence; the fingerprint keeps it a change.
+  const writer = { ...record, opaque: [{ tool: "Bash", text: "echo x > old-dirt" }] };
+  const written = () => evaluateDoneGate({ runId: "run", commits: [own] }, writer, deps, baseline);
+  expect(await written()).toMatchObject({ ok: false });
   await fs.writeFile(path.join(repo, "old-dirt"), "original\n");
   expect(await check()).toMatchObject({ ok: true });
+  expect(await written()).toMatchObject({ ok: true });
   // Content equality alone is insufficient when a different blob is staged.
   await fs.writeFile(path.join(repo, "old-dirt"), "staged change\n");
   await git(repo, ["add", "old-dirt"]);
   await fs.writeFile(path.join(repo, "old-dirt"), "original\n");
-  expect(await check()).toMatchObject({ ok: false });
+  expect(await written()).toMatchObject({ ok: false });
   // Explicit recorded edits always win over the unchanged-dirt exemption.
   await git(repo, ["reset", "-q", "--", "old-dirt"]);
   expect(await evaluateDoneGate({ runId: "run", commits: [own] }, { ...record, paths: [path.join(repo, "old-dirt")] }, deps, baseline))
