@@ -255,6 +255,57 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expect(input.instructions.releaseInstructionCopy).toHaveBeenCalledOnce();
   });
 
+  it.each(["same owner", "successor"] as const)("holds late OpenCode recovery evidence after setup fails (%s)", async owner => {
+    const { input, adapter, run } = await fixture();
+    input.agent.adapterType = adapter.type = "opencode_local";
+    const [owned] = await db.update(heartbeatRuns).set({ controllerBootId: randomUUID(),
+      controllerLeaseExpiresAt: new Date(Date.now() + 60_000), resultJson: {} }).where(eq(heartbeatRuns.id, run.id)).returning();
+    input.run = owned;
+    const lateEvidence = { earlySession: { sessionId: "original", sessionParams: { narBinding: { messageId: "original-message" } } } };
+    const latestBoot = owner === "successor" ? randomUUID() : owned.controllerBootId;
+    vi.mocked(buildPaperclipRuntimeMcpServers).mockImplementationOnce(async () => {
+      await db.update(heartbeatRuns).set({ controllerBootId: latestBoot, resultJson: lateEvidence }).where(eq(heartbeatRuns.id, run.id));
+      throw new Error("synthetic setup failure");
+    });
+    const result = await executeHeartbeatRuntime(db, input);
+    expect(result).toMatchObject({ dispatched: true, adapterResult: { resultJson: { executionRecovery: {
+      reason: "recovery_setup_exception", providerWorkEvidence: "unverified",
+    } } } });
+    expect(revokeHeartbeatRunGatewayTokens).not.toHaveBeenCalled();
+    expect(input.instructions.releaseInstructionCopy).not.toHaveBeenCalled();
+    if (!result.dispatched) throw new Error("expected unverified hold");
+    const { persistUnverifiedSharedOpenCode } = await import("./opencode-unverified-hold.js");
+    expect(await persistUnverifiedSharedOpenCode(db, { run: owned, resultJson: result.adapterResult.resultJson })).toBe(owner === "same owner");
+    expect(await read(run.id)).toMatchObject({ status: "running", controllerBootId: latestBoot, resultJson: lateEvidence });
+    if (owner === "successor") expect((await read(run.id)).resultJson).toEqual(lateEvidence);
+  });
+
+  it("holds an OpenCode setup failure when the recovery history cannot be read", async () => {
+    const { input, adapter } = await fixture();
+    input.agent.adapterType = adapter.type = "opencode_local";
+    input.services.getRun = vi.fn(async () => { throw new Error("synthetic read failure"); });
+    vi.mocked(buildPaperclipRuntimeMcpServers).mockRejectedValueOnce(new Error("synthetic setup failure"));
+    expect(await executeHeartbeatRuntime(db, input)).toMatchObject({ dispatched: true, adapterResult: { resultJson: {
+      executionRecovery: { reason: "recovery_setup_exception", providerWorkEvidence: "unverified" },
+    } } });
+    expect(revokeHeartbeatRunGatewayTokens).not.toHaveBeenCalled();
+    expect(input.instructions.releaseInstructionCopy).not.toHaveBeenCalled();
+  });
+
+  it("holds an OpenCode setup failure after its controller lease has expired", async () => {
+    const { input, adapter, run } = await fixture();
+    input.agent.adapterType = adapter.type = "opencode_local";
+    const [expired] = await db.update(heartbeatRuns).set({ controllerBootId: randomUUID(),
+      controllerLeaseExpiresAt: new Date(Date.now() - 60_000), resultJson: {} }).where(eq(heartbeatRuns.id, run.id)).returning();
+    input.run = expired;
+    vi.mocked(buildPaperclipRuntimeMcpServers).mockRejectedValueOnce(new Error("synthetic setup failure"));
+    expect(await executeHeartbeatRuntime(db, input)).toMatchObject({ dispatched: true, adapterResult: { resultJson: {
+      executionRecovery: { reason: "recovery_setup_exception", providerWorkEvidence: "unverified" },
+    } } });
+    expect(revokeHeartbeatRunGatewayTokens).not.toHaveBeenCalled();
+    expect(input.instructions.releaseInstructionCopy).not.toHaveBeenCalled();
+  });
+
   it.each([ { messageId: "message-original" }, null ])(
     "holds a preparing OpenCode orphan with a persisted NAR binding and no restart marker (%s)", async binding => {
       const { heartbeatService } = await import("../heartbeat.js");
