@@ -5867,6 +5867,7 @@ impl CodexCommandExecutor {
     }
 
     fn close_session(&mut self) -> Result<CommandExecution, DurableRunnerError> {
+        let had_owned_provider = self.provider.is_some();
         self.stop_owned_provider()?;
         let state = self
             .state
@@ -5898,6 +5899,9 @@ impl CodexCommandExecutor {
         let provider_termination_receipt = state.provider_termination_receipt.clone();
         self.save_state()?;
         let mut result = json!({"status": "closed", "providerSessionId": thread_id});
+        if had_owned_provider {
+            result["providerExitConfirmed"] = json!(true);
+        }
         if let Some(receipt) = provider_termination_receipt {
             result["providerTerminationReceipt"] = receipt;
         }
