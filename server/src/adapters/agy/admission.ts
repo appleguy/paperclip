@@ -31,6 +31,11 @@ export function isAgyHostLimitedModel(model: string): boolean {
   return /^(claude|gpt)-/i.test(model);
 }
 
+// Headless agy may use its configured default when no model is supplied.
+export function isAgyHeadlessHostLimitedModel(model: string | null | undefined): boolean {
+  return !model || !/^gemini(?:[.-]|$)/i.test(model);
+}
+
 export function isAgyAdmissionIdle(snapshot: unknown, conversationId: string | null, receiptMtime: number, now = Date.now()): boolean {
   if (!snapshot || typeof snapshot !== "object" || !conversationId) return false;
   const status = snapshot as Record<string, unknown>;

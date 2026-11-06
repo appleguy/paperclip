@@ -197,6 +197,7 @@ import {
 import { adapterExecutionTargetEnablesSandboxDuplexBridge, type AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
 import { createNativeSshCommandRunner } from "./native-ssh-command-runner.js";
 import { bindAntigravityHeadlessLease } from "./antigravity-headless-authority.js";
+import { AGY_HOST_ADMISSION, claimAgyHostAdmission, isAgyHeadlessHostLimitedModel } from "../../adapters/agy/admission.js";
 import { discoverRemoteExecutable, parseRemoteExecutableCandidate } from "./codex-model-fallback.js";
 export { parseRemoteExecutableCandidate } from "./codex-model-fallback.js";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
@@ -10326,12 +10327,17 @@ async function executePaperclipNativeSessionWithinScope(
       });
       const parent = resolve(resolvePaperclipInstanceRoot(), "runtime", "paperclip-runner", "antigravity");
       mkdirSync(parent, { recursive: true, mode: 0o700 });
+      const stateDirectory = join(parent, randomUUID());
       antigravityBackend = createNativeSessionBackend(input.execution, { antigravityAuthority: {
         identity: { runId: binding.runId, sessionId: input.execution.session.normalizedSessionId!, companyId: binding.companyId, issueId: binding.issueId, agentId: binding.agentId },
         runnerInstanceId: effectiveRunnerInstanceId, environmentLeaseId, turnId: randomUUID(), itemId: randomUUID(),
         bindingId: randomUUID(), bindingGeneration: generation, cwd: input.execution.workspace.cwd!,
-        stateDirectory: join(parent, randomUUID()), runnerBinary: resolvePaperclipRunnerBinary(), executable: cli,
+        stateDirectory, runnerBinary: resolvePaperclipRunnerBinary(), executable: cli,
         verifiedVersion: input.execution.provider.cliVersion, model: input.execution.provider.model ?? undefined, effort: input.execution.provider.effort, env: process.env, admit, withAdmission,
+        ...(isAgyHeadlessHostLimitedModel(input.execution.provider.model) ? {
+          claimHostAdmission: () => claimAgyHostAdmission(AGY_HOST_ADMISSION,
+            { runId: binding.runId, issueId: binding.issueId, stateDir: stateDirectory }, false),
+        } : {}),
       } });
     }
     let openCodeAdmission: Awaited<ReturnType<typeof startOpenCodeManagedBackend>> | undefined;
