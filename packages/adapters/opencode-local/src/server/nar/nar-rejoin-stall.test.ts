@@ -13,6 +13,7 @@ vi.mock("./opencode-http-driver.js", async (orig) => {
     async bindConversation() { return { conversationId: "ses_test" }; }
     async messageExists() { return false; }
     async inflightMessage() { return d.reads >= d.successorAfter ? "msg_successor" : d.inflight; }
+    async hasSuccessor() { return d.reads >= d.successorAfter; }
     async submit() { throw new Error("must not resend on rejoin"); }
     async readOutcomeMsg() { return ++d.reads >= d.settleAfter ? "hook_observed" : "working"; }
     async progressMark() { return d.marks.length > 1 ? d.marks.shift()! : d.marks[0] ?? null; }
@@ -34,7 +35,10 @@ async function run(extra: Record<string, unknown>, onLine?: (line: string) => vo
   const res = await runNarOpenCodeAttempt({
     configPath, agentId: "a", taskId: "t", runId: "run-1", cwd: dir, model: "", prompt: "p", timeoutSec: 0,
     pollMs: 1, probeMs: 0, idleGraceMs: 60_000, rejoinStallMs: 40, ...extra,
-    fetchImpl: (async () => { throw new Error("offline"); }) as unknown as typeof fetch,
+    fetchImpl: (async (url: string | URL | Request) => new Response(JSON.stringify({ data:
+      String(url).includes("/message?")
+        ? [{ id: messageIdFor(narOpIdFor("run-1")), type: "user", time: { created: 1 } }]
+        : {} }), { status: 200 })) as typeof fetch,
     onLog: async (_s, c) => { log.push(c); onLine?.(c); },
   });
   await fs.rm(dir, { recursive: true });
@@ -49,7 +53,7 @@ describe("NAR rejoin stall watchdog", () => {
     d.settleAfter = 8;
     const { res } = await run({ idleGraceMs: 0, rejoinStallMs: 60_000 });
     expect(res.providerTermination).toBeUndefined();
-    expect(res.proc.exitCode).toBe(0);
+    expect(res.executionRecovery).toMatchObject({ reason: "unowned_successor", providerWorkStarted: true });
     expect(d.interrupts).toBe(0);
   });
 

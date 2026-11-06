@@ -38,6 +38,8 @@ describe("OpenCode adapter nativeRuntime nar", () => {
   let clock: number;
   let assistantError: unknown;
   let trailing = false;
+  let successorOnMessageRead: number;
+  let messageReadsAfterPrompt: number;
 
   beforeEach(async () => {
     root = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-nar-adapter-"));
@@ -53,6 +55,8 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     clock = 1000;
     assistantError = undefined;
     trailing = false;
+    successorOnMessageRead = Infinity;
+    messageReadsAfterPrompt = 0;
     vi.stubEnv("XDG_CONFIG_HOME", root);
     runProcess.mockReset();
     const expected = "Basic " + Buffer.from("opencode:local-secret").toString("base64");
@@ -120,7 +124,12 @@ describe("OpenCode adapter nativeRuntime nar", () => {
         m = p.match(/^\/api\/session\/([^/]+)\/message$/);
         if (m) {
           const all = sessions.get(m[1]!)?.msgs ?? [];
-          if (!messagePageSize) return reply(200, { data: all });
+          if (promptPosts && ++messageReadsAfterPrompt === successorOnMessageRead) {
+            all.push({ id: "msg_external_successor", type: "user", text: "other run", time: { created: clock++ } },
+              { id: "msg_external_result", type: "assistant", time: { created: clock++, completed: clock++ },
+                content: [{ type: "text", text: "other result" }], cost: 10 });
+          }
+          if (!messagePageSize) return reply(200, { data: [...all].reverse() });
           // Like the real API once paging matters: newest first, `cursor.next` addresses the older page.
           const q = new URL(req.url ?? "", url).searchParams;
           const end = q.has("cursor") ? Number(q.get("cursor")) : all.length;
@@ -194,6 +203,28 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     } as never);
     expect(promptPosts).toBe(0);
     expect(result.resultJson?.executionRecovery).toMatchObject({ providerWorkStarted: false });
+  });
+
+  it.each([1, 2])("holds live completion when a successor appears on outcome read %i", async (read) => {
+    successorOnMessageRead = read;
+    const result = await execute(context("run-live-successor", { nativeRuntime: "nar" }) as never);
+    expect(result).toMatchObject({ exitCode: 75, resultJson: { executionRecovery: {
+      providerWorkStarted: true, reason: "unowned_successor",
+    } } });
+    expect(result.summary ?? "").toBe("");
+    expect(result.costUsd ?? null).toBeNull();
+    expect(promptPosts).toBe(1);
+    expect(interruptPosts).toBe(0);
+  });
+
+  it("holds live completion if its target is outside the outcome window", async () => {
+    messagePageSize = 1;
+    const result = await execute(context("run-live-older", { nativeRuntime: "nar" }) as never);
+    expect(result).toMatchObject({ exitCode: 75, resultJson: { executionRecovery: {
+      providerWorkStarted: true, reason: "outcome_unknown",
+    } } });
+    expect(promptPosts).toBe(1);
+    expect(interruptPosts).toBe(0);
   });
 
   it("retains possible provider work if checkpointing a rejoined turn fails", async () => {

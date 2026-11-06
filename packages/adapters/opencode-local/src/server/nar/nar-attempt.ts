@@ -543,14 +543,14 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
 
   let out: Awaited<ReturnType<typeof collectOutcome>>;
   try {
-    if (input.reattachOnly && await driver.hasSuccessor(conversationId, msgId))
-      return held("OpenCode reattach found a successor in message history; outcome held", true, conversationId, "unowned_successor");
-    out = await collectOutcome(f, server.url, server.passwordFile, conversationId, msgId, Boolean(input.reattachOnly));
-    if (input.reattachOnly && await driver.hasSuccessor(conversationId, msgId))
-      return held("OpenCode reattach found a successor while reading the outcome; outcome held", true, conversationId, "unowned_successor");
+    if (await driver.hasSuccessor(conversationId, msgId))
+      return held("OpenCode found a successor in message history; outcome held", true, conversationId, "unowned_successor");
+    out = await collectOutcome(f, server.url, server.passwordFile, conversationId, msgId, true);
+    if (await driver.hasSuccessor(conversationId, msgId))
+      return held("OpenCode found a successor while reading the outcome; outcome held", true, conversationId, "unowned_successor");
   } catch {
-    if (input.reattachOnly) return held("OpenCode reattach outcome could not be verified; held without replay", true, conversationId, "reattach_outcome_unknown");
-    out = { texts: [], usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, peakContextTokens: 0 }, usageReported: false, costUsd: null, sessionOutcome: null, capacityRefusal: false, cause: null };
+    return held("OpenCode outcome could not be verified; held without replay", true, conversationId,
+      input.reattachOnly ? "reattach_outcome_unknown" : "outcome_unknown");
   }
   const summary = out.texts.join("\n\n");
   if (summary && !loggedText) await onLog("stdout", summary + "\n");
