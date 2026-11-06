@@ -1080,6 +1080,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       )).for("update") : [];
       const ownsIssue = !verifiedPendingCardWake && owner?.assigneeAgentId === run.agentId &&
         context.wakeReason !== "source_scoped_recovery_action";
+      if (issueId && run.retryOfRunId) {
+        const [running] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.agentId, run.agentId),
+          eq(heartbeatRuns.issueId, issueId), eq(heartbeatRuns.status, "running"), ne(heartbeatRuns.id, run.id),
+        )).limit(1);
+        if (running) return { ownsIssue, blocked: true };
+      }
       const [handoff] = issueId ? await tx.select().from(caseHandoffs).where(and(eq(caseHandoffs.companyId, run.companyId), eq(caseHandoffs.issueId, issueId),
         inArray(caseHandoffs.state, ["awaiting_release", "pending_dispatch"]))).limit(1) : [];
       if (handoff && (handoff.wakeupRequestId !== run.wakeupRequestId || handoff.state === "awaiting_release"))

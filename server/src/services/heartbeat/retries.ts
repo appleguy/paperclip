@@ -2,7 +2,7 @@ import { notifyAttentionRetentionWork } from "../retention-work-notifications.js
 import { normalizeAgentNameKey } from "../agent-name-key.js";
 import { notifyStatusCardIssueChange } from "../status-card-notifications.js";
 import { notifyScheduledRetryDispatch } from "../run-dispatch-notifications.js";
-import { deriveTaskKeyWithHeartbeatFallback } from "./run-state.js";
+import { createHeartbeatRunState, deriveTaskKeyWithHeartbeatFallback } from "./run-state.js";
 import { infrastructureRetryDelayMs } from "../system-recovery-state.js";
 import {
   WORKSPACE_VALIDATION_FAILURE_CODE,
@@ -77,7 +77,6 @@ import {
 
 import type { AppendHeartbeatRunEventInput } from "../heartbeat-run-events.js";
 import type { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
-import type { createHeartbeatRunState } from "./run-state.js";
 import type { createHeartbeatRunPreparation } from "./run-preparation.js";
 import type { createRunDispatch, PostCommitEffect } from "../../modules/run-dispatch/index.js";
 
@@ -660,7 +659,10 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
       }
     }
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
-    const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
+    const recoveryResume = (run.status === "interrupted" || run.errorCode === "process_lost") && contextSnapshot.forceFreshSession !== true
+      ? await createHeartbeatRunState(db).resolveExplicitResumeSessionOverride(agent, { resumeFromRunId: run.id }, taskKey)
+      : null;
+    const sessionBefore = recoveryResume?.sessionDisplayId ?? await resolveSessionBeforeForWakeup(agent, taskKey);
     const interactionRunnerWait = retryReason === RUNNER_REVISION_WAIT_RETRY_REASON
       && isResolvedInteractionContinuationWakeContext(run.contextSnapshot);
     const interactionContinuationPayload =
@@ -692,6 +694,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
         ...contextSnapshot,
         executionRetryAccounting: accountingForScheduledRetry(run, retryReason, schedule.attempt),
         retryOfRunId: run.id,
+        ...(recoveryResume ? { resumeFromRunId: run.id, resumeSessionDisplayId: recoveryResume.sessionDisplayId, resumeSessionParams: recoveryResume.sessionParams } : {}),
         wakeReason,
         retryReason,
         ...(interactionRunnerWait ? { mutation: "interaction" } : {}),
@@ -794,6 +797,13 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
           await tx.execute(
             sql`select id from heartbeat_runs where company_id = ${run.companyId} and id = ${run.id} for update`,
           );
+          if (issueId && (run.status === "interrupted" || run.errorCode === "process_lost")) {
+            const [running] = await tx.select().from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.agentId, run.agentId),
+              eq(heartbeatRuns.issueId, issueId), eq(heartbeatRuns.status, "running"), ne(heartbeatRuns.id, run.id),
+            )).limit(1);
+            if (running) return { outcome: "scheduled", run: running, reusedExisting: true };
+          }
           if (targetWait && issueId) {
             // The issue lock serializes different refused runs, not just repeat
             // recovery of one predecessor. Never coalesce another issue/agent.
@@ -1335,7 +1345,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
         eventType: "lifecycle",
         stream: "system",
         level: "info",
-        message: `Reused existing continuation retry ${retryRun.scheduledRetryAttempt}/${schedule.maxAttempts}`,
+        message: retryRun.status === "running" ? "Recovery yielded to the active run for this task" : `Reused existing continuation retry ${retryRun.scheduledRetryAttempt}/${schedule.maxAttempts}`,
         payload: {
           retryRunId: retryRun.id,
           retryReason,

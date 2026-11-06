@@ -341,6 +341,40 @@ describePostgres("heartbeat retry module database wiring", () => {
     return refused!;
   }
 
+  it.each(["process_lost", "server_shutdown_interrupted"])("resumes the recorded session after %s", async errorCode => {
+    const f = await fixture();
+    const [source] = await db.update(heartbeatRuns).set({ status: errorCode === "process_lost" ? "failed" : "interrupted", errorCode, sessionIdAfter: "thread-1", resultJson: {
+      conversationContinuation: "continue_conversation_v1",
+      earlySession: { sessionId: "thread-1", sessionParams: { sessionId: "thread-1", cwd: "/saved-workspace" } },
+    } }).where(eq(heartbeatRuns.id, f.run.id)).returning();
+    const result = await boundRetries().retries.scheduleBoundedRetryForRun(source, f.agent, { now });
+    expect(result).toMatchObject({ outcome: "scheduled", run: { sessionIdBefore: "thread-1", contextSnapshot: {
+      resumeFromRunId: source.id, resumeSessionParams: { sessionId: "thread-1", cwd: "/saved-workspace" },
+    } } });
+  });
+
+  it("keeps ACP session identity and compatibility data on interrupted recovery", async () => {
+    const f = await fixture();
+    const params = { acpSessionId: "backend", agentSessionId: "thread", runtimeSessionName: "runtime",
+      sessionKey: "key", agent: "codex", cwd: "/saved-workspace", mode: "persistent", configFingerprint: "fingerprint" };
+    const [source] = await db.update(heartbeatRuns).set({ errorCode: "process_lost", sessionIdAfter: "thread",
+      resultJson: { conversationContinuation: "continue_conversation_v1", earlySession: { sessionId: "backend", sessionParams: params } },
+    }).where(eq(heartbeatRuns.id, f.run.id)).returning();
+    const result = await boundRetries().retries.scheduleBoundedRetryForRun(source, f.agent, { now });
+    expect(result).toMatchObject({ outcome: "scheduled", run: { contextSnapshot: { resumeSessionParams: params } } });
+  });
+
+  it("yields interrupted recovery to a running turn for the same agent and task", async () => {
+    const f = await fixture();
+    const [source] = await db.update(heartbeatRuns).set({ status: "interrupted", errorCode: "server_shutdown_interrupted" }).where(eq(heartbeatRuns.id, f.run.id)).returning();
+    const [running] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agent.id,
+      issueId: f.issue.id, scopeKind: "issue", status: "running", contextSnapshot: { issueId: f.issue.id } }).returning();
+    const result = await boundRetries().retries.scheduleBoundedRetryForRun(source, f.agent, { now });
+    expect(result).toMatchObject({ outcome: "scheduled", reusedExisting: true, run: { id: running.id } });
+    const pending = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "scheduled_retry")));
+    expect(pending).toHaveLength(0);
+  });
+
   it.each(["todo", "in_progress", "in_review", "blocked"])("three consecutive deferrals retain one pending wake and unchanged %s status", async status => {
     const f = await fixture();
     await db.update(issues).set({ status }).where(eq(issues.id, f.issue.id));

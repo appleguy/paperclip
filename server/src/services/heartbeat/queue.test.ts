@@ -384,6 +384,16 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     expect(await f.queue.claimQueuedRun(f.successor)).toMatchObject({ id: f.successor.id, status: "running" });
   });
 
+  it("yields an already queued retry to another running turn on the same task", async () => {
+    const f = await pendingPredecessorFixture();
+    await db.update(environmentLeases).set({ status: "released", releasedAt: new Date(), cleanupStatus: "success" }).where(eq(environmentLeases.id, f.lease.id));
+    const [running] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.agent.id,
+      issueId: f.issue.id, scopeKind: "issue", status: "running", contextSnapshot: { issueId: f.issue.id } }).returning();
+    expect(await f.queue.claimQueuedRun(f.successor)).toBeNull();
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, running.id));
+    expect(await f.queue.claimQueuedRun(f.successor)).toMatchObject({ id: f.successor.id, status: "running" });
+  });
+
   it.each(["missing", "foreign company", "other task", "other agent", "native task overrides context"] as const)(
     "does not hold a queued run for a %s retry source", async mismatch => {
       const f = await pendingPredecessorFixture();

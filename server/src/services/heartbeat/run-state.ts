@@ -636,14 +636,12 @@ export function buildExplicitResumeSessionOverride(input: {
         ? resumeRunSessionIdBefore
         : null
     : (resumeRunSessionIdAfter ?? resumeRunSessionIdBefore);
-  const runSessionParams = requiresCanonicalSessionIds(input.adapterType)
-    ? normalizeResumeParamsForAdapter(
-        input.adapterType,
-        input.sessionCodec.deserialize(input.resumeRunSessionParams ?? null),
-      )
-    : null;
+  const runSessionParams = normalizeResumeParamsForAdapter(
+    input.adapterType,
+    input.sessionCodec.deserialize(input.resumeRunSessionParams ?? null),
+  );
   const runSessionDisplayId = truncateDisplayId(
-    readNonEmptyString(runSessionParams?.sessionId),
+    (input.sessionCodec.getDisplayId?.(runSessionParams) ?? readNonEmptyString(runSessionParams?.sessionId)) ?? desiredDisplayId,
   );
   const taskSessionParams = normalizeResumeParamsForAdapter(
     input.adapterType,
@@ -673,17 +671,17 @@ export function buildExplicitResumeSessionOverride(input: {
       taskSessionParams != null) &&
     (input.taskSession.lastRunId === input.resumeFromRunId ||
       (!!desiredDisplayId && taskSessionDisplayId === desiredDisplayId));
-  const sessionParams = canReuseTaskSessionParams
-    ? taskSessionParams
-    : runSessionParams
-      ? runSessionParams
+  const sessionParams = runSessionParams
+    ? runSessionParams
+    : canReuseTaskSessionParams
+      ? taskSessionParams
       : desiredDisplayId
         ? { sessionId: desiredDisplayId }
         : null;
-  const sessionDisplayId = canReuseTaskSessionParams
-    ? taskSessionDisplayId
-    : runSessionParams
-      ? runSessionDisplayId
+  const sessionDisplayId = runSessionParams
+    ? runSessionDisplayId
+    : canReuseTaskSessionParams
+      ? taskSessionDisplayId
       : desiredDisplayId;
 
   if (!sessionDisplayId && !sessionParams) return null;
@@ -1626,6 +1624,7 @@ export function createHeartbeatRunState(db: Db) {
       : null;
     const sessionCodec = getAdapterSessionCodec(agent.adapterType);
     const resumeRunResult = parseObject(resumeRun.resultJson);
+    const earlySession = parseObject(resumeRunResult.earlySession);
     const resumeRunSessionId = requiresCanonicalSessionIds(agent.adapterType)
       ? (readNonEmptyString(resumeRunResult.sessionId) ??
         readNonEmptyString(resumeRunResult.session_id))
@@ -1635,7 +1634,9 @@ export function createHeartbeatRunState(db: Db) {
       resumeFromRunId,
       resumeRunSessionIdBefore: resumeRun.sessionIdBefore,
       resumeRunSessionIdAfter: resumeRun.sessionIdAfter,
-      resumeRunSessionParams: resumeRunSessionId
+      resumeRunSessionParams: Object.keys(parseObject(earlySession.sessionParams)).length
+        ? parseObject(earlySession.sessionParams)
+        : resumeRunSessionId
         ? { sessionId: resumeRunSessionId }
         : null,
       taskSession: resumeTaskSession,
