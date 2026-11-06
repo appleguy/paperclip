@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
@@ -95,6 +95,28 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
   const read = (id: string) => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)).then(rows => rows[0]!);
   const coordinators = (id: string) => db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, id));
   const sandbox = { kind: "remote" as const, transport: "sandbox" as const, remoteCwd: "/workspace", reusableLeaseConfigured: false };
+
+  it("persists the materialized pre-delivery context with the native execution", async () => {
+    const { input, run } = await fixture();
+    vi.mocked(buildNativeRuntimeContext).mockImplementationOnce(async () => {
+      const context = nativeRuntimeContextFixture();
+      context.instructions.bundle.rootPath = instructionRoot;
+      context.skills = ["zeta", "alpha"].map(key => ({ key, runtimeName: key, versionId: null, bundle: context.instructions.bundle }));
+      return { ...context, aggregateDigest: canonicalNativeRuntimeContextDigest(context) };
+    });
+    const selected = await selectHeartbeatRuntime(db, input);
+    const saved = (await read(run.id)).runnerProfileJson!;
+    const context = selected.nativeExecution!.runtimeContext;
+    const fields = {
+      instructionEntrySha256: createHash("sha256").update(await readFile(join(instructionRoot, "AGENTS.md"))).digest("hex"),
+      instructionBundleFingerprint: context.instructions.bundle.digest,
+      skillKeys: ["alpha", "zeta"],
+      promptMode: "unknown",
+    };
+    expect(saved.nativePreDeliveryContext).toEqual({ schema: "paperclip.native-pre-delivery-context.v1", ...fields,
+      sha256: createHash("sha256").update(JSON.stringify(fields)).digest("hex") });
+    expect(saved.nativeExecutionInput).toEqual(selected.nativeExecution);
+  });
 
   it("preserves preparation failure and skips runtime selection", async () => {
     const { input, run } = await fixture();

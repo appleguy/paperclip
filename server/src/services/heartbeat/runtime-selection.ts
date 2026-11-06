@@ -25,6 +25,8 @@ import type { CaseExecutionContext } from "../case-context.js";
 import type { buildExecutionContinuation } from "../execution-continuation.js";
 import type { agentInstructionWorkingCopyService } from "../agent-instruction-working-copies.js";
 import { createHash, randomUUID } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import path from "node:path";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentHarnessType, CHAT_PROVIDERS } from "@paperclipai/shared";
@@ -304,6 +306,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
   const { providerTraceRequested, providerTraceCapture } = input.trace;
   if (!isDotRun) assertEphemeralNativeRuntime(nativeRuntimeResolution.kind === "native");
   let nativeExecution: NativeExecutionInput | null = null;
+  let preDeliveryContextDigest: Record<string, unknown> | undefined;
   let getNativeFreshSessionHandoff: (() => Promise<string | null>) | undefined;
   let nativeRunnerInstanceId: string | null = null;
   let nativeWorkspaceSync: Awaited<ReturnType<typeof prepareNativeWorkspaceSync>> = null;
@@ -744,6 +747,17 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         runtimeSkillEntries,
         instructionWorkingCopy: instructionCopy ? { rootPath: instructionCopy.executionRoot, entryPath: instructionCopy.entryFile, ...(isAgentDirectoryCopy(instructionCopy) ? { kind: "agent_files" as const } : {}) } : undefined,
       });
+      // The bundle fingerprint covers the materialized file manifest; hash the
+      // actual entry bytes too. This is preparation evidence, not provider receipt.
+      const entry = await readFile(path.join(nativeRuntimeContext.instructions.bundle.rootPath, nativeRuntimeContext.instructions.entryPath));
+      const digestInputs = {
+        instructionEntrySha256: createHash("sha256").update(entry).digest("hex"),
+        instructionBundleFingerprint: nativeRuntimeContext.instructions.bundle.digest,
+        skillKeys: nativeRuntimeContext.skills.map(skill => skill.key).sort(),
+        promptMode: "unknown" as const,
+      };
+      preDeliveryContextDigest = { schema: "paperclip.native-pre-delivery-context.v1", ...digestInputs,
+        sha256: createHash("sha256").update(JSON.stringify(digestInputs)).digest("hex") };
       getNativeFreshSessionHandoff = nativeReviewRequest ? undefined : getFreshSessionHandoff;
       const nativeProviderConfig = nativeRuntimeResolution.profile.backend === "cursor_cloud_api"
         || nativeRuntimeResolution.profile.backend === "codex_app_server"
@@ -1033,6 +1047,8 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
               : {}),
             nativeExecutionInput:
               lockedProfile.nativeExecutionInput ?? nativeExecution,
+            ...(!lockedProfile.nativeExecutionInput && preDeliveryContextDigest
+              ? { nativePreDeliveryContext: preDeliveryContextDigest } : {}),
             nativeResourceDisposition: providerResourceDispositionForRun,
             nativeToolContractFingerprint:
               nativeToolContractFingerprintForTarget(
