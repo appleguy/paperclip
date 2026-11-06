@@ -829,8 +829,9 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     await db.update(agents).set({ lifecycleState: "ready", status: "paused",
       lifecycleHolds: ["manual"], pauseReason: "manual", pausedAt: new Date() }).where(eq(agents.id, agent.id));
     const resumed = await lifecycle.resumeAgent(agent.id);
-    expect(resumed).toMatchObject({ lifecycleState: "ready", status: "idle",
-      lifecycleHolds: [], pauseReason: null, pausedAt: null });
+    expect(resumed).toMatchObject({ lifecycleState: "resuming", status: "paused",
+      lifecycleHolds: [], pauseReason: null });
+    await work.process(agent.id);
     expect(await current(agent.id)).toMatchObject({ lifecycleState: "ready", status: "idle" });
   });
 

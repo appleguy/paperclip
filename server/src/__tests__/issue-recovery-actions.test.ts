@@ -40,6 +40,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { agentRoutes } from "../routes/agents.js";
 import type { ResumeRecoveryResolver } from "../services/recovery/resume-stranded.js";
+import { createAgentLifecycle, startAgentLifecycle } from "../services/agent-lifecycle.js";
 import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbeat.js";
 import { deliverReconciledExecutions, markExecutionReconciliation } from "../services/execution-recovery-resolution.js";
 import { legacyExecutionNeedsReconciliationWithEvidence } from "../services/legacy-execution-recovery.js";
@@ -2917,10 +2918,21 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     return { ...f, run, hold, action, body };
   }
 
-  it("restores only pause-stranded actions when an agent resumes", async () => {
+  it.each(["route", "resumeAgent", "updateAndTransition", "legacy"] as const)("restores only pause-stranded actions after async %s", async method => {
     const f = await seedCompany();
-    const pausedAt = new Date(Date.now() - 60_000);
-    await db.update(agents).set({ status: "paused", pausedAt }).where(eq(agents.id, f.coderId));
+    let resolve: ResumeRecoveryResolver;
+    const worker = startAgentLifecycle(db, {
+      requiredPluginIds: async () => [],
+      runHost: async () => "complete",
+      runPlugin: async () => "complete",
+    }, () => true, input => resolve(input));
+    const lifecycle = createAgentLifecycle(db);
+    await lifecycle.pauseAgent(f.coderId);
+    await worker.sweep();
+    const [paused] = await db.select().from(agents).where(eq(agents.id, f.coderId));
+    expect(paused).toMatchObject({ status: "paused", lifecycleState: "paused" });
+    const pausedAt = paused.pausedAt!;
+    expect(pausedAt).toBeInstanceOf(Date);
     const recovery = issueRecoveryActionService(db);
     const cases = [
       { name: "paused", evidence: { assigneeInvokabilityReason: "paused" }, eligible: true },
@@ -2950,26 +2962,61 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       seeded.push({ ...item, issueId, actionId: action.id });
     }
     const wake = vi.fn<ReturnType<typeof heartbeatService>["wakeup"]>(async () => ({ id: randomUUID() }) as never);
-    let resolve: ResumeRecoveryResolver;
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => { (req as any).actor = { type: "board", source: "local_implicit" }; next(); });
-    app.use("/api", agentRoutes(db, { resolvePauseStrandedIssue: input => resolve(input) }));
+    app.use("/api", agentRoutes(db, {}));
     app.use("/api", issueRoutes(db, {} as any, { recoveryActionEnqueueWakeup: wake,
       onRecoveryActionResolver: resolver => { resolve = resolver; } }));
     app.use(errorHandler);
-    await request(app).post(`/api/agents/${f.coderId}/resume`).send({}).expect(200);
+    if (method === "legacy") await db.update(agents).set({ lifecycleState: "ready" }).where(eq(agents.id, f.coderId));
+    if (method === "route") await request(app).post(`/api/agents/${f.coderId}/resume`).send({}).expect(200);
+    else if (method === "resumeAgent" || method === "legacy") await lifecycle.resumeAgent(f.coderId);
+    else await lifecycle.updateAndTransition(f.coderId, "resume", { name: "Resumed coder" });
+    const [pending] = await db.select().from(agents).where(eq(agents.id, f.coderId));
+    expect(pending).toMatchObject({ status: "paused", lifecycleState: "resuming" });
+    await worker.sweep();
     for (const item of seeded) {
       const [issue] = await db.select().from(issues).where(eq(issues.id, item.issueId));
       const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, item.actionId));
       expect(issue.status, item.name).toBe(item.eligible ? "todo" : item.issueStatus ?? "blocked");
       expect(action.status, item.name).toBe(item.eligible ? "resolved" : "active");
+      if (item.eligible) expect(action.outcome, item.name).toBe("handed_back");
     }
     expect(wake).toHaveBeenCalledTimes(4);
     for (const item of seeded.filter(item => item.eligible)) {
       expect(wake).toHaveBeenCalledWith(f.coderId, expect.objectContaining({
         reason: "issue_recovery_action_restored", payload: expect.objectContaining({ issueId: item.issueId }),
       }));
+    }
+    await worker.stop();
+  });
+
+  it("keeps a completed resume ready when restoring a stranded issue fails", async () => {
+    const f = await seedCompany();
+    const onReady = vi.fn(async () => {});
+    const worker = startAgentLifecycle(db, {
+      requiredPluginIds: async () => [], runHost: async () => "complete",
+      runPlugin: async () => "complete", onReady,
+    }, () => true, async () => { throw new Error("recovery unavailable"); });
+    try {
+      const lifecycle = createAgentLifecycle(db);
+      await lifecycle.pauseAgent(f.coderId);
+      await worker.sweep();
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, f.sourceIssueId));
+      const action = await issueRecoveryActionService(db).upsertSourceScoped({ companyId: f.companyId,
+        sourceIssueId: f.sourceIssueId, kind: "stranded_assigned_issue", cause: "stranded_assigned_issue",
+        fingerprint: "resume-failure", ownerType: "board", returnOwnerAgentId: f.coderId,
+        nextAction: "Restore the assigned task.", evidence: { assigneeInvokabilityReason: "paused" } });
+      await lifecycle.resumeAgent(f.coderId);
+      await worker.sweep();
+      const [agent] = await db.select().from(agents).where(eq(agents.id, f.coderId));
+      const [unchanged] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+      expect(agent).toMatchObject({ status: "idle", lifecycleState: "ready" });
+      expect(unchanged.status).toBe("active");
+      expect(onReady).toHaveBeenCalledOnce();
+    } finally {
+      await worker.stop();
     }
   });
 

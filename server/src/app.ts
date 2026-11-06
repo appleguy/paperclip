@@ -565,7 +565,9 @@ export async function createApp(
   app.use(nativeRunMcpRoutes());
   const hostServicesDisposers = new Map<string, () => void>();
   let lifecyclePluginsReady = false;
-  const agentLifecycle = startAgentLifecycle(db, createLifecycleDriver(db, workerManager), () => lifecyclePluginsReady && !isWarmStandby() && !isIdleTaskDrainActive());
+  let resolvePauseStrandedIssue: import("./services/recovery/resume-stranded.js").ResumeRecoveryResolver;
+  const agentLifecycle = startAgentLifecycle(db, createLifecycleDriver(db, workerManager), () => lifecyclePluginsReady && !isWarmStandby() && !isIdleTaskDrainActive(),
+    input => resolvePauseStrandedIssue(input));
   const connectionIntentHeartbeat = heartbeatService(db, {
     pluginWorkerManager: workerManager,
   });
@@ -772,10 +774,8 @@ export async function createApp(
     // production, so a failed login leaves no log trail.
     log: (line) => logger.info(line),
   });
-  let resolvePauseStrandedIssue: import("./services/recovery/resume-stranded.js").ResumeRecoveryResolver;
   api.use(
     agentRoutes(db, {
-      resolvePauseStrandedIssue: (input) => resolvePauseStrandedIssue(input),
       chatRunRetries: chatChannels,
       pluginWorkerManager: workerManager,
       deploymentMode: opts.deploymentMode,

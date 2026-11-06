@@ -65,6 +65,10 @@ export function createLifecycleWorker(store: LifecycleStore, driver: LifecycleDr
           if (!await runStep("complete_plugin", () => store.completePlugin(agent, owner, pluginId), pluginId)) continue phase;
         }
         const changed = await runStep("transition", () => store.change(id, "complete", { version: agent.lifecycleVersion, owner }));
+        if (changed?.lifecycleState === "ready") {
+          await attempt({ ...context, stage: "ready", phase: changed.lifecycleState },
+            async () => { await driver.onActivated?.(changed, agent); }).catch(() => {});
+        }
         if (changed?.lifecycleState === "ready" && !stopped && canRun()) {
           // Accepted messages may already be waiting for verification. Do not
           // leave them until the periodic queue sweep. Readiness is committed;

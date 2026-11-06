@@ -60,24 +60,20 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
       : !holds.length && agent.lifecycleState === "paused" ? "resuming" as const : agent.lifecycleState
     : command === "resume" && holds.length ? agent.lifecycleState
     : transition(agent.lifecycleState, command, agent.lifecycleOperation?.resumeState);
+  // Route legacy ready-but-paused rows through the same committed resume effect.
+  const legacyResume = command === "resume" && !holds.length && next === "ready" && agent.status === "paused";
+  if (legacyResume) next = "resuming";
   if (restartPause && next === "paused") next = "pausing";
   if (command === "complete" && next === "ready" && holds.length) next = "pausing";
   if (command === "complete" && next === "paused" && !holds.length) next = "resuming";
   if (["complete", "reconcile"].includes(command) && next === "paused" && holds.length === 1 && holds[0] === "setup"
     && await effects.setupRequiresPreparation(tx, agent.companyId, agent.defaultEnvironmentId, agent)) next = "preparing";
   if (next === agent.lifecycleState) {
-    // Older pause paths could leave status=paused while lifecycleState=ready.
-    // A successful resume must restore the dispatchable compatibility status,
-    // not merely clear the hold and return HTTP 200 with a paused agent.
-    const status = command === "resume" && !holds.length && next === "ready"
-      ? compatibilityStatus(next, agent.status) : agent.status;
     if (JSON.stringify(holds) !== JSON.stringify(agent.lifecycleHolds) ||
-      agent.pauseReason !== (holds[0] ?? null) || status !== agent.status) {
-      if (status !== agent.status) await effects.beforeStatusChange(tx, agent.companyId, agent.id, agent.status, status);
+      agent.pauseReason !== (holds[0] ?? null)) {
       const [updated] = await tx.update(agents).set({ lifecycleHolds: holds, pauseReason: holds[0] ?? null,
-        status, ...(status !== agent.status ? { pausedAt: null } : {}), updatedAt: new Date() })
+        updatedAt: new Date() })
         .where(eq(agents.id, agent.id)).returning();
-      if (status !== agent.status) await effects.recordStatus(tx, agent.companyId, agent.id, agent.status, status);
       return updated;
     }
     return agent;
@@ -85,7 +81,7 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
   const operation: AgentLifecycleOperation = {
     responsibleUserId: agent.lifecycleOperation?.responsibleUserId,
     id: randomUUID(), hostComplete: false, completedPluginIds: [], attempts: 0,
-    resumeState: next === "pausing"
+    resumeState: legacyResume ? "ready" : next === "pausing"
       ? agent.lifecycleState === "preparing" || agent.lifecycleState === "verifying" ? agent.lifecycleState : agent.lifecycleOperation?.resumeState ?? "ready"
       : agent.lifecycleOperation?.resumeState,
   };

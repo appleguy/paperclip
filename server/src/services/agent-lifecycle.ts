@@ -26,6 +26,8 @@ import { instanceSettingsService } from "./instance-settings.js";
 import { pluginEnvironmentRequiresAgent, pluginForAgentEnvironment } from "./plugin-environment-driver.js";
 import { isProviderApiSetupDraft } from "./native-runtime/provider-api-placement.js";
 import { retryPending, settingsReconciler } from "../adapters/claude-rc/pending-settings.js";
+import { restorePauseStrandedIssues, type ResumeRecoveryResolver } from "./recovery/resume-stranded.js";
+import type { Request } from "express";
 
 export { scheduleAgentLifecycle, processAgentLifecycle } from "../modules/agent-lifecycle/index.js";
 export type { LifecycleDriver, LifecycleAgent } from "../modules/agent-lifecycle/index.js";
@@ -105,17 +107,31 @@ export function createAgentLifecycle(db: Db, hooks: BudgetServiceHooks = {}) {
   };
 }
 
-function trackedDriver(driver: lifecycle.LifecycleDriver): lifecycle.LifecycleDriver {
+function trackedDriver(db: Db, driver: lifecycle.LifecycleDriver, resolve?: ResumeRecoveryResolver): lifecycle.LifecycleDriver {
   return { ...driver, runHost: agent => trackIdleWork(driver.runHost(agent)),
-    runPlugin: (agent, pluginId) => trackIdleWork(driver.runPlugin(agent, pluginId)) };
+    runPlugin: (agent, pluginId) => trackIdleWork(driver.runPlugin(agent, pluginId)),
+    async onActivated(agent, previous) {
+      if (resolve && (previous.lifecycleState === "resuming" || previous.pausedAt)) {
+        try {
+          await restorePauseStrandedIssues({ db, companyId: agent.companyId, agentId: agent.id,
+            pausedAt: previous.pausedAt ?? null,
+            req: { actor: { type: "board", source: "local_implicit" } } as Request,
+            resolve,
+            onError: (err, issueId) => logger.warn({ err, issueId, agentId: agent.id }, "failed to restore pause-stranded issue") });
+        } catch (err) {
+          logger.warn({ err, agentId: agent.id }, "failed to find pause-stranded issues");
+        }
+      }
+      await driver.onActivated?.(agent, previous);
+    } };
 }
 
-export function configureAgentLifecycle(db: Db, driver: lifecycle.LifecycleDriver, canRun = () => true) {
-  return lifecycle.configureAgentLifecycle(db, createAgentLifecycleEffects(), trackedDriver(driver), canRun);
+export function configureAgentLifecycle(db: Db, driver: lifecycle.LifecycleDriver, canRun = () => true, resolve?: ResumeRecoveryResolver) {
+  return lifecycle.configureAgentLifecycle(db, createAgentLifecycleEffects(), trackedDriver(db, driver, resolve), canRun);
 }
 
-export function startAgentLifecycle(db: Db, driver: lifecycle.LifecycleDriver, canRun: () => boolean) {
-  return lifecycle.startAgentLifecycle(db, createAgentLifecycleEffects(), trackedDriver(driver), canRun);
+export function startAgentLifecycle(db: Db, driver: lifecycle.LifecycleDriver, canRun: () => boolean, resolve?: ResumeRecoveryResolver) {
+  return lifecycle.startAgentLifecycle(db, createAgentLifecycleEffects(), trackedDriver(db, driver, resolve), canRun);
 }
 
 /** Budget evaluation owns the transaction and supplies the aggregate agent decision. */

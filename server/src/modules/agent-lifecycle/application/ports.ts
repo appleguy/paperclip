@@ -4,6 +4,7 @@ import type { LifecycleCommand } from "../domain/policy.js";
 export interface LifecycleAgent {
   id: string;
   companyId: string;
+  pausedAt?: Date | null;
   lifecycleState: AgentLifecycleState;
   lifecycleVersion: number;
   lifecycleHolds?: readonly string[];
@@ -28,6 +29,8 @@ export interface LifecycleDriver {
   requiredPluginIds(agent: LifecycleAgent): Promise<string[]>;
   runHost(agent: LifecycleAgent): Promise<"complete" | "pending">;
   runPlugin(agent: LifecycleAgent, pluginId: string): Promise<"complete" | "pending">;
+  /** Run post-commit recovery even if the worker is draining. */
+  onActivated?(agent: LifecycleAgent, previous: LifecycleAgent): Promise<void>;
   /** Notify the scheduler only after readiness has committed. */
   onReady?(agent: LifecycleAgent): Promise<void>;
 }
