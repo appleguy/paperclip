@@ -2947,7 +2947,14 @@ impl CodexCommandExecutor {
         let completion_contract = completion_contract(payload)?;
         let tool_set = authorized_tool_set(payload)?;
         if let Some(state) = self.state.as_mut() {
-            if state.config != config || state.completion_contract != completion_contract {
+            let mut identity_config = config.clone();
+            if let (Some(incoming), Some(existing)) = (
+                identity_config.shared_daemon.as_mut(),
+                state.config.shared_daemon.as_ref(),
+            ) {
+                incoming.thread_name = existing.thread_name.clone();
+            }
+            if state.config != identity_config || state.completion_contract != completion_contract {
                 return Err(DurableRunnerError::invalid(
                     "Codex provider or completion contract changed across the durable run",
                 ));
@@ -2967,6 +2974,7 @@ impl CodexCommandExecutor {
                     "Codex provider session is already closed",
                 ));
             }
+            let mut changed = false;
             if state.tool_bridge.has_catalog() {
                 state
                     .tool_bridge
@@ -2982,6 +2990,17 @@ impl CodexCommandExecutor {
                         "run.prepare tool contract rejected: {error}"
                     ))
                 })?;
+                changed = true;
+            }
+            if let (Some(existing), Some(incoming)) =
+                (state.config.shared_daemon.as_mut(), config.shared_daemon.as_ref())
+            {
+                if existing.thread_name != incoming.thread_name {
+                    existing.thread_name = incoming.thread_name.clone();
+                    changed = true;
+                }
+            }
+            if changed {
                 self.save_state()?;
             }
         } else {
@@ -3685,14 +3704,14 @@ impl CodexCommandExecutor {
                 &shared.socket_path,
                 std::time::Duration::from_secs(15),
                 shared.thread_id.clone(),
-                peer,
+                peer.clone(),
             )
         } else {
             crate::codex_shared_socket::SharedSocket::connect_authenticated(
                 &shared.socket_path,
                 std::time::Duration::from_secs(15),
                 shared.thread_id.clone(),
-                peer,
+                peer.clone(),
             )
         }
         .map_err(|_| DurableRunnerError::invalid("shared daemon connection failed"))?;
@@ -3727,6 +3746,45 @@ impl CodexCommandExecutor {
             return Err(DurableRunnerError::invalid(
                 "shared daemon identity or workspace mismatch",
             ));
+        }
+        if !bootstrap {
+            if let Some(name) = shared.thread_name.as_deref().map(str::trim).filter(|name| {
+                !name.is_empty()
+                    && name.chars().count() <= 200
+                    && !name.chars().any(char::is_control)
+                    && snapshot.pointer("/result/thread/name").and_then(Value::as_str) != Some(*name)
+            }) {
+                // Keep cosmetic request failures from detaching the observation socket.
+                let rename = (|| {
+                    if inspect().map_err(|_| "socket inspection failed".to_owned())? != observed {
+                        return Err("socket generation changed".to_owned());
+                    }
+                    let mut naming_socket = crate::codex_shared_socket::SharedSocket::connect_authenticated(
+                        &shared.socket_path,
+                        std::time::Duration::from_secs(2),
+                        shared.thread_id.clone(),
+                        peer,
+                    ).map_err(|error| format!("{error:?}"))?;
+                    let initialized = naming_socket.request("initialize", json!({"clientInfo":{"name":"paperclip-runnerd","title":"Paperclip Runner","version":"1"},"capabilities":{"experimentalApi":true,"requestAttestation":false}})).map_err(|error| format!("{error:?}"))?;
+                    if initialized.get("error").is_some() {
+                        return Err("initialization rejected".to_owned());
+                    }
+                    naming_socket.initialized().map_err(|error| format!("{error:?}"))?;
+                    if inspect().map_err(|_| "socket inspection failed".to_owned())? != observed
+                        || naming_socket.verify_peer().is_err()
+                    {
+                        return Err("socket or peer changed".to_owned());
+                    }
+                    let response = naming_socket.request("thread/name/set", json!({"threadId":shared.thread_id,"name":name})).map_err(|error| format!("{error:?}"))?;
+                    if response.get("error").is_some() {
+                        return Err("rename rejected".to_owned());
+                    }
+                    Ok::<(), String>(())
+                })();
+                if let Err(error) = rename {
+                    eprintln!("shared daemon thread rename failed: {error}");
+                }
+            }
         }
         let bootstrap_notification = if bootstrap {
             loop {
