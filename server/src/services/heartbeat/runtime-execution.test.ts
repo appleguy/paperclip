@@ -9,7 +9,7 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { agents, budgetPolicies, companies, completionContracts, nativeRunResults, costEvents, agentWakeupRequests, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issues, executionWorkspaces, nativeRunFinalizations, runUsageReceipts, workspaceOperations, type Db } from "@paperclipai/db";
+import { agents, budgetPolicies, companies, completionContracts, nativeRunResults, costEvents, agentWakeupRequests, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issues, executionWorkspaces, nativeRunFinalizations, runUsageReceipts, workspaceOperations, toolProfiles, toolMcpGateways, toolMcpGatewayTokens, type Db } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { trace } from "@opentelemetry/api";
@@ -357,6 +357,12 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
 
   it("re-enters the original OpenCode message through host execution and preserves resources on untagged shutdown", async () => {
     const { input, adapter, run } = await fixture();
+    const [profile] = await db.insert(toolProfiles).values({ companyId: run.companyId, profileKey: "restart-fixture", name: "Restart fixture" }).returning();
+    const [gateway] = await db.insert(toolMcpGateways).values({ companyId: run.companyId, name: "Restart fixture", slug: "restart-fixture", profileId: profile!.id }).returning();
+    const [token] = await db.insert(toolMcpGatewayTokens).values({ companyId: run.companyId, gatewayId: gateway!.id, name: "Restart fixture", tokenHash: `restart-${run.id}`, subjectType: "heartbeat_run", subjectId: run.id }).returning();
+    const actualPreparation = await vi.importActual<typeof import("./run-preparation.js")>("./run-preparation.js");
+    vi.mocked(revokeHeartbeatRunGatewayTokens).mockImplementationOnce(actualPreparation.revokeHeartbeatRunGatewayTokens);
+    onTestFinished(() => { vi.mocked(revokeHeartbeatRunGatewayTokens).mockReset().mockImplementation(async () => {}); });
     const boot = randomUUID();
     const sid = sessionIdFor({ agentId: input.agent.id, issueId: input.task.issueId! });
     const messageId = messageIdFor(narOpIdFor(run.id));
@@ -417,9 +423,13 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
       } });
       expect(writes).toBe(0);
       expect(revokeHeartbeatRunGatewayTokens).not.toHaveBeenCalled();
+      expect((await db.select().from(toolMcpGatewayTokens).where(eq(toolMcpGatewayTokens.id, token!.id)))[0]?.revokedAt).toBeNull();
       expect(input.instructions.releaseInstructionCopy).not.toHaveBeenCalled();
       expect(await readFile(configPath, "utf8")).toContain(url);
       expect(await readFile(workspaceFile, "utf8")).toBe("original workspace");
+      // Verify that the seeded record is actually subject to the real revoker.
+      await actualPreparation.revokeHeartbeatRunGatewayTokens({ db, companyId: run.companyId, runId: run.id });
+      expect((await db.select().from(toolMcpGatewayTokens).where(eq(toolMcpGatewayTokens.id, token!.id)))[0]?.revokedAt).toBeInstanceOf(Date);
     } finally {
       await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     }
