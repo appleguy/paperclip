@@ -44,15 +44,22 @@ import { basename, dirname, join, relative } from "node:path";
 import { resolvePaperclipInstanceRoot } from "../../home-paths.js";
 import {
   activityLog,
+  agents,
+  agentTaskSessions,
   budgetReservations,
+  companies,
+  createDb,
   heartbeatRuns,
   environmentLeases,
   executionWorkspaces,
+  goals,
   heartbeatRunEvents,
   issueThreadInteractions,
   issues,
   nativeRunFinalizations,
   nativeRunResults,
+  projects,
+  startEmbeddedPostgresTestDatabase,
   type Db,
 } from "@paperclipai/db";
 import {
@@ -91,6 +98,8 @@ import {
   NativeProviderStateIncompatibleError,
   NativeProviderTerminalFailure,
   NativeSessionProtocolIntegrityError,
+  authorizedToolSetForProvider,
+  createSharedCodexThreadConfig,
 } from "../../vendor/paperclip-runner/index.js";
 import * as issueServiceModule from "../issues.js";
 import * as runEventWriter from "../heartbeat-run-events.js";
@@ -116,11 +125,19 @@ import { acknowledgedNativeStopExecutionHasStopped, isAcknowledgedNativeStop } f
 import { admittedNativeProviderPack, nativeProviderPackAdmissionPending, rememberAdmittedNativeProviderPack } from "./native-provider-pack-admission.js";
 import { canonicalProviderPackJson } from "./remote-provider-pack-verification.js";
 import * as providerPackAdmission from "./native-provider-pack-admission.js";
+import { and, eq } from "drizzle-orm";
+import { inspectCodexSharedDaemon } from "./codex-shared-daemon.js";
+import { claimRegisteredCodexSharedOption, rolloverSettledCodexSession } from "./codex-shared-admission.js";
+import { localNativeDaemonHost, registerCodexNativeDelegation } from "./codex-native-delegation.js";
 
 vi.mock("node:fs", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:fs")>();
   return { ...actual, readFileSync: vi.fn(actual.readFileSync) };
 });
+
+vi.mock("./codex-shared-daemon.js", () => ({
+  inspectCodexSharedDaemon: vi.fn(),
+}));
 
 const usageRecorder = vi.hoisted(() => ({
   create: vi.fn<typeof import("../usage-receipts.js")["createRunUsageRecorder"]>(),
@@ -18636,3 +18653,69 @@ it.each(["codex_shared_existing_session_requires_recovery", "codex_shared_grant_
   expect(code).toBe(message);
   expect(nativeSessionFailureDisposition(1, new Date(), code)).toMatchObject({ phase: "terminal_failure", failureCode: message, nextAttemptAt: null });
 });
+
+it("recovers an unreconcilable Codex shared fingerprint by retiring it and opening a fresh session (SCO-1048)", async () => {
+  // A later top-level test ("HTTP Stop during remote runner staging") spies
+  // runEventWriter.appendHeartbeatRunEvent without restoring it; this file has
+  // no restoreMocks, so revert spies before asserting on real run events.
+  vi.restoreAllMocks();
+  const root = await mkdtemp(join(tmpdir(), "codex-shared-recovery-"));
+  const daemon = Object.freeze({
+    socketPath: join(root, "daemon.sock"),
+    codexHome: root,
+    cliVersion: "0.166.0" as const,
+    appServerVersion: "0.166.0" as const,
+    daemonGeneration: "1:one",
+    peer: Object.freeze({ pid: 1, startSeconds: 1, startMicroseconds: 1, executable: "/usr/bin/codex" }),
+  });
+  vi.mocked(inspectCodexSharedDaemon).mockResolvedValue(daemon);
+  const database = await startEmbeddedPostgresTestDatabase("codex-shared-recovery-");
+  const db = createDb(database.connectionString);
+  try {
+    const companyId = randomUUID(), projectId = randomUUID(), goalId = randomUUID(), issueId = randomUUID(), agentId = randomUUID(), runId = randomUUID(), normalizedSessionId = randomUUID(), runnerInstanceId = randomUUID(), executionWorkspaceId = randomUUID(), environmentLeaseId = randomUUID(), taskSessionId = randomUUID(), bootId = randomUUID(), oldRunId = randomUUID(), bootstrapRunId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Test", issuePrefix: "SCR" });
+    await db.insert(projects).values({ id: projectId, companyId, name: "Test" });
+    await db.insert(goals).values({ id: goalId, companyId, title: "Test", level: "company" });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Test", role: "engineer", adapterType: "paperclip_runner" });
+    const host = { hostId: "recovery", codexExecutable: "/usr/bin/codex", codexHome: root, runnerExecutable: "/usr/bin/paperclip-runner", home: root };
+    const delegation = await registerCodexNativeDelegation(db, localNativeDaemonHost(host), { companyId, projectId, agentId, model: "gpt-5.1-codex", effort: "high", issuer: "board", expiresAt: new Date(Date.now() + 120000) });
+    await db.insert(issues).values({ id: issueId, companyId, projectId, goalId, title: "Test", status: "in_progress", assigneeAgentId: agentId });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: issueId, nativeSessionId: normalizedSessionId, runnerInstanceId, status: "running", runtimeMode: "native" });
+    await db.insert(heartbeatRuns).values({ id: oldRunId, companyId, agentId, nativeIssueId: issueId, nativeSessionId: normalizedSessionId, runnerInstanceId, status: "failed", runtimeMode: "native" });
+    await db.update(issues).set({ executionRunId: runId, checkoutRunId: runId }).where(eq(issues.id, issueId));
+    await db.insert(executionWorkspaces).values({ id: executionWorkspaceId, companyId, projectId, name: "test", mode: "shared", strategyType: "local" });
+    await db.insert(environmentLeases).values({ id: environmentLeaseId, companyId, executionWorkspaceId, issueId, heartbeatRunId: runId, status: "active" });
+    await db.insert(nativeRunFinalizations).values({ runId, companyId, issueId, phase: "running", leaseOwner: "sco1048", attempt: 1, leaseExpiresAt: new Date(Date.now() + 120000), controllerBootId: bootId, controllerPid: process.pid, controllerProcessStartedAt: new Date(1000), controllerGeneration: 1 });
+    // Stale shared fingerprint: bootstrap recorded for a different run than the
+    // saved lastRunId, so rollover can never reconcile it.
+    await db.insert(agentTaskSessions).values({ id: taskSessionId, companyId, agentId, adapterType: "paperclip_runner", taskKey: issueId, sessionDisplayId: "stale-display", goalJson: { objective: "stale goal", status: "paused" }, lastRunId: oldRunId, goalRevision: 1, sessionParamsJson: { codexSharedBootstrapV1: { state: "created", threadId: "stale-thread", runId: bootstrapRunId } } });
+    // First attempt: the fingerprint is unreconcilable, so rollover reports false with no side effects.
+    expect(await db.transaction(async tx => {
+      const [row] = await tx.select().from(agentTaskSessions).where(eq(agentTaskSessions.id, taskSessionId)).for("update", { noWait: true }).limit(1);
+      return rolloverSettledCodexSession(tx, row!, runId);
+    })).toBe(false);
+    const launch = { cwd: root, instructions: "SCO-1048 recovery fixture", approvalPolicy: "never" as const, readOnly: true, webSearchDisabled: true, threadConfig: createSharedCodexThreadConfig({ cwd: root, readOnly: true, webSearchDisabled: true, networkAccess: false, codexHome: root, codexExecutable: "/usr/bin/codex", path: process.env.PATH! }), authorizedTools: authorizedToolSetForProvider("codex", [{ name: "paperclip_test", description: "test", inputSchema: { type: "object", properties: {}, additionalProperties: false } }]) };
+    const claim = { db, companyId, agentId, issueId, runId, normalizedSessionId, runnerInstanceId, executionWorkspaceId, model: "gpt-5.1-codex", effort: "high", leaseOwner: "sco1048", leaseAttempt: 1, controller: { bootId, pid: process.pid, processStartedAt: new Date(1000) }, delegationGrantId: delegation.grantId, launch, ...host };
+    const first = await claimRegisteredCodexSharedOption(claim);
+    expect(first.daemon.threadId).toBe("");
+    const firstRow = (await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.id, taskSessionId)))[0]!;
+    expect(firstRow).toMatchObject({ sessionDisplayId: null, goalJson: null, lastRunId: runId });
+    expect(firstRow.sessionParamsJson).toEqual({ __paperclipSharedRunFence: runId });
+    const firstRecovery = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, runId), eq(heartbeatRunEvents.eventType, "shared_session_recovered")));
+    expect(firstRecovery).toHaveLength(1);
+    expect(firstRecovery[0]!.payload).toMatchObject({ oldThreadId: "stale-thread" });
+    // Second attempt: no identity remains, so the same run claims a fresh session as-is.
+    const second = await claimRegisteredCodexSharedOption(claim);
+    expect(second.daemon.threadId).toBe("");
+    const secondRow = (await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.id, taskSessionId)))[0]!;
+    expect(secondRow).toMatchObject({ sessionDisplayId: null, goalJson: null, lastRunId: runId });
+    expect(secondRow.sessionParamsJson).toEqual({ __paperclipSharedRunFence: runId });
+    const secondRecovery = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, runId), eq(heartbeatRunEvents.eventType, "shared_session_recovered")));
+    expect(secondRecovery).toHaveLength(1);
+  } finally {
+    vi.mocked(inspectCodexSharedDaemon).mockReset();
+    await db.$client.end();
+    await database.cleanup();
+    await rm(root, { recursive: true, force: true });
+  }
+}, 60000);

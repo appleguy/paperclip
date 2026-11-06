@@ -101,7 +101,13 @@ export async function claimRegisteredCodexSharedOption(input:{db:Db;companyId:st
     if (typeof revision!=="string") throw new Error("codex_delegation_unavailable");
     await assertCodexNativeDelegation(tx,{companyId:input.companyId,agentId:input.agentId,projectId:issue.projectId,model:input.model,effort:input.effort,hostId:input.hostId,processGeneration,delegationGrantId:input.delegationGrantId,delegationRevision:revision});
     const [existing]=await tx.select().from(agentTaskSessions).where(and(eq(agentTaskSessions.companyId,input.companyId),eq(agentTaskSessions.agentId,input.agentId),eq(agentTaskSessions.adapterType,"paperclip_runner"),eq(agentTaskSessions.taskKey,input.issueId))).for("update",{noWait:true}).limit(1);
-    if (existing && hasCodexSharedSessionIdentity(existing) && !await rolloverSettledCodexSession(tx,existing,input.runId)) throw new Error("codex_shared_existing_session_requires_recovery");
+    if (existing && hasCodexSharedSessionIdentity(existing) && !await rolloverSettledCodexSession(tx,existing,input.runId)) {
+      // A saved fingerprint that cannot be reconciled is not an admission blocker: retire the stale shared identity and continue as a fresh session (SCO-1048).
+      const staleThreadId=record(record(existing.sessionParamsJson).codexSharedBootstrapV1).threadId;
+      await retireSharedIdentity(tx,existing,input.runId);
+      await tx.update(agentTaskSessions).set({goalJson:null}).where(eq(agentTaskSessions.id,existing.id));
+      await appendHeartbeatRunEvent(tx as unknown as Db,{companyId:input.companyId,agentId:input.agentId,runId:input.runId,eventType:"shared_session_recovered",stream:"system",payload:{oldThreadId:typeof staleThreadId==="string"?staleThreadId:null}});
+    }
     const taskSessionId=existing?.id ?? randomUUID();
     if (existing) await tx.update(agentTaskSessions).set({lastRunId:input.runId,...(!hasCodexSharedSessionIdentity(existing) && typeof record(existing.sessionParamsJson).__paperclipSharedRunFence==="string" ? {sessionParamsJson:{...record(existing.sessionParamsJson),__paperclipSharedRunFence:input.runId}} : {}),updatedAt:sql`clock_timestamp()`}).where(eq(agentTaskSessions.id,taskSessionId));
     else await tx.insert(agentTaskSessions).values({id:taskSessionId,companyId:input.companyId,agentId:input.agentId,adapterType:"paperclip_runner",taskKey:input.issueId,lastRunId:input.runId,sessionParamsJson:{}});
