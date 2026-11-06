@@ -1,8 +1,7 @@
 import { and, eq, sql } from "drizzle-orm";
 import { heartbeatRuns, type Db } from "@paperclipai/db";
 
-/** Preserve the run until the provider turn is reconciled, even when the
- * local shared CLI exited. Returning true also holds on a lost row CAS. */
+/** Identify a result that must not authorize resource cleanup. */
 export function isUnverifiedSharedOpenCode(input: {
   run: typeof heartbeatRuns.$inferSelect;
   adapterType: string;
@@ -19,14 +18,15 @@ export function isUnverifiedSharedOpenCode(input: {
 export async function persistUnverifiedSharedOpenCode(db: Db, input: {
   run: typeof heartbeatRuns.$inferSelect;
   resultJson: Record<string, unknown> | null | undefined;
-}): Promise<void> {
+}): Promise<boolean> {
   const recovery = input.resultJson?.executionRecovery;
-  await db.update(heartbeatRuns).set({
+  const updated = await db.update(heartbeatRuns).set({
     resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({ executionRecovery: recovery })}::jsonb`,
     updatedAt: new Date(),
   }).where(and(eq(heartbeatRuns.id, input.run.id), eq(heartbeatRuns.companyId, input.run.companyId),
     eq(heartbeatRuns.runtimeMode, "legacy"), eq(heartbeatRuns.status, "running"),
     input.run.controllerBootId
       ? sql`${heartbeatRuns.controllerBootId} = ${input.run.controllerBootId} and ${heartbeatRuns.controllerLeaseExpiresAt} > clock_timestamp()`
-      : sql`false`));
+      : sql`false`)).returning({ id: heartbeatRuns.id });
+  return updated.length === 1;
 }

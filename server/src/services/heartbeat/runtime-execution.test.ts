@@ -173,6 +173,25 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run.id))).toHaveLength(0);
   });
 
+  it("holds a dispatched OpenCode orphan when the unverified result loses its lease before persistence", async () => {
+    const { heartbeatService } = await import("../heartbeat.js");
+    const { persistUnverifiedSharedOpenCode } = await import("./opencode-unverified-hold.js");
+    const { input, run } = await fixture();
+    const boot = randomUUID();
+    await db.update(agents).set({ adapterType: "opencode_local", status: "paused" }).where(eq(agents.id, input.agent.id));
+    await db.update(heartbeatRuns).set({ controllerBootId: boot,
+      controllerLeaseExpiresAt: sql`clock_timestamp() - interval '1 second'`, executionStage: "dispatching",
+      resultJson: {} }).where(eq(heartbeatRuns.id, run.id));
+    const staleRun = { ...run, controllerBootId: boot };
+    expect(await persistUnverifiedSharedOpenCode(db, { run: staleRun, resultJson: { executionRecovery: {
+      kind: "bootstrap", reason: "outcome_unknown", providerWorkEvidence: "unverified",
+    } } })).toBe(false);
+    const reaped = await heartbeatService(db).reapOrphanedRuns();
+    expect(reaped.runIds).not.toContain(run.id);
+    expect(await read(run.id)).toMatchObject({ status: "running", resultJson: {} });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run.id))).toHaveLength(0);
+  });
+
   it("registers the plain OpenCode CLI controller when its child spawns", async () => {
     const { input, adapter, run } = await fixture();
     adapter.type = "opencode_local";

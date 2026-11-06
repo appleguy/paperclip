@@ -3562,10 +3562,15 @@ export function heartbeatService(
         const { adapterResult } = execution;
         if (isUnverifiedSharedOpenCode({ run, adapterType: agent.adapterType, resultJson: adapterResult.resultJson })) {
           legacyOpenCodeProviderUnverified = true;
-          await persistUnverifiedSharedOpenCode(db, { run, resultJson: adapterResult.resultJson }).catch(err => {
+          const persisted = await persistUnverifiedSharedOpenCode(db, { run, resultJson: adapterResult.resultJson }).catch(err => {
             logger.error({ err, runId: run.id }, "failed to persist unverified shared OpenCode hold");
+            return false;
           });
-          logger.warn({ runId: run.id }, "holding shared OpenCode run without provider termination proof");
+          if (persisted) {
+            logger.warn({ runId: run.id }, "holding shared OpenCode run without provider termination proof");
+          } else {
+            logger.error({ runId: run.id }, "unverified shared OpenCode hold was not persisted; retaining local resources");
+          }
           return;
         }
         // Reconcile the referenced-project set against the real remote staging outcome. A referenced

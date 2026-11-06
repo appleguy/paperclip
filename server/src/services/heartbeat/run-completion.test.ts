@@ -192,13 +192,23 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     const resultJson = { executionRecovery: { kind: "bootstrap", reason: "shared_session_unverified", providerWorkStarted: true } };
     expect(isUnverifiedSharedOpenCode({ run: f.run, adapterType: "opencode_local", resultJson })).toBe(true);
     expect(isUnverifiedSharedOpenCode({ run: f.run, adapterType: "process", resultJson })).toBe(false);
-    await persistUnverifiedSharedOpenCode(db, { run: f.run, resultJson });
+    expect(await persistUnverifiedSharedOpenCode(db, { run: f.run, resultJson })).toBe(true);
     expect(await read(f.run.id)).toMatchObject({ status: "running", resultJson: {
       executionCancellation: { state: "requested" }, executionRecovery: resultJson.executionRecovery,
     } });
     await db.update(heartbeatRuns).set({ controllerBootId: randomUUID(), resultJson: { successor: true } }).where(eq(heartbeatRuns.id, f.run.id));
-    await persistUnverifiedSharedOpenCode(db, { run: f.run, resultJson });
+    expect(await persistUnverifiedSharedOpenCode(db, { run: f.run, resultJson })).toBe(false);
     expect(await read(f.run.id)).toMatchObject({ status: "running", resultJson: { successor: true } });
+  });
+
+  it("reports an unpersisted OpenCode hold after its controller lease expires", async () => {
+    const { persistUnverifiedSharedOpenCode } = await import("./opencode-unverified-hold.js");
+    const boot = randomUUID();
+    const f = await fixture({ controllerBootId: boot, controllerLeaseExpiresAt: new Date(Date.now() - 60_000),
+      resultJson: { existing: true } });
+    const resultJson = { executionRecovery: { kind: "bootstrap", reason: "outcome_unknown", providerWorkEvidence: "unverified" } };
+    expect(await persistUnverifiedSharedOpenCode(db, { run: f.run, resultJson })).toBe(false);
+    expect(await read(f.run.id)).toMatchObject({ status: "running", resultJson: { existing: true } });
   });
 
   it("fences OpenCode log binding after a controller takeover", async () => {
