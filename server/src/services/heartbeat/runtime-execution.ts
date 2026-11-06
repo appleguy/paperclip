@@ -946,8 +946,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               onEvent: onAdapterEvent,
               onSession: async (session) => {
                 const sessionParams = getAdapterSessionCodec(agent.adapterType).serialize(session.sessionParams ?? null);
-                const legacyOpenCodeBinding = run.runtimeMode === "legacy" && agent.adapterType === "opencode_local" &&
-                  parseObject(sessionParams?.narBinding).schema === "paperclip.opencode-binding.v1";
+                const legacyOpenCodeSession = run.runtimeMode === "legacy" && agent.adapterType === "opencode_local";
                 const [updated] = await db.update(heartbeatRuns).set({
                   sessionIdAfter: session.sessionDisplayId ?? session.sessionId,
                   resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({ earlySession: { sessionId: session.sessionId, sessionParams } })}::jsonb`,
@@ -955,8 +954,8 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
                 }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.agentId, run.agentId), eq(heartbeatRuns.status, "running"),
                   run.controllerBootId ? eq(heartbeatRuns.controllerBootId, run.controllerBootId) : isNull(heartbeatRuns.controllerBootId),
                   run.controllerBootId ? gt(heartbeatRuns.controllerLeaseExpiresAt, sql`clock_timestamp()`) : undefined,
-                  legacyOpenCodeBinding ? eq(heartbeatRuns.runtimeMode, "legacy") : undefined,
-                  legacyOpenCodeBinding && !run.controllerBootId ? sql`false` : undefined,
+                  legacyOpenCodeSession ? eq(heartbeatRuns.runtimeMode, "legacy") : undefined,
+                  legacyOpenCodeSession && !run.controllerBootId ? sql`false` : undefined,
                   agent.adapterType === "opencode_local" && parseObject(sessionParams?.narBinding).schema === "paperclip.opencode-binding.v1"
                     ? sql`coalesce(${heartbeatRuns.resultJson}->'executionCancellation'->>'state', '') <> 'requested'` : undefined,
                 )).returning({ id: heartbeatRuns.id });
