@@ -11,6 +11,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { readableRuntimePath } from "@paperclipai/adapter-utils/readable-runtime-paths";
+import { parseHeartbeatPolicy } from "../../services/heartbeat/timer-policy.js";
 import { assertAssembledPrompt, preflightSessionPrompt, applyPromptRotation } from "@paperclipai/adapter-utils/token-preflight";
 import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
@@ -324,13 +325,16 @@ export async function acquire(stateDir: string, deadline: number): Promise<() =>
 
 /** SCO-991: one tmux seat per concurrent run. Slot 0 is the agent's configured seat, unchanged. */
 export type AgySlot = { index: number; session: string; stateDir: string; cwd: string };
-export const AGY_MAX_SLOTS = 4;
+export const AGY_MAX_SLOTS = 50;
 const SLOT_WORKSPACE_ROOT = "/Volumes/NVM/AI_Agent_Runtime/workspaces";
 /** Ownership rule: agy runs one Claude/GPT job at a time, so only Gemini tiers get more than one seat. */
 export function agySlotCount(slots: unknown, model: string): number {
   if (!model.startsWith("gemini-")) return 1;
   const n = Math.trunc(Number(slots));
   return Number.isFinite(n) ? Math.min(AGY_MAX_SLOTS, Math.max(1, n)) : 1;
+}
+export function agySlotCountForAgent(agent: AdapterExecutionContext["agent"], model: string): number {
+  return agySlotCount(parseHeartbeatPolicy(agent as Parameters<typeof parseHeartbeatPolicy>[0]).maxConcurrentRuns, model);
 }
 export function agySlot(index: number, socket: string, session: string, stateDir: string, cwd: string): AgySlot {
   if (index === 0) return { index, session, stateDir, cwd };
@@ -501,7 +505,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   assertWorkableCwd(baseCwd);
   const requestedModel = asString(cfg.model, DEFAULT_MODEL);
   const model = AGY_MODELS.includes(requestedModel as typeof AGY_MODELS[number]) ? requestedModel : DEFAULT_MODEL;
-  const slots = Array.from({ length: agySlotCount(cfg.slots, model) },
+  const slots = Array.from({ length: agySlotCountForAgent(ctx.agent, model) },
     (_, i) => agySlot(i, socket, baseSession, baseStateDir, baseCwd));
   let { session, stateDir, cwd } = slots[0]!;
   const issueId = asString(ctx.context.issueId, asString(ctx.context.taskId, ""));

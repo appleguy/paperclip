@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import { agySlot, agySlotCount, target, tmux, tryAcquire, AGY_MAX_SLOTS } from "./execute.js";
+import { agySlot, agySlotCount, agySlotCountForAgent, target, tmux, tryAcquire, AGY_MAX_SLOTS } from "./execute.js";
 
 describe("agy concurrent seats (SCO-991)", () => {
   it("gives more than one seat only to Gemini tiers", () => {
@@ -12,8 +12,16 @@ describe("agy concurrent seats (SCO-991)", () => {
     expect(agySlotCount(4, "claude-opus-5-5-high")).toBe(1);
     expect(agySlotCount(2, "claude-sonnet-5-5-medium")).toBe(1);
     expect(agySlotCount(undefined, "gemini-3.8-flash-low")).toBe(1);
+    expect(agySlotCount(12, "gemini-3.8-flash-low")).toBe(12);
     expect(agySlotCount(99, "gemini-3.8-flash-low")).toBe(AGY_MAX_SLOTS);
     expect(agySlotCount(0, "gemini-3.8-flash-low")).toBe(1);
+  });
+
+  it("uses the heartbeat policy for the seat count", () => {
+    const agent = { id: "agent", companyId: "company", name: "agy", adapterType: "agy_local",
+      adapterConfig: { slots: 1 }, runtimeConfig: { heartbeat: { maxConcurrentRuns: 3 } } };
+    expect(agySlotCountForAgent(agent, "gemini-4-argon-high")).toBe(3);
+    expect(agySlotCountForAgent(agent, "claude-opus-5-5-high")).toBe(1);
   });
 
   it("keeps seat 1 as configured and isolates later seats", () => {
