@@ -262,7 +262,7 @@ describe("OpenCode v2.2.5 driver: observe and outcome", () => {
     expect(await d.readOutcome(c, "op-9")).toBe("working");
     s.emit(c, { type: "session.execution.succeeded" });
     expect(await d.readOutcome(c, "op-9")).toBe("hook_observed");
-    expect(await mk(s).interrupt(c, op(9), FENCE)).toBe("requested");
+    expect(await mk(s).interrupt(c, op(9), FENCE)).toBe("uncertain");
   });
   it("2.2.5 hidden log: settles from projected state (inbox drained, inactive, idle after the message)", async () => {
     const s = new FakeServer();

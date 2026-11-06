@@ -427,26 +427,22 @@ export class OpenCodeHttpDriver implements ProviderDriver {
     }
   }
 
-  // Do not interrupt an idle session or a different (possibly owner-driven) turn.
-  // A repeated Stop after the provider goes idle is a no-op, not a second write.
-  async interruptExpectedMessage(conversationId: string, messageId: string, op: Op, fence: Fence): Promise<"requested" | "uncertain" | "idle"> {
+  // The inbox DELETE names the exact queued message. Session interrupt has no
+  // atomic expected-message condition: even a matching read can race a direct
+  // client or a successor. Hold active work until the provider offers that
+  // condition, rather than interrupting a potentially different turn.
+  async interruptExpectedMessage(conversationId: string, messageId: string, _op: Op, _fence: Fence): Promise<"requested" | "uncertain" | "idle"> {
     try {
       if (await this.inflightMessage(conversationId, { cancelPendingMessageId: messageId }) !== messageId) return "idle";
     } catch {
       // An unreadable state is not authority to cancel an unverified turn.
       return "uncertain";
     }
-    // An outside client can start a turn here or later interrupt a fresh turn.
-    return this.interrupt(conversationId, op, fence);
+    return "uncertain";
   }
 
-  async interrupt(conversationId: string, _op: Op, _f: Fence): Promise<"requested" | "uncertain"> {
-    try {
-      const r = await this.json("POST", `/api/session/${encodeURIComponent(conversationId)}/interrupt`);
-      return r.status === 200 && typeof r.data?.interrupted === "boolean" ? "requested" : "uncertain";
-    } catch {
-      return "uncertain";
-    }
+  async interrupt(_conversationId: string, _op: Op, _f: Fence): Promise<"requested" | "uncertain"> {
+    return "uncertain";
   }
 }
 

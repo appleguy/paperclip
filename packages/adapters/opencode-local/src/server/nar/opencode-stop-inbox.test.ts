@@ -61,11 +61,11 @@ describe("OpenCode stop inbox cancellation", () => {
     expect(calls.some((call) => call.endsWith("/interrupt"))).toBe(false);
   });
 
-  it("rechecks and interrupts the target if it was delivered during cancellation", async () => {
+  it("holds if the target was delivered during cancellation", async () => {
     pending = ["msg_target"];
     deliveredDuringCancel = true;
-    expect(await driver.interruptExpectedMessage("ses_fixture", "msg_target", op, fence)).toBe("requested");
-    expect(calls.at(-1)).toBe("POST /api/session/ses_fixture/interrupt");
+    expect(await driver.interruptExpectedMessage("ses_fixture", "msg_target", op, fence)).toBe("uncertain");
+    expect(calls.some((call) => call.endsWith("/interrupt"))).toBe(false);
   });
 
   it("does not interrupt an unrelated active turn when queued cancellation fails", async () => {
@@ -77,11 +77,11 @@ describe("OpenCode stop inbox cancellation", () => {
     expect(calls.some((call) => call.endsWith("/interrupt"))).toBe(false);
   });
 
-  it("keeps interrupting a matching active turn", async () => {
+  it("holds a matching active turn when conditional interrupt is unavailable", async () => {
     active = "msg_target";
-    expect(await driver.interruptExpectedMessage("ses_fixture", "msg_target", op, fence)).toBe("requested");
+    expect(await driver.interruptExpectedMessage("ses_fixture", "msg_target", op, fence)).toBe("uncertain");
     expect(calls.some((call) => call.startsWith("DELETE "))).toBe(false);
-    expect(calls.at(-1)).toBe("POST /api/session/ses_fixture/interrupt");
+    expect(calls.some((call) => call.endsWith("/interrupt"))).toBe(false);
   });
 
   it("does not interrupt a different active turn", async () => {

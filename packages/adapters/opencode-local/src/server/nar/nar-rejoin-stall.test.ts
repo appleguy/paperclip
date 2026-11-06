@@ -54,6 +54,7 @@ describe("NAR rejoin stall watchdog", () => {
   });
 
   it("interrupts a rejoined message with no progress and ends the run as interrupted", async () => {
+    d.verified = true;
     const { res, log } = await run({});
     expect(d.interrupts).toBe(1);
     expect(res.providerTermination).toEqual({ proof: "session_idle", reason: expect.stringContaining("stalled") });
