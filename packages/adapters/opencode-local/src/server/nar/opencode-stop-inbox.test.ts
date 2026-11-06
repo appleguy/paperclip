@@ -11,6 +11,10 @@ describe("OpenCode stop inbox cancellation", () => {
   let deliveredDuringCancel: boolean;
   let cancellationFails: boolean;
   let targetRecorded: boolean;
+  let historicalSuccessor: boolean;
+  let unreadableHistory: boolean;
+  let successorOnHistoryRead: number;
+  let historyReads: number;
   let idleAt: number | undefined;
   let calls: string[];
   let driver: OpenCodeHttpDriver;
@@ -26,6 +30,10 @@ describe("OpenCode stop inbox cancellation", () => {
     deliveredDuringCancel = false;
     cancellationFails = false;
     targetRecorded = true;
+    historicalSuccessor = false;
+    unreadableHistory = false;
+    successorOnHistoryRead = Infinity;
+    historyReads = 0;
     idleAt = 2;
     calls = [];
     const fetchImpl = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
@@ -40,7 +48,15 @@ describe("OpenCode stop inbox cancellation", () => {
         return new Response(null, { status: 204 });
       }
       if (pathname === "/api/session/active") return Response.json({ data: active ? { ses_fixture: { type: "running" } } : {} });
-      if (pathname.endsWith("/message")) return Response.json({ data: active ? [{ id: active, type: "user", time: { created: 1 } }] : [] });
+      if (pathname.endsWith("/message")) {
+        if (unreadableHistory) return new Response(null, { status: 500 });
+        if (++historyReads >= successorOnHistoryRead) historicalSuccessor = true;
+        return Response.json({ data: [
+          ...(active && active !== "msg_target" ? [{ id: active, type: "user", time: { created: 2 } }] : []),
+          ...(historicalSuccessor ? [{ id: "msg_successor", type: "user", time: { created: 2 } }] : []),
+          ...(targetRecorded ? [{ id: "msg_target", type: "user", time: { created: 1 } }] : []),
+        ] });
+      }
       if (pathname.endsWith("/message/msg_target")) return targetRecorded
         ? Response.json({ data: { id: "msg_target", type: "user", time: { created: 1 } } }) : new Response(null, { status: 404 });
       if (pathname === "/api/session/ses_fixture") return Response.json({ data: { time: { idle: idleAt }, outcome: "interrupted" } });
@@ -103,5 +119,21 @@ describe("OpenCode stop inbox cancellation", () => {
     idleAt = 2;
     targetRecorded = false;
     expect(await driver.verifyStoppedMessage("ses_fixture", "msg_target")).toBe(false);
+  });
+
+  it("does not attribute an idle successor's outcome to the original Stop", async () => {
+    historicalSuccessor = true;
+    expect(await driver.verifyStoppedMessage("ses_fixture", "msg_target")).toBe(false);
+    historicalSuccessor = false;
+    unreadableHistory = true;
+    expect(await driver.verifyStoppedMessage("ses_fixture", "msg_target")).toBe(false);
+    expect(calls.some((call) => call.endsWith("/interrupt"))).toBe(false);
+  });
+
+  it("holds if a successor appears while termination evidence is read", async () => {
+    successorOnHistoryRead = 2;
+    expect(await driver.verifyStoppedMessage("ses_fixture", "msg_target")).toBe(false);
+    expect(historyReads).toBe(2);
+    expect(calls.some((call) => call.endsWith("/interrupt"))).toBe(false);
   });
 });

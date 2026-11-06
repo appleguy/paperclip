@@ -420,8 +420,14 @@ export class OpenCodeHttpDriver implements ProviderDriver {
 
   async verifyStoppedMessage(conversationId: string, messageId: string): Promise<boolean> {
     try {
+      // Session outcome and idle time belong to the latest turn, not
+      // necessarily this one. A completed successor can otherwise make an
+      // unverified Stop appear settled. History reads must be conclusive on
+      // both sides of the mutable session-state observation.
+      if (await this.hasSuccessor(conversationId, messageId)) return false;
       if (await this.stateOutcome(conversationId, messageId) !== "hook_observed") return false;
-      return await this.inflightMessage(conversationId) === null;
+      if (await this.inflightMessage(conversationId) !== null) return false;
+      return !await this.hasSuccessor(conversationId, messageId);
     } catch {
       return false;
     }
