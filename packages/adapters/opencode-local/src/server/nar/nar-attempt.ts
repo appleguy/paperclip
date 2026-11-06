@@ -43,7 +43,7 @@ export interface NarAttemptInput {
   probeMs?: number;
   idleGraceMs?: number;
   unreachableGiveUpMs?: number;
-  /** Hold a rejoined in-flight message after this long without progress (default 20 min). */
+  /** A rejoined in-flight message with no progress for this long is interrupted and the run ends (default 20 min). */
   rejoinStallMs?: number;
   fetchImpl?: typeof fetch;
 }
@@ -293,8 +293,8 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
     const sub = await driver.submit(host, conversationId, { opId, kind: "prompt", payloadSha256, text: input.prompt }, fence);
     if (sub.grade === "outcome_unknown") {
       if (explicitStopRequested(signal)) {
-        // A lost admission response does not authorize a resend or an
-        // unfenced session-wide interrupt.
+        // A lost admission response does not authorize a resend. Best-effort
+        // scoped interrupt only if this exact message is observed in flight.
         await driver.interruptExpectedMessage(conversationId, msgId,
           { opId: `${opId}-interrupt`, kind: "interrupt", payloadSha256: "" }, fence);
       }
@@ -346,10 +346,10 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
         const interruptResult = explicitStopRequested(signal) ? await interruptOnce() : "rejoin";
         if (interruptResult !== "rejoin") {
           // Verify from OpenCode that the turn ended (session idle/absent, or the server restarted).
-          for (let i = 0; i < (interruptResult === "requested" ? 10 : 1); i++) {
+          for (let i = 0; i < 10; i++) {
             const proof = await verifyTermination(driver, hostPid, conversationId);
             if (proof) return interrupted("stopped by explicit Stop", proof, conversationId);
-            if (interruptResult === "requested") await sleep(1500);
+            await sleep(1500);
           }
         }
         const interrupted_ = interruptResult;
@@ -396,7 +396,7 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
             }
           }
           // SCO-756: a rejoined message can stay in flight with nothing happening (run 2a483f33 sat 80 min on an idle
-          // GPU). Bound observation after rejoinStallMs without claiming an unverified provider stop.
+          // GPU). Bound it: no progress for rejoinStallMs interrupts that exact message so the next wake prompts afresh.
           if (rejoined && idleSince === null) {
             const mark = await driver.progressMark(conversationId);
             if (mark === null || mark !== progressMark) { if (mark !== null) progressMark = mark; progressAt = Date.now(); }
@@ -407,14 +407,14 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
                 await onLog("stderr", `[paperclip] ${m}\n`);
                 return held(m, true, conversationId, "unowned_turn_stalled");
               }
-              await onLog("stderr", `[paperclip] NAR rejoined message ${msgId} made no progress for ${mins} min; checking stop\n`);
-              const stopResult = await interruptOnce().catch(() => "uncertain" as const);
-              for (let i = 0; i < (stopResult === "requested" ? 10 : 1); i++) {
+              await onLog("stderr", `[paperclip] NAR rejoined message ${msgId} made no progress for ${mins} min; interrupting it\n`);
+              await interruptOnce().catch(() => undefined);
+              for (let i = 0; i < 10; i++) {
                 const proof = await verifyTermination(driver, hostPid, conversationId);
                 if (proof) return interrupted(`rejoined message stalled ${mins} min`, proof, conversationId);
-                if (stopResult === "requested") await sleep(1500);
+                await sleep(1500);
               }
-              const m = `OpenCode NAR rejoined message stalled ${mins} min; termination not verified`;
+              const m = `OpenCode NAR rejoined message stalled ${mins} min; interrupt sent, termination not verified`;
               await onLog("stderr", `[paperclip] ${m}\n`);
               return held(m, true, conversationId, "rejoin_stalled");
             }
