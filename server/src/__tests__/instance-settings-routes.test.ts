@@ -1,12 +1,14 @@
 import { generateKeyPairSync, randomUUID, sign } from "node:crypto";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import express from "express";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { hoistModuleGraph } from "./helpers/hoist-module-graph.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
-import { localProcessBirth } from "../services/deploy-owner.js";
+import { deployOwnerLiveness, localProcessBirth } from "../services/deploy-owner.js";
 import * as admission from "../services/task-admission.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { installDatabaseWorkSignals } from "../../../packages/db/src/work-signals.js";
@@ -1222,6 +1224,79 @@ describe("instance settings routes", () => {
         admission.stopTaskDrain();
       }
     }, 15_000);
+
+    it.skipIf(process.platform !== "darwin").each(["during POST", "after acceptance"])("reclaims an actual deploy client killed %s", async phase => {
+      admission.stopTaskDrain();
+      mockHeartbeatService.computeTaskDrain.mockImplementation(admission.computeTaskDrain);
+      mockHeartbeatService.applyTaskDrain.mockImplementation(admission.applyTaskDrain);
+      mockHeartbeatService.stopTaskDrain.mockImplementation(admission.stopTaskDrain);
+      mockHeartbeatService.getTaskDrainStatus.mockImplementation(() => {
+        const state = admission.readTaskDrain(new Date());
+        return { ...idleStatus, draining: !!state, ...(state ? { startedAt: state.startedAt.toISOString() } : {}),
+          ...(state?.ownerId ? { ownerId: state.ownerId } : {}) };
+      });
+      const coordinator = createDeliveryWorkCoordinator({ owner: installDatabaseWorkSignals({ execute: async () => [],
+        transaction: async () => { throw new Error("unexpected transaction"); } }),
+        canRun: () => true, onError: error => { throw error; } });
+      let resumed!: () => void;
+      const released = new Promise<void>(resolve => { resumed = resolve; });
+      const worker = admission.registerTaskDrainExpiryWork(coordinator, resumed);
+      let releaseAudit!: () => void;
+      let entered!: () => void;
+      const auditEntered = new Promise<void>(resolve => { entered = resolve; });
+      if (phase === "during POST") {
+        mockDb.transaction.mockImplementation(async (fn: (tx: unknown) => Promise<unknown>) => {
+          entered();
+          await new Promise<void>(resolve => { releaseAudit = resolve; });
+          return fn(TX_SENTINEL);
+        });
+      }
+      const dir = await fs.mkdtemp("/Volumes/NVM/AI_Agent_Runtime/tmp/sco1020-route-");
+      const base = "http://127.0.0.1:3100";
+      await fs.writeFile(path.join(dir, "context.json"), JSON.stringify({ currentProfile: "test", profiles: { test: { apiBase: base } } }));
+      await fs.writeFile(path.join(dir, "auth.json"), JSON.stringify({ credentials: { [base]: { token: "isolated-test-token" } } }));
+      const script = path.join(dir, "owner.sh");
+      await fs.writeFile(script, '"$1" "$2" begin "$3"\nstatus=$?\n[ "$status" -ne 0 ] || sleep 30\nexit "$status"\n');
+      const server = createApp(adminActor).listen(0, "127.0.0.1");
+      await once(server, "listening");
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("test server did not bind TCP");
+      const manifest = path.join(dir, "manifest.json");
+      const helper = path.resolve("../ops/research/runner-control/experiments/unified-native-mission/deploy-drain.mjs");
+      const child = spawn("/bin/sh", [script, process.execPath, helper, manifest], { detached: true, stdio: "ignore",
+        env: { ...process.env, PAPERCLIP_CONTEXT: path.join(dir, "context.json"),
+          PAPERCLIP_AUTH_STORE: path.join(dir, "auth.json"), PAPERCLIP_DEPLOY_API_BASE: `http://127.0.0.1:${address.port}` } });
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      const bounded = <T,>(promise: Promise<T>) => Promise.race([promise, new Promise<never>((_, reject) => {
+        deadline = setTimeout(() => reject(new Error("deploy client did not reach expected state")), 10_000);
+      })]).finally(() => { if (deadline) clearTimeout(deadline); });
+      try {
+        await worker.ready;
+        if (phase === "during POST") await bounded(auditEntered);
+        else await vi.waitFor(async () => {
+          const record = JSON.parse(await fs.readFile(manifest, "utf8"));
+          expect(record.phase).toBe("draining");
+        }, { timeout: 10_000 });
+        const record = JSON.parse(await fs.readFile(manifest, "utf8"));
+        expect(record.phase).toBe(phase === "during POST" ? "starting" : "draining");
+        expect(record.deployOwner).toEqual({ pid: child.pid, birth: await localProcessBirth(child.pid!) });
+        const exited = once(child, "exit");
+        process.kill(-child.pid!, "SIGKILL");
+        await exited;
+        releaseAudit?.();
+        try { await bounded(released); } catch (error) {
+          throw new Error(`owner cleanup did not run: ${await deployOwnerLiveness(record.deployOwner)}, drain=${!!admission.readTaskDrain(new Date())}, deadline=${coordinator.nextWakeAt()}`, { cause: error });
+        }
+        expect(admission.readTaskDrain(new Date())).toBeNull();
+      } finally {
+        if (child.exitCode === null && child.signalCode === null) process.kill(-child.pid!, "SIGKILL");
+        releaseAudit?.();
+        await worker.stop();
+        await coordinator.stop();
+        admission.stopTaskDrain();
+        await new Promise<void>(resolve => server.close(() => resolve()));
+      }
+    }, 25_000);
 
     it("returns the opt-in instance-wide safety report to an instance admin", async () => {
       mockHeartbeatService.getTaskDrainStatus.mockReturnValue(idleStatus);
