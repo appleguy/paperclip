@@ -1,8 +1,8 @@
 # Auto-unblocker
 
-This repository copy is not automatically promoted to the existing tool under
-`/Volumes/NVM/Paperclip/ops/auto-unblocker`. Apply is reserved for Board using
-its own credential. Never pass that credential to a worker.
+The operational entry point at `/Volumes/NVM/Paperclip/ops/auto-unblocker`
+redirects to this repository copy. Apply is reserved for Board using its own
+credential. Never pass that credential to a worker.
 
 Set `PAPERCLIP_API_URL`, `PAPERCLIP_COMPANY_ID` and an authorized
 `PAPERCLIP_API_KEY`. Inspect the current blocked set without changing it:
@@ -32,11 +32,11 @@ monitor timing. It checks the issue again after those reads. The apply request
 uses `PATCH /api/issues/:id/guarded-unblock` with only `status: "todo"` and
 `expectedBlockedTransition`: the observed `statusVersion`, `updatedAt`,
 `blockedTransitionAt`, and complete `blockedByIssueIds` from diagnostics.
-The server checks the blocked issue and dependency readiness under transaction
-locks; a stale snapshot must be reviewed again. A missing endpoint or any
-error is a failed apply, never a reason to fall back to the ordinary PATCH.
-This guard does not make the preceding interaction, approval and recovery reads
-atomic; Board must still review those gates. It does not establish clearance.
+The server checks the blocked issue, dependency readiness, pending interactions,
+approvals and recovery actions under transaction locks; a stale snapshot must
+be reviewed again. A missing endpoint or any error is a failed apply, never a
+reason to fall back to the ordinary PATCH. The guard does not establish that
+the descriptor action has cleared; Board must still review each proposal.
 
 `--cleanup-decisions` is inspection-only and requires the Board credential;
 it cannot be combined with apply. Peer redelivery and Board routing appear in
