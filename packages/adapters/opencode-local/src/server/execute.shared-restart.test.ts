@@ -126,4 +126,20 @@ describe("OpenCode adapter reconnects to persistent server after SIGTERM", () =>
     expect(created).toBe(0);
     expect(interrupted).toEqual([]);
   });
+
+  it.each(["clean", "signal", "throws"] as const)("only reports provider stopped for a shared CLI %s outcome", async outcome => {
+    const stopped = vi.fn(async () => {});
+    runProcess.mockImplementationOnce(async (...args) => {
+      args[4].onProcessStopped?.();
+      if (outcome === "throws") throw new Error("local client failure");
+      return { exitCode: outcome === "clean" ? 0 : null, signal: outcome === "signal" ? "SIGTERM" : null,
+        timedOut: false, stdout: "", stderr: "", pid: 12, startedAt: "" } as never;
+    });
+    const result = execute({ ...context("callback-run"), onProviderStopped: stopped });
+    if (outcome === "throws") await expect(result).resolves.toMatchObject({ resultJson: {
+      executionRecovery: { reason: "shared_session_unverified", providerWorkStarted: true },
+    } });
+    else await result;
+    expect(stopped).toHaveBeenCalledTimes(outcome === "clean" ? 1 : 0);
+  });
 });

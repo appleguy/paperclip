@@ -947,6 +947,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     };
 
+    // A shared CLI exit alone does not establish that its provider turn ended.
+    // Keep the stopped callback closed unless the shared attempt exits cleanly.
+    let sharedProviderUnverified = sharedSession !== null;
     try {
       const initial = await runAttempt(sharedSession?.resumed ? sharedSession.sessionId : sessionId);
       if (narMode) {
@@ -968,6 +971,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         return { ...result, resultJson: { ...(result.resultJson ?? {}),
           executionRecovery: { kind: "bootstrap", providerWorkStarted: true, reason: "shared_session_unverified" } } };
       }
+      sharedProviderUnverified = false;
       const initialFailed =
         !initial.proc.timedOut && ((initial.proc.exitCode ?? 0) !== 0 || Boolean(initial.parsed.errorMessage));
       if (
@@ -987,9 +991,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
 
       return toResult(initial);
+    } catch (error) {
+      if (!sharedSession) throw error;
+      sharedProviderUnverified = true;
+      // The client can fail after submitting to the persistent server; retain
+      // the run instead of letting generic setup failure imply provider exit.
+      return { exitCode: 75, signal: null, timedOut: false,
+        errorMessage: "Shared OpenCode client failed with provider state unverified",
+        resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: true, reason: "shared_session_unverified" } } };
     } finally {
       try {
-        await providerStop.collectBeforeRestore();
+        if (!sharedProviderUnverified) await providerStop.collectBeforeRestore();
       } finally {
         await Promise.all([
           paperclipBridge?.stop(),
