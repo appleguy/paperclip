@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { agents, companies, createDb, heartbeatRunEvents, heartbeatRuns, issueRecoveryActions, issues } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions, issues } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
@@ -93,6 +93,38 @@ describe.skipIf(!support.supported)("execution blocker recovery lifetime", () =>
       workspaceRestoreRecovery: { schema: "paperclip.workspace-restore-recovery.v1", leaseIds: [] },
     } });
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ recoveryActionId: f.action.id, workspaceRepairRequired: true });
+  });
+
+  it("retains source-run unsafe restore evidence across reset and releases it when replay is cleared", async () => {
+    const f = await fixture({ status: "resolved", run: { resultJson: { workspaceRestoreFailure: "restore_unsafe_archive" } } });
+    const boundaryId = randomUUID();
+    await db.insert(issueComments).values({ id: boundaryId, companyId: f.companyId, issueId: f.issueId,
+      authorType: "user", authorUserId: "board", body: "/new", createdAt: new Date("2030-01-01T00:00:00Z") });
+    await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "board", conversationState: "active", conversationBoundaryCommentId: boundaryId }).where(eq(issues.id, f.issueId));
+    const expected = { recoveryActionId: f.action.id, runId: f.run.id, workspaceRepairRequired: true, canRetry: false };
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject(expected);
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId, { conversationResetCommentId: boundaryId })).toMatchObject(expected);
+    await db.update(issueRecoveryActions).set({ evidence: { runId: f.run.id, automaticRecovery: { replay: "allowed" } } }).where(eq(issueRecoveryActions.id, f.action.id));
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+  });
+
+  it("does not attribute another issue's unsafe restore to a resolved action", async () => {
+    const f = await fixture({ status: "resolved", run: { resultJson: { workspaceRestoreFailure: "restore_unsafe_archive" } } });
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: randomUUID() } }).where(eq(heartbeatRuns.id, f.run.id));
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    await db.update(heartbeatRuns).set({ contextSnapshot: { issueId: f.issueId }, runtimeMode: "native" }).where(eq(heartbeatRuns.id, f.run.id));
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    await db.update(issueRecoveryActions).set({ evidence: { runId: "not-a-uuid", automaticRecovery: { replay: "blocked" } } }).where(eq(issueRecoveryActions.id, f.action.id));
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+  });
+
+  it("binds sourceRunId restore evidence to the same company", async () => {
+    const f = await fixture({ status: "resolved", run: { resultJson: { workspaceRestoreFailure: "restore_unsafe_archive" } } });
+    await db.update(issueRecoveryActions).set({ evidence: { sourceRunId: f.run.id, automaticRecovery: { replay: "blocked" } } }).where(eq(issueRecoveryActions.id, f.action.id));
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ runId: f.run.id, workspaceRepairRequired: true });
+    const other = await fixture({ status: "resolved", run: { resultJson: { workspaceRestoreFailure: "restore_unsafe_archive" } } });
+    await db.update(issueRecoveryActions).set({ evidence: { sourceRunId: other.run.id, automaticRecovery: { replay: "blocked" } } }).where(eq(issueRecoveryActions.id, f.action.id));
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
   });
 
   it("does not exempt an interrupted former Claude run from unfinished workspace repair", async () => {

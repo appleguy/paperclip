@@ -112,8 +112,27 @@ export function executionContinuationSourcePredicate() {
   return executionRecoveryActionPredicate(true);
 }
 
+// Older recovery actions may retain the unsafe-restore marker only on the
+// original run. Require the same company, issue and legacy execution before
+// treating that evidence as a workspace obligation for this action.
+function originalRunUnsafeRestorePredicate() {
+  return sql`${issueRecoveryActions.cause} = 'legacy_execution_requires_reconciliation' and exists (
+    select 1 from ${heartbeatRuns}
+    where ${heartbeatRuns.companyId} = ${issueRecoveryActions.companyId}
+      and ${heartbeatRuns.id} = ${canonicalExecutionUuid(sql`coalesce(${issueRecoveryActions.evidence}->>'runId', ${issueRecoveryActions.evidence}->>'sourceRunId')`)}
+      and ${heartbeatRuns.runtimeMode} = 'legacy'
+      and (${heartbeatRuns.issueId} is null or ${heartbeatRuns.issueId} = ${issueRecoveryActions.sourceIssueId})
+      and ((${heartbeatRuns.nativeIssueId} is not null and ${heartbeatRuns.nativeIssueId} = ${issueRecoveryActions.sourceIssueId})
+        or (${heartbeatRuns.nativeIssueId} is null and ${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueRecoveryActions.sourceIssueId}::text))
+      and ${heartbeatRuns.resultJson}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'
+  )`;
+}
+
 function executionRecoveryActionPredicate(includeResolvedSources: boolean) {
   return or(and(unverifiedOpenCodeRecoveryActionPredicate(), or(
+    inArray(issueRecoveryActions.status, ["active", "escalated"]),
+    and(eq(issueRecoveryActions.status, "resolved"), sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`),
+  )), and(originalRunUnsafeRestorePredicate(), or(
     inArray(issueRecoveryActions.status, ["active", "escalated"]),
     and(eq(issueRecoveryActions.status, "resolved"), sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`),
   )), and(
@@ -242,6 +261,7 @@ export function restoreHoldReleasedForCurrentOwnerPredicate() {
   return sql`coalesce((${and(
     sql`${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema' = ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}`,
     sql`coalesce(${issueRecoveryActions.evidence}->>'workspaceRestoreFailure', '') <> 'restore_unsafe_archive'`,
+    sql`not (${originalRunUnsafeRestorePredicate()})`,
     sql`exists (select 1 from ${heartbeatRuns} stopped
       join ${issues} task on task.company_id = stopped.company_id and task.id = ${issueRecoveryActions.sourceIssueId}
       where stopped.company_id = ${issueRecoveryActions.companyId}
@@ -283,6 +303,7 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
       unreconciledNativeExportPredicate(),
       sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
       sql`${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema' = ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}`,
+      originalRunUnsafeRestorePredicate(),
     ),
   )).orderBy(desc(issueRecoveryActions.updatedAt)).limit(1);
   // A context reset cannot establish that an orphaned provider turn stopped.
