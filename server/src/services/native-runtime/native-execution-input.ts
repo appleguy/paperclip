@@ -153,6 +153,7 @@ export function renderZeroFactsInput(input: Pick<BuildNativeExecutionInput, "iss
   const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
   const wake = record(input.wakePayload);
   const continuation = record(wake.executionContinuation);
+  const questionResponse = record(wake.questionResponse);
   const lines: string[] = [];
   const issue = [input.issue.identifier, input.issue.title].filter((value) => typeof value === "string" && value.length > 0).join(" ");
   if (issue) lines.push(`Issue: ${issue}`);
@@ -167,6 +168,7 @@ export function renderZeroFactsInput(input: Pick<BuildNativeExecutionInput, "iss
     return parts.length ? [parts.join(" ")] : [];
   }) : [];
   if (comments.length) lines.push(`Comments:\n${comments.join("\n")}`);
+  if (typeof questionResponse.summaryMarkdown === "string" && questionResponse.summaryMarkdown.length) lines.push(`Question response: ${questionResponse.summaryMarkdown}`);
   if (typeof continuation.completedWork === "string" && continuation.completedWork.length) lines.push(`Continuation: ${continuation.completedWork}`);
   if (input.workspace.cwd) lines.push(`Workspace: ${input.workspace.cwd}`);
   return lines.join("\n\n");
@@ -266,7 +268,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
   const externalChatSkillDescription = configuredGitHubSkills.length > 0
     ? `Configured GitHub instruction skills:\n${configuredGitHubSkills.map((skill) => `/${skill.runtimeName}`).join("\n")}`
     : null;
-  const taskPrompt = input.zero ? renderZeroFactsInput(input) : caseProjectionBootstrapPrefix(input.caseContext) + [
+  const taskPrompt = input.zero ? renderZeroFactsInput({ ...input, wakePayload }) : caseProjectionBootstrapPrefix(input.caseContext) + [
     wakePrompt,
     // Durable task questions must survive the current provider turn.
     // Keep routing visible before deferred tool discovery; usage belongs in the tool schema.

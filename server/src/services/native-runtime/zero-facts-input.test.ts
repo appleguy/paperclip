@@ -20,6 +20,14 @@ describe("native zero facts", () => {
   it("omits absent facts without substitutes", () => {
     expect(renderZeroFactsInput({ ...args, issue: { ...args.issue, identifier: null, status: null, description: null }, wakePayload: null })).toBe("Issue: Fix\n\nWorkspace: /work");
   });
+  it("includes the materialized answer in fresh and resumed zero prompts", () => {
+    const wakePayload = { reason: "answered", externalChatQuestionResponse: {}, interactionId: "i1" };
+    const interactionResponses = [{ interactionId: "i1", kind: "ask_user_questions" as const, response: { status: "answered", result: { summaryMarkdown: "Use blue" } } }];
+    const fresh = buildNativeExecutionInput({ ...args, zero: true, wakePayload, interactionResponses });
+    expect(fresh.task.prompt).toContain("Question response: Use blue");
+    const resumed = buildNativeExecutionInput({ ...args, zero: true, wakePayload, interactionResponses, resumedSession: true, previousTurn: { runId: args.runId, task: args.issue } as BuildNativeExecutionInput["previousTurn"] });
+    expect(resumed.continuationPrompt).toBe(fresh.task.prompt);
+  });
   it("retains the default prompt", () => {
     const normal = buildNativeExecutionInput(args);
     expect(normal).toEqual(buildNativeExecutionInput({ ...args, zero: false }));
