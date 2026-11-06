@@ -48,6 +48,11 @@ interface IssueBaseOptions extends BaseClientOptions {
   assigneeAgentId?: string;
   projectId?: string;
   match?: string;
+  limit?: string;
+  offset?: string;
+  sortField?: string;
+  sortDir?: string;
+  afterId?: string;
 }
 
 interface IssueCreateOptions extends BaseClientOptions {
@@ -182,7 +187,12 @@ export function registerIssueCommands(program: Command): void {
       .option("--status <csv>", "Comma-separated statuses")
       .option("--assignee-agent-id <id>", "Filter by assignee agent ID")
       .option("--project-id <id>", "Filter by project ID")
-      .option("--match <text>", "Local text match on identifier/title/description")
+      .option("--match <text>", "Local text match on identifier/title/description within the returned page")
+      .option("--limit <n>", "Page size (server default 500; maximum 1000)")
+      .option("--offset <n>", "Number of issues to skip; combine with a stable sort for pagination")
+      .option("--sort-field <field>", "Sort field: updated, created, or id")
+      .option("--sort-dir <direction>", "Sort direction: asc or desc")
+      .option("--after-id <uuid>", "Keyset cursor; requires --sort-field id --sort-dir asc and no offset")
       .action(async (opts: IssueBaseOptions) => {
         try {
           const ctx = resolveCommandContext(opts, { requireCompany: true });
@@ -190,6 +200,11 @@ export function registerIssueCommands(program: Command): void {
           if (opts.status) params.set("status", opts.status);
           if (opts.assigneeAgentId) params.set("assigneeAgentId", opts.assigneeAgentId);
           if (opts.projectId) params.set("projectId", opts.projectId);
+          if (opts.limit) params.set("limit", opts.limit);
+          if (opts.offset) params.set("offset", opts.offset);
+          if (opts.sortField) params.set("sortField", opts.sortField);
+          if (opts.sortDir) params.set("sortDir", opts.sortDir);
+          if (opts.afterId) params.set("afterId", opts.afterId);
 
           const query = params.toString();
           const path = `${apiPath`/api/companies/${ctx.companyId}/issues`}${query ? `?${query}` : ""}`;

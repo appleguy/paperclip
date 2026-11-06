@@ -476,6 +476,8 @@ npx paperclipai issue force-release <issue-id>
 
 `issue create` sent from an agent run bound to an ordinary execution task is parented under that task when `--parent-id` is omitted; pass `--standalone` to create intentionally top-level work (`parentId: null`). The two flags are mutually exclusive.
 
+Issue lists are paginated: the server defaults to 500 rows and caps each page at 1000. `--match` filters only the returned page; absence from that page does not establish that an issue is missing. For a larger scan, use `--limit 1000 --sort-field id --sort-dir asc`, then pass the last returned ID as `--after-id <uuid>` until the returned page is shorter than the requested limit. Keyset paging requires ascending ID order and no nonzero offset. `--offset <n>` and `--sort-field created|updated|id --sort-dir asc|desc` are also available for explicit page reads. A multi-request scan is not a transactional snapshot; preserve its observation window.
+
 Issue subresources are exposed as Paperclip API wrappers. Commands that map to broad server schemas accept JSON payloads and validate them with shared schemas before sending.
 
 ```sh
