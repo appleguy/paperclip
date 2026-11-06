@@ -31,6 +31,7 @@ import { createHeartbeatRunState } from "./run-state.js";
 import { buildEffectiveRunSessionConfigMetadata } from "./workspaces.js";
 import { revokeHeartbeatRunGatewayTokens } from "./run-preparation.js";
 import { executeHeartbeatRuntime, type HeartbeatRuntimeExecutionInput } from "./runtime-execution.js";
+import { claimLegacyRestartController } from "./legacy-restart-claim.js";
 
 import { prepareNativeHeartbeatRun } from "../native-runtime/prepare-native-run.js";
 import { buildNativeCompletionContract } from "../native-runtime/completion-contracts.js";
@@ -138,6 +139,23 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
       return { exitCode: 0, signal: null, timedOut: false };
     });
     await executeHeartbeatRuntime(db, input);
+  });
+  it("preserves a checkpoint and Stop written after the hot-restart scan", async () => {
+    const { run } = await fixture();
+    const oldBoot = randomUUID();
+    const [scanned] = await db.update(heartbeatRuns).set({ controllerBootId: oldBoot,
+      resultJson: { prior: "retained", restartReattach: { count: 1 } } }).where(eq(heartbeatRuns.id, run.id)).returning();
+    const lateBinding = { sessionId: "ses_original", sessionParams: { narBinding: { messageId: "msg_original" } } };
+    const lateStop = { state: "requested", reason: "pause" };
+    await db.update(heartbeatRuns).set({ resultJson: { ...scanned.resultJson,
+      earlySession: lateBinding, executionCancellation: lateStop } }).where(eq(heartbeatRuns.id, run.id));
+
+    const restart = { count: 2, previousServerPid: 10, newServerPid: 20, at: new Date() };
+    const claimed = await claimLegacyRestartController(db, scanned, restart);
+    expect(claimed?.resultJson).toMatchObject({ prior: "retained", earlySession: lateBinding,
+      executionCancellation: lateStop, restartReattach: { count: 2, previousServerPid: 10, newServerPid: 20 } });
+    expect(claimed?.controllerBootId).not.toBe(oldBoot);
+    expect(await claimLegacyRestartController(db, scanned, restart)).toBeNull();
   });
   it.each(["current", "expired", "replaced-owner", "generation", "attempt", "boot", "pid", "process-start", "stopped", "unknown-code", "permission", "io", "diagnostic-sink-failed", "diagnostic-lock-busy"] as const)(
     "preserves post-result diagnostics without changing recovery authority (%s)", async scenario => {

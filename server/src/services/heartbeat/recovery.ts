@@ -6,6 +6,7 @@ import { legacyWorkspaceRecoveryNotMigrated } from "../legacy-workspace-recovery
 import { pendingFailedNativeRetryCancellationCondition } from "../native-runtime/native-cancellation-request.js";
 import { notifyLiveRunRecovery } from "../live-run-recovery-notifications.js";
 import { registerLiveRecoveryWork } from "./live-recovery-work.js";
+import { claimLegacyRestartController } from "./legacy-restart-claim.js";
 import { NATIVE_RETAINED_OWNER_WAIT } from "../native-runtime/native-controller-recovery.js";
 import { nativeEnvironmentSettlementDisposition, nativeEnvironmentSettlementWork } from "../native-runtime/native-environment-settlement-work.js";
 import { nativeWorkspaceFinalizationWork } from "../native-runtime/native-workspace-finalization-work.js";
@@ -869,33 +870,9 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         }
         // Take the controller from the previous boot in one guarded write; the
         // lease watcher in executeRun renews it from here.
-        const claimed = await db
-          .update(heartbeatRuns)
-          .set({
-            controllerBootId: legacyControllerBootId,
-            controllerLeaseExpiresAt: sql`clock_timestamp() + interval '60 seconds'`,
-            executionStage: "preparing",
-            resultJson: preserveWorkspaceRestoreRecoveryMetadataSql({
-              ...parseObject(run.resultJson),
-              restartReattach: {
-                count: count + 1,
-                at: now.toISOString(),
-                previousServerPid: intent.previousServerPid,
-                newServerPid: process.pid,
-              },
-            }, true),
-            updatedAt: now,
-          })
-          .where(and(
-            eq(heartbeatRuns.id, run.id),
-            eq(heartbeatRuns.status, "running"),
-            eq(heartbeatRuns.runtimeMode, "legacy"),
-            run.controllerBootId === null
-              ? isNull(heartbeatRuns.controllerBootId)
-              : eq(heartbeatRuns.controllerBootId, run.controllerBootId),
-          ))
-          .returning()
-          .then((rows) => rows[0] ?? null);
+        const claimed = await claimLegacyRestartController(db, run, {
+          count: count + 1, at: now, previousServerPid: intent.previousServerPid, newServerPid: process.pid,
+        });
         if (!claimed) {
           classify(candidate, "lost", "restart_reattach_claim_not_applied", patch);
           continue;
