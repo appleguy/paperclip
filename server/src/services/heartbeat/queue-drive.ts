@@ -105,8 +105,12 @@ export function createHeartbeatQueueDrive(db: Db, deps: QueueDriveDependencies) 
           latest?.errorCode === CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE) continue;
       // Do not bypass the process-loss recovery lane's exhausted retry budget.
       if (latest?.errorCode === "process_lost" && (latest.processLossRetryCount ?? 0) >= 1) continue;
+      // Coded system cancellations (target_busy, reassignment, pause) stay drivable; an
+      // attributed stop or a bare unattributed "cancelled" waits for a fresh cause.
+      const cancelledBy = latest?.resultJson?.cancelledByActorType;
       if (latest?.status === "cancelled" && (latest.errorCode === "operator_interrupted" ||
-          latest.resultJson?.cancelledByActorType !== "system")) continue;
+          ["user", "board", "agent"].includes(String(cancelledBy)) ||
+          (cancelledBy !== "system" && (latest.errorCode == null || latest.errorCode === "cancelled")))) continue;
       if (recent.length === 2 && recent.every(row => FAILURE_STATUSES.has(row.status))) continue;
 
       const admittedRun = await deps.enqueueWakeup(source.agentId, {

@@ -256,6 +256,17 @@ describe.skipIf(!postgres.supported)("queue drive persisted selection and deboun
     expect(deps.enqueueWakeup).toHaveBeenCalledOnce();
   });
 
+  it.each(["target_busy", "issue_assignee_changed", "agent_paused"])(
+    "drives an issue whose latest run was a coded system cancellation %s", async errorCode => {
+      const held = await issue();
+      await db.update(heartbeatRuns).set({ status: "cancelled", resultJson: {}, errorCode,
+        contextSnapshot: { issueId: held.id } }).where(eq(heartbeatRuns.id, source.id));
+      await drive.wakeNextAssignedIssueAfterRun(source);
+      expect(picked()).toBe(held.id);
+      expect(deps.enqueueWakeup).toHaveBeenCalledOnce();
+    },
+  );
+
   it("does not continue a running source", async () => {
     await issue();
     await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, source.id));
