@@ -10359,14 +10359,19 @@ async function executePaperclipNativeSessionWithinScope(
     }
     // v13: the executor launches the ONE genuine Claude interactive session; the managed service adopts it (no second launch).
     let claudeBackend: ReturnType<typeof createNativeSessionBackend> | undefined;
-    let claudeTranscriptScope: { home: string; claudeConfigDir?: string; cwd: string; sessionId: string } | undefined;
+    let claudeTranscriptCursor: Awaited<ReturnType<typeof import("@paperclipai/paperclip-runner").ClaudeInteractiveNativeBackend.transcriptCursor>> | undefined;
     if (input.execution.schema === "paperclip.native-execution-input.v13" && input.backend === undefined) {
       if (input.runnerExecutionTarget?.kind === "remote" || input.restartRecovery || !input.execution.workspace.cwd) throw new Error("claude_interactive_requires_fresh_local_admission");
       const stateDirectory = process.env.PAPERCLIP_CLAUDE_INTERACTIVE_STATE_DIR?.trim(), hookHelperExecutable = process.env.PAPERCLIP_CLAUDE_HOOK_HELPER?.trim();
       if (!stateDirectory || !hookHelperExecutable) throw new Error("claude_interactive_host_not_configured");
       const execution = input.execution, binding = execution.binding;
       const host = await resolveClaudeNativeHostSettings();
-      claudeTranscriptScope = { ...host, cwd: execution.workspace.cwd!, sessionId: execution.session.normalizedSessionId! };
+      try {
+        const { ClaudeInteractiveNativeBackend } = await import("@paperclipai/paperclip-runner");
+        claudeTranscriptCursor = await ClaudeInteractiveNativeBackend.transcriptCursor({ ...host, cwd: execution.workspace.cwd!, sessionId: execution.session.normalizedSessionId! });
+      } catch (error) {
+        logger.warn({ err: error, runId: binding.runId }, "Could not scope Claude transcript usage");
+      }
       claudeAdmission = await startClaudeNativeSession(input.db, { execution, runnerInstanceId: effectiveRunnerInstanceId, leaseOwner, attempt, controller, assertControllerActive,
         completionFeedback: async result => { assertControllerActive(); return nativeCompletionFeedback(input.db, binding.runId, result); },
         host: { ...host, stateDirectory, hookHelperExecutable } });
@@ -10871,10 +10876,10 @@ async function executePaperclipNativeSessionWithinScope(
       nativeAccountingComplete = snapshot.complete && snapshot.turnId === native.turnId;
     } else nativeAccountingComplete = observedAccountingUsage !== null
       && observedAccountingTurn !== undefined && observedAccountingTurn === native.turnId;
-    if (claudeTranscriptScope) {
+    if (claudeTranscriptCursor) {
       try {
         const { ClaudeInteractiveNativeBackend } = await import("@paperclipai/paperclip-runner");
-        const peak = await ClaudeInteractiveNativeBackend.transcriptPeak(claudeTranscriptScope);
+        const peak = await ClaudeInteractiveNativeBackend.transcriptPeak(claudeTranscriptCursor);
         if (peak) observedPeakContextTokens = Math.max(observedPeakContextTokens, peak);
       } catch (error) {
         logger.warn({ err: error, runId: input.execution.binding.runId }, "Could not read Claude transcript usage");

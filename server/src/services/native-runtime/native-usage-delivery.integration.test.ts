@@ -76,6 +76,23 @@ describe("producer-owned native usage", () => {
     expect(run!.usageJson).toMatchObject({ peakContextTokens: 30500 });
   });
 
+  it("retains context-only Codex occupancy without completing or pricing unknown billing", async () => {
+    const input = await seed();
+    await db.update(heartbeatRuns).set({ runnerInstanceId: input.runnerInstanceId }).where(eq(heartbeatRuns.id, input.runId));
+    const delivery = await createNativeUsageDelivery(db, input);
+    const report = event(input, 1, "usage.reported");
+    report.payload = { context: { usedTokens: 30500, windowTokens: 200000 }, runDeltaAvailable: false };
+    await delivery.capture(report);
+    const { billing: _billing, ...source } = input;
+    const resumed = await createNativeUsageContinuationDelivery(db, source);
+    await resumed.capture(event(input, 2, "turn.completed"));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.runId));
+    expect(run!.usageJson).toMatchObject({ peakContextTokens: 30500, accountingReceiptReady: false, costStatus: "unpriced" });
+    const receipts = await db.select().from(runUsageReceipts).where(eq(runUsageReceipts.runId, input.runId));
+    expect(receipts.at(-1)!.receiptJson).toMatchObject({ receipt: { complete: false, costStatus: "unpriced", costUsd: null,
+      usage: { inputTokens: 0, outputTokens: 0, peakContextTokens: 30500 } } });
+  });
+
   it.each([
     { name: "a report whose terminal was already acknowledged", types: ["usage.reported"] },
     { name: "a report and its terminal", types: ["usage.reported", "turn.completed"] },

@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { realpath } from "node:fs/promises";
+import { open, realpath } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import type { NativeSession, NativeSessionBackend, OpenNativeSessionInput, PersistedNativeSession } from "../../contracts/native-session-backend.js";
@@ -26,28 +25,53 @@ export interface ClaudeInteractiveNativePort {
 const capabilities = { resume: false, typedEvents: true, steering: false, interruption: false, structuredResult: true,
   completionBoundary: "paperclip_work_session" as const, providerTermination: "unavailable" as const, dynamicTools: true };
 const identityMatches = (a: NativeRunIdentity, b: NativeRunIdentity) => a.runId === b.runId && a.sessionId === b.sessionId && a.companyId === b.companyId && a.issueId === b.issueId && a.agentId === b.agentId;
+type TranscriptScope = { home: string; claudeConfigDir?: string; cwd: string; sessionId: string };
+type TranscriptCursor = { path: string; sessionId: string; offset: number; device?: number; inode?: number; skipPartial: boolean };
 
 export class ClaudeInteractiveNativeBackend implements NativeSessionBackend {
   constructor(private readonly port: ClaudeInteractiveNativePort) {}
-  static async transcriptPeak(input: { home: string; claudeConfigDir?: string; cwd: string; sessionId: string }): Promise<number | undefined> {
+  static async transcriptCursor(input: TranscriptScope): Promise<TranscriptCursor> {
     if (!isAbsolute(input.home) || !isAbsolute(input.cwd) || (input.claudeConfigDir && !isAbsolute(input.claudeConfigDir))
       || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(input.sessionId)) throw new Error("claude_transcript_scope_invalid");
     const project = (await realpath(resolve(input.cwd))).replace(/[^a-zA-Z0-9]/g, "-");
     const path = join(input.claudeConfigDir ?? join(input.home, ".claude"), "projects", project, `${input.sessionId}.jsonl`);
+    try {
+      const file = await open(path, "r");
+      try {
+        const stat = await file.stat();
+        const last = Buffer.alloc(1);
+        if (stat.size) await file.read(last, 0, 1, stat.size - 1);
+        return { path, sessionId: input.sessionId, offset: stat.size, device: stat.dev, inode: stat.ino,
+          skipPartial: stat.size > 0 && last[0] !== 10 };
+      } finally { await file.close(); }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      return { path, sessionId: input.sessionId, offset: 0, skipPartial: false };
+    }
+  }
+  static async transcriptPeak(cursor: TranscriptCursor): Promise<number | undefined> {
     let peak = 0;
     try {
-      const lines = createInterface({ input: createReadStream(path), crlfDelay: Infinity });
-      for await (const line of lines) {
-        let entry: any;
-        try { entry = JSON.parse(line); } catch { continue; }
-        if (entry?.type !== "assistant" || (entry.sessionId ?? entry.session_id) !== input.sessionId) continue;
-        const usage = entry.message?.usage;
-        if (!usage || typeof usage !== "object") continue;
-        const values = [usage.input_tokens, usage.cache_read_input_tokens ?? 0, usage.cache_creation_input_tokens ?? 0, usage.output_tokens];
-        if (!values.every(value => typeof value === "number" && Number.isSafeInteger(value) && value >= 0)) continue;
-        const total = values.reduce((sum, value) => sum + value, 0);
-        if (Number.isSafeInteger(total) && total <= 2_147_483_647) peak = Math.max(peak, total);
-      }
+      const file = await open(cursor.path, "r");
+      try {
+        const stat = await file.stat();
+        if ((cursor.inode !== undefined && (cursor.inode !== stat.ino || cursor.device !== stat.dev)) || stat.size < cursor.offset) return undefined;
+        if (stat.size === cursor.offset) return undefined;
+        const lines = createInterface({ input: file.createReadStream({ start: cursor.offset, autoClose: false }), crlfDelay: Infinity });
+        let skipPartial = cursor.skipPartial;
+        for await (const line of lines) {
+          if (skipPartial) { skipPartial = false; continue; }
+          let entry: any;
+          try { entry = JSON.parse(line); } catch { continue; }
+          if (entry?.type !== "assistant" || (entry.sessionId ?? entry.session_id) !== cursor.sessionId) continue;
+          const usage = entry.message?.usage;
+          if (!usage || typeof usage !== "object") continue;
+          const values = [usage.input_tokens, usage.cache_read_input_tokens ?? 0, usage.cache_creation_input_tokens ?? 0, usage.output_tokens];
+          if (!values.every(value => typeof value === "number" && Number.isSafeInteger(value) && value >= 0)) continue;
+          const total = values.reduce((sum, value) => sum + value, 0);
+          if (Number.isSafeInteger(total) && total <= 2_147_483_647) peak = Math.max(peak, total);
+        }
+      } finally { await file.close(); }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }

@@ -185,12 +185,12 @@ function createNativeUsageReceiver(db: Db, input: NativeUsageDeliveryInput, sour
         receivedAt: event.emittedAt, producerEvent: fact, receipt: { complete: false } };
       const snapshot = observe(envelope);
       const normalized = normalizeNativeUsage(snapshot.usage, { inputIncludesCacheReads: input.provider.kind === "codex" });
-      const usage = normalized && peakContextTokens > 0 ? { ...normalized, peakContextTokens } : normalized;
+      const usage = peakContextTokens > 0 ? { ...(normalized ?? { inputTokens: 0, outputTokens: 0 }), peakContextTokens } : normalized;
       envelope.receipt = priceAnthropicReceipt(priceCodexReceipt({ ...input.billing,
-        model: input.provider.model ?? "unknown", usage, usageBasis: "per_run", complete: snapshot.complete && usage !== undefined,
-        costUsd: usage ? nativeUsageCostUsd(snapshot.usage, input.provider) ?? null : null,
-        costUsdExact: typeof snapshot.usage?.accountingCostUsdExact === "string" ? snapshot.usage.accountingCostUsdExact : undefined,
-        costStatus: usage === undefined || snapshot.usage?.accountingCostIncomplete === true ? "unpriced"
+        model: input.provider.model ?? "unknown", usage, usageBasis: "per_run", complete: snapshot.complete && normalized !== undefined,
+        costUsd: normalized ? nativeUsageCostUsd(snapshot.usage, input.provider) ?? null : null,
+        costUsdExact: normalized && typeof snapshot.usage?.accountingCostUsdExact === "string" ? snapshot.usage.accountingCostUsdExact : undefined,
+        costStatus: normalized === undefined || snapshot.usage?.accountingCostIncomplete === true ? "unpriced"
           : input.provider.kind === "aws_agentcore" ? "estimated" : undefined,
       }));
       envelope.liveCostCents = liveRunUsageCostCents(envelope.receipt as AdapterUsageCheckpoint);
