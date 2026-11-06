@@ -102,7 +102,7 @@ export async function hasPendingRunCleanup(db: Db, companyId: string, runId: str
   return state?.pending !== false;
 }
 
-/** Only unresolved execution or explicit workspace recovery obligations hold dispatch. */
+/** Unresolved execution, uncertain external actions and workspace obligations hold dispatch. */
 export function executionBlockerPredicate() {
   return executionRecoveryActionPredicate(false);
 }
@@ -151,12 +151,14 @@ function executionRecoveryActionPredicate(includeResolvedSources: boolean) {
     or(unreconciledNativeExportPredicate(), and(
       inArray(issueRecoveryActions.cause, [...EXECUTION_RECONCILIATION_CAUSES]),
       or(inArray(issueRecoveryActions.status, ["active", "escalated"]),
-        // Resolved bookkeeping and its stale replay flag cannot re-arm an
-        // ordinary execution hold. Retained files remain an explicit repair
-        // obligation, independently of automatic recovery's terminal status.
+        // A resolved recovery record can still explicitly report an unknown
+        // external action. Do not allow a generic retry to repeat that action.
+        // Ordinary legacy bookkeeping stays released (SCO-1043); retained
+        // files remain an independent repair obligation.
         and(eq(issueRecoveryActions.status, "resolved"),
           sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
           includeResolvedSources ? sql`true` : or(
+            eq(issueRecoveryActions.cause, "uncertain_external_action"),
             sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
             sql`${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema' = ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}`,
           ),

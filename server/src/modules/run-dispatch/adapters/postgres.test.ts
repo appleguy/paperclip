@@ -1474,11 +1474,13 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     const issueId = randomUUID(), runId = randomUUID();
     await db.insert(issues).values({ id: issueId, companyId, title: "Uncertain email", status: "in_progress", assigneeAgentId: agentId });
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, status: "queued", contextSnapshot: { issueId, wakeReason: "retry_failed_run" } });
-    await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId, kind: "active_run_watchdog", ownerType: "board", cause: "uncertain_external_action", status, evidence: status === "resolved" ? { automaticRecovery: { replay: "blocked" } } : {}, fingerprint: runId, nextAction: "Verify whether email-1 was sent before continuing." });
+    const [action] = await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId, kind: "active_run_watchdog", ownerType: "board", cause: "uncertain_external_action", status, evidence: status === "resolved" ? { automaticRecovery: { replay: "blocked" } } : {}, fingerprint: runId, nextAction: "Verify whether email-1 was sent before continuing." }).returning();
     expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ cause: "uncertain_external_action", nextAction: "Verify whether email-1 was sent before continuing." });
     expect(await getExecutionBlocker(db, randomUUID(), issueId)).toBeNull();
     const adapter = createPostgresRunDispatchAdapter(db);
     await expect(adapter.cancelStaleQueuedRun({ companyId, runId, expectedStatus: "queued", now: new Date() })).resolves.toMatchObject({ outcome: "cancelled", errorCode: "execution_reconciliation_required" });
+    await db.update(issueRecoveryActions).set({ status: "resolved", evidence: { executionReconciliation: { outcome: "verified" } } }).where(eq(issueRecoveryActions.id, action!.id));
+    expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
   });
 
   it.each(["active", "resolved"])("allows a new message through a historical %s interruption hold", async status => {
@@ -1513,13 +1515,14 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0].status).toBe("blocked");
   });
 
-  it.each(["process", "http", null])("keeps a historical %s hold after switching to a conversation adapter", async historicalAdapter => {
+  it.each(["process", "http", null])("releases settled historical %s bookkeeping after switching to a conversation adapter", async historicalAdapter => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     await db.update(agents).set({ adapterType: "codex_local" }).where(eq(agents.id, agentId));
     const issueId = randomUUID(), previousRunId = randomUUID();
     await seedIssue({ companyId, issueId, status: "blocked", assigneeAgentId: agentId });
     await db.insert(heartbeatRuns).values({ id: previousRunId, companyId, agentId,
-      status: "interrupted", errorCode: "server_shutdown_interrupted", contextSnapshot: { issueId } });
+      status: "interrupted", errorCode: "server_shutdown_interrupted", contextSnapshot: { issueId },
+      nextEventSeq: historicalAdapter ? 2 : 1 });
     if (historicalAdapter) await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: previousRunId,
       seq: 1, eventType: "adapter.invoke", payload: { adapterType: historicalAdapter } });
     const [action] = await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId,
@@ -1529,8 +1532,9 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     }).returning();
     expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ recoveryActionId: action!.id });
     await settleUnrecoverableExecutions(db);
-    expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ recoveryActionId: action!.id });
+    expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
     const [retained] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id));
+    expect(retained).toMatchObject({ status: "resolved", outcome: "cancelled" });
     expect(retained.evidence.automaticRecovery).toMatchObject({ replay: "blocked", actionOutcome: "unknown" });
   });
 
