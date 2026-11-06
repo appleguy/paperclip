@@ -220,6 +220,17 @@ describe("heartbeat retry module callbacks", () => {
     expect(database.access).not.toHaveBeenCalled();
   });
 
+  it("does not replay a verified foreign turn through the bounded retry scheduler", async () => {
+    const database = guardedDatabase();
+    const deps = callbacks();
+    const run = { ...unitRun(), runnerProfileJson: { adapterDispatch: { adapterType: "opencode_local" } },
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: true, reason: "unowned_turn_verified_idle",
+        providerSessionId: "session-original", providerMessageId: "message-original" } } } as Run;
+    const retry = await extracted.createHeartbeatRetries(database.db, deps).scheduleBoundedRetryForRun(run, { adapterType: "opencode_local" } as Agent);
+    expect(retry).toMatchObject({ outcome: "not_scheduled", reason: expect.stringContaining("fresh queue continuation") });
+    expect(database.access).not.toHaveBeenCalled();
+  });
+
   it("passes the service's worktree cutoff and publishes only returned effects", async () => {
     const database = guardedDatabase();
     const deps = callbacks();

@@ -51,6 +51,14 @@ export const legacyReconciliationRunFields = {
     else ${heartbeatRuns.runnerProfileJson} end`,
 };
 
+export function isVerifiedForeignOpenCodeTurn(run: Partial<Pick<Run, "runnerProfileJson" | "resultJson">>): boolean {
+  const recovery = run.resultJson?.executionRecovery as Record<string, unknown> | undefined;
+  return claimedAdapterType({ runnerProfileJson: run.runnerProfileJson ?? null }) === "opencode_local" &&
+    recovery?.kind === "bootstrap" && recovery.providerWorkStarted === true && recovery.reason === "unowned_turn_verified_idle" &&
+    typeof recovery.providerSessionId === "string" && recovery.providerSessionId.length > 0 &&
+    typeof recovery.providerMessageId === "string" && recovery.providerMessageId.length > 0;
+}
+
 /** Error families describe availability, not whether earlier actions happened. */
 export function legacyExecutionNeedsReconciliation(
   run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot" | "error" | "exitCode" | "runnerProfileJson">>,
@@ -68,6 +76,10 @@ export function legacyExecutionNeedsReconciliation(
   // A shared OpenCode turn may survive its lost controller. A generic
   // conversation-continuation marker does not prove that turn stopped.
   const lossRecovery = run.resultJson?.executionRecovery as Record<string, unknown> | undefined;
+  // A foreign OpenCode turn is never the retry's result. The adapter may
+  // release the hold only after checking that exact message, idle state and
+  // absence of a successor; the next wake must inspect retained history.
+  if (isVerifiedForeignOpenCodeTurn(run)) return false;
   // An OpenCode reattach can fail after provider work may have started. A
   // generic conversation continuation is not proof that the original turn
   // ended, even if the adapter surfaced this as an ordinary failure.

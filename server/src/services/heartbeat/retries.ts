@@ -15,7 +15,7 @@ import {
   CONVERSATION_CONTINUATION_POLICY,
   hasConversationContinuationPolicy,
 } from "../conversation-continuation.js";
-import { legacyExecutionNeedsReconciliationWithEvidence } from "../legacy-execution-recovery.js";
+import { isVerifiedForeignOpenCodeTurn, legacyExecutionNeedsReconciliationWithEvidence } from "../legacy-execution-recovery.js";
 import { isSuppressedLegacyDispositionRepair } from "../recovery/legacy-continuation.js";
 import {
   executionFailureRetryCount,
@@ -451,6 +451,9 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
       delayMs?: number;
     },
   ) {
+    if (isVerifiedForeignOpenCodeTurn(run)) return { outcome: "not_scheduled" as const,
+      reason: "A verified foreign turn requires a fresh queue continuation, not a prompt retry.",
+      issueId: readNonEmptyString(run.contextSnapshot?.issueId) };
     if (!opts?.retryReason && run.errorCode === RUNNER_REVISION_MISMATCH_CODE) opts = { ...RUNNER_REVISION_MISMATCH_RETRY, ...opts };
     if (await hasCaseHandoffForRun(run)) return { outcome: "not_scheduled" as const,
       reason: "The durable case handoff owns successor work.", issueId: readNonEmptyString(run.contextSnapshot?.issueId) };

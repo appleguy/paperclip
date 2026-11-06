@@ -15,7 +15,7 @@ export type NarAttempt = {
   possibleWork: boolean;
   capacityRefusal: boolean;
   /** Merged into resultJson by execute.ts; absent on success. */
-  executionRecovery?: { kind: "bootstrap"; providerWorkStarted: boolean; reason: string; providerWorkEvidence?: "unverified" };
+  executionRecovery?: { kind: "bootstrap"; providerWorkStarted: boolean; reason: string; providerWorkEvidence?: "unverified"; providerSessionId?: string; providerMessageId?: string };
   /** Set when OpenCode itself proved the provider turn is gone (SCO-679); execute.ts acknowledges the cancellation. */
   providerTermination?: { proof: "server_restarted" | "session_idle"; reason: string };
 };
@@ -32,6 +32,9 @@ export interface NarAttemptInput {
   title?: string;
   /** Session Paperclip chose to resume; null/absent means it rotated (or this is the first wake). */
   resumeSessionId?: string | null;
+  /** A foreign-turn continuation must retain the observed provider history. */
+  requireResumeSession?: boolean;
+  expectedResumeSessionId?: string;
   /** Re-entering an existing run must observe its own prompt only, never submit another. */
   reattachOnly?: boolean;
   /** A previously persisted exact binding, when the run had rejoined an older turn. */
@@ -287,9 +290,15 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
       if (input.reattachBinding && matches[0] !== input.reattachBinding.sessionId)
         return held("OpenCode reattach binding does not match its recorded session; held without replay", true, null, "reattach_binding_mismatch");
       targetSession = matches[0]!;
-    } else targetSession = await chooseSessionId(driver, scope, input.resumeSessionId, msgId);
+    } else {
+      if (input.requireResumeSession && (!input.resumeSessionId || input.resumeSessionId !== input.expectedResumeSessionId))
+        return held("OpenCode foreign-turn continuation has no retained session; held without replay", true, null, "foreign_continuation_session_missing");
+      targetSession = await chooseSessionId(driver, scope, input.resumeSessionId, msgId);
+      if (input.requireResumeSession && targetSession !== input.resumeSessionId)
+        return held("OpenCode foreign-turn continuation cannot resume its retained session; held without replay", true, input.resumeSessionId ?? null, "foreign_continuation_session_missing");
+    }
     const bound = await driver.bindConversation(
-      host, { ...scope, cwd: input.cwd, model: input.model || undefined, title: input.title }, input.reattachOnly ? "resume" : "new", fence,
+      host, { ...scope, cwd: input.cwd, model: input.model || undefined, title: input.title }, input.reattachOnly || input.requireResumeSession ? "resume" : "new", fence,
       targetSession,
     );
     conversationId = bound.conversationId;
@@ -327,6 +336,8 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
     if (checked) {
       input.prompt = checked.prompt;
       if (checked.rotate) {
+        if (input.requireResumeSession)
+          return held("OpenCode foreign-turn continuation cannot rotate away from retained history; held without replay", true, conversationId, "foreign_continuation_rotation_refused");
         const freshId = await chooseSessionId(driver, scope, null, msgId);
         if (freshId === conversationId || await driver.inflightMessage(freshId))
           throw new Error("NAR input guard refused context rotation: conversation became busy");
@@ -522,6 +533,11 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
   // were never delivered. Preserve the provider turn and hold its outcome
   // for recovery instead of reporting a successful retry or replaying input.
   if (!ownsMessage) {
+    if (await driver.verifyStoppedMessage(conversationId, msgId)) {
+      const result = held("OpenCode NAR verified the foreign turn idle; its outcome remains untrusted", true, conversationId, "unowned_turn_verified_idle");
+      result.executionRecovery = { ...result.executionRecovery!, providerSessionId: conversationId, providerMessageId: msgId };
+      return result;
+    }
     return held("OpenCode NAR observed another run's settled turn; outcome is untrusted and held without replay", true, conversationId, "unowned_turn_settled");
   }
 

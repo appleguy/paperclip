@@ -23,7 +23,7 @@ vi.mock("./opencode-http-driver.js", async (orig) => {
   return { ...real, OpenCodeHttpDriver: FakeDriver };
 });
 import { narOpIdFor, runNarOpenCodeAttempt } from "./nar-attempt.js";
-import { messageIdFor } from "./opencode-http-driver.js";
+import { messageIdFor, sessionIdFor } from "./opencode-http-driver.js";
 
 async function run(extra: Record<string, unknown>, onLine?: (line: string) => void) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "nar-stall-"));
@@ -77,6 +77,37 @@ describe("NAR rejoin stall watchdog", () => {
     expect(d.interrupts).toBe(0);
     expect(res.proc.exitCode).not.toBe(0);
     expect(res.executionRecovery).toMatchObject({ providerWorkStarted: true, reason: "unowned_turn_settled" });
+  });
+
+  it("records verified idle only for the exact foreign turn without replaying or interrupting it", async () => {
+    d.inflight = messageIdFor(narOpIdFor("other-run"));
+    d.settleAfter = 1;
+    d.verified = true;
+    const { res } = await run({});
+    expect(d.checks).toBe(1);
+    expect(d.interrupts).toBe(0);
+    expect(res.proc.exitCode).not.toBe(0);
+    expect(res.executionRecovery).toMatchObject({ providerWorkStarted: true, reason: "unowned_turn_verified_idle",
+      providerSessionId: "ses_test", providerMessageId: messageIdFor(narOpIdFor("other-run")) });
+  });
+
+  it("holds a continuation when its retained session is missing", async () => {
+    const { res } = await run({ requireResumeSession: true });
+    expect(res.executionRecovery).toMatchObject({ providerWorkStarted: true, reason: "foreign_continuation_session_missing" });
+    expect(d.interrupts).toBe(0);
+  });
+
+  it("holds a continuation if its current session differs from the verified one", async () => {
+    const { res } = await run({ requireResumeSession: true, resumeSessionId: "ses_other", expectedResumeSessionId: "ses_verified" });
+    expect(res.executionRecovery).toMatchObject({ providerWorkStarted: true, reason: "foreign_continuation_session_missing" });
+  });
+
+  it("holds rather than rotating a verified continuation away from its history", async () => {
+    d.inflight = null;
+    const session = sessionIdFor({ agentId: "a", issueId: "t" }, 0);
+    const { res } = await run({ requireResumeSession: true, resumeSessionId: session, expectedResumeSessionId: session,
+      preflight: async () => ({ rotate: true, prompt: "replacement" }) });
+    expect(res.executionRecovery).toMatchObject({ providerWorkStarted: true, reason: "foreign_continuation_rotation_refused" });
   });
 
   it("holds an explicit stop of an observed foreign turn without interrupting it", async () => {

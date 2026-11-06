@@ -43,6 +43,36 @@ describe.skipIf(!support.supported)("stranded assigned issue recovery", () => {
     expect(f.enqueueWakeup).toHaveBeenCalledWith(f.agent.id, expect.objectContaining({ reason: "issue_continuation_needed" }));
   });
 
+  it("queues a fresh continuation only after the foreign OpenCode turn was verified idle", async () => {
+    const f = await fixture("failed", "adapter_failed");
+    f.enqueueWakeup.mockImplementation(async () => {
+      const [queued] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.agent.id,
+        issueId: f.issue.id, invocationSource: "automation", status: "queued", runtimeMode: "legacy",
+        contextSnapshot: { issueId: f.issue.id } }).returning();
+      await db.insert(agentWakeupRequests).values({ companyId: f.company.id, agentId: f.agent.id,
+        source: "automation", status: "queued", runId: queued.id, payload: { issueId: f.issue.id } });
+      return queued;
+    });
+    await db.update(agents).set({ adapterType: "opencode_local" }).where(eq(agents.id, f.agent.id));
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { adapterDispatch: { adapterType: "opencode_local" } },
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: true, reason: "unowned_turn_verified_idle", providerSessionId: "session-original", providerMessageId: "message-original" } } }).where(eq(heartbeatRuns.id, f.run.id));
+    expect(await f.sweep()).toMatchObject({ continuationRequeued: 1, escalated: 0 });
+    expect(f.enqueueWakeup).toHaveBeenCalledWith(f.agent.id, expect.objectContaining({ reason: "issue_continuation_needed",
+      contextSnapshot: expect.objectContaining({ paperclipForeignTurnContinuation: true, paperclipForeignTurnSessionId: "session-original" }) }));
+    expect(f.scheduleRecoveryRetry).not.toHaveBeenCalled();
+    await f.sweep();
+    expect(f.enqueueWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an unverified settled foreign turn held for reconciliation", async () => {
+    const f = await fixture("failed", "adapter_failed");
+    await db.update(agents).set({ adapterType: "opencode_local" }).where(eq(agents.id, f.agent.id));
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { adapterDispatch: { adapterType: "opencode_local" } },
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: true, reason: "unowned_turn_settled" } } }).where(eq(heartbeatRuns.id, f.run.id));
+    expect(await f.sweep()).toMatchObject({ continuationRequeued: 0, escalated: 1 });
+    expect(f.enqueueWakeup).not.toHaveBeenCalled();
+  });
+
   it("reports and preserves operator cancellation", async () => {
     const f = await fixture("cancelled");
     await db.update(heartbeatRuns).set({ resultJson: { cancelledByActorType: "user" } }).where(eq(heartbeatRuns.id, f.run.id));

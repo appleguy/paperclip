@@ -646,13 +646,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         includeCommunicationGuidance: false,
       });
       const shouldUseResumeDeltaPrompt = resumedSession && wakePrompt.length > 0;
-      const renderedPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
+      const renderedPrompt = context.paperclipForeignTurnContinuation === true || shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
         ? ""
         : stripConnectionGuidanceWithoutIntent(renderTemplate(promptTemplate, templateData), context);
       const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
       const recoveryNote = resumedSession && sharedSession?.resumed &&
         (sharedSession.recovered || isPaperclipRecoveryWakePayload(context.paperclipWake))
         ? "Controller restart recovery: inspect the existing session history. Do not repeat any completed tool actions; continue only unfinished work."
+        : "";
+      const foreignTurnNote = context.paperclipForeignTurnContinuation === true
+        ? "The previous provider turn finished with untrusted results. Inspect the retained session and issue history before acting. Do not replay the previous prompt or repeat completed actions; resolve unknown outcomes before continuing unfinished work."
         : "";
       // Keep the reusable agent prompt ahead of task-specific and per-run data.
       const basePrompt = joinPromptSections([
@@ -662,6 +665,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         renderedPrompt,
         taskContextNote,
         recoveryNote,
+        foreignTurnNote,
         sessionHandoffNote,
         freshSessionHandoff,
         resumedSession ? "" : instructionsPathNote,
@@ -725,6 +729,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const preflight = async (actualSessionId?: string) => {
         const gate = await preflightSessionPrompt(ctx, model, prompt, actualSessionId ?? resumeSessionId);
         if (gate.rotate) {
+          if (context.paperclipForeignTurnContinuation === true) return { rotate: true, prompt };
           if (sharedSession) throw new Error(`Token preflight refused shared OpenCode CLI resume: safe generation rotation requires NAR; ${gate.reason}`);
           applyPromptRotation(ctx, gate);
           resumeSessionId = null;
@@ -771,6 +776,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           priorParams.sessionId === priorSession.sessionId;
         return runNarOpenCodeAttempt({
           configPath: sharedConfigPath, agentId: agent.id, taskId: narTaskId, runId, cwd: effectiveExecutionCwd, resumeSessionId: sessionId,
+          requireResumeSession: context.paperclipForeignTurnContinuation === true,
+          expectedResumeSessionId: context.paperclipForeignTurnContinuation === true ? asString(context.paperclipForeignTurnSessionId, "") : undefined,
           model: model && variant ? `${model}#${variant}` : model, prompt, timeoutSec, signal: ctx.signal, onLog, preflight,
           onBound: ctx.onSession ? async binding => {
             await ctx.onSession!({ sessionId: binding.sessionId, sessionParams: {

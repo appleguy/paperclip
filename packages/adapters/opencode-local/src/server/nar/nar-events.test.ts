@@ -14,6 +14,7 @@ vi.mock("./opencode-http-driver.js", async (orig) => {
     async inflightMessage() { return driver.inflight; }
     async messageExists() { if (driver.unreadable) throw new Error("unreadable inbox"); return driver.exists; }
     async hasSuccessor() { return false; }
+    async verifyStoppedMessage() { return false; }
     async submit() { driver.submits++; return { grade: "outcome_unknown", evidence: "test" }; }
     async readOutcomeMsg() { return "hook_observed"; }
     async interruptExpectedMessage() { driver.interrupts++; return "idle"; }

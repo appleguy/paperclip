@@ -123,6 +123,7 @@ import { PROVIDER_LIMIT_DEFAULT_COOLDOWN_MS } from "../system-recovery-state.js"
 import { parseProviderQuotaClockReset } from "../provider-quota-reset.js";
 import { hasUnverifiedNativeWorkspaceFinalizationOwner } from "../native-runtime/native-workspace-finalization-recovery-state.js";
 import {
+  isVerifiedForeignOpenCodeTurn,
   legacyExecutionNeedsReconciliationWithEvidence,
   legacyReconciliationRunFields,
   terminalizeLegacyExecution,
@@ -2008,7 +2009,13 @@ export function recoveryService(
           });
           return null;
         }
-        if (deps.scheduleRecoveryRetry) {
+        const foreignTurnContinuation = isVerifiedForeignOpenCodeTurn(predecessor);
+        if (foreignTurnContinuation) {
+          const evidence = predecessor.resultJson!.executionRecovery as Record<string, unknown>;
+          input.extraContext = { ...input.extraContext, paperclipForeignTurnContinuation: true,
+            paperclipForeignTurnSessionId: evidence.providerSessionId };
+        }
+        if (deps.scheduleRecoveryRetry && !foreignTurnContinuation) {
           const retry = await deps.scheduleRecoveryRetry(predecessor.id);
           if (retry) return retry;
           // A spent budget is the one "no retry" the sweeper must not wait
