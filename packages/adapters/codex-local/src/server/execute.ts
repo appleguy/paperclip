@@ -585,9 +585,17 @@ export async function ensureCodexSkillsInjected(
 }
 
 import { codexRemoteControlViolation, codexRcDaemonDownReason } from "./rc-guard.js";
+import { codexIssueScope, prepareCodexIssueSession, stampCodexIssueResult, stampCodexIssueSession } from "./issue-session-scope.js";
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
-  return withCodexRunQuota(ctx, executeCodex);
+  // Restart reattachment belongs to the already-admitted run, not a new wake.
+  if (ctx.context.paperclipRestartReattach === true) return withCodexRunQuota(ctx, executeCodex);
+  const prepared = prepareCodexIssueSession(ctx);
+  const scoped = ctx.onSession && prepared.scope ? {
+    ...prepared.ctx,
+    onSession: (session: Parameters<NonNullable<AdapterExecutionContext["onSession"]>>[0]) => ctx.onSession!(stampCodexIssueSession(session, prepared.scope)),
+  } : prepared.ctx;
+  return stampCodexIssueResult(await withCodexRunQuota(scoped, executeCodex), prepared.scope);
 }
 
 async function executeCodex(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
@@ -623,7 +631,7 @@ async function executeCodex(ctx: AdapterExecutionContext): Promise<AdapterExecut
       executionTarget: ctx.executionTarget,
       legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
     }));
-    const acpSharedDir = acpRemote ? null : sharedConversationStateDir(ctx.config);
+    const acpSharedDir = acpRemote || (ctx.context.paperclipRestartReattach !== true && codexIssueScope(ctx.context)) ? null : sharedConversationStateDir(ctx.config);
     if (!acpSharedDir) return executeCodexAcp(ctx);
     const acpThread = await readSharedCodexThread(acpSharedDir);
     if (acpThread?.sessionParams) {
@@ -1164,8 +1172,8 @@ async function executeCodex(ctx: AdapterExecutionContext): Promise<AdapterExecut
       );
     }
     const runtimeSessionParams = parseObject(runtime.sessionParams);
-    // keepConversation seats resume their one seat-wide thread on every wake, whatever the issue or workspace.
-    const sharedThreadDir = executionTargetIsRemote ? null : sharedConversationStateDir(config);
+    // Issue wakes use their scoped session; other wakes retain seat-wide continuity.
+    const sharedThreadDir = executionTargetIsRemote || (context.paperclipRestartReattach !== true && codexIssueScope(context)) ? null : sharedConversationStateDir(config);
     const sharedThread = sharedThreadDir ? await readSharedCodexThread(sharedThreadDir) : null;
     const runtimeSessionId = sharedThread?.sessionId ?? asString(runtimeSessionParams.sessionId, runtime.sessionId ?? "");
     const runtimeSessionCwd = sharedThread ? "" : asString(runtimeSessionParams.cwd, "");

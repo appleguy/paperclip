@@ -65,6 +65,7 @@ export {
 } from "./quota.js";
 import type { AdapterSessionCodec } from "@paperclipai/adapter-utils";
 import { sessionCodec as acpxSessionCodec } from "@paperclipai/adapter-utils/acpx-engine/session-codec";
+import { copyCodexIssueScope } from "./issue-session-scope.js";
 
 function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
@@ -75,7 +76,10 @@ export const sessionCodec: AdapterSessionCodec = {
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
     const record = raw as Record<string, unknown>;
     const sessionId = readNonEmptyString(record.sessionId) ?? readNonEmptyString(record.session_id);
-    if (!sessionId) return acpxSessionCodec.deserialize(raw);
+    if (!sessionId) {
+      const params = acpxSessionCodec.deserialize(raw);
+      return params ? copyCodexIssueScope(params, record) : null;
+    }
     const cwd =
       readNonEmptyString(record.cwd) ??
       readNonEmptyString(record.workdir) ??
@@ -83,18 +87,21 @@ export const sessionCodec: AdapterSessionCodec = {
     const workspaceId = readNonEmptyString(record.workspaceId) ?? readNonEmptyString(record.workspace_id);
     const repoUrl = readNonEmptyString(record.repoUrl) ?? readNonEmptyString(record.repo_url);
     const repoRef = readNonEmptyString(record.repoRef) ?? readNonEmptyString(record.repo_ref);
-    return {
+    return copyCodexIssueScope({
       sessionId,
       ...(cwd ? { cwd } : {}),
       ...(workspaceId ? { workspaceId } : {}),
       ...(repoUrl ? { repoUrl } : {}),
       ...(repoRef ? { repoRef } : {}),
-    };
+    }, record);
   },
   serialize(params: Record<string, unknown> | null) {
     if (!params) return null;
     const sessionId = readNonEmptyString(params.sessionId) ?? readNonEmptyString(params.session_id);
-    if (!sessionId) return acpxSessionCodec.serialize(params);
+    if (!sessionId) {
+      const serialized = acpxSessionCodec.serialize(params);
+      return serialized ? copyCodexIssueScope(serialized, params) : null;
+    }
     const cwd =
       readNonEmptyString(params.cwd) ??
       readNonEmptyString(params.workdir) ??
@@ -102,13 +109,13 @@ export const sessionCodec: AdapterSessionCodec = {
     const workspaceId = readNonEmptyString(params.workspaceId) ?? readNonEmptyString(params.workspace_id);
     const repoUrl = readNonEmptyString(params.repoUrl) ?? readNonEmptyString(params.repo_url);
     const repoRef = readNonEmptyString(params.repoRef) ?? readNonEmptyString(params.repo_ref);
-    return {
+    return copyCodexIssueScope({
       sessionId,
       ...(cwd ? { cwd } : {}),
       ...(workspaceId ? { workspaceId } : {}),
       ...(repoUrl ? { repoUrl } : {}),
       ...(repoRef ? { repoRef } : {}),
-    };
+    }, params);
   },
   getDisplayId(params: Record<string, unknown> | null) {
     if (!params) return null;

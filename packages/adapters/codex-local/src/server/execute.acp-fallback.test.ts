@@ -146,4 +146,22 @@ describe("codex_local ACP startup fallback", () => {
 
     expect(runAdapterExecutionTargetProcess).not.toHaveBeenCalled();
   });
+
+  it("does not use the seat-wide ACP thread for an issue wake", async () => {
+    const ctx = { ...buildContext({ engine: "acp", keepConversation: true, stateDir: "/tmp/codex-seat-absent" }),
+      context: { issueId: "issue-a", projectId: "project-a" },
+      runtime: { sessionId: "old-shared", sessionParams: null, sessionDisplayId: "old-shared", taskKey: "issue-a" } };
+    await expect(execute(ctx as never)).rejects.toThrow('Unexpected "<<"');
+    expect(executeCodexAcp).toHaveBeenCalledWith(expect.objectContaining({
+      runtime: expect.objectContaining({ sessionId: null, sessionParams: null, taskKey: "issue-a" }),
+    }));
+  });
+
+  it("preserves the admitted session during restart reattachment", async () => {
+    const ctx = { ...buildContext({ engine: "acp" }),
+      context: { issueId: "issue-a", projectId: "project-a", paperclipRestartReattach: true },
+      runtime: { sessionId: "admitted", sessionParams: { sessionId: "admitted" }, sessionDisplayId: "admitted", taskKey: "issue-a" } };
+    await expect(execute(ctx as never)).rejects.toThrow('Unexpected "<<"');
+    expect(executeCodexAcp).toHaveBeenCalledWith(expect.objectContaining({ runtime: ctx.runtime }));
+  });
 });
