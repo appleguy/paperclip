@@ -757,10 +757,34 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // Own cancellation before the first shared-server request. Without this,
         // heartbeat Stop has no registered adapter controller to abort.
         await ctx.onCancellationReady?.();
+        const priorSession = parseObject(context.paperclipRestartReattachSession);
+        const priorParams = parseObject(priorSession.sessionParams);
+        const priorBinding = parseObject(priorParams.narBinding);
+        const hasPriorBinding = Object.hasOwn(priorParams, "narBinding");
+        const priorValid = priorBinding.schema === "paperclip.opencode-binding.v1" && priorBinding.runId === runId &&
+          priorBinding.agentId === agent.id && priorBinding.taskId === narTaskId &&
+          priorBinding.configPath === sharedConfigPath && priorParams.cwd === effectiveExecutionCwd &&
+          (priorBinding.kind === "submit" || priorBinding.kind === "rejoin") &&
+          typeof priorBinding.providerOrigin === "string" && priorBinding.providerOrigin.length > 0 &&
+          typeof priorBinding.messageId === "string" && priorBinding.messageId.length > 0 &&
+          typeof priorSession.sessionId === "string" && priorSession.sessionId.length > 0 &&
+          priorParams.sessionId === priorSession.sessionId;
         return runNarOpenCodeAttempt({
           configPath: sharedConfigPath, agentId: agent.id, taskId: narTaskId, runId, cwd: effectiveExecutionCwd, resumeSessionId: sessionId,
           model: model && variant ? `${model}#${variant}` : model, prompt, timeoutSec, signal: ctx.signal, onLog, preflight,
+          onBound: ctx.onSession ? async binding => {
+            await ctx.onSession!({ sessionId: binding.sessionId, sessionParams: {
+              sessionId: binding.sessionId, cwd: effectiveExecutionCwd,
+              narBinding: { schema: "paperclip.opencode-binding.v1", runId, agentId: agent.id,
+                taskId: narTaskId, messageId: binding.messageId, kind: binding.kind,
+                hostPid: binding.hostPid, configPath: sharedConfigPath, providerOrigin: binding.providerOrigin },
+            } });
+          } : undefined,
           reattachOnly: context.paperclipRestartReattach === true,
+          ...(context.paperclipRestartReattach === true && hasPriorBinding ? priorValid
+            ? { reattachBinding: { sessionId: priorSession.sessionId as string, messageId: priorBinding.messageId as string,
+                providerOrigin: priorBinding.providerOrigin as string } }
+            : { invalidReattachBinding: true } : {}),
           title: sessionTitleFor(wakeIssue.identifier, wakeIssue.title),
         });
       }

@@ -11,6 +11,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async (original) => ({
 }));
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
 import { execute } from "./execute.js";
+import { sessionCodec } from "./index.js";
 import { OpenCodeHttpDriver, messageIdFor, sessionIdFor } from "./nar/opencode-http-driver.js";
 import { narOpIdFor, runNarOpenCodeAttempt } from "./nar/nar-attempt.js";
 import { estimatePromptTokens } from "@paperclipai/adapter-utils/token-preflight";
@@ -172,6 +173,42 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect(sessions.size).toBe(1);
     expect(userMsgs().map((m) => m.id)).toEqual([messageIdFor(narOpIdFor("run-1"))]);
     expect([...sessions.values()][0]!.info.model).toEqual({ providerID: "openai", id: "fixture", variant: "medium" });
+  });
+
+  it("checkpoints the exact run and message before submitting a NAR prompt", async () => {
+    const saved: unknown[] = [];
+    const result = await execute({ ...context("run-bound", { nativeRuntime: "nar" }),
+      onSession: async (session: unknown) => { expect(promptPosts).toBe(0); saved.push(session); },
+    } as never);
+    expect(result.exitCode).toBe(0);
+    expect(saved).toMatchObject([{ sessionId: sessionIdFor(scope), sessionParams: { sessionId: sessionIdFor(scope),
+      narBinding: { schema: "paperclip.opencode-binding.v1", runId: "run-bound", agentId: scope.agentId,
+        taskId: scope.issueId, messageId: messageIdFor(narOpIdFor("run-bound")), kind: "submit", hostPid: serverPid, configPath: cfg, providerOrigin: url } } }]);
+    const params = (saved[0] as { sessionParams: Record<string, unknown> }).sessionParams;
+    expect(sessionCodec.deserialize(sessionCodec.serialize(params))).toMatchObject({ narBinding: params.narBinding });
+  });
+
+  it("does not submit a new prompt if binding persistence fails", async () => {
+    const result = await execute({ ...context("run-unbound", { nativeRuntime: "nar" }),
+      onSession: async () => { throw new Error("checkpoint lost ownership"); },
+    } as never);
+    expect(promptPosts).toBe(0);
+    expect(result.resultJson?.executionRecovery).toMatchObject({ providerWorkStarted: false });
+  });
+
+  it("retains possible provider work if checkpointing a rejoined turn fails", async () => {
+    const sid = sessionIdFor(scope);
+    const orphan = messageIdFor(narOpIdFor("run-old"));
+    sessions.set(sid, { info: { id: sid, location: { directory: root }, time: { created: clock++ } },
+      msgs: [{ id: orphan, type: "user", time: { created: clock++ } }] });
+    active.add(sid);
+    const result = await execute({ ...context("run-rejoin", { nativeRuntime: "nar" }),
+      onSession: async () => { throw new Error("checkpoint lost ownership"); },
+    } as never);
+    expect(result.resultJson?.executionRecovery).toMatchObject({ providerWorkStarted: true });
+    expect(active.has(sid)).toBe(true);
+    expect(promptPosts).toBe(0);
+    expect(interruptPosts).toBe(0);
   });
 
   it("posts stable instructions before per-run bridge material in the exact NAR body", async () => {
@@ -369,13 +406,54 @@ describe("OpenCode adapter nativeRuntime nar", () => {
       active.delete(sid);
     };
     const gate = vi.fn(async () => { throw new Error("must never rotate an in-flight rejoin"); });
+    const saved: unknown[] = [];
     const retry = await execute({ ...context("run-1-retry", { nativeRuntime: "nar", model: "openai/qwen", tokenPreflightShare: 0.000001 }), evaluateSessionPrompt: gate,
+      onSession: async (session: unknown) => { saved.push(session); },
       onLog: async (_stream: string, chunk: string) => { if (chunk.includes("nar_rejoin")) finish(); } } as never);
     expect(promptPosts).toBe(0);
     expect(gate).not.toHaveBeenCalled();
     expect(userMsgs().map((m) => m.id)).toEqual([orphan]);
+    expect(saved).toMatchObject([{ sessionParams: { narBinding: { runId: "run-1-retry", messageId: orphan, kind: "rejoin" } } }]);
     expect(retry).toMatchObject({ exitCode: 0, summary: "orphan finished", sessionId: sid, costUsd: 0.25 });
   }, 15_000);
+
+  it("reattaches to its persisted rejoined message, without taking Stop ownership", async () => {
+    const sid = sessionIdFor(scope);
+    const orphan = messageIdFor(narOpIdFor("original-run"));
+    sessions.set(sid, { info: { id: sid, location: { directory: root }, time: { created: clock++ } },
+      msgs: [{ id: orphan, type: "user", time: { created: clock++ } }] });
+    active.add(sid);
+    const params = { sessionId: sid, cwd: root, narBinding: { schema: "paperclip.opencode-binding.v1", runId: "retry-run",
+      agentId: scope.agentId, taskId: scope.issueId, messageId: orphan, kind: "rejoin", configPath: cfg, providerOrigin: url } };
+    const retry = await execute({ ...context("retry-run", { nativeRuntime: "nar" }),
+      context: { taskId: scope.issueId, paperclipRestartReattach: true,
+        paperclipRestartReattachSession: { sessionId: sid, sessionParams: params } },
+      onLog: async (_stream: string, chunk: string) => {
+        if (chunk.includes("nar_rejoin")) {
+          const s = sessions.get(sid)!;
+          s.msgs.push({ id: "msg_done", type: "assistant", time: { created: clock++, completed: clock++ },
+            content: [{ type: "text", text: "done" }] });
+          s.info.time.idle = clock++; s.info.outcome = "succeeded"; active.delete(sid);
+        }
+      },
+    } as never);
+    expect(retry).toMatchObject({ exitCode: 0, summary: "done" });
+    expect(promptPosts).toBe(0);
+    expect(interruptPosts).toBe(0);
+  });
+
+  it("holds a reattach when the persisted binding belongs to another run", async () => {
+    const sid = sessionIdFor(scope);
+    const result = await execute({ ...context("run-current", { nativeRuntime: "nar" }),
+      context: { taskId: scope.issueId, paperclipRestartReattach: true,
+        paperclipRestartReattachSession: { sessionId: sid, sessionParams: { sessionId: sid, cwd: root,
+          narBinding: { schema: "paperclip.opencode-binding.v1", runId: "run-other", agentId: scope.agentId,
+            taskId: scope.issueId, messageId: "msg_old", kind: "rejoin", configPath: cfg, providerOrigin: url } } } },
+    } as never);
+    expect(result.resultJson?.executionRecovery).toMatchObject({ providerWorkStarted: true, reason: "reattach_binding_invalid" });
+    expect(promptPosts).toBe(0);
+    expect(interruptPosts).toBe(0);
+  });
 
   it("logs new text and tool progress while a rejoined turn is still running", async () => {
     const sid = sessionIdFor(scope);

@@ -9166,6 +9166,38 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  it("rejects an OpenCode binding checkpoint after a Stop wins the run row", async () => {
+    let context!: { onSession?: (session: { sessionId: string; sessionParams: Record<string, unknown> }) => Promise<void> };
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let checkpointRejected = false;
+    mockAdapterExecute.mockImplementationOnce(async input => {
+      context = input as typeof context;
+      await gate;
+      try {
+        await context.onSession!({ sessionId: "ses_fixture", sessionParams: { sessionId: "ses_fixture",
+          narBinding: { schema: "paperclip.opencode-binding.v1", messageId: "msg_fixture" } } });
+      } catch { checkpointRejected = true; }
+      return { exitCode: 1, signal: null, timedOut: false, errorMessage: "checkpoint rejected",
+        resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } };
+    });
+    const { runId, agentId } = await seedRunFixture({ runtimeMode: "legacy", agentStatus: "idle", runStatus: "queued", includeIssue: false });
+    await db.update(agents).set({ adapterType: "opencode_local" }).where(eq(agents.id, agentId));
+    const heartbeat = heartbeatService(db);
+    try {
+      await heartbeat.resumeQueuedRuns();
+      await waitForValue(async () => context);
+      await db.update(heartbeatRuns).set({ resultJson: { executionCancellation: { state: "requested" } } }).where(eq(heartbeatRuns.id, runId));
+      release();
+      await heartbeat.drainActiveRunExecutions();
+      expect(checkpointRejected).toBe(true);
+      expect((await heartbeat.getRun(runId))?.resultJson?.earlySession).toBeUndefined();
+    } finally {
+      release();
+      await heartbeat.drainActiveRunExecutions();
+    }
+  });
+
   it("signals an embedded adapter and waits for its cleanup before returning Stop", async () => {
     const { runId } = await seedRunFixture({ runtimeMode: "legacy", includeIssue: false });
     const control = createAdapterExecutionControl();

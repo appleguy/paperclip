@@ -822,6 +822,9 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
         ...(["agy_local", "opencode_local"].includes(agent.adapterType) ? {
           paperclipRestartReattach: typeof parseObject(parseObject(run.resultJson).restartReattach).count === "number",
         } : {}),
+        ...(agent.adapterType === "opencode_local" && typeof parseObject(parseObject(run.resultJson).restartReattach).count === "number" ? {
+          paperclipRestartReattachSession: parseObject(parseObject(run.resultJson).earlySession),
+        } : {}),
         // SCO-1098: a re-entered codex_local run waits for the daemon turn its thread already holds.
         ...(agent.adapterType === "codex_local" && typeof parseObject(parseObject(run.resultJson).restartReattach).count === "number" ? {
           paperclipRestartReattach: true,
@@ -933,6 +936,8 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
                 }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.agentId, run.agentId), eq(heartbeatRuns.status, "running"),
                   run.controllerBootId ? eq(heartbeatRuns.controllerBootId, run.controllerBootId) : isNull(heartbeatRuns.controllerBootId),
                   run.controllerBootId ? gt(heartbeatRuns.controllerLeaseExpiresAt, sql`clock_timestamp()`) : undefined,
+                  agent.adapterType === "opencode_local" && parseObject(sessionParams?.narBinding).schema === "paperclip.opencode-binding.v1"
+                    ? sql`coalesce(${heartbeatRuns.resultJson}->'executionCancellation'->>'state', '') <> 'requested'` : undefined,
                 )).returning({ id: heartbeatRuns.id });
                 if (!updated) throw new Error("Session checkpoint lost run ownership");
               },

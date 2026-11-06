@@ -34,12 +34,17 @@ export interface NarAttemptInput {
   resumeSessionId?: string | null;
   /** Re-entering an existing run must observe its own prompt only, never submit another. */
   reattachOnly?: boolean;
+  /** A previously persisted exact binding, when the run had rejoined an older turn. */
+  reattachBinding?: { sessionId: string; messageId: string; providerOrigin: string };
+  invalidReattachBinding?: boolean;
   prompt: string;
   /** Check only new submissions; an in-flight recovery must remain observable. */
   preflight?: (sessionId?: string) => void | { rotate: boolean; prompt: string } | Promise<void | { rotate: boolean; prompt: string }>;
   timeoutSec: number;
   signal?: AbortSignal;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+  /** Persist the exact provider binding before submitting or observing a turn. */
+  onBound?: (binding: { sessionId: string; messageId: string; kind: "submit" | "rejoin"; hostPid: number | null; providerOrigin: string }) => Promise<void>;
   pollMs?: number;
   /** Liveness probe cadence, idle-session grace, and unreachable-server give-up (SCO-679). */
   probeMs?: number;
@@ -234,6 +239,8 @@ async function chooseSessionId(
 
 export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<NarAttempt> {
   const { onLog, signal } = input;
+  if (input.reattachOnly && input.invalidReattachBinding)
+    return held("OpenCode reattach binding is invalid; held without replay", true, null, "reattach_binding_invalid");
   if (signal?.aborted) return held("OpenCode NAR stopped before provider contact", Boolean(input.reattachOnly), null, "aborted_pre_submit");
   const f = input.fetchImpl ?? fetch;
   let server: { url: string; passwordFile: string };
@@ -243,13 +250,16 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
     await onLog("stderr", "[paperclip] NAR OpenCode server config unavailable; no inference sent.\n");
     return held("OpenCode NAR server config unavailable; no new inference sent", Boolean(input.reattachOnly), null, "config");
   }
+  if (input.reattachBinding && input.reattachBinding.providerOrigin !== server.url)
+    return held("OpenCode reattach provider endpoint changed; held without replay", true, null, "reattach_provider_mismatch");
   const driver = new OpenCodeHttpDriver({ url: server.url, passwordFile: server.passwordFile, fetchImpl: f });
   const opId = narOpIdFor(input.runId);
   const ownMessageId = messageIdFor(opId);
-  let msgId = ownMessageId;
+  let msgId = input.reattachBinding?.messageId ?? ownMessageId;
   let conversationId: string | null = null;
   let rejoined = false;
   let hostPid: number | null = null;
+  let observedProviderWork = Boolean(input.reattachOnly);
   try {
     const host = await driver.attestHost(input.agentId);
     const hostDetail = host.detail as { pid?: unknown } | undefined;
@@ -264,9 +274,11 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
       const matches: string[] = [];
       for (let g = 0; g <= latest; g++) {
         const candidate = sessionIdFor(scope, g);
-        if (await driver.messageExists(candidate, ownMessageId)) matches.push(candidate);
+        if (await driver.messageExists(candidate, msgId)) matches.push(candidate);
       }
       if (matches.length !== 1) return held("OpenCode reattach could not uniquely locate this run's message; held without replay", true, null, "reattach_message_unknown");
+      if (input.reattachBinding && matches[0] !== input.reattachBinding.sessionId)
+        return held("OpenCode reattach binding does not match its recorded session; held without replay", true, null, "reattach_binding_mismatch");
       targetSession = matches[0]!;
     } else targetSession = await chooseSessionId(driver, scope, input.resumeSessionId, msgId);
     const bound = await driver.bindConversation(
@@ -278,7 +290,8 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
     // Rejoin: the conversation is per agent+issue, so a busy one is still working an earlier run's prompt
     // (e.g. Paperclip restarted mid-run). Settle on that message; never queue a second prompt behind it.
     const inflight = await driver.inflightMessage(conversationId);
-    if (input.reattachOnly && inflight && inflight !== ownMessageId) {
+    observedProviderWork ||= Boolean(inflight);
+    if (input.reattachOnly && inflight && inflight !== msgId) {
       return held("OpenCode reattach found a different in-flight message; held without interrupting it", true, conversationId, "unowned_turn");
     }
     if (signal?.aborted) {
@@ -293,12 +306,13 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
     if (input.reattachOnly) {
       // A successor can already be active, or our message can have completed
       // while the controller was down. Observe only the original message.
-      msgId = ownMessageId;
       rejoined = true;
+      await input.onBound?.({ sessionId: conversationId, messageId: msgId, kind: "rejoin", hostPid, providerOrigin: server.url });
       await onLog("stdout", narEventLine("nar_rejoin", { sessionId: conversationId, messageId: msgId }));
     } else if (inflight) {
       msgId = inflight;
       rejoined = true;
+      await input.onBound?.({ sessionId: conversationId, messageId: msgId, kind: "rejoin", hostPid, providerOrigin: server.url });
       await onLog("stdout", `[paperclip] NAR rejoined in-flight message ${inflight}; prompt not resent\n`);
       await onLog("stdout", narEventLine("nar_rejoin", { sessionId: conversationId, messageId: inflight }));
     } else {
@@ -315,7 +329,10 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
       }
     }
     const payloadSha256 = createHash("sha256").update(input.prompt).digest("hex");
+    await input.onBound?.({ sessionId: conversationId, messageId: msgId, kind: "submit", hostPid, providerOrigin: server.url });
+    if (signal?.aborted) return held("OpenCode NAR stopped before sending a new prompt", false, conversationId, "aborted_pre_submit");
     await onLog("stdout", narEventLine("nar_prompt_dispatch", { sessionId: conversationId, clientMessageId: msgId, promptSha256: payloadSha256 }));
+    observedProviderWork = true; // Submission can reach the provider even if its response is lost.
     const sub = await driver.submit(host, conversationId, { opId, kind: "prompt", payloadSha256, text: input.prompt }, fence);
     if (sub.grade === "outcome_unknown") {
       if (explicitStopRequested(signal)) {
@@ -332,9 +349,9 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
   } catch (e) {
     const msg = e instanceof OpenCodeHttpError ? `${e.code}: ${e.message}` : (e as Error).message;
     // Before submit nothing was sent. A rejection (4xx) or auth failure is also pre-admission.
-    const safe = `OpenCode NAR ${input.reattachOnly ? "reattach failed" : "attempt failed before inference"}: ${msg.slice(0, 300)}`;
+    const safe = `OpenCode NAR ${observedProviderWork ? "provider work unverified" : "attempt failed before inference"}: ${msg.slice(0, 300)}`;
     await onLog("stderr", `[paperclip] ${safe}\n`);
-    return held(safe, Boolean(input.reattachOnly), conversationId, input.reattachOnly ? "reattach_unavailable" : "pre_submit");
+    return held(safe, observedProviderWork, conversationId, input.reattachOnly ? "reattach_unavailable" : "pre_submit");
   }
 
   const deadline = input.timeoutSec > 0 ? Date.now() + input.timeoutSec * 1000 : Infinity;
