@@ -11718,7 +11718,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
   async function interactionRecoveryRuns(agentId: string) {
     return db
-      .select({ id: heartbeatRuns.id })
+      .select({ id: heartbeatRuns.id, contextSnapshot: heartbeatRuns.contextSnapshot })
       .from(heartbeatRuns)
       .where(and(
         eq(heartbeatRuns.agentId, agentId),
@@ -11752,11 +11752,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   it("does not requeue an accepted plan approval whose accept-time wake is deferred behind another run", async () => {
     const { companyId, agentId, issueId, interactionId } =
       await seedResolvedInteractionRecoveryFixture({ title: "Plan approval waiting for the active run" });
-    await db.insert(agentWakeupRequests).values({
+    const [wake] = await db.insert(agentWakeupRequests).values({
       companyId, agentId, source: "automation", triggerDetail: "system", reason: "issue_commented",
       status: "deferred_issue_execution", requestedByActorType: "user", requestedByActorId: "responsible-user",
-      payload: { issueId, mutation: "interaction", interactionId, interactionStatus: "accepted" },
-    });
+      payload: { issueId, mutation: "interaction", interactionId, interactionStatus: "accepted",
+        _paperclipWakeContext: { issueId, wakeReason: "issue_commented", interactionId, interactionStatus: "accepted" } },
+    }).returning();
 
     const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
 
@@ -11765,7 +11766,39 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const wakes = await db.select({ status: agentWakeupRequests.status }).from(agentWakeupRequests)
       .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.companyId, companyId)));
     expect(wakes).toEqual([{ status: "deferred_issue_execution" }]);
+    // Once the prior owner has finished, the retained receipt is promoted.
+    await db.insert(heartbeatRuns).values({ companyId, agentId, invocationSource: "assignment",
+      runtimeMode: "legacy", status: "succeeded", contextSnapshot: { issueId }, finishedAt: new Date() });
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+    const [delivered] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake!.id));
+    expect(delivered?.runId).toBeTruthy();
+    expect((await heartbeat.getRun(delivered!.runId!))?.contextSnapshot).toMatchObject({ interactionId });
+    expect(await interactionRecoveryRuns(agentId)).toEqual([]);
   });
+
+  it.each(["comment", "older interaction", "stale resolution", "wrong status"])(
+    "does not let a deferred %s hide a lost accepted-interaction wake",
+    async (kind) => {
+      const { companyId, agentId, issueId, interactionId, resolvedAt } =
+        await seedResolvedInteractionRecoveryFixture({ title: "Lost accepted interaction wake" });
+      await db.insert(agentWakeupRequests).values({
+        companyId, agentId, source: "automation", reason: "issue_commented",
+        status: "deferred_issue_execution", requestedByActorType: "user", requestedByActorId: "responsible-user",
+        requestedAt: kind === "stale resolution" ? new Date(resolvedAt.getTime() - 1000) : new Date(),
+        payload: kind === "comment" ? { issueId, commentId: randomUUID() } : {
+          issueId, mutation: "interaction", interactionId: kind === "older interaction" ? randomUUID() : interactionId,
+          interactionStatus: kind === "wrong status" ? "rejected" : "accepted",
+        },
+      });
+      const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+      expect(result.continuationRequeued).toBe(1);
+      const runs = await interactionRecoveryRuns(agentId);
+      expect(runs).toHaveLength(1);
+      expect(runs[0]?.contextSnapshot).toMatchObject({ interactionId, interactionStatus: "accepted" });
+    },
+  );
 
   it("requeues accepted interaction continuations even when a later successful run is unrelated", async () => {
     const { companyId, agentId, issueId, interactionId, resolvedAt } =

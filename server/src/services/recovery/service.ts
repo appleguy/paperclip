@@ -1802,7 +1802,7 @@ export function recoveryService(
     companyId: string,
     issueId: string,
     agentId?: string | null,
-    includeDeferred = false,
+    interaction?: { id: string; status: string; resolvedAt: Date },
   ) {
     return db
       .select({ id: agentWakeupRequests.id })
@@ -1810,9 +1810,15 @@ export function recoveryService(
       .where(
         and(
           eq(agentWakeupRequests.companyId, companyId),
-          inArray(agentWakeupRequests.status, includeDeferred ? ["queued", "deferred_issue_execution"] : ["queued"]),
+          inArray(agentWakeupRequests.status, interaction ? ["queued", "deferred_issue_execution"] : ["queued"]),
           sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
           agentId ? eq(agentWakeupRequests.agentId, agentId) : sql`true`,
+          interaction ? and(
+            sql`${agentWakeupRequests.payload} ->> 'mutation' = 'interaction'`,
+            sql`${agentWakeupRequests.payload} ->> 'interactionId' = ${interaction.id}`,
+            sql`${agentWakeupRequests.payload} ->> 'interactionStatus' = ${interaction.status}`,
+            gte(agentWakeupRequests.requestedAt, interaction.resolvedAt),
+          ) : sql`true`,
         ),
       )
       .limit(1)
@@ -5121,7 +5127,11 @@ export function recoveryService(
             continue;
           }
 
-          if (await hasQueuedIssueWake(issue.companyId, issue.id, agentId, true)) {
+          if (await hasQueuedIssueWake(issue.companyId, issue.id, agentId, {
+            id: acceptedContinuationInteraction.id,
+            status: acceptedContinuationInteraction.status,
+            resolvedAt: acceptedInteractionResolvedAt,
+          })) {
             recordSkip(issue, "interaction_queued_wake");
             continue;
           }
