@@ -17,7 +17,7 @@ import { recoveryPostgresSupport as support, startRecoveryPostgres } from "../..
 import * as pluginWorkspaces from "../plugin-workspaces.js";
 import * as legacyRecovery from "../legacy-execution-recovery.js";
 import { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
-import { createAdapterExecutionControl } from "../adapter-execution-control.js";
+import { adapterExecutionControls, createAdapterExecutionControl } from "../adapter-execution-control.js";
 import { executionWorkspaceService } from "../execution-workspaces.js";
 import { workspaceOperationService } from "../workspace-operations.js";
 import { instanceSettingsService } from "../instance-settings.js";
@@ -157,6 +157,23 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expect(adapter.execute).not.toHaveBeenCalled();
     expect(input.effects.onLegacyAdapterEntered).not.toHaveBeenCalled();
     expect(input.instructions.releaseInstructionCopy).not.toHaveBeenCalled();
+  });
+
+  it("registers the plain OpenCode CLI controller when its child spawns", async () => {
+    const { input, adapter, run } = await fixture();
+    adapter.type = "opencode_local";
+    input.agent.adapterType = "opencode_local";
+    adapter.execute.mockImplementationOnce(async ctx => {
+      expect(adapterExecutionControls.has(run.id)).toBe(false);
+      await ctx.onSpawn!({ pid: 12345, processGroupId: 12345, startedAt: new Date().toISOString() });
+      expect(adapterExecutionControls.get(run.id)).toBe(input.control.executionControl);
+      return { exitCode: 0, signal: null, timedOut: false };
+    });
+    try {
+      await executeHeartbeatRuntime(db, input);
+    } finally {
+      adapterExecutionControls.delete(run.id);
+    }
   });
 
   it("persists a provider session while the legacy adapter is still running and fences late callbacks", async () => {

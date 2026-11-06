@@ -709,4 +709,15 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect(promptPosts).toBe(0);
     expect(sessions.size).toBe(0);
   });
+
+  it("forwards the plain CLI child spawn to the controller", async () => {
+    const onSpawn = vi.fn(async () => {});
+    runProcess.mockImplementationOnce(async (_runId, _target, _command, _args, options) => {
+      await options.onSpawn?.({ pid: 12345, processGroupId: 12345, startedAt: "test" });
+      return { exitCode: 0, signal: null, timedOut: false,
+        stdout: JSON.stringify({ type: "text", sessionID: "ses_legacy1234", part: { text: "legacy" } }), stderr: "", pid: 12345, startedAt: "" } as never;
+    });
+    await execute({ ...context("legacy-spawn", { sharedServerRecoveryConfigPath: "" }), onSpawn } as never);
+    expect(onSpawn).toHaveBeenCalledWith({ pid: 12345, processGroupId: 12345, startedAt: "test" });
+  });
 });

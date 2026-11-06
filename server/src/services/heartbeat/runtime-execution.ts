@@ -1006,6 +1006,13 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               },
               onSpawn: async (meta) => {
                 markDispatchStarted();
+                // Plain OpenCode CLI owns a child process but does not call
+                // onCancellationReady. Publish its control only after spawn,
+                // when the process transport can actually stop that child.
+                if (adapter.type === "opencode_local" && executionControl.getOpenCodeExecutionMode?.() === "plain_cli" &&
+                    (!executionTarget || executionTarget.kind === "local")) {
+                  await registerAdapterExecutionControl(run.id, executionControl);
+                }
                 await persistRunProcessMetadata(run.id, {
                   pid: meta.pid,
                   processGroupId:
