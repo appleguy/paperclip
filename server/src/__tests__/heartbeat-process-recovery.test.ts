@@ -3348,6 +3348,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(runs.filter(run => run.retryOfRunId === f.runId)).toHaveLength(1);
   });
 
+  it("retains an OpenCode run with a pending Stop when its controller is lost", async () => {
+    const { runId, agentId } = await seedRunFixture({ adapterType: "opencode_local", runtimeMode: "legacy", agentStatus: "paused" });
+    await db.update(heartbeatRuns).set({ resultJson: { executionCancellation: { state: "requested" } } })
+      .where(eq(heartbeatRuns.id, runId));
+    const result = await heartbeatService(db).reapOrphanedRuns();
+    expect(result.runIds).not.toContain(runId);
+    expect(await heartbeatService(db).getRun(runId)).toMatchObject({ status: "running", resultJson: { executionCancellation: { state: "requested" } } });
+    expect(await selectRecoveryRunsByAgent(agentId)).toHaveLength(1);
+  });
+
   it("schedules one conversation continuation after losing the provider", async () => {
     const { agentId, runId, issueId } = await seedRunFixture({
       agentStatus: "idle",
@@ -9066,6 +9076,37 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       }
     },
   );
+
+  it("honors a recorded OpenCode Stop when adapter registration follows it", async () => {
+    let releaseRegistration!: () => void;
+    const registrationGate = new Promise<void>(resolve => { releaseRegistration = resolve; });
+    let context!: { onCancellationReady?: () => Promise<void>; signal?: AbortSignal };
+    let providerStarts = 0;
+    mockAdapterExecute.mockImplementationOnce(async input => {
+      context = input as typeof context;
+      await registrationGate;
+      await context.onCancellationReady?.();
+      if (!context.signal?.aborted) providerStarts++;
+      return { exitCode: 1, signal: null, timedOut: false, errorMessage: "Stopped before provider startup",
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false } };
+    });
+    const { runId, agentId } = await seedRunFixture({ runtimeMode: "legacy", agentStatus: "idle", runStatus: "queued", includeIssue: false });
+    await db.update(agents).set({ adapterType: "opencode_local" }).where(eq(agents.id, agentId));
+    const heartbeat = heartbeatService(db);
+    try {
+      await heartbeat.resumeQueuedRuns();
+      await waitForValue(async () => context);
+      await expect(heartbeat.cancelRun(runId)).rejects.toMatchObject({ status: 409 });
+      expect(await heartbeat.getRun(runId)).toMatchObject({ status: "running", resultJson: { executionCancellation: { state: "requested" } } });
+      releaseRegistration();
+      await heartbeat.drainActiveRunExecutions();
+      expect(context.signal?.aborted).toBe(true);
+      expect(providerStarts).toBe(0);
+    } finally {
+      releaseRegistration();
+      await heartbeat.drainActiveRunExecutions();
+    }
+  });
 
   it("signals an embedded adapter and waits for its cleanup before returning Stop", async () => {
     const { runId } = await seedRunFixture({ runtimeMode: "legacy", includeIssue: false });

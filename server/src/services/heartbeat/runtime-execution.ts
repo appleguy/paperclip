@@ -974,6 +974,12 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
                 const current = await getRun(run.id);
                 if (!current || isHeartbeatRunTerminalStatus(current.status)) {
                   executionControl.controller.abort(new Error("Run stopped before provider startup"));
+                } else if (agent.adapterType === "opencode_local" &&
+                    parseObject(current.resultJson?.executionCancellation).state === "requested") {
+                  // A Stop may have recorded intent while this adapter waited
+                  // to register. Honor it before any OpenCode prompt is sent.
+                  executionControl.controller.abort(Object.assign(new Error("OpenCode Stop recorded before adapter readiness"),
+                    { code: "paperclip_explicit_run_stop" }));
                 }
               },
               onSpawn: async (meta) => {

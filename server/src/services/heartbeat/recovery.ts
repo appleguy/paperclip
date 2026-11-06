@@ -55,6 +55,7 @@ import {
   sql,
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import type { SQL } from "drizzle-orm";
 import {
   agents,
   environmentLeases,
@@ -148,7 +149,8 @@ export interface HeartbeatRecoveryDependencies extends Pick<HeartbeatRetryDepend
     graceMs?: number;
   }) => Promise<void>;
   setRunStatus: (runId: string, status: string, patch?: Partial<typeof heartbeatRuns.$inferInsert>) => Promise<HeartbeatRun | null>;
-  setRunStatusFromLive: (runId: string, status: string, fromStatuses: string[], patch?: Partial<typeof heartbeatRuns.$inferInsert>) => Promise<{
+  setRunStatusFromLive: (runId: string, status: string, fromStatuses: string[], patch?: Partial<typeof heartbeatRuns.$inferInsert>,
+    failureReport?: undefined, cancellationCondition?: SQL) => Promise<{
     updated: boolean;
     run: HeartbeatRun | null;
   }>;
@@ -2731,6 +2733,10 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
             return result;
           })(),
         },
+        undefined,
+        adapterType === "opencode_local" && run.runtimeMode === "legacy"
+          ? sql`coalesce(${heartbeatRuns.resultJson}->'executionCancellation'->>'state', '') <> 'requested'`
+          : undefined,
       );
       if (!failureWrite.updated || !failureWrite.run) continue;
       let finalizedRun: typeof heartbeatRuns.$inferSelect | null =

@@ -1362,6 +1362,28 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         ? captureAdapterStopOwnership(run.id)
         : undefined;
     const control = stopOwnership?.control;
+    // A shared OpenCode session can continue after its Paperclip controller is
+    // lost. An absent in-process handle is not a provider termination receipt.
+    // Persist the request, but retain the run and its resources for recovery.
+    if (run.runtimeMode === "legacy" && run.status === "running" && !control && !running &&
+        (agent?.adapterType === "opencode_local" || parseObject(run.runnerProfileJson?.adapterDispatch).adapterType === "opencode_local")) {
+      let held: { id: string } | undefined;
+      try {
+        [held] = await db.update(heartbeatRuns).set({
+          resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
+            ...attribution, cancellation,
+            executionCancellation: { state: "requested", requestedAt: new Date().toISOString() },
+          })}::jsonb`,
+          updatedAt: new Date(),
+        }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+          eq(heartbeatRuns.status, "running"), eq(heartbeatRuns.runtimeMode, "legacy"))).returning({ id: heartbeatRuns.id });
+      } finally {
+        stopOwnership?.release();
+      }
+      if (!held) return getRun(run.id);
+      throw conflict("Stop is recorded, but the OpenCode controller is unavailable and provider termination is unverified.",
+        { code: "adapter_stop_pending", runId: run.id });
+    }
     // Capture the existing adapter owner before waiting on the run lock. Then
     // atomically fence preparation and refresh the selected runtime, so Stop
     // cannot miss a native handoff that won after its first read.

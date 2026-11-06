@@ -141,6 +141,23 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
   let db: Db;
   const { fixture, liveRun } = setupRunControlDatabase("paperclip-heartbeat-run-control-module", value => { db = value; });
 
+  it("records Stop without finalizing an OpenCode run whose controller is missing", async () => {
+    const { company, agent } = await fixture();
+    await db.update(agents).set({ adapterType: "opencode_local" }).where(eq(agents.id, agent.id));
+    const [run] = await db.insert(heartbeatRuns).values({
+      companyId: company.id, agentId: agent.id, status: "running", runtimeMode: "legacy",
+      runtimeModeResolvedAt: new Date(), executionStage: "dispatching",
+    }).returning();
+    const deps = callbacks(db);
+    await expect(createHeartbeatRunControl(db, deps).cancelRunInternal(run.id, "Operator Stop"))
+      .rejects.toMatchObject({ status: 409 });
+    const current = await deps.getRun(run.id);
+    expect(current).toMatchObject({ status: "running", resultJson: { executionCancellation: { state: "requested" } } });
+    expect(deps.setRunStatusFromLive).not.toHaveBeenCalled();
+    expect(deps.envOrchestrator.releaseForRun).not.toHaveBeenCalled();
+    expect(deps.startNextQueuedRunForAgent).not.toHaveBeenCalled();
+  });
+
   it.each(["queued", "running", "cancelled", "succeeded"] as const)("does not supersede a retry that becomes %s between lookup and the cancellation fence", async status => {
     const { company, agent } = await fixture();
     const [run] = await db.insert(heartbeatRuns).values({
