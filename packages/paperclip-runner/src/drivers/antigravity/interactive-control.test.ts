@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { AntigravityInteractiveControl, emptyAgyEditor } from "./interactive-control.js";
@@ -92,6 +92,46 @@ describe("Antigravity interactive seat", () => {
       await expect(control.submit("uncertain", "work")).rejects.toThrow(/connection lost/);
       expect((await readdir(stateDir)).filter(name => name.endsWith(".reservation"))).toHaveLength(1);
       await expect(control.submit("uncertain", "work")).rejects.toThrow();
+    } finally { await rm(stateDir, { recursive: true, force: true }); }
+  });
+
+  it("interrupts only the checkpointed pane, escalating if it stays busy", async () => {
+    const stateDir = await mkdtemp(path.join(scratch, "agy-interactive-"));
+    const calls: string[][] = [];
+    let clock = 0;
+    const tmux = async (args: string[]) => {
+      calls.push(args);
+      if (args[0] === "display-message") return "%42 123 agy";
+      if (args[0] === "capture-pane") return screen;
+      return "";
+    };
+    try {
+      await writeFile(path.join(stateDir, "active.json"), JSON.stringify({ runId: "run-1" }));
+      const control = await AntigravityInteractiveControl.attach({ socket: "socket", session: "seat", stateDir, authorize: () => true, tmux });
+      await expect(control.interruptRun("other", { isIdle: async () => false })).rejects.toThrow(/ownership/);
+      expect(calls.filter(args => args[0] === "send-keys")).toEqual([]);
+      const result = await control.interruptRun("run-1", { isIdle: async () => clock >= 6000, now: () => clock,
+        wait: async ms => { clock += ms; }, timeoutMs: 10_000 });
+      expect(result).toBe("idle");
+      expect(calls.filter(args => args[0] === "send-keys")).toEqual([
+        ["send-keys", "-t", "%42", "Escape"], ["send-keys", "-t", "%42", "C-c"],
+      ]);
+    } finally { await rm(stateDir, { recursive: true, force: true }); }
+  });
+
+  it("returns restart required at the deadline and refuses a changed checkpoint", async () => {
+    const stateDir = await mkdtemp(path.join(scratch, "agy-interactive-"));
+    let clock = 0;
+    const tmux = async (args: string[]) => args[0] === "display-message" ? "%42 123 agy" : args[0] === "capture-pane" ? screen : "";
+    try {
+      await writeFile(path.join(stateDir, "active.json"), JSON.stringify({ runId: "run-1" }));
+      const control = await AntigravityInteractiveControl.attach({ socket: "socket", session: "seat", stateDir, authorize: () => true, tmux });
+      expect(await control.interruptRun("run-1", { isIdle: async () => false, now: () => clock,
+        wait: async ms => { clock += ms; }, timeoutMs: 1000 })).toBe("restart_required");
+      await expect(control.interruptRun("run-1", { isIdle: async () => {
+        await writeFile(path.join(stateDir, "active.json"), JSON.stringify({ runId: "run-2" }));
+        return false;
+      }, now: () => clock, wait: async ms => { clock += ms; }, timeoutMs: 1000 })).rejects.toThrow(/ownership/);
     } finally { await rm(stateDir, { recursive: true, force: true }); }
   });
 

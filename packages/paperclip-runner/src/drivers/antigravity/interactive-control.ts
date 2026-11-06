@@ -32,13 +32,14 @@ export class AntigravityInteractiveControl {
 
   static async open(input: {
     socket: string; session: string; stateDir: string; cwd: string; tmpDir: string; executable: string; model: string;
-    rejoinOnly: boolean; expectedRemoteControlUrl?: string; authorize: (operationId: string) => boolean; tmux?: Tmux;
+    rejoinOnly: boolean; expectedRemoteControlUrl?: string; conversationId?: string; authorize: (operationId: string) => boolean; tmux?: Tmux;
     wait?: (ms: number) => Promise<void>; startupTimeoutMs?: number;
   }): Promise<AntigravityInteractiveControl> {
     if (!idPattern.test(input.socket) || !idPattern.test(input.session) ||
       ![input.stateDir, input.cwd, input.tmpDir, input.executable].every(path.isAbsolute) ||
       input.cwd === "/" || input.cwd.startsWith("/private/var/folders/") || input.cwd.startsWith("/var/folders/") ||
-      !/^[a-zA-Z0-9][a-zA-Z0-9.-]{0,199}$/.test(input.model)) throw new Error("Invalid Antigravity seat launch");
+      !/^[a-zA-Z0-9][a-zA-Z0-9.-]{0,199}$/.test(input.model) ||
+      (input.conversationId !== undefined && !/^[a-zA-Z0-9][a-zA-Z0-9-]{0,199}$/.test(input.conversationId))) throw new Error("Invalid Antigravity seat launch");
     const tmux = input.tmux ?? (async (args: string[]) =>
       (await exec("/opt/homebrew/bin/tmux", ["-L", input.socket, ...args], { timeout: 10_000, maxBuffer: 2_000_000 })).stdout);
     let exists = true;
@@ -49,7 +50,8 @@ export class AntigravityInteractiveControl {
       await fs.mkdir(input.tmpDir, { recursive: true, mode: 0o700 });
       await fs.mkdir(input.stateDir, { recursive: true, mode: 0o700 });
       await tmux(["new-session", "-d", "-s", input.session, "-c", input.cwd, "-e", `TMPDIR=${input.tmpDir}`,
-        input.executable, "--remote-control", "--dangerously-skip-permissions", "--model", input.model]);
+        input.executable, "--remote-control", "--dangerously-skip-permissions", "--model", input.model,
+        ...(input.conversationId ? ["--conversation", input.conversationId] : [])]);
     }
     const wait = input.wait ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
     const deadline = Date.now() + (input.startupTimeoutMs ?? 45_000);
@@ -60,6 +62,38 @@ export class AntigravityInteractiveControl {
         await wait(1000);
       }
     }
+  }
+
+  /** The caller holds the seat lock for the whole operation. */
+  async interruptRun(runId: string, options: {
+    isIdle: (after: number) => Promise<boolean>; wait?: (ms: number) => Promise<void>;
+    now?: () => number; timeoutMs?: number;
+  }): Promise<"idle" | "restart_required"> {
+    const now = options.now ?? Date.now;
+    const wait = options.wait ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
+    const started = now();
+    const deadline = started + (options.timeoutMs ?? 60_000);
+    const check = async () => {
+      const active = JSON.parse(await fs.readFile(path.join(this.input.stateDir, "active.json"), "utf8")) as { runId?: unknown };
+      if (!runId || active.runId !== runId) throw new Error("Antigravity stop checkpoint ownership changed");
+      const identity = (await this.input.tmux(["display-message", "-p", "-t", `=${this.input.session}:`, "#{pane_id} #{pane_pid} #{pane_current_command}"])).trim();
+      if (identity !== `${this.input.paneId} ${this.input.panePid} agy`) throw new Error("Antigravity seat identity changed");
+    };
+    await check();
+    await this.input.tmux(["send-keys", "-t", this.input.paneId, "Escape"]);
+    let sentControlC = false;
+    while (now() < deadline) {
+      await check();
+      if (await options.isIdle(started)) { await check(); return "idle"; }
+      if (!sentControlC && now() - started >= 5000) {
+        await check();
+        await this.input.tmux(["send-keys", "-t", this.input.paneId, "C-c"]);
+        sentControlC = true;
+      }
+      await wait(Math.min(500, Math.max(0, deadline - now())));
+    }
+    await check();
+    return "restart_required";
   }
 
   static async attach(input: {
