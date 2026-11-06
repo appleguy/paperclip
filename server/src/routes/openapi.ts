@@ -11205,6 +11205,14 @@ registerCurrentRoute({
 });
 
 registerCurrentRoute({
+  method: "get",
+  path: "/api/mcp/project-tools",
+  tags: ["projects"],
+  summary: "Reject SSE discovery because the project tools endpoint supports POST only",
+  responses: { 405: { description: "SSE stream is not supported" }, 401: r.unauthorized, 403: r.forbidden },
+});
+
+registerCurrentRoute({
   method: "post",
   path: "/runtime-tools/github/credentials",
   tags: ["connection-intents"],

@@ -8,6 +8,11 @@ import { forbidden } from "../errors.js";
 /** Mounted after actor middleware; connection-scoped tokens cannot authenticate here. */
 export function projectToolRoutes(db: Db) {
   const router = Router();
+  // Streamable HTTP clients probe GET for a server stream; MCP requires 405 when none is offered (a 404 aborts Codex startup).
+  router.get("/mcp/project-tools", async (req, res) => {
+    await projectToolContext(db, req.actor);
+    res.set("Allow", "POST").status(405).end();
+  });
   router.post("/mcp/project-tools", async (req, res) => {
     const context = await projectToolContext(db, req.actor);
     assertCompanyAccess(req, context.run.companyId);
