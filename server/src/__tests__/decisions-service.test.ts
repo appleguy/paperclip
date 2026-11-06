@@ -552,10 +552,10 @@ describePg("decisionService", () => {
   it("delivers the continuation when the origin agent cancels a decision", async () => {
     const created = await createCommentDecision();
 
-    const cancelled = await service().cancel(created.id, { actorType: "agent", actorId: agentId, runId });
+    const cancelled = await service().cancel(created.id, { actorType: "agent", actorId: agentId, runId, reason: "Misrouted blocker decision" });
 
     expect(cancelled.status).toBe("cancelled");
-    expect(cancelled.metadata).toMatchObject({ continuationPending: false });
+    expect(cancelled.metadata).toMatchObject({ continuationPending: false, cancelReason: "Misrouted blocker decision" });
     expect(wakes).toEqual([{ companyId, agentId, issueId: originIssueId, decisionId: created.id, outcome: "cancelled" }]);
   });
 

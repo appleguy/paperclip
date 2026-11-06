@@ -717,7 +717,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
     return resumeDecision(claimed, input.userActor);
   }
 
-  async function cancel(id: string, actor: { actorType: "agent" | "user"; actorId: string; runId?: string | null }) {
+  async function cancel(id: string, actor: { actorType: "agent" | "user"; actorId: string; runId?: string | null; reason?: string }) {
     const current = await get(id); if (!current) throw notFound("Decision not found");
     if (actor.actorType === "agent" && actor.actorId !== current.originAgentId) throw forbidden("Only the origin agent may cancel");
     if (current.status === "cancelled") {
@@ -725,9 +725,10 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
       return (await get(id))!;
     }
     const [updated] = await writeDecisionChange(db, async tx => tx.update(decisions).set({ status: "cancelled", updatedAt: new Date(), metadata: { ...current.metadata,
+      ...(actor.reason ? { cancelReason: actor.reason } : {}),
       ...(current.continuationPolicy === "wake_origin_agent" ? { continuationPending: true } : {}) } }).where(and(eq(decisions.id, id), eq(decisions.status, "open"))).returning(), { companyId: current.companyId, sourceId: id });
     if (!updated) throw conflict("decision_already_resolved", { code: "decision_already_resolved" });
-    await logActivity(db, { companyId: updated.companyId, actorType: actor.actorType, actorId: actor.actorId, runId: actor.runId, action: "decision.cancelled", entityType: "decision", entityId: id });
+    await logActivity(db, { companyId: updated.companyId, actorType: actor.actorType, actorId: actor.actorId, runId: actor.runId, action: "decision.cancelled", entityType: "decision", entityId: id, details: actor.reason ? { reason: actor.reason } : undefined });
     await continuations.deliver(updated.id);
     return (await get(id))!;
   }

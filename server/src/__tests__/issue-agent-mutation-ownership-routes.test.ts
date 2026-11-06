@@ -1851,6 +1851,29 @@ describe("agent issue mutation checkout ownership", () => {
     );
   });
 
+  it("rejects an agent blocking its own issue on itself without a dependency or pending decision", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId }));
+    const db = createRunContextDb({}, ownerAgentId, ownerRunId, [], false, { userId: "board-user" });
+    const res = await request(await createApp(ownerActor(), db)).patch(`/api/issues/${issueId}`).send({
+      status: "blocked",
+      unblockDescriptor: { owner: { agentId: ownerAgentId }, action: "Continue later" },
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toContain("executionPolicy.monitor.nextCheckAt");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("permits a self-owned block with an unresolved dependency", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress", assigneeAgentId: ownerAgentId }));
+    mockIssueService.getDependencyReadiness.mockResolvedValue({ blockerIssueIds: [issueId], unresolvedBlockerCount: 1 });
+    const db = createRunContextDb({}, ownerAgentId, ownerRunId, [], false, { userId: "board-user" });
+    const res = await request(await createApp(ownerActor(), db)).patch(`/api/issues/${issueId}`).send({
+      status: "blocked",
+      unblockDescriptor: { owner: { agentId: ownerAgentId }, action: "Review the dependency" },
+    });
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+  });
+
   it.each(["bare blocked update", "human-owned inbox fixture"] as const)(
     "applies the production blocked contract to the %s", async kind => {
       const actor = boardActor();

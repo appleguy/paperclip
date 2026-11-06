@@ -194,7 +194,8 @@ export function decisionRoutes(db: Db, options: DecisionServiceOptions) {
     assertBoardOrAgent(req);
     const decision = await getAccessibleResource(req, res, svc.get(req.params.id as string), "Decision not found");
     if (!decision) return;
-    const actor = getActorInfo(req); res.json(await svc.cancel(decision.id, { actorType: actor.actorType, actorId: actor.actorId, runId: actor.runId }));
+    const reason = z.string().trim().min(1).max(2000).optional().parse(req.body?.reason);
+    const actor = getActorInfo(req); res.json(await svc.cancel(decision.id, { actorType: actor.actorType, actorId: actor.actorId, runId: actor.runId, reason }));
   });
   return router;
 }

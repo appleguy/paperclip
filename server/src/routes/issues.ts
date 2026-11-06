@@ -14701,6 +14701,12 @@ export function issueRoutes(
         const requestedBlockerIds = Array.isArray(req.body.blockedByIssueIds)
           ? [...new Set(req.body.blockedByIssueIds as string[])]
           : null;
+        const currentReadiness = requestedBlockerIds === null
+          ? await svc.getDependencyReadiness(existing.id)
+          : null;
+        const hasBlockerIds = requestedBlockerIds !== null
+          ? requestedBlockerIds.length > 0
+          : (currentReadiness?.blockerIssueIds?.length ?? 0) > 0;
         const hasUnresolvedBlocker = requestedBlockerIds
           ? requestedBlockerIds.length > 0 &&
             (await db
@@ -14715,8 +14721,7 @@ export function issueRoutes(
               )
               .limit(1)
               .then((rows) => rows.length > 0))
-          : (await svc.getDependencyReadiness(existing.id))
-              .unresolvedBlockerCount > 0;
+          : (currentReadiness?.unresolvedBlockerCount ?? 0) > 0;
         const [pendingInteraction, pendingApproval] = await Promise.all([
           db
             .select({ id: issueThreadInteractions.id })
@@ -14745,6 +14750,18 @@ export function issueRoutes(
             .limit(1)
             .then((rows) => rows[0] ?? null),
         ]);
+        if (
+          req.actor.type === "agent" &&
+          existing.assigneeAgentId === req.actor.agentId &&
+          descriptor && descriptor.owner !== "board" &&
+          "agentId" in descriptor.owner && descriptor.owner.agentId === req.actor.agentId &&
+          !hasBlockerIds && !pendingInteraction && !pendingApproval
+        ) {
+          res.status(422).json({
+            error: "A self-owned block has no external blocker. Keep working, or set executionPolicy.monitor.nextCheckAt when waiting on an external event.",
+          });
+          return;
+        }
         if (
           !hasUnresolvedBlocker &&
           !pendingInteraction &&
