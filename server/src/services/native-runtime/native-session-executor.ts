@@ -9025,6 +9025,7 @@ async function executePaperclipNativeSessionWithinScope(
     input.execution.provider.kind !== "claude_managed" &&
     input.execution.provider.kind !== "aws_agentcore" &&
     input.execution.provider.kind !== "acpx" &&
+    input.execution.schema !== "paperclip.native-execution-input.v11" &&
     input.execution.schema !== "paperclip.native-execution-input.v12" &&
     input.execution.schema !== "paperclip.native-execution-input.v13" &&
     input.execution.schema !== "paperclip.native-execution-input.v6" &&
@@ -9621,8 +9622,8 @@ async function executePaperclipNativeSessionWithinScope(
       : "unpriced" as const;
     const billing = resolveNativeBilling(input.execution.provider, input.runnerEnvironment, input.billingIdentity);
     const costUsdExact = input.execution.provider.kind !== "cursor_cloud" && typeof usage?.accountingCostUsdExact === "string" ? usage.accountingCostUsdExact : undefined;
-    const checkpoint: AdapterUsageCheckpoint = { usage: accountingUsage && observedPeakContextTokens > 0
-      ? { ...accountingUsage, peakContextTokens: observedPeakContextTokens } : accountingUsage, ...billing, complete, usageBasis: "per_run", costUsdExact,
+    const checkpoint: AdapterUsageCheckpoint = { usage: observedPeakContextTokens > 0
+      ? { ...(accountingUsage ?? { inputTokens: 0, outputTokens: 0 }), peakContextTokens: observedPeakContextTokens } : accountingUsage, ...billing, complete, usageBasis: "per_run", costUsdExact,
       model: input.execution.provider.model ?? "unknown", costUsd: accountingCost ?? null, costStatus };
     if (input.onUsage) await input.onUsage(checkpoint);
     else {
@@ -9650,6 +9651,16 @@ async function executePaperclipNativeSessionWithinScope(
     const payload = record(event.payload);
     const usage = record(payload.usage);
     const delta = record(usage.runDelta);
+    if (input.execution.provider.kind === "antigravity_headless" && event.eventType === "harness.diagnostic" && payload.code === "antigravity_step_usage") {
+      const values = [usage.inputTokens, usage.cacheReadTokens, usage.outputTokens];
+      if (values.every(value => typeof value === "number" && Number.isSafeInteger(value) && value >= 0)) {
+        const used = (values as number[]).reduce((sum, value) => sum + value, 0);
+        if (used > 0 && used <= 2_147_483_647) {
+          observedPeakContextTokens = Math.max(observedPeakContextTokens, used);
+          await persistAccountingUsage(null, false);
+        }
+      }
+    }
     if (payload.kind === "usage" && input.execution.provider.kind === "codex") {
       const context = record(usage.context);
       const last = record(usage.last);
@@ -10342,14 +10353,17 @@ async function executePaperclipNativeSessionWithinScope(
     }
     // v13: the executor launches the ONE genuine Claude interactive session; the managed service adopts it (no second launch).
     let claudeBackend: ReturnType<typeof createNativeSessionBackend> | undefined;
+    let claudeTranscriptScope: { home: string; claudeConfigDir?: string; cwd: string; sessionId: string } | undefined;
     if (input.execution.schema === "paperclip.native-execution-input.v13" && input.backend === undefined) {
       if (input.runnerExecutionTarget?.kind === "remote" || input.restartRecovery || !input.execution.workspace.cwd) throw new Error("claude_interactive_requires_fresh_local_admission");
       const stateDirectory = process.env.PAPERCLIP_CLAUDE_INTERACTIVE_STATE_DIR?.trim(), hookHelperExecutable = process.env.PAPERCLIP_CLAUDE_HOOK_HELPER?.trim();
       if (!stateDirectory || !hookHelperExecutable) throw new Error("claude_interactive_host_not_configured");
       const execution = input.execution, binding = execution.binding;
+      const host = await resolveClaudeNativeHostSettings();
+      claudeTranscriptScope = { ...host, cwd: execution.workspace.cwd!, sessionId: execution.session.normalizedSessionId! };
       claudeAdmission = await startClaudeNativeSession(input.db, { execution, runnerInstanceId: effectiveRunnerInstanceId, leaseOwner, attempt, controller, assertControllerActive,
         completionFeedback: async result => { assertControllerActive(); return nativeCompletionFeedback(input.db, binding.runId, result); },
-        host: { ...(await resolveClaudeNativeHostSettings()), stateDirectory, hookHelperExecutable } });
+        host: { ...host, stateDirectory, hookHelperExecutable } });
       claudeBackend = createNativeSessionBackend(execution, { runnerInstanceId: effectiveRunnerInstanceId, claudeInteractiveAuthority: { port: claudeAdmission.port, model: execution.provider.model, effort: execution.provider.effort } });
     }
     let remoteWarmRecoveryPending = remoteWarmRecovery !== undefined;
@@ -10851,6 +10865,15 @@ async function executePaperclipNativeSessionWithinScope(
       nativeAccountingComplete = snapshot.complete && snapshot.turnId === native.turnId;
     } else nativeAccountingComplete = observedAccountingUsage !== null
       && observedAccountingTurn !== undefined && observedAccountingTurn === native.turnId;
+    if (claudeTranscriptScope) {
+      try {
+        const { ClaudeInteractiveNativeBackend } = await import("@paperclipai/paperclip-runner");
+        const peak = await ClaudeInteractiveNativeBackend.transcriptPeak(claudeTranscriptScope);
+        if (peak) observedPeakContextTokens = Math.max(observedPeakContextTokens, peak);
+      } catch (error) {
+        logger.warn({ err: error, runId: input.execution.binding.runId }, "Could not read Claude transcript usage");
+      }
+    }
     native = { ...native, usage: observedAccountingUsage };
     await persistAccountingUsage(native.usage, nativeAccountingComplete);
     try {

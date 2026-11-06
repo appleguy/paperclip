@@ -1,4 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { createReadStream } from "node:fs";
+import { realpath } from "node:fs/promises";
+import { isAbsolute, join, resolve } from "node:path";
+import { createInterface } from "node:readline";
 import type { NativeSession, NativeSessionBackend, OpenNativeSessionInput, PersistedNativeSession } from "../../contracts/native-session-backend.js";
 import type { NativeRunIdentity } from "../../contracts/types.js";
 import type { PrpStructuredRunResult } from "../../protocol/replay-contract.js";
@@ -25,6 +29,30 @@ const identityMatches = (a: NativeRunIdentity, b: NativeRunIdentity) => a.runId 
 
 export class ClaudeInteractiveNativeBackend implements NativeSessionBackend {
   constructor(private readonly port: ClaudeInteractiveNativePort) {}
+  static async transcriptPeak(input: { home: string; claudeConfigDir?: string; cwd: string; sessionId: string }): Promise<number | undefined> {
+    if (!isAbsolute(input.home) || !isAbsolute(input.cwd) || (input.claudeConfigDir && !isAbsolute(input.claudeConfigDir))
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(input.sessionId)) throw new Error("claude_transcript_scope_invalid");
+    const project = (await realpath(resolve(input.cwd))).replace(/[^a-zA-Z0-9]/g, "-");
+    const path = join(input.claudeConfigDir ?? join(input.home, ".claude"), "projects", project, `${input.sessionId}.jsonl`);
+    let peak = 0;
+    try {
+      const lines = createInterface({ input: createReadStream(path), crlfDelay: Infinity });
+      for await (const line of lines) {
+        let entry: any;
+        try { entry = JSON.parse(line); } catch { continue; }
+        if (entry?.type !== "assistant" || (entry.sessionId ?? entry.session_id) !== input.sessionId) continue;
+        const usage = entry.message?.usage;
+        if (!usage || typeof usage !== "object") continue;
+        const values = [usage.input_tokens, usage.cache_read_input_tokens ?? 0, usage.cache_creation_input_tokens ?? 0, usage.output_tokens];
+        if (!values.every(value => typeof value === "number" && Number.isSafeInteger(value) && value >= 0)) continue;
+        const total = values.reduce((sum, value) => sum + value, 0);
+        if (Number.isSafeInteger(total) && total <= 2_147_483_647) peak = Math.max(peak, total);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+    return peak || undefined;
+  }
   async descriptor() {
     return { kind: "runner" as const, name: "claude_interactive_v1", version: "1", capabilities,
       runtimeContextCapabilities: { instructions: "native" as const, skills: "native" as const, mcp: "native" as const } };

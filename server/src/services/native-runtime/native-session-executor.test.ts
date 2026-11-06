@@ -8027,6 +8027,21 @@ describe("native terminal-turn accounting", () => {
       usage: { inputTokens: 400, cachedInputTokens: 100, outputTokens: 20, peakContextTokens: 300 } }));
   });
 
+  it("records agy step context without certifying billing totals", async () => {
+    const onUsage = vi.fn(async (_receipt: AdapterUsageCheckpoint) => {});
+    state.execute.mockReset().mockImplementationOnce(async () => {
+      for (const usage of [{ inputTokens: 200, cacheReadTokens: 30000, outputTokens: 40 }, { inputTokens: 20, cacheReadTokens: 100, outputTokens: 2 }]) {
+        await accountingEvents.committed!({ eventType: "harness.diagnostic", turnId: "turn", payload: { code: "antigravity_step_usage", usage } } as unknown as PrpEvent);
+      }
+      return { result: { summary: "done" }, terminal: { runTerminalState: "succeeded" }, turnId: "turn",
+        normalizedSessionId: "session", providerSessionId: null, driverKind: "test", driverVersion: "1", nativeEventCount: 2, highestContiguousSourceSeq: 2, usage: null };
+    });
+    await executePaperclipNativeSession({ db: leaseDb(), execution: { ...execution, schema: "paperclip.native-execution-input.v11", provider: { kind: "antigravity_headless", model: "test" } } as NativeExecutionInput,
+      runnerInstanceId: "runner", backend: {} as never, onUsage });
+    expect(onUsage).toHaveBeenLastCalledWith(expect.objectContaining({ complete: false, costStatus: "unpriced",
+      usage: { inputTokens: 0, outputTokens: 0, peakContextTokens: 30240 } }));
+  });
+
   it.each(["stale_warm_zero", "partial", "fresh", "fresh_zero", "new_turn", "later_partial", "merged_partial"])("requires fresh complete usage at native completion (%s)", async scenario => {
     const onUsage = vi.fn(async (_receipt: import("@paperclipai/adapter-utils").AdapterUsageCheckpoint) => {});
     const usage = { inputTokens: 120, cacheReadTokens: 100, outputTokens: 10, providerCostUsd: 0 };
