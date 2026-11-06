@@ -18,7 +18,7 @@ export interface ClaudeNativeHost {
   /** Private (0700, owned) directory holding one exclusive journal directory per run. */
   stateDirectory: string; hookHelperExecutable: string;
 }
-export interface ClaudeLaunchedControl extends ClaudeLiveSessionControl { stopOwnedProcess(): Promise<void> }
+export interface ClaudeLaunchedControl extends ClaudeLiveSessionControl { stopOwnedProcess(): Promise<void>; detach(): Promise<void> }
 export interface StartClaudeNativeSessionInput {
   execution: NativeExecutionInputV13; runnerInstanceId: string; leaseOwner: string; attempt: number;
   controller: { bootId: string; pid: number; processStartedAt: Date };
@@ -125,11 +125,31 @@ export async function startClaudeNativeSession(db: Db, input: StartClaudeNativeS
 
   const readReceipt = () => readClaudeTerminalReceipt(db, journal);
   let closed = false;
+  let detached = false;
+  let interrupted = false;
   const port: ClaudeInteractiveNativePort = Object.freeze({
     identity, runnerInstanceId: input.runnerInstanceId, nativeSessionId,
     async verify() { await readReceipt(); await control.identity(); },
     readReceipt,
     async dispatch(prompt: { id: string; text: string }) { await control.ownerInput({ operationId: prompt.id, text: claudeNativePromptInput(prompt.text) }); },
+    async stop() {
+      if (detached) throw new Error("claude_interactive_controller_detached");
+      if (closed) return;
+      if (!interrupted) {
+        await port.verify();
+        await control.interrupt({ operationId: `stop:${b.runId}` });
+        interrupted = true;
+      }
+      // Ctrl-C delivery alone is not termination proof. close waits for tool
+      // effects and confirms exit through the original owned process handle.
+      await port.close();
+    },
+    async detach() {
+      if (detached) return;
+      await control.detach();
+      detached = true;
+      unregister();
+    },
     async waitForReceipt(signal: AbortSignal) {
       for (;;) {
         signal.throwIfAborted();
@@ -148,7 +168,7 @@ export async function startClaudeNativeSession(db: Db, input: StartClaudeNativeS
     /** Never assumes a native tool stopped: finalizes only when no tool effect is in flight and the durable journal has
      * no reservation without a recorded outcome. Otherwise it throws and leaves session, authority and registry intact. */
     async close() {
-      if (closed) return;
+      if (closed || detached) return;
       if (!await admitted.settled(input.settleTimeoutMs ?? 5000)) throw new Error("claude_native_effects_unsettled");
       if (await admitted.unsettled() !== 0) throw new Error("claude_native_effects_unsettled");
       active.value = false;

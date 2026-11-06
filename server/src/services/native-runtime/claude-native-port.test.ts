@@ -54,7 +54,7 @@ const support = await getEmbeddedPostgresTestSupport();
   function start(f: Awaited<ReturnType<typeof seed>>, extra: Record<string, unknown> = {}) {
     const registry = new ClaudeLiveSessionRegistry();
     const control = { identity: vi.fn(async () => ({ pid: 1 })), ownerInput: vi.fn(async () => ({ write: "attempted", delivery: "unknown", completion: "unproven" })),
-      interrupt: vi.fn(async () => ({})), settlement: () => ({}), capabilities: () => ({ tools: "scoped_admitted_run" }), stopOwnedProcess: vi.fn(async () => {}) };
+      interrupt: vi.fn(async () => ({})), settlement: () => ({}), capabilities: () => ({ tools: "scoped_admitted_run" }), stopOwnedProcess: vi.fn(async () => {}), detach: vi.fn(async () => {}) };
     const launched: Array<Record<string, any>> = [];
     const launch = vi.fn(async (options: Record<string, unknown>) => { launched.push(options); return control; });
     const feedback = vi.fn(async () => "accepted");
@@ -210,5 +210,26 @@ const support = await getEmbeddedPostgresTestSupport();
     h.control.stopOwnedProcess.mockRejectedValueOnce(new Error("exit unconfirmed"));
     await expect(port.close()).rejects.toThrow("exit unconfirmed");
     expect(h.registry.has(f.companyId, f.runId)).toBe(true);
+  });
+
+  it("interrupts and confirms owned process exit for an explicit native Stop", async () => {
+    const f = await seed(), h = start(f), { port } = await h.started;
+    const session = await new ClaudeInteractiveNativeBackend(port).openSession({ identity: port.identity });
+    await session.cancel!({ reason: "Agent paused", signal: new AbortController().signal }).cleanup;
+    expect(h.control.interrupt).toHaveBeenCalledWith({ operationId: `stop:${f.runId}` });
+    expect(h.control.stopOwnedProcess).toHaveBeenCalledOnce();
+    expect(h.control.detach).not.toHaveBeenCalled();
+    expect(h.registry.has(f.companyId, f.runId)).toBe(false);
+  });
+
+  it("detaches for restart and does not interrupt or stop the provider during final cleanup", async () => {
+    const f = await seed(), h = start(f), { port } = await h.started;
+    const session = await new ClaudeInteractiveNativeBackend(port).openSession({ identity: port.identity });
+    await session.detachControllerForRestart!();
+    await session.close();
+    expect(h.control.detach).toHaveBeenCalledOnce();
+    expect(h.control.interrupt).not.toHaveBeenCalled();
+    expect(h.control.stopOwnedProcess).not.toHaveBeenCalled();
+    expect(h.registry.has(f.companyId, f.runId)).toBe(false);
   });
 });

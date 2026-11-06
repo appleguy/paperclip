@@ -13,6 +13,8 @@ export function createOpenCodeNativePort(db: Db, binding: OpenCodeSharedBinding,
   let reading: ReturnType<typeof readOpenCodeTerminalReceipt> | undefined;
   const observationAbort = new AbortController();
   let observation: Promise<void> | undefined;
+  let stopping: Promise<void> | undefined;
+  let interrupted = false;
   function readReceipt() {
     if (reading) return reading;
     const current = readOpenCodeTerminalReceipt(db, binding);
@@ -25,6 +27,14 @@ export function createOpenCodeNativePort(db: Db, binding: OpenCodeSharedBinding,
       async verify() { await readOpenCodeHost(db, binding); await host.verifySession(binding.providerSessionId, binding); },
       readReceipt,
       async dispatch(prompt: { id: string; text: string }) { await host.dispatchForRun(db, binding, prompt); },
+      stop() {
+        return stopping ??= (async () => {
+          if (!interrupted) { await host.interruptForRun(db, binding); interrupted = true; }
+          // This host is isolated and owned by this run. Its exit confirms Stop;
+          // ordinary observer close below never calls interrupt or shutdown.
+          await host.shutdown();
+        })().catch(error => { stopping = undefined; throw error; });
+      },
       async startObservation() {
         if (observation) throw new Error("opencode_observation_already_started");
         let ready!: () => void;

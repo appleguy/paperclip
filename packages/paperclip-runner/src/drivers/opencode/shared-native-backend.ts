@@ -13,6 +13,8 @@ export interface OpenCodeSharedNativePort {
   dispatch(input: { id: string; text: string }): Promise<void>;
   startObservation(): Promise<void>;
   waitForReceipt(signal: AbortSignal): Promise<{ result: PrpStructuredRunResult; operationId: string; recordedAt: string }>;
+  /** Explicit Stop only; resolves after the owned provider has stopped. */
+  stop(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -29,7 +31,7 @@ export class OpenCodeSharedNativeBackend implements NativeSessionBackend {
     await this.port.verify();
     input.signal?.throwIfAborted();
     const port = this.port, abort = new AbortController();
-    let started = false;
+    let started = false, cancelled = false, detached = false;
     let releaseStart!: () => void, rejectStart!: (error: unknown) => void;
     const startedGate = new Promise<void>((resolve, reject) => { releaseStart = resolve; rejectStart = reject; });
     void startedGate.catch(() => {});
@@ -40,18 +42,20 @@ export class OpenCodeSharedNativeBackend implements NativeSessionBackend {
         await startedGate;
         const receipt = await port.waitForReceipt(abort.signal);
         abort.signal.throwIfAborted();
+        if (cancelled || detached) throw new Error("opencode_shared_controller_closed");
         if (!/^[a-f0-9]{64}$/.test(receipt.operationId) || !Number.isFinite(Date.parse(receipt.recordedAt))) throw new Error("opencode_shared_receipt_invalid");
         yield { schema: "paperclip.prp.event.v1", sourceEventId: `opencode:${port.identity.runId}:${receipt.operationId}`, sourceSeq: 1,
           sourceInstanceId: port.runnerInstanceId, sourceKind: "runner", runId: port.identity.runId, normalizedSessionId: port.identity.sessionId,
           eventType: "run.result.proposed", schemaVersion: 1, priority: 0, emittedAt: receipt.recordedAt, payload: receipt.result };
       },
       async startTurn({ message }) {
-        if (started || abort.signal.aborted || message.role !== "user") throw new Error("opencode_shared_dispatch_unavailable");
+        if (started || cancelled || abort.signal.aborted || message.role !== "user") throw new Error("opencode_shared_dispatch_unavailable");
         started = true;
         try {
           // A committed result survives controller loss. Never send a new
           // prompt merely because its prior controller did not finish PRP.
           const prior = await port.readReceipt();
+          if (cancelled || detached || abort.signal.aborted) throw new Error("opencode_shared_dispatch_unavailable");
           const id = prior ? "work_session_receipt" : `msg_${randomUUID()}`;
           if (!prior) await port.dispatch({ id, text: message.text });
           await port.startObservation();
@@ -60,8 +64,23 @@ export class OpenCodeSharedNativeBackend implements NativeSessionBackend {
         } catch (error) { rejectStart(error); throw error; }
       },
       async result() { return null; },
+      cancel() {
+        if (detached) throw new Error("opencode_shared_controller_detached");
+        cancelled = true;
+        return { cleanup: port.stop().then(() => {
+          abort.abort(new Error("opencode_shared_cancelled"));
+          rejectStart(new Error("opencode_shared_cancelled"));
+        }) };
+      },
+      async detachControllerForRestart() {
+        // close releases only the observer, never the owned provider host.
+        detached = true;
+        await port.close();
+        abort.abort(new Error("opencode_shared_controller_detached"));
+        rejectStart(new Error("opencode_shared_controller_detached"));
+      },
       async snapshot(): Promise<PersistedNativeSession> { return { backendKind: "runner", driverKind: "opencode_shared_v2", sessionId: input.identity.sessionId, identity: { ...input.identity }, providerSessionId: port.providerSessionId, cursor: null }; },
-      async close() { abort.abort(new Error("opencode_shared_controller_closed")); rejectStart(new Error("opencode_shared_controller_closed")); await port.close(); },
+      async close() { abort.abort(new Error("opencode_shared_controller_closed")); rejectStart(new Error("opencode_shared_controller_closed")); if (!detached) await port.close(); },
     };
     return session;
   }

@@ -238,7 +238,7 @@ it.each([true, false])("requires an authenticated work-session receipt (accepted
     provider: { kind: "opencode_shared_v2" as const, model: "fixture/model", effort: "high", cliVersion: "2.2.5" as const }, homeMode: "preconfigured" as const };
   const appended: PrpEvent[] = [];
   const backend = new OpenCodeSharedNativeBackend({ identity, runnerInstanceId: "runner-recovery", providerSessionId: "ses_fixture", async verify() {},
-    async readReceipt() { return null; }, async dispatch() {}, async startObservation() {}, async close() {}, async waitForReceipt() { return { result, operationId: "a".repeat(64), recordedAt: "2026-08-09T00:00:00.000Z" }; },
+    async readReceipt() { return null; }, async dispatch() {}, async startObservation() {}, async stop() {}, async close() {}, async waitForReceipt() { return { result, operationId: "a".repeat(64), recordedAt: "2026-08-09T00:00:00.000Z" }; },
   });
   const work = executeNativeSession({ input: execution, backend, controlPlane: {
     async openRun() {}, async checkpointSession() {}, async completeRun() {},

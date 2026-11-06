@@ -21,6 +21,11 @@ import { createOpenCodeBoundFetch } from "./opencode-bound-fetch.js";
       const create = createOpenCodeBoundFetch({ pid: process.pid, port, isAlive: () => true, allowEmptySessionCreate: true });
       await expect(create(`http://127.0.0.1:${port}/api/session`, { method: "POST", body: '{"prompt":"no"}' })).rejects.toThrow("target_invalid");
       await expect(create(`http://127.0.0.1:${port}/api/session/ses_x/prompt`, { method: "POST", body: "{}" })).rejects.toThrow("target_invalid");
+      const interrupt = createOpenCodeBoundFetch({ pid: process.pid, port, isAlive: () => true, allowInterruptForSession: "ses_owned" });
+      expect(await (await interrupt(`http://127.0.0.1:${port}/api/session/ses_owned/interrupt`, { method: "POST" })).text()).toBe("ok");
+      await expect(interrupt(`http://127.0.0.1:${port}/api/session/ses_other/interrupt`, { method: "POST" })).rejects.toThrow("target_invalid");
+      await expect(interrupt(`http://127.0.0.1:${port}/api/session/ses_owned/interrupt?all=true`, { method: "POST" })).rejects.toThrow("target_invalid");
+      await expect(interrupt(`http://127.0.0.1:${port}/api/session/ses_owned/interrupt`, { method: "POST", body: "{}" })).rejects.toThrow("target_invalid");
     } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
   });
 });

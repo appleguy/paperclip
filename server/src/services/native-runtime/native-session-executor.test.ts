@@ -8648,7 +8648,7 @@ describe("native session cancellation", () => {
     await running;
   });
 
-  it("observes cleanup failure after cancellation authority is committed", async () => {
+  it("keeps a failed provider Stop pending and allows it to be retried", async () => {
     state.cancel.mockImplementationOnce(() => ({
       cleanup: Promise.reject(new Error("provider cleanup failed")),
     }));
@@ -8661,10 +8661,27 @@ describe("native session cancellation", () => {
 
     await expect(
       cancelNativeSession(execution.binding.runId, "budget hard stop"),
+    ).rejects.toThrow("provider cleanup failed");
+    await expect(
+      cancelNativeSession(execution.binding.runId, "retry provider Stop"),
     ).resolves.toBe(true);
+    expect(state.cancel).toHaveBeenCalledTimes(2);
 
     state.release?.();
     await running;
+  });
+
+  it("does not acknowledge provider cleanup that exceeds the Stop deadline", async () => {
+    let releaseCleanup!: () => void;
+    state.cancel.mockReturnValueOnce({ cleanup: new Promise<void>(resolve => { releaseCleanup = resolve; }) });
+    const running = executePaperclipNativeSession({ db: leaseDb(), execution, runnerInstanceId: "runner" });
+    await vi.waitFor(() => expect(state.release).toBeTypeOf("function"));
+    try {
+      await expect(cancelNativeSession(execution.binding.runId, "operator Stop")).rejects.toThrow("pending");
+      expect(state.cancel.mock.calls[0]?.[0].signal.aborted).toBe(true);
+      releaseCleanup();
+      await expect(cancelNativeSession(execution.binding.runId, "retry Stop")).resolves.toBe(true);
+    } finally { releaseCleanup(); state.release?.(); await running; }
   });
 
   it("binds cancellation to nativeIssueId and merges metadata under a row lock", async () => {

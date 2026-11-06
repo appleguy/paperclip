@@ -1214,11 +1214,11 @@ describePostgres("heartbeat recovery module ownership", () => {
     }
   });
 
-  it("notifies a replacement after committing the departing controller's released lease", async () => {
+  it.each(["codex_app_server", "claude_interactive_v1", "opencode_shared_v2"])("detaches %s and notifies a replacement without cancelling the provider", async driverKind => {
     const run = await seedRun(), deps = callbacks(db);
     const identity = await currentNativeControllerIdentity();
     await db.update(agents).set({ adapterType: "paperclip_runner" }).where(eq(agents.id, run.agentId));
-    await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: run.issueId }).where(eq(heartbeatRuns.id, run.id));
+    await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: run.issueId, driverKind }).where(eq(heartbeatRuns.id, run.id));
     await db.insert(nativeRunFinalizations).values({ runId: run.id, companyId: run.companyId, issueId: run.issueId!,
       phase: "observed", controllerBootId: identity.bootId, leaseOwner: "departing-server", leaseExpiresAt: new Date(Date.now() + 60_000) });
     const wake = vi.fn(), unsubscribe = subscribeDeliveryWork(db, DELIVERY_QUEUES.nativeProcessSessions, wake);
@@ -1226,6 +1226,10 @@ describePostgres("heartbeat recovery module ownership", () => {
       const before = new Date();
       await createHeartbeatRecovery(db, deps).drainRunningRunsForShutdown("SIGTERM", before, [run.id]);
       expect(native.detach).toHaveBeenCalledWith([run.id]);
+      expect(deps.cancelHeartbeatNativeRun).not.toHaveBeenCalled();
+      expect(deps.terminateHeartbeatRunProcess).not.toHaveBeenCalled();
+      expect(deps.releaseEnvironmentLeasesForRun).not.toHaveBeenCalled();
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0]?.status).toBe("running");
       expect(wake).toHaveBeenCalled();
       const [saved] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, run.id));
       expect(saved.leaseExpiresAt).toEqual(before);

@@ -17,6 +17,10 @@ export interface ClaudeInteractiveNativePort {
   /** Controller-originated task prompt. Delivery is a terminal write attempt, never an acknowledgement. */
   dispatch(input: { id: string; text: string }): Promise<void>;
   waitForReceipt(signal: AbortSignal): Promise<{ result: PrpStructuredRunResult; operationId: string; recordedAt: string }>;
+  /** Explicit Stop only; resolves after the owned provider process has stopped. */
+  stop(): Promise<void>;
+  /** Release the controller without signalling the provider. */
+  detach(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -96,7 +100,7 @@ export class ClaudeInteractiveNativeBackend implements NativeSessionBackend {
     await port.verify();
     input.signal?.throwIfAborted();
     const abort = new AbortController();
-    let started = false;
+    let started = false, cancelled = false, detached = false;
     let releaseStart!: () => void, rejectStart!: (error: unknown) => void;
     const startedGate = new Promise<void>((resolve, reject) => { releaseStart = resolve; rejectStart = reject; });
     void startedGate.catch(() => {});
@@ -107,17 +111,19 @@ export class ClaudeInteractiveNativeBackend implements NativeSessionBackend {
         await startedGate;
         const receipt = await port.waitForReceipt(abort.signal);
         abort.signal.throwIfAborted();
+        if (cancelled || detached) throw new Error("claude_interactive_controller_closed");
         if (!/^[a-f0-9]{64}$/.test(receipt.operationId) || !Number.isFinite(Date.parse(receipt.recordedAt))) throw new Error("claude_interactive_receipt_invalid");
         yield { schema: "paperclip.prp.event.v1", sourceEventId: `claude:${port.identity.runId}:${receipt.operationId}`, sourceSeq: 1,
           sourceInstanceId: port.runnerInstanceId, sourceKind: "runner", runId: port.identity.runId, normalizedSessionId: port.identity.sessionId,
           eventType: "run.result.proposed", schemaVersion: 1, priority: 0, emittedAt: receipt.recordedAt, payload: receipt.result };
       },
       async startTurn({ message }) {
-        if (started || abort.signal.aborted || message.role !== "user") throw new Error("claude_interactive_dispatch_unavailable");
+        if (started || cancelled || abort.signal.aborted || message.role !== "user") throw new Error("claude_interactive_dispatch_unavailable");
         started = true;
         try {
           // A committed result survives controller loss: never re-prompt the session for it.
           const prior = await port.readReceipt();
+          if (cancelled || detached || abort.signal.aborted) throw new Error("claude_interactive_dispatch_unavailable");
           const id = prior ? "work_session_receipt" : `claude_${randomUUID()}`;
           if (!prior) await port.dispatch({ id, text: message.text });
           releaseStart();
@@ -125,10 +131,24 @@ export class ClaudeInteractiveNativeBackend implements NativeSessionBackend {
         } catch (error) { rejectStart(error); throw error; }
       },
       async result() { return null; },
+      cancel() {
+        if (detached) throw new Error("claude_interactive_controller_detached");
+        cancelled = true;
+        return { cleanup: port.stop().then(() => {
+          abort.abort(new Error("claude_interactive_cancelled"));
+          rejectStart(new Error("claude_interactive_cancelled"));
+        }) };
+      },
+      async detachControllerForRestart() {
+        detached = true;
+        await port.detach();
+        abort.abort(new Error("claude_interactive_controller_detached"));
+        rejectStart(new Error("claude_interactive_controller_detached"));
+      },
       async snapshot(): Promise<PersistedNativeSession> {
         return { backendKind: "runner", driverKind: "claude_interactive_v1", sessionId: input.identity.sessionId, identity: { ...input.identity }, providerSessionId: port.nativeSessionId, cursor: null };
       },
-      async close() { abort.abort(new Error("claude_interactive_controller_closed")); rejectStart(new Error("claude_interactive_controller_closed")); await port.close(); },
+      async close() { abort.abort(new Error("claude_interactive_controller_closed")); rejectStart(new Error("claude_interactive_controller_closed")); if (!detached) await port.close(); },
     };
     return session;
   }

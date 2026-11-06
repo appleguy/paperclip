@@ -88,6 +88,16 @@ export async function readOpenCodeHost(db: Db, binding: OpenCodeSharedBinding): 
   });
 }
 
+/** Explicit Stop under the exact current controller's authority. */
+export async function withOpenCodeStopAuthority<T>(db: Db, binding: OpenCodeSharedBinding, stop: (host: SharedHostRecord) => Promise<T>): Promise<T> {
+  // Keep the existing lease/run/task-session locks through provider Stop. A
+  // replacement controller cannot adopt this host between validation and Stop.
+  return withLockedSession(db, binding, async (_tx, _session, _params, native) => {
+    if (native.sessionCreation !== undefined && object(native.sessionCreation).state !== "observed") throw new Error("opencode_creation_unconfirmed");
+    return stop(validateHost(native.host, binding));
+  });
+}
+
 /** Private restoration material, available only to the exact current controller lease. */
 export async function readOpenCodeHostRestoration(db: Db, binding: OpenCodeSharedBinding): Promise<{ host: SharedHostRecord; password: string; proxy: { baseURL: string; token: string } }> {
   return withLockedSession(db, binding, async (tx, _session, _params, native) => {

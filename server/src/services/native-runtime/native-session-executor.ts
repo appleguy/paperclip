@@ -8394,27 +8394,30 @@ async function performNativeCancellation(
               signal: cancellationAbort.signal,
             }).cleanup;
             let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
-            const settled = await Promise.race([
-              cleanup.then(
-                () => true,
-                () => true,
-              ),
-              new Promise<false>((resolve) => {
-                cleanupTimer = setTimeout(
-                  () => resolve(false),
-                  NATIVE_SESSION_CANCELLATION_CLEANUP_GRACE_MS,
-                );
-              }),
-            ]);
-            if (cleanupTimer) clearTimeout(cleanupTimer);
+            let settled: boolean;
+            try {
+              settled = await Promise.race([
+                cleanup.then(() => true),
+                new Promise<false>((resolve) => {
+                  cleanupTimer = setTimeout(
+                    () => resolve(false),
+                    NATIVE_SESSION_CANCELLATION_CLEANUP_GRACE_MS,
+                  );
+                }),
+              ]);
+            } finally {
+              if (cleanupTimer) clearTimeout(cleanupTimer);
+            }
             if (!settled) {
               cancellationAbort.abort(
                 new Error("native session cancellation cleanup timed out"),
               );
               void cleanup.catch(() => undefined);
+              throw new NativeCancellationPendingRecoveryError();
             }
           } else if (active.session.interrupt)
             await active.session.interrupt({ reason });
+          else throw new NativeCancellationPendingRecoveryError();
         } catch (error) {
           active.cancelRequested = false;
           throw error;

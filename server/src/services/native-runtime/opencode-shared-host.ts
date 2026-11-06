@@ -10,7 +10,7 @@ import { createOpenCodeBoundFetch } from "./opencode-bound-fetch.js";
 import { verifyOpenCodeNativeCatalog } from "./opencode-native-catalog.js";
 import { createOpenCodeSharedObserver } from "./opencode-shared-observer.js";
 import { validateOpenCodeLogItem, type OpenCodeSharedBinding } from "./opencode-shared-authority.js";
-import { completeOpenCodeSessionCreation, deliverOpenCodeMcpRestoration, persistOpenCodeHost, readOpenCodeHost, readOpenCodeHostRestoration, reserveOpenCodeMcpRestoration } from "./opencode-shared-recovery.js";
+import { completeOpenCodeSessionCreation, deliverOpenCodeMcpRestoration, persistOpenCodeHost, readOpenCodeHost, readOpenCodeHostRestoration, reserveOpenCodeMcpRestoration, withOpenCodeStopAuthority } from "./opencode-shared-recovery.js";
 import { nativeSha256 } from "./canonical.js";
 import { createOpenCodeManagedMutation } from "./opencode-managed-mutation.js";
 import { createOpenCodeMcpAdmission } from "./opencode-mcp-admission.js";
@@ -80,7 +80,7 @@ export async function startOpenCodeSharedHost(input: { executable: string; dataR
         if (child.exitCode !== null || child.signalCode !== null || !child.kill("SIGTERM")) throw new Error("opencode_host_shutdown_unconfirmed");
         await Promise.race([exited, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("opencode_host_shutdown_timeout")), 5000); })]);
       } finally { if (timer) clearTimeout(timer); await bridge?.close(); await input.onShutdown?.(); }
-    })();
+    })().catch(error => { shuttingDown = undefined; throw error; });
   }
   try {
   child.stderr.resume();
@@ -136,6 +136,21 @@ export async function startOpenCodeSharedHost(input: { executable: string; dataR
   return Object.freeze({
     generation,
     shutdown,
+    async interruptForRun(db: Db, binding: OpenCodeSharedBinding) {
+      return withIngressCheck(async () => {
+        if (binding.generation !== generation || binding.version !== "2.2.5") throw new Error("opencode_host_binding_mismatch");
+        await verifySession(binding.providerSessionId, binding);
+        return withOpenCodeStopAuthority(db, binding, async host => {
+          if (host.pid !== pid || host.port !== port) throw new Error("opencode_host_binding_mismatch");
+          const send = createOpenCodeBoundFetch({ pid, port, isAlive: () => alive, allowInterruptForSession: binding.providerSessionId });
+          const response = await send(`${origin}/api/session/${encodeURIComponent(binding.providerSessionId)}/interrupt`, {
+            method: "POST", headers: { authorization }, signal: AbortSignal.timeout(10_000),
+          });
+          if (!response.ok || (await response.json() as { interrupted?: unknown }).interrupted !== true) throw new Error("opencode_interrupt_unconfirmed");
+          await shutdown();
+        });
+      });
+    },
     verifySession,
     async verifyCatalog(model: string, effort: string) {
       if (!input.provider || `${input.provider.provider}/${input.provider.model}` !== model) throw new Error("opencode_native_catalog_identity_invalid");

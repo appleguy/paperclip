@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { agentTaskSessions, agents, companies, companySecretVersions, heartbeatRuns, issues, nativeRunFinalizations, projects } from "@paperclipai/db";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { describeEmbeddedPostgres, useEmbeddedPostgres } from "../../__tests__/helpers/route-test-harness.js";
 
 const state = vi.hoisted(() => ({ secret: "", controller: { pid: 4, bootId: "boot", processStartedAt: new Date(1) }, created: 0, actualService: null as null | ((db: any) => any) }));
@@ -13,7 +13,7 @@ vi.mock("../secrets.js", () => ({ secretService: (db: unknown) => state.actualSe
   create: async (_company: string, input: { value: string }) => { state.secret = input.value; state.created++; return { id: "secret-ref", latestVersion: 1 }; },
   resolveSecretValue: async () => state.secret,
 }) }));
-import { persistOpenCodeHost, readOpenCodeHost, readOpenCodeHostRestoration, reserveOpenCodeMcpRestoration } from "./opencode-shared-recovery.js";
+import { persistOpenCodeHost, readOpenCodeHost, readOpenCodeHostRestoration, reserveOpenCodeMcpRestoration, withOpenCodeStopAuthority } from "./opencode-shared-recovery.js";
 import { createOpenCodeManagedMutation } from "./opencode-managed-mutation.js";
 
 const binding: OpenCodeSharedBinding = { companyId: "company", projectId: "project", issueId: "issue", agentId: "agent", runId: "run", taskSessionId: "task", normalizedSessionId: "native", runnerInstanceId: "runner", providerSessionId: "ses_test", generation: "generation", epoch: "epoch", version: "2.2.5", model: "model", effort: "high", leaseOwner: "lease", leaseAttempt: 1, controllerBootId: "boot", controllerPid: 4, controllerProcessStartedAt: new Date(1), controllerGeneration: 1 };
@@ -31,6 +31,18 @@ function fixture() {
 }
 beforeEach(() => { state.secret = ""; state.created = 0; state.controller = { pid: 4, bootId: "boot", processStartedAt: new Date(1) }; });
 describe("OpenCode host recovery", () => {
+  it("checks the exact lease and generation before allowing provider Stop", async () => {
+    const f = fixture(), stop = vi.fn(async () => "stopped");
+    await persistOpenCodeHost(f.db, binding, host);
+    expect(await withOpenCodeStopAuthority(f.db, binding, stop)).toBe("stopped");
+    expect(stop).toHaveBeenCalledWith(expect.objectContaining({ pid: host.pid, generation: host.generation }));
+    stop.mockClear();
+    f.changeGeneration();
+    await expect(withOpenCodeStopAuthority(f.db, binding, stop)).rejects.toThrow("binding_mismatch");
+    f.expire();
+    await expect(withOpenCodeStopAuthority(f.db, binding, stop)).rejects.toThrow("lease_lost");
+    expect(stop).not.toHaveBeenCalled();
+  });
   it("recovers an encrypted-secret reference and identity after controller memory is lost", async () => {
     const f = fixture(); await persistOpenCodeHost(f.db, binding, host);
     expect(JSON.stringify(f.params)).not.toContain(host.password);
@@ -135,6 +147,14 @@ describeEmbeddedPostgres("OpenCode host recovery lease transaction", () => {
       await persistOpenCodeHost(ctx.db, b, host);
       const restored = await readOpenCodeHost(ctx.db, b);
       expect(restored.host.generation).toBe(b.generation); expect(restored.password).toBe(host.password);
+      await withOpenCodeStopAuthority(ctx.db, b, async stoppingHost => {
+        expect(stoppingHost.pid).toBe(host.pid);
+        // A replacement cannot take ownership while the provider Stop is in flight.
+        await expect(ctx.db.transaction(async tx => {
+          await tx.execute(sql`set local lock_timeout = '100ms'`);
+          await tx.update(nativeRunFinalizations).set({ leaseOwner: "successor" }).where(eq(nativeRunFinalizations.runId, runId));
+        })).rejects.toThrow();
+      });
       const encrypted = await ctx.db.select().from(companySecretVersions);
       expect(JSON.stringify(encrypted)).not.toContain(host.password);
       await expect(readOpenCodeHost(ctx.db, { ...b, leaseOwner: "foreign" })).rejects.toThrow("lease_lost");
