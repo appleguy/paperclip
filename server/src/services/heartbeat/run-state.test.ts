@@ -397,6 +397,26 @@ describePostgres("heartbeat run state database wiring", () => {
     expect(await state.listRuns(companyId, foreign.agent.id)).toEqual([]);
   });
 
+  it("pages a bounded cohort across equal and sub-millisecond timestamps without crossing companies", async () => {
+    const { companyId, agent, state } = await fixture();
+    const foreign = await fixture();
+    await db.execute(sql`insert into heartbeat_runs (company_id, agent_id, created_at)
+      values (${companyId}::uuid, ${agent.id}::uuid, '2026-01-01T00:00:00Z'),
+             (${companyId}::uuid, ${agent.id}::uuid, '2026-01-01T00:00:00.000001Z'),
+             (${companyId}::uuid, ${agent.id}::uuid, '2026-01-01T00:00:00.000001Z'),
+             (${companyId}::uuid, ${agent.id}::uuid, '2026-01-02T00:00:00Z'),
+             (${foreign.companyId}::uuid, ${foreign.agent.id}::uuid, '2026-01-01T00:00:00Z')`);
+    const options = { createdFrom: new Date('2026-01-01T00:00:00Z'), createdBefore: new Date('2026-01-02T00:00:00Z') };
+    const all = await state.listRuns(companyId, undefined, 10, options);
+    const page1 = await state.listRuns(companyId, undefined, 1, options);
+    const page2 = await state.listRuns(companyId, undefined, 1, { ...options, beforeId: page1[0].id });
+    const page3 = await state.listRuns(companyId, undefined, 1, { ...options, beforeId: page2[0].id });
+    const page4 = await state.listRuns(companyId, undefined, 1, { ...options, beforeId: page3[0].id });
+    expect(all).toHaveLength(3);
+    expect([...page1, ...page2, ...page3].map(row => row.id)).toEqual(all.map(row => row.id));
+    expect(page4).toEqual([]);
+  });
+
   it("preserves legacy context text, native issue precedence and summary privacy", async () => {
     const { companyId, agent, issue, state } = await fixture();
     const contexts: unknown[] = [null, [], "legacy", 3, true, {}, {

@@ -326,6 +326,17 @@ describeEmbeddedPostgres("heartbeat run privacy routes", { concurrent: false }, 
     expect(summarizedStub).toMatchObject({ redacted: true, durationMs: 60_000, costUsd: 0.42 });
     expect(summarizedStub.usageJson).toMatchObject({ inputTokens: 11, outputTokens: 7 });
 
+    const bounds = "createdFrom=2000-01-01T00%3A00%3A00Z&createdBefore=2100-01-01T00%3A00%3A00Z";
+    const boundedHistory = await request(app).get(`/api/companies/${fixture.companyId}/heartbeat-runs?${bounds}&limit=1`);
+    expect(boundedHistory.status).toBe(200);
+    const boundedNext = await request(app).get(`/api/companies/${fixture.companyId}/heartbeat-runs?${bounds}&limit=1&beforeId=${boundedHistory.body[0].id}`);
+    expect(boundedNext.status).toBe(200);
+    const boundedPrivate = [...boundedHistory.body, ...boundedNext.body].find((run: { id: string }) => run.id === fixture.privateRunId);
+    expect(boundedPrivate).toMatchObject({ redacted: true });
+    expect(boundedPrivate).not.toHaveProperty("contextSnapshot");
+    expect((await request(app).get(`/api/companies/${fixture.companyId}/heartbeat-runs?createdFrom=invalid`)).status).toBe(400);
+    expect((await request(app).get(`/api/companies/${fixture.companyId}/heartbeat-runs?${bounds}&beforeId=not-a-uuid`)).status).toBe(400);
+
     const live = await request(app).get(`/api/companies/${fixture.companyId}/live-runs`);
     expect(live.status).toBe(200);
     expect(live.body[0]).toMatchObject({ id: fixture.privateRunId, redacted: true, costUsd: 0.42 });

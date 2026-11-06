@@ -7138,7 +7138,33 @@ export function agentRoutes(
       ? Math.max(1, Math.min(HEARTBEAT_RUN_LIST_MAX_LIMIT, parseInt(limitParam, 10) || HEARTBEAT_RUN_LIST_DEFAULT_LIMIT))
       : HEARTBEAT_RUN_LIST_DEFAULT_LIMIT;
     const summary = req.query.summary === "true" || req.query.summary === "1";
-    const recentRuns = await heartbeat.list(companyId, agentId, limit, { summary });
+    const bounded = req.query.createdFrom !== undefined || req.query.createdBefore !== undefined || req.query.beforeId !== undefined;
+    let createdFrom: Date | undefined;
+    let createdBefore: Date | undefined;
+    let beforeId: string | undefined;
+    if (bounded) {
+      const from = req.query.createdFrom;
+      const before = req.query.createdBefore;
+      const cursor = req.query.beforeId;
+      const iso = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?(?:Z|[+-]\d\d:\d\d)$/;
+      if (typeof from !== "string" || typeof before !== "string" || !iso.test(from) || !iso.test(before)) throw badRequest("createdFrom and createdBefore must be ISO timestamps with timezone");
+      createdFrom = new Date(from);
+      createdBefore = new Date(before);
+      if (!Number.isFinite(createdFrom.getTime()) || !Number.isFinite(createdBefore.getTime()) || createdFrom >= createdBefore) throw badRequest("Invalid created-time range");
+      if (req.query.latestFailuresOnly === "true") throw badRequest("latestFailuresOnly cannot be combined with bounded pagination");
+      if (cursor !== undefined) {
+        if (typeof cursor !== "string" || cursor !== cursor.trim() || !isUuidLike(cursor)) throw badRequest("Invalid beforeId");
+        const [anchor] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+          eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, cursor),
+          agentId ? eq(heartbeatRuns.agentId, agentId) : undefined,
+          sql`${heartbeatRuns.createdAt} >= ${createdFrom.toISOString()}::timestamptz`,
+          sql`${heartbeatRuns.createdAt} < ${createdBefore.toISOString()}::timestamptz`,
+        )).limit(1);
+        if (!anchor) throw badRequest("beforeId is not in this cohort");
+        beforeId = cursor;
+      }
+    }
+    const recentRuns = await heartbeat.list(companyId, agentId, limit, { summary, createdFrom, createdBefore, beforeId });
     const runs = req.query.latestFailuresOnly === "true" ? latestFailedRunsByAgent(recentRuns) : recentRuns;
     const readDecisions = await getHeartbeatRunReadDecisions(db, access, req.actor, runs);
     res.json(await runRedactions.redactForRuns(companyId, runs.map((run, index) =>

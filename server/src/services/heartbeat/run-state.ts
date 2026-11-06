@@ -1859,7 +1859,7 @@ export function createHeartbeatRunState(db: Db) {
       companyId: string,
       agentId?: string,
       limit?: number,
-      options: { summary?: boolean } = {},
+      options: { summary?: boolean; createdFrom?: Date; createdBefore?: Date; beforeId?: string } = {},
     ) => {
       const safeForLegacyEncoding = await hasUnsafeTextProjectionDatabase();
       const summary = options.summary === true;
@@ -1885,15 +1885,14 @@ export function createHeartbeatRunState(db: Db) {
           )
           .from(heartbeatRuns)
           .leftJoin(heartbeatRunListContextRecord, sql`true`)
-          .where(
-            agentId
-              ? and(
-                  eq(heartbeatRuns.companyId, companyId),
-                  eq(heartbeatRuns.agentId, agentId),
-                )
-              : eq(heartbeatRuns.companyId, companyId),
-          )
-          .orderBy(desc(heartbeatRuns.createdAt));
+          .where(and(
+            eq(heartbeatRuns.companyId, companyId),
+            agentId ? eq(heartbeatRuns.agentId, agentId) : undefined,
+            options.createdFrom ? sql`${heartbeatRuns.createdAt} >= ${options.createdFrom.toISOString()}::timestamptz` : undefined,
+            options.createdBefore ? sql`${heartbeatRuns.createdAt} < ${options.createdBefore.toISOString()}::timestamptz` : undefined,
+            options.beforeId ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) < (select created_at, id from heartbeat_runs where company_id = ${companyId}::uuid and id = ${options.beforeId}::uuid)` : undefined,
+          ))
+          .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id));
 
         const boundedLimit = Number.isFinite(limit)
           ? Math.max(1, Math.min(HEARTBEAT_RUN_LIST_MAX_LIMIT, Math.trunc(limit!)))
