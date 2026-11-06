@@ -1303,6 +1303,17 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
       res.status(404).json({ error: "Company not found" });
       return;
     }
+    // The status transaction fences admission first. Deliver explicit Stop
+    // directly: the lifecycle worker may be suspended by an idle task drain.
+    // Repeated pause requests also retry any provider stop still pending.
+    if (body.status === "paused") {
+      const companyAgents = await db.select({ id: agentsTable.id }).from(agentsTable)
+        .where(eq(agentsTable.companyId, companyId));
+      await heartbeatService(db).cancelInvocationsForAgents(
+        companyAgents.map(agent => agent.id),
+        "Company paused by a board operator",
+      );
+    }
     if (!lifecycleEventEmittedByService) {
       await logActivity(db, {
         companyId,

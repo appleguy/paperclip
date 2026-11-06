@@ -36,6 +36,7 @@ const mockCompanyArtifactsService = vi.hoisted(() => ({
 }));
 
 const mockLogActivity = vi.hoisted(() => vi.fn());
+const mockCancelInvocations = vi.hoisted(() => vi.fn());
 const mockFeedbackService = vi.hoisted(() => ({
   listIssueVotesForUser: vi.fn(),
   listFeedbackTraces: vi.fn(),
@@ -51,6 +52,7 @@ vi.mock("../services/index.js", () => ({
   companyPortabilityService: () => mockCompanyPortabilityService,
   companyService: () => mockCompanyService,
   feedbackService: () => mockFeedbackService,
+  heartbeatService: () => ({ cancelInvocationsForAgents: mockCancelInvocations }),
   instanceSettingsService: () => ({
     getExperimental: vi.fn(),
   }),
@@ -76,7 +78,9 @@ function createCompany() {
   };
 }
 
-async function createApp(actor: Record<string, unknown>) {
+async function createApp(actor: Record<string, unknown>, db: unknown = {
+  select: () => ({ from: () => ({ where: async () => [] }) }),
+}) {
   const [{ companyRoutes }, { errorHandler }] = await Promise.all([
     vi.importActual<typeof import("../routes/companies.js")>("../routes/companies.js"),
     vi.importActual<typeof import("../middleware/index.js")>("../middleware/index.js"),
@@ -87,7 +91,7 @@ async function createApp(actor: Record<string, unknown>) {
     (req as any).actor = actor;
     next();
   });
-  app.use("/api/companies", companyRoutes({} as any));
+  app.use("/api/companies", companyRoutes(db as any));
   app.use(errorHandler);
   return app;
 }
@@ -99,6 +103,32 @@ describe("PATCH /api/companies/:companyId/branding", () => {
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
     vi.clearAllMocks();
+  });
+
+  it.each(["active", "paused"])("delivers provider Stop after persisting company pause from %s", async status => {
+    mockCompanyService.getById.mockResolvedValue({ ...createCompany(), status });
+    mockCompanyService.update.mockResolvedValue({ ...createCompany(), status: "paused" });
+    const where = vi.fn(async () => {
+      expect(mockCompanyService.update).toHaveBeenCalledOnce();
+      return [{ id: "opencode-agent" }, { id: "codex-agent" }, { id: "claude-agent" }];
+    });
+    const db = { select: vi.fn(() => ({ from: vi.fn(() => ({ where })) })) };
+    const app = await createApp({ type: "board", userId: "user-1", source: "local_implicit" }, db);
+    const res = await request(app).patch("/api/companies/company-1").send({ status: "paused" });
+    expect(res.status).toBe(200);
+    expect(where).toHaveBeenCalledOnce();
+    expect(mockCancelInvocations).toHaveBeenCalledWith(
+      ["opencode-agent", "codex-agent", "claude-agent"], "Company paused by a board operator",
+    );
+  });
+
+  it("does not interrupt providers for an ordinary company edit", async () => {
+    mockCompanyService.getById.mockResolvedValue(createCompany());
+    mockCompanyService.update.mockResolvedValue(createCompany());
+    const app = await createApp({ type: "board", userId: "user-1", source: "local_implicit" });
+    const res = await request(app).patch("/api/companies/company-1").send({ description: "Edited" });
+    expect(res.status).toBe(200);
+    expect(mockCancelInvocations).not.toHaveBeenCalled();
   });
 
   it("rejects non-CEO agent callers", async () => {

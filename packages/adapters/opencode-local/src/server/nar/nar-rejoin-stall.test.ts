@@ -128,6 +128,17 @@ describe("NAR rejoin stall watchdog", () => {
     }
   });
 
+  it("detaches a rejoined turn for server restart without interrupting the provider", async () => {
+    const controller = new AbortController();
+    const { res } = await run({ signal: controller.signal, rejoinStallMs: 60_000 }, line => {
+      if (line.includes("nar_rejoin")) setTimeout(() => controller.abort(new Error("Interrupted by graceful server shutdown")), 0);
+    });
+    expect(d.interrupts).toBe(0);
+    expect(d.inflight).toBe(messageIdFor(narOpIdFor("run-1")));
+    expect(res.providerTermination).toBeUndefined();
+    expect(res.executionRecovery).toMatchObject({ providerWorkStarted: true, reason: "aborted" });
+  });
+
   it.each([true, false])("requires target proof after an uncertain interrupt (verified: %s)", async verified => {
     d.interruptResult = "uncertain";
     d.verified = verified;

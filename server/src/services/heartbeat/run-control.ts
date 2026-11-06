@@ -1713,7 +1713,14 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         ),
       );
 
-    for (const run of runs) await cancelRunInternal(run.id, reason, { errorCode });
+    const failures: unknown[] = [];
+    for (const run of runs) {
+      try { await cancelRunInternal(run.id, reason, { errorCode }); }
+      catch (error) { failures.push(error); }
+    }
+    // A provider with an uncertain Stop must not prevent the other runs from
+    // receiving their own Stop. Preserve the original pending/error response.
+    if (failures.length) throw failures[0];
 
     return runs.length;
   }
@@ -1760,13 +1767,16 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       (agentId) => agentId.length > 0,
     );
     let runsCancelled = 0;
+    const failures: unknown[] = [];
     for (const agentId of uniqueAgentIds) {
-      runsCancelled += await cancelActiveForAgentInternal(agentId, reason);
+      try { runsCancelled += await cancelActiveForAgentInternal(agentId, reason); }
+      catch (error) { failures.push(error); }
     }
     const wakeupsCancelled = await cancelPendingWakeupsForAgentsInternal(
       uniqueAgentIds,
       reason,
     );
+    if (failures.length) throw failures[0];
     return {
       agentIds: uniqueAgentIds,
       runsCancelled,

@@ -141,6 +141,29 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
   let db: Db;
   const { fixture, liveRun } = setupRunControlDatabase("paperclip-heartbeat-run-control-module", value => { db = value; });
 
+  it("delivers the rest of a company pause despite a pending provider Stop and suppressed scheduling", async () => {
+    const { company, agent } = await fixture();
+    await db.update(agents).set({ adapterType: "opencode_local" }).where(eq(agents.id, agent.id));
+    const [claude] = await db.insert(agents).values({ companyId: company.id, name: "Claude", adapterType: "claude_local" }).returning();
+    const [codex] = await db.insert(agents).values({ companyId: company.id, name: "Codex", adapterType: "codex_local" }).returning();
+    const runs = await db.insert(heartbeatRuns).values([
+      { companyId: company.id, agentId: agent.id, status: "running", runtimeMode: "legacy", runtimeModeResolvedAt: new Date() },
+      { companyId: company.id, agentId: agent.id, status: "queued", runtimeMode: "legacy", runtimeModeResolvedAt: new Date() },
+      { companyId: company.id, agentId: claude.id, status: "queued", runtimeMode: "legacy", runtimeModeResolvedAt: new Date() },
+      { companyId: company.id, agentId: codex.id, status: "queued", runtimeMode: "legacy", runtimeModeResolvedAt: new Date() },
+    ]).returning();
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId: company.id, agentId: agent.id, source: "assignment", status: "queued" }).returning();
+    const deps = callbacks(db);
+    deps.getSchedulingSuppression.mockResolvedValue({ suppressed: true });
+    await expect(createHeartbeatRunControl(db, deps).cancelInvocationsForAgentsInternal(
+      [agent.id, claude.id, codex.id], "Company paused by a board operator",
+    )).rejects.toThrow();
+    const persisted = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.id, runs.map(run => run.id)));
+    expect(runs.map(run => persisted.find(row => row.id === run.id)?.status)).toEqual(["running", "cancelled", "cancelled", "cancelled"]);
+    expect(persisted.find(run => run.id === runs[0]!.id)?.resultJson).toMatchObject({ executionCancellation: { state: "requested" } });
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id)))[0]?.status).toBe("cancelled");
+  });
+
   it("records Stop without finalizing an OpenCode run whose controller is missing", async () => {
     const { company, agent } = await fixture();
     await db.update(agents).set({ adapterType: "opencode_local" }).where(eq(agents.id, agent.id));
