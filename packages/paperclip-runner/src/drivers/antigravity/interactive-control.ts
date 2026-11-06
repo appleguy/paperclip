@@ -59,6 +59,7 @@ export class AntigravityInteractiveControl {
 
   static async open(input: {
     socket: string; session: string; stateDir: string; cwd: string; tmpDir: string; executable: string; model: string;
+    remoteControlName?: string;
     rejoinOnly: boolean; requireNew?: boolean; expectedRemoteControlUrl?: string; expectedSeat?: { paneId: string; panePid: string }; conversationId?: string; authorize: (operationId: string) => boolean; tmux?: Tmux;
     wait?: (ms: number) => Promise<void>; startupTimeoutMs?: number;
   }): Promise<AntigravityInteractiveControl> {
@@ -74,7 +75,8 @@ export class AntigravityInteractiveControl {
       await fs.mkdir(input.tmpDir, { recursive: true, mode: 0o700 });
       await fs.mkdir(input.stateDir, { recursive: true, mode: 0o700 });
       await tmux(["new-session", "-d", "-s", input.session, "-c", input.cwd, "-e", `TMPDIR=${input.tmpDir}`,
-        input.executable, "--remote-control", "--dangerously-skip-permissions", "--model", input.model,
+        input.executable, "--remote-control", ...(input.remoteControlName ? ["--remote-control-name", input.remoteControlName] : []),
+        "--dangerously-skip-permissions", "--model", input.model,
         ...(input.conversationId ? ["--conversation", input.conversationId] : [])]);
     }
     const wait = input.wait ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));

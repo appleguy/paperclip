@@ -15,6 +15,8 @@ import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclip
 import { readableRuntimePath } from "@paperclipai/adapter-utils/readable-runtime-paths";
 import { AntigravityInteractiveControl, AntigravityInteractiveRun } from "../../vendor/paperclip-runner/live/index.js";
 import { parseHeartbeatPolicy } from "../../services/heartbeat/timer-policy.js";
+import { cleanDisplayName, modelEffortName, stripModelEffortWords } from "../../services/native-runtime/model-effort-name.js";
+import { sanitizeRcName, slotRcName } from "../claude-rc/rc-name.js";
 import { AGY_HOST_ADMISSION, claimAgyHostAdmission, isAgyAdmissionIdle, isAgyHostLimitedModel } from "./admission.js";
 import { assertAssembledPrompt, preflightSessionPrompt, applyPromptRotation } from "@paperclipai/adapter-utils/token-preflight";
 import {
@@ -48,6 +50,12 @@ function modelLabel(model: string): string {
   const i = model.lastIndexOf("-");
   const tier = model.slice(i + 1);
   return `${MODEL_FAMILIES[model.slice(0, i)] ?? model} ${tier.charAt(0).toUpperCase()}${tier.slice(1)}`;
+}
+export function agyRcName(agentName: string, model: string, slot: number): string {
+  const effort = model.match(/-(low|medium|high|xhigh|max)$/i)?.[1];
+  const tag = modelEffortName("agy", model, effort);
+  const agent = stripModelEffortWords(cleanDisplayName(agentName), "agy", model, effort) || "Agent";
+  return slotRcName(sanitizeRcName(`${tag ? `${tag} ` : ""}${agent}`), slot);
 }
 const ID = /^[a-zA-Z0-9_-]{1,55}$/;
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
@@ -569,7 +577,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ownedRunId = adopted?.runId ?? ctx.runId;
     ctx.signal?.throwIfAborted();
     control = await AntigravityInteractiveControl.open({ socket, session, cwd, stateDir,
-      tmpDir: agentTmpDir(socket, session), executable: AGY, model, rejoinOnly: Boolean(adopted),
+      tmpDir: agentTmpDir(socket, session), executable: AGY, model,
+      remoteControlName: agyRcName(ctx.agent.name, model, claimed.slot.index), rejoinOnly: Boolean(adopted),
       expectedRemoteControlUrl: adopted?.rcUrl,
       ...(adopted?.paneId && adopted.panePid ? { expectedSeat: { paneId: adopted.paneId, panePid: adopted.panePid } } : {}),
       authorize: operationId => operationId === ownedRunId && !ctx.signal?.aborted,

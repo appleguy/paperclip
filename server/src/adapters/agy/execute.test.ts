@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { adoptableActive, inputGuard, isEmptyInputBox, normalizeOneLine, parseReceipt, parseRemoteUrl, parseRemoteConversationId, pasteSettleMs, resolveAgyModel, needsCompaction, AGY_CONTEXT_LIMIT_TOKENS } from "./execute.js";
+import { adoptableActive, agyRcName, inputGuard, isEmptyInputBox, normalizeOneLine, parseReceipt, parseRemoteUrl, parseRemoteConversationId, pasteSettleMs, resolveAgyModel, needsCompaction, AGY_CONTEXT_LIMIT_TOKENS } from "./execute.js";
 
 describe("agy single-RC dispatch safety", () => {
   it("parses shared /r/ base URL and drops conversation query", () => {
@@ -142,6 +142,11 @@ describe("agy 200k context cap", () => {
 });
 
 describe("resolveAgyModel", () => {
+  it("puts the model and effort before the seat name and keeps the slot distinct", () => {
+    expect(agyRcName("Flash Worker Low", "gemini-3.8-flash-low", 0)).toBe("GF@L Worker");
+    expect(agyRcName("Argon Worker", "gemini-4-argon-high", 2)).toBe("Ar@H Worker s2");
+    expect(agyRcName("Claude Sonnet Worker", "claude-sonnet-5-5-medium", 0)).toBe("S@M Claude Worker");
+  });
   it("defaults to flash-low and accepts Flash, Argon and Claude-via-agy tiers", () => {
     expect(resolveAgyModel(undefined)).toBe("gemini-3.8-flash-low");
     for (const m of ["gemini-3.8-flash-low", "gemini-3.8-flash-medium", "gemini-3.8-flash-high", "gemini-4-argon-high", "claude-opus-5-5-high", "claude-sonnet-5-5-medium"]) expect(resolveAgyModel(m)).toBe(m);

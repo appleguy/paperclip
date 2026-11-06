@@ -21,14 +21,17 @@ describe("Antigravity interactive seat", () => {
     };
     const options = { socket: "socket", session: "seat", stateDir: path.join(root, "state"),
       cwd: path.join(root, "workspace"), tmpDir: path.join(root, "tmp"), executable: "/opt/homebrew/bin/agy",
-      model: "gemini-4-argon-high", authorize: () => true, tmux };
+      model: "gemini-4-argon-high", remoteControlName: "Ar@H Worker s1", authorize: () => true, tmux };
     try {
       await expect(AntigravityInteractiveControl.open({ ...options, rejoinOnly: true })).rejects.toThrow(/reconcile/);
       expect(calls.some(args => args[0] === "new-session")).toBe(false);
       const control = await AntigravityInteractiveControl.open({ ...options, rejoinOnly: false });
       expect(control.remoteControlUrl).toBe("https://antigravity.google.com/r/seat-1");
       expect(calls.find(args => args[0] === "new-session")).toEqual(["new-session", "-d", "-s", "seat", "-c", options.cwd,
-        "-e", `TMPDIR=${options.tmpDir}`, options.executable, "--remote-control", "--dangerously-skip-permissions", "--model", options.model]);
+        "-e", `TMPDIR=${options.tmpDir}`, options.executable, "--remote-control", "--remote-control-name", options.remoteControlName,
+        "--dangerously-skip-permissions", "--model", options.model]);
+      await AntigravityInteractiveControl.open({ ...options, rejoinOnly: true, remoteControlName: "Ar@L Changed" });
+      expect(calls.filter(args => args[0] === "new-session")).toHaveLength(1);
     } finally { await rm(root, { recursive: true, force: true }); }
   });
 
