@@ -82,6 +82,7 @@ const mockBudgetService = vi.hoisted(() => ({
 
 const mockHeartbeatService = vi.hoisted(() => ({
   cancelActiveForAgent: vi.fn(),
+  getRun: vi.fn(),
 }));
 
 const mockIssueApprovalService = vi.hoisted(() => ({
@@ -349,6 +350,27 @@ function resetMockDefaults() {
 describe("agent cross-tenant route authorization", () => {
   beforeEach(() => {
     resetMockDefaults();
+  });
+
+  it("denies OpenCode held-turn inspection to agents and cross-company Board actors", async () => {
+    const runId = "44444444-4444-4444-8444-444444444444";
+    const agentApp = await createApp({ type: "agent", agentId, companyId });
+    const agentResponse = await requestApp(agentApp, baseUrl => request(baseUrl).get(`/api/heartbeat-runs/${runId}/opencode-held-turn`));
+    expect(agentResponse.status).toBe(403);
+    expect(mockHeartbeatService.getRun).not.toHaveBeenCalled();
+
+    mockHeartbeatService.getRun.mockResolvedValue({ id: runId, companyId, agentId });
+    const boardApp = await createApp({ type: "board", userId: "other", companyIds: [], source: "session" });
+    const boardResponse = await requestApp(boardApp, baseUrl => request(baseUrl).get(`/api/heartbeat-runs/${runId}/opencode-held-turn`));
+    expect(boardResponse.status).toBe(404);
+    expect(mockAgentService.getById).not.toHaveBeenCalled();
+
+    mockHeartbeatService.getRun.mockResolvedValue({ id: runId, companyId, agentId, scopeKind: "company", runtimeMode: "legacy", status: "running" });
+    const allowedBoard = await createApp({ type: "board", userId: "owner", source: "local_implicit" });
+    const allowedResponse = await requestApp(allowedBoard, baseUrl => request(baseUrl).get(`/api/heartbeat-runs/${runId}/opencode-held-turn`));
+    expect(allowedResponse.status).toBe(200);
+    expect(allowedResponse.headers["cache-control"]).toBe("no-store");
+    expect(allowedResponse.body).toEqual({ state: "unverified", reason: "run_not_eligible", terminalizationAuthorized: false });
   });
 
   it("enforces company boundaries before mutating or reading agent keys", async () => {

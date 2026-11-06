@@ -281,6 +281,7 @@ import { DEFAULT_GEMINI_LOCAL_MODEL } from "@paperclipai/adapter-gemini-local";
 import { DEFAULT_KIMI_LOCAL_MODEL } from "@paperclipai/adapter-kimi-local";
 import { DEFAULT_OPENCODE_LOCAL_MODEL } from "@paperclipai/adapter-opencode-local";
 import { requireOpenCodeModelId } from "@paperclipai/adapter-opencode-local/server";
+import { inspectHeldOpenCodeRun } from "../services/opencode-held-turn-inspection.js";
 import {
   loadDefaultAgentInstructionsBundle,
   resolveDefaultAgentInstructionsBundleRole,
@@ -7313,6 +7314,23 @@ export function agentRoutes(
       ),
       req.actor.type === "board" ? getActorInfo(req).actorId : null,
     ));
+  });
+
+  // This is a bounded read-only observation, not a Stop or a recovery decision.
+  router.get("/heartbeat-runs/:runId/opencode-held-turn", async (req, res) => {
+    assertBoard(req);
+    const runId = readHeartbeatRunId(req);
+    const run = await getAccessibleResource(req, res, heartbeat.getRun(runId), "Heartbeat run not found");
+    if (!run) return;
+    if (!(await assertRunTelemetryReadAllowed(req, res, run.companyId))) return;
+    if (!(await assertRunReadAllowed(req, res, run))) return;
+    const agent = await svc.getById(run.agentId);
+    res.set("Cache-Control", "no-store");
+    const observation = await inspectHeldOpenCodeRun({ run, agent,
+      loadRun: async () => (await heartbeat.getRun(runId)) ?? null,
+      loadAgent: async () => (await svc.getById(run.agentId)) ?? null,
+    });
+    res.json({ ...observation, terminalizationAuthorized: false });
   });
 
   router.post("/heartbeat-runs/:runId/cancel", async (req, res) => {
