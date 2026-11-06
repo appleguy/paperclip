@@ -57,9 +57,11 @@ export interface BuildNativeExecutionInput {
     identifier: string | null;
     title: string;
     description: string | null;
+    status?: string | null;
     workMode: string;
   };
   taskPrompt: string;
+  zero?: boolean;
   initialCommunicationGuidance?: string | null;
   /** Bounded, redacted background restored only after a fresh provider bootstrap. */
   freshSessionHandoff?: string | null;
@@ -145,6 +147,29 @@ export interface BuildNativeExecutionInput {
     sources?: Array<{ id: string; source: NativeCompletionSource }>;
   };
   runtimeContext: NativeRuntimeContextSnapshot;
+}
+/** Render only facts already supplied to the native input constructor. */
+export function renderZeroFactsInput(input: Pick<BuildNativeExecutionInput, "issue" | "wakePayload" | "workspace">): string {
+  const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const wake = record(input.wakePayload);
+  const continuation = record(wake.executionContinuation);
+  const lines: string[] = [];
+  const issue = [input.issue.identifier, input.issue.title].filter((value) => typeof value === "string" && value.length > 0).join(" ");
+  if (issue) lines.push(`Issue: ${issue}`);
+  if (input.issue.status) lines.push(`Status: ${input.issue.status}`);
+  if (input.issue.description) lines.push(`Description: ${input.issue.description}`);
+  if (typeof wake.reason === "string" && wake.reason.length) lines.push(`Wake: ${wake.reason}`);
+  const comments = Array.isArray(wake.comments) ? [...wake.comments].reverse().flatMap((value) => {
+    const comment = record(value);
+    const author = record(comment.author);
+    const parts = [comment.authorType, author.id].filter((part): part is string => typeof part === "string" && part.length > 0);
+    if (typeof comment.body === "string" && comment.body.length > 0) parts.push(comment.body);
+    return parts.length ? [parts.join(" ")] : [];
+  }) : [];
+  if (comments.length) lines.push(`Comments:\n${comments.join("\n")}`);
+  if (typeof continuation.completedWork === "string" && continuation.completedWork.length) lines.push(`Continuation: ${continuation.completedWork}`);
+  if (input.workspace.cwd) lines.push(`Workspace: ${input.workspace.cwd}`);
+  return lines.join("\n\n");
 }
 export function buildNativeExecutionInput(input: BuildNativeExecutionInput & { provider: "muse"; museBinding: MuseBindingSnapshot }): NativeExecutionInputV8;
 export function buildNativeExecutionInput(input: BuildNativeExecutionInput & { provider: "antigravity_headless" }): NativeExecutionInputV11;
@@ -241,7 +266,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
   const externalChatSkillDescription = configuredGitHubSkills.length > 0
     ? `Configured GitHub instruction skills:\n${configuredGitHubSkills.map((skill) => `/${skill.runtimeName}`).join("\n")}`
     : null;
-  const taskPrompt = caseProjectionBootstrapPrefix(input.caseContext) + [
+  const taskPrompt = input.zero ? renderZeroFactsInput(input) : caseProjectionBootstrapPrefix(input.caseContext) + [
     wakePrompt,
     // Durable task questions must survive the current provider turn.
     // Keep routing visible before deferred tool discovery; usage belongs in the tool schema.
@@ -275,7 +300,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
       initialCommunicationGuidance: [input.initialCommunicationGuidance, input.freshSessionHandoff].filter(Boolean).join("\n\n"),
     } : {}),
     ...(input.resumedSession && input.previousTurn && !input.conversationMode ? {
-      continuationPrompt: buildNativeContinuationPrompt({
+      continuationPrompt: input.zero ? taskPrompt : buildNativeContinuationPrompt({
         wakePayload: input.wakePayload,
         previousRunId: input.previousTurn.runId,
         previousIssue: input.previousTurn.task,

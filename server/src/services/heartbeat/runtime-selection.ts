@@ -804,6 +804,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
               agentKeyId: agentIdentity?.keyId,
               companyId: agent.companyId,
               runId: run.id,
+              zero: parseObject(agent.adapterConfig).promptMode === "zero",
               issue: nativeReviewRequest ? { ...issueRef, title: `Review: ${issueRef.title}`, description: nativeReviewRequest } : issueRef,
               taskPrompt: [
                 nativeReviewRequest ?? readNonEmptyString(
