@@ -1,0 +1,123 @@
+import { execFile } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { promisify } from "node:util";
+
+const exec = promisify(execFile);
+const idPattern = /^[a-zA-Z0-9_-]{1,55}$/;
+const remotePattern = /https:\/\/antigravity\.google\.com\/r\/[a-zA-Z0-9-]+/;
+type Tmux = (args: string[]) => Promise<string>;
+
+export function emptyAgyEditor(screen: string): boolean {
+  const lines = screen.replace(/\r/g, "").trimEnd().split("\n").slice(-35);
+  const borders = lines.flatMap((line, i) => /^\s*[─━═]{6,}\s*$/.test(line) ? [i] : []);
+  for (let i = borders.length - 1; i > 0; i--) {
+    const bottom = borders[i]!;
+    if (lines.length - bottom > 10) return false;
+    const editor = lines.slice(borders[i - 1]! + 1, bottom).filter(line => line.trim() !== "");
+    if (!/^\s*>/.test(editor[0] ?? "")) continue;
+    return editor.length === 1 && /^\s*>\s*$/.test(editor[0]!);
+  }
+  return false;
+}
+
+/** An existing seat is usable only while its exact pane and process remain present.
+ * The caller holds the seat lock and reconciles any prior dispatched turn. */
+export class AntigravityInteractiveControl {
+  private constructor(private readonly input: {
+    socket: string; session: string; stateDir: string; paneId: string; panePid: string;
+    tmux: Tmux; authorize: (operationId: string) => boolean;
+  }, readonly remoteControlUrl: string) {}
+
+  static async open(input: {
+    socket: string; session: string; stateDir: string; cwd: string; tmpDir: string; executable: string; model: string;
+    rejoinOnly: boolean; expectedRemoteControlUrl?: string; authorize: (operationId: string) => boolean; tmux?: Tmux;
+    wait?: (ms: number) => Promise<void>; startupTimeoutMs?: number;
+  }): Promise<AntigravityInteractiveControl> {
+    if (!idPattern.test(input.socket) || !idPattern.test(input.session) ||
+      ![input.stateDir, input.cwd, input.tmpDir, input.executable].every(path.isAbsolute) ||
+      input.cwd === "/" || input.cwd.startsWith("/private/var/folders/") || input.cwd.startsWith("/var/folders/") ||
+      !/^[a-zA-Z0-9][a-zA-Z0-9.-]{0,199}$/.test(input.model)) throw new Error("Invalid Antigravity seat launch");
+    const tmux = input.tmux ?? (async (args: string[]) =>
+      (await exec("/opt/homebrew/bin/tmux", ["-L", input.socket, ...args], { timeout: 10_000, maxBuffer: 2_000_000 })).stdout);
+    let exists = true;
+    try { await tmux(["has-session", "-t", `=${input.session}:`]); } catch { exists = false; }
+    if (!exists) {
+      if (input.rejoinOnly) throw new Error("Antigravity active seat unavailable; reconcile without replay");
+      await fs.mkdir(input.cwd, { recursive: true });
+      await fs.mkdir(input.tmpDir, { recursive: true, mode: 0o700 });
+      await fs.mkdir(input.stateDir, { recursive: true, mode: 0o700 });
+      await tmux(["new-session", "-d", "-s", input.session, "-c", input.cwd, "-e", `TMPDIR=${input.tmpDir}`,
+        input.executable, "--remote-control", "--dangerously-skip-permissions", "--model", input.model]);
+    }
+    const wait = input.wait ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
+    const deadline = Date.now() + (input.startupTimeoutMs ?? 45_000);
+    for (;;) {
+      try { return await AntigravityInteractiveControl.attach({ ...input, tmux }); }
+      catch (error) {
+        if (exists || Date.now() >= deadline || !(error instanceof Error) || !/identity unavailable/.test(error.message)) throw error;
+        await wait(1000);
+      }
+    }
+  }
+
+  static async attach(input: {
+    socket: string; session: string; stateDir: string; expectedRemoteControlUrl?: string;
+    authorize: (operationId: string) => boolean; tmux?: Tmux;
+  }): Promise<AntigravityInteractiveControl> {
+    if (!idPattern.test(input.socket) || !idPattern.test(input.session) || !path.isAbsolute(input.stateDir))
+      throw new Error("Invalid Antigravity seat");
+    const tmux = input.tmux ?? (async (args: string[]) =>
+      (await exec("/opt/homebrew/bin/tmux", ["-L", input.socket, ...args], { timeout: 10_000, maxBuffer: 2_000_000 })).stdout);
+    const target = ["-t", `=${input.session}:`];
+    const identity = (await tmux(["display-message", "-p", ...target, "#{pane_id} #{pane_pid} #{pane_current_command}"])).trim();
+    const match = /^(%\d+) (\d+) agy$/.exec(identity);
+    if (!match) throw new Error("Antigravity seat identity unavailable");
+    const screen = await tmux(["capture-pane", ...target, "-p", "-J", "-S", "-150"]);
+    const remoteControlUrl = screen.match(remotePattern)?.[0];
+    if (!remoteControlUrl || (input.expectedRemoteControlUrl && input.expectedRemoteControlUrl !== remoteControlUrl))
+      throw new Error("Antigravity Remote Control identity unavailable or changed");
+    const state = await fs.lstat(input.stateDir);
+    if (!state.isDirectory() || state.isSymbolicLink() || (process.platform !== "win32" && ((state.mode & 0o077) !== 0 || state.uid !== process.getuid?.())))
+      throw new Error("Antigravity seat state must be private and owned");
+    return new AntigravityInteractiveControl({ ...input, tmux, paneId: match[1]!, panePid: match[2]! }, remoteControlUrl);
+  }
+
+  async submit(operationId: string, message: string): Promise<{ disposition: "written_consumption_unknown" }> {
+    if (!operationId || !message || /[\r\n]/.test(message) || message.startsWith("/") || !this.input.authorize(operationId))
+      throw new Error("Antigravity interactive submission denied");
+    const sessionTarget = ["-t", `=${this.input.session}:`];
+    const target = ["-t", this.input.paneId];
+    const identity = (await this.input.tmux(["display-message", "-p", ...sessionTarget, "#{pane_id} #{pane_pid} #{pane_current_command}"])).trim();
+    if (identity !== `${this.input.paneId} ${this.input.panePid} agy`) throw new Error("Antigravity seat identity changed");
+    const screen = await this.input.tmux(["capture-pane", ...target, "-p", "-J", "-S", "-150"]);
+    const currentUrl = screen.match(remotePattern)?.[0];
+    if (currentUrl && currentUrl !== this.remoteControlUrl) throw new Error("Antigravity Remote Control identity changed");
+    if (!emptyAgyEditor(screen)) throw new Error("Antigravity input guard refused");
+    const id = createHash("sha256").update(operationId).digest("hex");
+    const reservation = path.join(this.input.stateDir, `dispatch-${id}.reservation`);
+    const fd = await fs.open(reservation, "wx", 0o600);
+    try {
+      await fd.writeFile(JSON.stringify({ operationId, paneId: this.input.paneId, panePid: this.input.panePid,
+        inputSha256: createHash("sha256").update(message).digest("hex") }));
+      await fd.sync();
+    } finally { await fd.close(); }
+    const directory = await fs.open(this.input.stateDir, "r");
+    try { await directory.sync(); } finally { await directory.close(); }
+    const file = path.join(this.input.stateDir, `input-${randomUUID()}`);
+    const buffer = `paperclip-agy-${randomUUID()}`;
+    try {
+      if (!this.input.authorize(operationId)) throw new Error("Antigravity interactive admission revoked");
+      await fs.writeFile(file, message, { flag: "wx", mode: 0o600 });
+      await this.input.tmux(["load-buffer", "-b", buffer, file]);
+      await this.input.tmux(["paste-buffer", "-p", "-r", "-d", "-b", buffer, ...target]);
+      await new Promise(resolve => setTimeout(resolve, Math.min(3000, Math.max(350, 500 + Math.ceil(message.length / 1500) * 300))));
+      await this.input.tmux(["send-keys", ...target, "Enter"]);
+    } finally {
+      await this.input.tmux(["delete-buffer", "-b", buffer]).catch(() => {});
+      await fs.rm(file, { force: true });
+    }
+    return { disposition: "written_consumption_unknown" };
+  }
+}
