@@ -227,12 +227,26 @@ describe.skipIf(!postgres.supported)("queue drive persisted selection and deboun
     { resultJson: { cancelledByActorType: "user" }, errorCode: null },
     { resultJson: { cancelledByActorType: "board" }, errorCode: null },
     { resultJson: {}, errorCode: "operator_interrupted" },
+    { resultJson: {}, errorCode: null },
   ])("does not continue an operator cancellation: $resultJson $errorCode", async ({ resultJson, errorCode }) => {
-    await issue();
-    await db.update(heartbeatRuns).set({ status: "cancelled", resultJson, errorCode }).where(eq(heartbeatRuns.id, source.id));
+    const held = await issue();
+    await db.update(heartbeatRuns).set({ status: "cancelled", resultJson, errorCode,
+      contextSnapshot: { issueId: held.id } }).where(eq(heartbeatRuns.id, source.id));
     await drive.wakeNextAssignedIssueAfterRun(source);
     expect(deps.enqueueWakeup).not.toHaveBeenCalled();
   });
+
+  it.each(["chat_control_completed_source", "chat_control_recovery_proof_unresolved"])(
+    "skips a nonretrying chat recovery outcome %s while driving other work", async errorCode => {
+      const held = await issue({ priority: "critical" });
+      const ready = await issue({ priority: "low" });
+      await db.update(heartbeatRuns).set({ status: errorCode === "chat_control_completed_source" ? "cancelled" : "failed",
+        errorCode, contextSnapshot: { issueId: held.id } }).where(eq(heartbeatRuns.id, source.id));
+      await drive.wakeNextAssignedIssueAfterRun(source);
+      expect(picked()).toBe(ready.id);
+      expect(deps.enqueueWakeup).toHaveBeenCalledOnce();
+    },
+  );
 
   it.each(["cancelled", "interrupted"])("continues after a system %s", async status => {
     const ready = await issue();

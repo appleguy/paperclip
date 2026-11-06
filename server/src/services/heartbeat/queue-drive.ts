@@ -8,6 +8,7 @@ import { getExecutionBlocker, hasPendingRunCleanup } from "../execution-blocker.
 import type { HeartbeatQueueDependencies, createHeartbeatQueue } from "./queue.js";
 import { parseHeartbeatPolicy } from "./timer-policy.js";
 import { parseObject } from "../../adapters/utils.js";
+import { CHAT_CONTROL_RECOVERY_STOP_CODE, CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE } from "../chat-control-recovery-stop.js";
 
 export const QUEUE_DRIVE_WAKE_REASON = "issue_queue_drive";
 const COMPLETED_STATUSES = ["succeeded", "failed", "timed_out", "cancelled", "interrupted"];
@@ -98,8 +99,11 @@ export function createHeartbeatQueueDrive(db: Db, deps: QueueDriveDependencies) 
           ${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId') = ${issue.id}`,
       )).orderBy(desc(heartbeatRuns.finishedAt), desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(2);
       const latest = recent[0];
+      // These outcomes require a fresh request, not an automatic assignment wake.
+      if (latest?.errorCode === CHAT_CONTROL_RECOVERY_STOP_CODE ||
+          latest?.errorCode === CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE) continue;
       if (latest?.status === "cancelled" && (latest.errorCode === "operator_interrupted" ||
-          ["user", "board"].includes(String(latest.resultJson?.cancelledByActorType)))) continue;
+          latest.resultJson?.cancelledByActorType !== "system")) continue;
       if (recent.length === 2 && recent.every(row => FAILURE_STATUSES.has(row.status))) continue;
 
       const admittedRun = await deps.enqueueWakeup(source.agentId, {
