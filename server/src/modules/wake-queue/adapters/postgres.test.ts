@@ -475,6 +475,76 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
   });
 
   it.each([
+    "stale_done", "stale_cancelled", "fresh_done", "fresh_cancelled", "mixed_comments",
+    "unstarted_run", "other_agent", "other_issue", "native_issue", "task_id", "native_other_issue",
+  ])("does not revive terminal work from comments already seen by its assignee (%s)", async scenario => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent({ companyId });
+    const otherAgentId = await seedAgent({ companyId });
+    const status = scenario.endsWith("cancelled") ? "cancelled" : "done";
+    const issueId = await seedIssue({ companyId, assigneeAgentId: agentId, status });
+    const otherIssueId = await seedIssue({ companyId });
+    const beforeComment = new Date("2020-01-01T18:00:00Z");
+    const commentAt = new Date("2020-01-01T18:54:12Z");
+    const closingRunStartedAt = new Date("2020-01-01T19:55:00Z");
+    const closeAt = new Date("2020-01-01T20:01:05Z");
+    const fresh = scenario.startsWith("fresh") || scenario === "mixed_comments";
+    const stale = ["stale_done", "stale_cancelled", "native_issue", "task_id"].includes(scenario);
+    const runId = await seedRun({ companyId, agentId, status: "succeeded", contextSnapshot: { issueId } });
+    await db.update(heartbeatRuns).set({ startedAt: scenario.startsWith("stale") || fresh ? closingRunStartedAt : beforeComment,
+      finishedAt: closeAt }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ executionRunId: runId, checkoutRunId: runId }).where(eq(issues.id, issueId));
+
+    // Board-token comments appear user-authored even when posted by an agent.
+    const [comment] = await db.insert(issueComments).values({ companyId, issueId,
+      authorType: "user", authorUserId: "responsible-user", body: "Please handle this fix",
+      createdAt: scenario.startsWith("fresh") ? closeAt : commentAt }).returning();
+    const commentIds = [comment.id];
+    if (scenario === "mixed_comments") {
+      const [followUp] = await db.insert(issueComments).values({ companyId, issueId,
+        authorType: "user", authorUserId: "responsible-user", body: "New follow-up",
+        createdAt: closeAt }).returning();
+      commentIds.push(followUp.id);
+    }
+    // Reproduce the deferred assignment surviving four later runs. Negative
+    // cases retain a later row that must not count as having seen this input.
+    for (let index = 0; index < 3; index++) {
+      const laterId = await seedRun({ companyId,
+        agentId: scenario === "other_agent" ? otherAgentId : agentId,
+        status: "succeeded",
+        contextSnapshot: scenario === "task_id" ? { taskId: issueId }
+          : { issueId: ["other_issue", "native_other_issue"].includes(scenario) ? otherIssueId : issueId },
+      });
+      await db.update(heartbeatRuns).set({
+        startedAt: scenario === "unstarted_run" ? null : fresh ? beforeComment : closingRunStartedAt,
+        nativeIssueId: scenario === "native_issue" ? issueId
+          : scenario === "native_other_issue" ? otherIssueId : null,
+        ...(scenario === "native_issue" ? { contextSnapshot: {} } : {}),
+      }).where(eq(heartbeatRuns.id, laterId));
+    }
+    const wakeId = await seedDeferredWake({ companyId, agentId, issueId, requestedByActorId: "responsible-user",
+      payload: { _paperclipWakeContext: { issueId, wakeReason: "issue_commented", wakeCommentIds: commentIds } },
+    });
+    const adapter = createPostgresWakeQueueAdapter(db, stubDeps);
+    const release = createReleaseIssueExecution({ issueLock: {
+      withIssueExecutionLock: (input, fn) => adapter.withIssueExecutionLock(input, async (locked, ports) => {
+        expect(await ports.transaction.haveDeferredCommentsBeenSeen({ companyId, issueId, agentId, commentIds })).toBe(stale);
+        return fn(locked, ports);
+      }),
+    },
+      recovery: { escalateStrandedAssignedIssue: async () => undefined, escalateStrandedRecoveryIssueInPlace: async () => undefined },
+    });
+    const result = await release({ companyId, runId, now: new Date("2020-01-01T20:01:17Z"), suppressImmediateRecovery: true });
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId));
+    const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(wake.status).toBe(stale ? "cancelled" : "queued");
+    expect(wake.runId === null).toBe(stale);
+    expect(issue.status).toBe(stale ? status : "todo");
+    expect(result.outcome.kind).toBe(stale ? "released" : "promoted");
+    expect(result.postCommitEffects.some(effect => effect.kind === "issue_reopened")).toBe(!stale);
+  });
+
+  it.each([
     "completed", "multiple_comments", "repeated_reference", "parent_reference", "mixed_issue_references", "mixed_foreign_references", "mixed_unknown_references", "no_comments", "missing_comment",
     "human_comment", "other_run_comment", "foreign_comment", "other_issue_comment", "deleted_comment",
     "mixed_human_comments", "mixed_other_run_comments", "mixed_unrelated_comments",

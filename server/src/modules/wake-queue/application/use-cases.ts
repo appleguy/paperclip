@@ -351,6 +351,27 @@ async function promoteDeferredWake(
     workingCandidate.deferredCommentIds.length > 0 &&
     (currentIssue.status === "done" || currentIssue.status === "cancelled")
   ) {
+    // Deferred comment delivery can lag behind several runs, including the
+    // one that completed this task. Only feedback newer than those runs may
+    // revive assignee execution; a queued but unstarted run proves nothing.
+    if (
+      workingCandidate.agentId === currentIssue.assigneeAgentId &&
+      await ports.transaction.haveDeferredCommentsBeenSeen({
+        companyId: run.companyId,
+        issueId: currentIssue.id,
+        agentId: workingCandidate.agentId,
+        commentIds: workingCandidate.deferredCommentIds,
+      })
+    ) {
+      await ports.transaction.cancelDeferredWake({
+        companyId: run.companyId,
+        wakeId: workingCandidate.id,
+        agentId: workingCandidate.agentId,
+        reason: "Deferred comment wake was already seen by a later assignee run on this terminal task",
+        now: input.now,
+      });
+      return null;
+    }
     const selfAuthorship = await ports.transaction.getCommentSelfAuthorship({
       companyId: run.companyId,
       issueId: currentIssue.id,

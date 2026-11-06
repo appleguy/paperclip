@@ -421,6 +421,33 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       return { allSelfAuthored: rows.length > 0 && rows.every((row) => row.createdByRunId === finishingRunId) };
     },
 
+    async haveDeferredCommentsBeenSeen({ companyId, issueId, agentId, commentIds }) {
+      const uniqueCommentIds = [...new Set(commentIds)];
+      if (uniqueCommentIds.length === 0) return false;
+      // Match the indexed origin-issue expression, preserving native binding
+      // precedence. Return only bounded comment facts, never run contexts.
+      const rows = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+        eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId),
+        inArray(issueComments.id, uniqueCommentIds), isNull(issueComments.deletedAt),
+        currentConversationCommentCondition(),
+        sql`exists (
+          select 1 from ${heartbeatRuns}
+          where ${heartbeatRuns.companyId} = ${companyId}
+            and ${heartbeatRuns.agentId} = ${agentId}
+            and coalesce(
+              ${heartbeatRuns.nativeIssueId}::text,
+              nullif(${heartbeatRuns.contextSnapshot}->>'issueId', ''),
+              nullif(${heartbeatRuns.contextSnapshot}->>'taskId', ''),
+              nullif(${heartbeatRuns.contextSnapshot}->>'taskKey', '')
+            ) = ${issueId}
+            and ${heartbeatRuns.startedAt} > ${issueComments.createdAt}
+        )`,
+      ));
+      // Missing or foreign comments cannot establish that the entire wake
+      // was consumed. A batch containing any new feedback must still reopen.
+      return rows.length === uniqueCommentIds.length;
+    },
+
     async isCompletedDelegationMention({ companyId, issueId, finishingRunId, wakeAgentId, commentIds }) {
       if (
         run.companyId !== companyId || run.id !== finishingRunId ||

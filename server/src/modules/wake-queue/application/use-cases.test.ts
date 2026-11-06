@@ -115,6 +115,7 @@ function createFakeTransaction(overrides: Partial<WakeQueueTransaction> = {}): W
       releasePolicy: null,
     })),
     getCommentSelfAuthorship: vi.fn(async () => ({ allSelfAuthored: false })),
+    haveDeferredCommentsBeenSeen: vi.fn(async () => false),
     isCompletedDelegationMention: vi.fn(async () => false),
     reopenIssue: vi.fn(async () => null),
     claimDeferredWakeForPromotion: vi.fn(async () => true),
@@ -569,6 +570,27 @@ describe("releaseIssueExecution", () => {
     expect(transaction.reopenIssue).not.toHaveBeenCalled();
     expect(transaction.finalizePromotedWake).toHaveBeenCalledTimes(scenario === "verified" ? 1 : 0);
     expect(transaction.cancelDeferredWake).toHaveBeenCalledTimes(scenario === "verified" ? 0 : 1);
+  });
+
+  it.each(["done", "cancelled"])("cancels an already-seen assignee comment before reopening %s work", async status => {
+    const queue = [wakeCandidate({ agentId: ISSUE.assigneeAgentId!, deferredCommentIds: ["old-board-comment"] })];
+    const transaction = createFakeTransaction({
+      findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
+      haveDeferredCommentsBeenSeen: vi.fn(async () => true),
+    });
+    const release = createReleaseIssueExecution({
+      issueLock: createFakeIssueLock(createFakeHost(), transaction, { ...ISSUE, status }),
+      recovery: createFakeRecovery(),
+    });
+    const result = await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() });
+    expect(transaction.haveDeferredCommentsBeenSeen).toHaveBeenCalledWith({
+      companyId: RUN.companyId, issueId: ISSUE.id, agentId: ISSUE.assigneeAgentId, commentIds: ["old-board-comment"],
+    });
+    expect(transaction.cancelDeferredWake).toHaveBeenCalledTimes(1);
+    expect(transaction.reopenIssue).not.toHaveBeenCalled();
+    expect(transaction.claimDeferredWakeForPromotion).not.toHaveBeenCalled();
+    expect(transaction.finalizePromotedWake).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ outcome: { kind: "released" }, postCommitEffects: [] });
   });
 
   it("reopens a completed task before promoting its assignee's human follow-up", async () => {
