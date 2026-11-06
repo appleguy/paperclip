@@ -135,6 +135,10 @@ export const createProjectSchema = z.object({
 
 export type CreateProject = z.infer<typeof createProjectSchema>;
 
+/** create_project tool input (idempotency key required). Convert it here: a converter from another zod copy (the server's own) crashes on these schemas. */
+export const createProjectToolInputSchema = createProjectSchema.required({ idempotencyKey: true });
+export const createProjectToolInputJSONSchema = () => z.toJSONSchema(createProjectToolInputSchema, { io: "input" });
+
 export const updateProjectSchema = objectWithoutDefaults(
   z.object(projectFields),
 ).partial();
