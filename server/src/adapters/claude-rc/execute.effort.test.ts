@@ -1,7 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { parseSeatLaunch, reconcileSeatSettings } from "./execute.js";
+import { tryAcquire } from "../agy/execute.js";
+import { parseSeatLaunch, reconcileIdleSeat, reconcileSeatSettings } from "./execute.js";
 
 const idle = "❯ \n  bypass permissions on (shift+tab to cycle)";
 const busy = "✻ Synthesizing… (esc to …)\n❯ \n  bypass permissions on";
@@ -49,5 +50,64 @@ describe("live Claude settings", () => {
     await reconcileSeatSettings({ stateDir: dir, identity: "seat", launchModel: "sonnet", launchEffort: "high",
       model: "opus", effort: "high", screen: async () => idle, submit });
     expect(submit.mock.calls.map(call => call[0])).toEqual(["/model opus", "/effort high"]);
+  });
+
+  it("defers behind dispatch and an unresolved checkpoint before reading current settings", async () => {
+    const readCurrent = vi.fn(async () => ({ effort: "xhigh" }));
+    const apply = vi.fn(async () => true);
+    const options = { stateDir: dir, readCurrent, apply };
+    const unlock = await tryAcquire(dir);
+    expect(unlock).not.toBeNull();
+    expect(await reconcileIdleSeat(options)).toBe(false);
+    expect(readCurrent).not.toHaveBeenCalled();
+    await unlock!();
+    await fs.writeFile(path.join(dir, "active.json"), "{}");
+    expect(await reconcileIdleSeat(options)).toBe(false);
+    expect(readCurrent).not.toHaveBeenCalled();
+    await fs.rm(path.join(dir, "active.json"));
+    expect(await reconcileIdleSeat(options)).toBe(true);
+    expect(apply).toHaveBeenCalledExactlyOnceWith({ effort: "xhigh" });
+  });
+
+  it("retries a busy seat with fresh settings and records a confirmed change once", async () => {
+    let screen = busy;
+    let effort = "high";
+    const submit = vi.fn(async (_command: string, _confirmed: RegExp) => true);
+    const options = {
+      stateDir: dir,
+      readCurrent: async () => ({ effort }),
+      apply: ({ effort: current }: { effort: string }) => reconcileSeatSettings({
+        stateDir: dir, identity: "seat-1", launchModel: "sonnet", launchEffort: "high",
+        model: "sonnet", effort: current, screen: async () => screen, submit,
+      }),
+    };
+    effort = "xhigh";
+    expect(await reconcileIdleSeat(options)).toBe(false);
+    expect(submit).not.toHaveBeenCalled();
+    screen = idle;
+    expect(await reconcileIdleSeat(options)).toBe(true);
+    expect(await reconcileIdleSeat(options)).toBe(true);
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(submit.mock.calls[0]![0]).toBe("/effort xhigh");
+  });
+
+  it("releases the seat mutex if reading current settings fails", async () => {
+    await expect(reconcileIdleSeat({ stateDir: dir, readCurrent: async () => { throw new Error("read failed"); },
+      apply: async () => true })).rejects.toThrow("read failed");
+    const unlock = await tryAcquire(dir);
+    expect(unlock).not.toBeNull();
+    await unlock!();
+  });
+
+  it("recognizes settings already applied by dispatch after the caller restarts", async () => {
+    const submit = vi.fn(async (_command: string, _confirmed: RegExp) => true);
+    const settings = { stateDir: dir, identity: "seat-1", launchModel: "sonnet", launchEffort: "high",
+      model: "sonnet", effort: "xhigh", screen: async () => idle, submit };
+    const unlock = await tryAcquire(dir);
+    expect(await reconcileSeatSettings(settings)).toBe(true);
+    await unlock!();
+    expect(await reconcileIdleSeat({ stateDir: dir, readCurrent: async () => ({ ...settings }),
+      apply: current => reconcileSeatSettings(current) })).toBe(true);
+    expect(submit).toHaveBeenCalledTimes(1);
   });
 });

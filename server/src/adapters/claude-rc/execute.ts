@@ -211,7 +211,7 @@ export async function reconcileSeatSettings(o: {
   stateDir: string; identity: string; launchModel: string | null; launchEffort: string | null;
   model: string; effort: string; screen: () => Promise<string>;
   submit: (command: string, confirmed: RegExp) => Promise<boolean>;
-}): Promise<void> {
+}): Promise<boolean> {
   const file = path.join(o.stateDir, "applied-settings.json");
   const saved = await fs.readFile(file, "utf8").then(t => JSON.parse(t) as SeatSettings).catch(() => null);
   const state: SeatSettings = saved?.identity === o.identity ? saved : {
@@ -219,11 +219,11 @@ export async function reconcileSeatSettings(o: {
   };
   for (const key of ["model", "effort"] as const) {
     if (state[key] === o[key]) continue;
-    if (!isClaudeIdle(await o.screen())) return;
+    if (!isClaudeIdle(await o.screen())) return false;
     const confirmation = key === "effort"
       ? new RegExp(`Set effort level to ${o.effort}\\b`, "i")
       : /(?:set|switched|changed) (?:the )?model (?:to|:)/i;
-    if (!(await o.submit(`/${key} ${o[key]}`, confirmation))) return;
+    if (!(await o.submit(`/${key} ${o[key]}`, confirmation))) return false;
     state[key] = o[key];
     // Claude may choose a different default effort after a model switch.
     if (key === "model") state.effort = null;
@@ -237,16 +237,17 @@ export async function reconcileSeatSettings(o: {
     await fs.writeFile(temp, JSON.stringify(state), { mode: 0o600 });
     await fs.rename(temp, file);
   }
+  return true;
 }
 
 export async function applySeatSettings(socket: string, session: string, stateDir: string, model: string, effort: string,
-  log: (message: string) => Promise<void> | void = () => {}): Promise<void> {
+  log: (message: string) => Promise<void> | void = () => {}): Promise<boolean> {
   const pid = (await tmux(socket, ["display-message", "-p", ...target(session), "#{pane_pid}"])).trim();
-  if (!/^\d+$/.test(pid)) { await log("[claude-rc] Cannot identify seat process; settings reconciliation deferred\n"); return; }
+  if (!/^\d+$/.test(pid)) { await log("[claude-rc] Cannot identify seat process; settings reconciliation deferred\n"); return false; }
   const { stdout } = await promisify(execFile)("/bin/ps", ["-p", pid, "-o", "lstart=", "-o", "command="]);
   const launch = parseSeatLaunch(pid, stdout);
-  if (!launch) { await log("[claude-rc] Cannot read seat launch settings; reconciliation deferred\n"); return; }
-  await reconcileSeatSettings({
+  if (!launch) { await log("[claude-rc] Cannot read seat launch settings; reconciliation deferred\n"); return false; }
+  return reconcileSeatSettings({
     stateDir, identity: launch.identity, launchModel: launch.model, launchEffort: launch.effort, model, effort,
     screen: () => claudePane(socket, session),
     submit: async (command, confirmed) => {
@@ -264,6 +265,32 @@ export async function applySeatSettings(socket: string, session: string, stateDi
       return false;
     },
   });
+}
+
+/** Share dispatch's seat mutex and leave unresolved checkpoints untouched. */
+export async function reconcileIdleSeat<T>(o: {
+  stateDir: string;
+  readCurrent: () => Promise<T | null>;
+  apply: (current: T) => Promise<boolean>;
+}): Promise<boolean> {
+  const exists = await fs.stat(o.stateDir).then(stat => stat.isDirectory()).catch(error => {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  });
+  if (!exists) return false;
+  const unlock = await tryAcquire(o.stateDir);
+  if (!unlock) return false;
+  try {
+    const active = await fs.stat(path.join(o.stateDir, "active.json")).then(() => true).catch(error => {
+      if (error.code === "ENOENT") return false;
+      throw error;
+    });
+    if (active) return false;
+    const current = await o.readCurrent();
+    return current === null ? false : await o.apply(current);
+  } finally {
+    await unlock();
+  }
 }
 /** Type one slash command literally, then Enter; true when the harness echoed `expect`. */
 export async function typeNativeGoal(socket: string, session: string, text: string, expect: RegExp): Promise<boolean> {
