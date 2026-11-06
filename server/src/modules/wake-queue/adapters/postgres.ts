@@ -1247,6 +1247,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
 
         for (const issue of candidateIssues) {
           if (issue.executionRunId === run.id || issue.checkoutRunId === run.id) {
+            await notifyDeferredExecutionWork(tx, { companyId: input.companyId });
             await notifyExternalConversationSettlement(tx, { companyId: input.companyId, issueId: issue.id });
             await notifyUnsafeWorkspaceExportRecovery(tx, { companyId: input.companyId, issueId: issue.id });
             await notifyNativeStatusReassessment(tx, { companyId: input.companyId, issueId: issue.id });

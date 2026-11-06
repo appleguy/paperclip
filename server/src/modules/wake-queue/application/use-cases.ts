@@ -796,6 +796,7 @@ export type AdmitWakeBehindIssueExecutionInput = {
   issueExecutionAgentNameKey: string | null;
   activeExecutionRun: WakeAdmissionActiveExecutionRun;
   allowRunCoalescing?: boolean;
+  deferRunningProcessWake?: boolean;
   durableReceipt?: DurableWakeAdmissionReceipt;
   reason?: string | null;
   /** Tracks which runs are still live in this process, for the zombie-run filter. */
@@ -844,7 +845,8 @@ export function createAdmitWakeBehindIssueExecution(deps: {
     // A manual click establishes a fresh execution identity. Even a matching
     // requester can have a different originating identity on an exact retry.
     const shouldDeferFollowupWake =
-      Boolean(manualUserWakeActorId) || deps.helpers.shouldDeferFollowupWakeForSameIssue({
+      Boolean(manualUserWakeActorId) || (input.deferRunningProcessWake === true &&
+        input.activeExecutionRun.status === "running" && isSameExecutionAgent) || deps.helpers.shouldDeferFollowupWakeForSameIssue({
         activeRunStatus: input.activeExecutionRun.status,
         isSameExecutionAgent,
         wakeCommentId: input.wakeCommentId,

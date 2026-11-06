@@ -74,6 +74,8 @@ export function registerDeferredReceiptWork(
               sql`jsonb_typeof(${agentWakeupRequests.payload}#>'{_paperclipWakeContext,wakeCommentIds}') = 'array'
                 and ${agentWakeupRequests.payload}#>'{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
               sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`,
+              sql`exists (select 1 from agents a where a.id = ${agentWakeupRequests.agentId}
+                and a.company_id = ${agentWakeupRequests.companyId} and a.adapter_type = 'process')`,
               sql`exists (select 1 from heartbeat_runs r where r.company_id = ${agentWakeupRequests.companyId}
                 and r.runtime_mode = 'legacy' and r.status = 'cancelled'
                 and r.result_json->>'queuedCommentInterruptQueueId' = ${agentWakeupRequests.id}::text)`,
