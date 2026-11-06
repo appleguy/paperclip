@@ -132,6 +132,7 @@ describe.skipIf(!postgres.supported)("queue drive persisted selection and deboun
 
   it("debounces replayed completion callbacks across service instances", async () => {
     await issue();
+    await issue();
     const other = createHeartbeatQueueDrive(db, deps);
     await drive.wakeNextAssignedIssueAfterRun(source);
     await other.wakeNextAssignedIssueAfterRun(source);
@@ -202,7 +203,8 @@ describe.skipIf(!postgres.supported)("queue drive persisted selection and deboun
     expect(deps.enqueueWakeup).not.toHaveBeenCalled();
   });
 
-  it.each(["queued", "running", "scheduled_retry"])("leaves existing %s work in charge", async status => {
+  it.each(["queued", "running", "scheduled_retry"])("leaves existing %s work in charge on a single-slot seat", async status => {
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, source.agentId));
     await issue();
     await db.insert(heartbeatRuns).values({ companyId: source.companyId, agentId: source.agentId,
       status, invocationSource: "assignment" });
@@ -210,9 +212,39 @@ describe.skipIf(!postgres.supported)("queue drive persisted selection and deboun
     expect(deps.enqueueWakeup).not.toHaveBeenCalled();
   });
 
-  it.each(["cancelled", "interrupted", "running"])("does not turn %s into automatic continuation", async status => {
+  it.each(["queued", "running", "scheduled_retry"])("drives an available slot around existing %s work", async status => {
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 2 } } }).where(eq(agents.id, source.agentId));
+    const busy = await issue({ priority: "critical" });
+    const ready = await issue({ priority: "low" });
+    await db.insert(heartbeatRuns).values({ companyId: source.companyId, agentId: source.agentId,
+      status, invocationSource: "assignment", contextSnapshot: { issueId: busy.id } });
+    await drive.wakeNextAssignedIssueAfterRun(source);
+    expect(picked()).toBe(ready.id);
+    expect(deps.enqueueWakeup).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    { resultJson: { cancelledByActorType: "user" }, errorCode: null },
+    { resultJson: { cancelledByActorType: "board" }, errorCode: null },
+    { resultJson: {}, errorCode: "operator_interrupted" },
+  ])("does not continue an operator cancellation: $resultJson $errorCode", async ({ resultJson, errorCode }) => {
     await issue();
-    await db.update(heartbeatRuns).set({ status }).where(eq(heartbeatRuns.id, source.id));
+    await db.update(heartbeatRuns).set({ status: "cancelled", resultJson, errorCode }).where(eq(heartbeatRuns.id, source.id));
+    await drive.wakeNextAssignedIssueAfterRun(source);
+    expect(deps.enqueueWakeup).not.toHaveBeenCalled();
+  });
+
+  it.each(["cancelled", "interrupted"])("continues after a system %s", async status => {
+    const ready = await issue();
+    await db.update(heartbeatRuns).set({ status, resultJson: { cancelledByActorType: "system" } }).where(eq(heartbeatRuns.id, source.id));
+    await drive.wakeNextAssignedIssueAfterRun(source);
+    expect(picked()).toBe(ready.id);
+    expect(deps.enqueueWakeup).toHaveBeenCalledOnce();
+  });
+
+  it("does not continue a running source", async () => {
+    await issue();
+    await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, source.id));
     await drive.wakeNextAssignedIssueAfterRun(source);
     expect(deps.enqueueWakeup).not.toHaveBeenCalled();
   });
