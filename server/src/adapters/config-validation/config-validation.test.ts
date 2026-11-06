@@ -53,6 +53,26 @@ it("rejects models outside agy's allowlist and separate effort settings", async 
   await expect(validateConfig("agy_local", { cwd: "/Volumes/NVM/../.." })).rejects.toThrow(/root/);
 });
 
+describe.each(["claude_rc_local", "agy_local"])("%s tmux names", type => {
+  it.each(["tmuxSocket", "tmuxSession"])("rejects invalid %s identifiers", async field => {
+    for (const value of ["bad/socket", "bad.socket", "bad:session", "two words", "bad\nname", "x".repeat(56), 42, {}]) {
+      await expect(validateConfig(type, { [field]: value })).rejects.toMatchObject({ status: 422, message: expect.stringContaining(field) });
+    }
+  });
+
+  it("accepts defaults and the runtime's trimmed names", async () => {
+    for (const value of [undefined, null, "", "   ", "valid_1-name", "  trimmed-name  ", "x".repeat(55)]) {
+      await expect(validateConfig(type, { tmuxSocket: value, tmuxSession: value })).resolves.toBeUndefined();
+    }
+  });
+});
+
+it("validates the generated RC session names for the configured seat count", async () => {
+  await expect(validateConfig("claude_rc_local", { tmuxSession: "x".repeat(52), slots: 4 })).resolves.toBeUndefined();
+  await expect(validateConfig("claude_rc_local", { tmuxSession: "x".repeat(53), slots: 2 })).rejects.toThrow(/seat suffix/);
+  await expect(validateConfig("claude_rc_local", { tmuxSession: "x".repeat(55), slots: 1 })).resolves.toBeUndefined();
+});
+
 it("checks all effort field aliases and model-specific effort limits", async () => {
   await expect(validateConfig("codex_local", { model: "gpt-6.1-sol", modelReasoningEffort: "ultra" })).resolves.toBeUndefined();
   await expect(validateConfig("codex_local", { model: "gpt-6-luna", modelReasoningEffort: "ultra" })).rejects.toThrow(/modelReasoningEffort/);

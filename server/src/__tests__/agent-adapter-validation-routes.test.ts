@@ -340,6 +340,60 @@ describe("agent routes adapter validation", () => {
     await unregisterTestAdapter(missingAdapterType);
   });
 
+  describe.each(["claude_rc_local", "agy_local"])("%s tmux names at save", adapterType => {
+    it.each(["agents", "agent-hires"])("rejects an invalid socket before %s writes anything", async endpoint => {
+      const app = await createApp();
+      const response = await requestApp(app, base => request(base)
+        .post(`/api/companies/company-1/${endpoint}`)
+        .send({ name: "Invalid socket", adapterType, adapterConfig: { tmuxSocket: "bad/socket" } }));
+      expect(response.status, JSON.stringify(response.body)).toBe(422);
+      expect(response.body.error).toContain("adapterConfig.tmuxSocket");
+      expect(mockAgentService.create).not.toHaveBeenCalled();
+      expect(mockSecretService.normalizeAdapterConfigForPersistence).not.toHaveBeenCalled();
+    });
+
+    it.each([{ tmuxSocket: "bad.socket" }, { tmuxSession: "bad:session" }])("rejects a merged update without persistence: %j", async adapterConfig => {
+      const existing = { ...(await mockAgentService.getById()), adapterType,
+        adapterConfig: { tmuxSocket: "valid-socket", tmuxSession: "valid-session" } };
+      mockAgentService.getById.mockResolvedValue(existing);
+      const app = await createApp();
+      const response = await requestApp(app, base => request(base).patch(`/api/agents/${existing.id}`).send({ adapterConfig }));
+      expect(response.status, JSON.stringify(response.body)).toBe(422);
+      expect(response.body.error).toContain(`adapterConfig.${Object.keys(adapterConfig)[0]}`);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+      expect(mockSecretService.normalizeAdapterConfigForPersistence).not.toHaveBeenCalled();
+      expect(existing.adapterConfig).toEqual({ tmuxSocket: "valid-socket", tmuxSession: "valid-session" });
+    });
+
+    it("validates inherited names and replacement config while allowing profile edits", async () => {
+      const existing = { ...(await mockAgentService.getById()), adapterType, adapterConfig: { tmuxSocket: "old.invalid" } };
+      mockAgentService.getById.mockResolvedValue(existing);
+      const app = await createApp();
+      const merged = await requestApp(app, base => request(base).patch(`/api/agents/${existing.id}`).send({ adapterConfig: { timeoutSec: 60 } }));
+      expect(merged.status, JSON.stringify(merged.body)).toBe(422);
+      expect(mockAgentService.update).not.toHaveBeenCalled();
+      const profile = await requestApp(app, base => request(base).patch(`/api/agents/${existing.id}`).send({ name: "Renamed" }));
+      expect(profile.status, JSON.stringify(profile.body)).toBe(200);
+      const replacement = await requestApp(app, base => request(base).patch(`/api/agents/${existing.id}`).send({ replaceAdapterConfig: true, adapterConfig: { tmuxSocket: "valid_1-name" } }));
+      expect(replacement.status, JSON.stringify(replacement.body)).toBe(200);
+    });
+
+    it("rejects invalid names on revision rollback", async () => {
+      const existing = { ...(await mockAgentService.getById()), adapterType, adapterConfig: {} };
+      mockAgentService.getById.mockResolvedValue(existing);
+      mockAgentService.getConfigRevision.mockResolvedValue({ afterConfig: {
+        adapterType, adapterConfig: { tmuxSocket: "bad/socket" }, runtimeConfig: {},
+      } });
+      const app = await createApp();
+      const response = await requestApp(app, base => request(base).post(
+        `/api/agents/${existing.id}/config-revisions/33333333-3333-4333-8333-333333333333/rollback`,
+      ));
+      expect(response.status, JSON.stringify(response.body)).toBe(422);
+      expect(response.body.error).toContain("adapterConfig.tmuxSocket");
+      expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
+    });
+  });
+
   it.each(["agents", "agent-hires"])("rejects an invalid RC model before %s writes anything", async endpoint => {
     const app = await createApp();
     const response = await requestApp(app, base => request(base)

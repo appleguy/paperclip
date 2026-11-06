@@ -1,8 +1,10 @@
-import { assertWorkableCwd, isValidSeatSettings } from "./execute.js";
+import { assertWorkableCwd, isValidSeatSettings, rcSlotCount } from "./execute.js";
+import { validateRemoteControlNames } from "../config-validation/remote-control-names.js";
 import path from "node:path";
 import { unprocessable } from "../../errors.js";
 
 export function validateConfig(config: Record<string, unknown>): void {
+  validateRemoteControlNames("claude_rc_local", config, rcSlotCount(config.slots));
   const model = config.model ?? "claude-sonnet-5-5";
   const effort = config.effort ?? "medium";
   if (typeof model !== "string" || !isValidSeatSettings(model, "medium")) {

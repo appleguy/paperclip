@@ -1,8 +1,10 @@
 import { AGY_MODELS } from "./execute.js";
+import { validateRemoteControlNames } from "../config-validation/remote-control-names.js";
 import path from "node:path";
 import { unprocessable } from "../../errors.js";
 
 export function validateConfig(config: Record<string, unknown>): void {
+  validateRemoteControlNames("agy_local", config);
   if (config.model !== undefined && !(AGY_MODELS as readonly unknown[]).includes(config.model)) {
     throw unprocessable(`Invalid agy_local adapterConfig.model: permits only ${AGY_MODELS.join(", ")}`);
   }
