@@ -8,6 +8,7 @@ import {
   agents,
   boardApiKeys,
   heartbeatRuns,
+  issues,
 } from "@paperclipai/db";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
@@ -34,7 +35,8 @@ function createDbState(input: {
   agent: { id: string; companyId: string; status?: string; lifecycleHolds?: string[] };
   agentKey?: { id: string; agentId: string; companyId: string; keyHash: string; responsibleUserId?: string | null };
   run?: { id: string; companyId: string; agentId: string; responsibleUserId?: string | null;
-    status?: string; contextSnapshot?: Record<string, unknown>; resultJson?: Record<string, unknown> };
+    status?: string; issueId?: string | null; contextSnapshot?: Record<string, unknown>; resultJson?: Record<string, unknown> };
+  issue?: { id: string; executionRunId: string | null; checkoutRunId: string | null };
 }) {
   const activity: Array<Record<string, unknown>> = [];
   const agentRow = {
@@ -61,6 +63,7 @@ function createDbState(input: {
         agentId: input.run.agentId,
         responsibleUserId: input.run.responsibleUserId ?? null,
         status: input.run.status ?? "running",
+        issueId: input.run.issueId ?? null,
         contextSnapshot: input.run.contextSnapshot ?? {},
         resultJson: input.run.resultJson ?? {},
       }
@@ -73,6 +76,7 @@ function createDbState(input: {
         if (table === agentApiKeys) return keyRow ? [keyRow] : [];
         if (table === agents) return [agentRow];
         if (table === heartbeatRuns) return runRow ? [runRow] : [];
+        if (table === issues) return input.issue ? [input.issue] : [];
         return [];
       }),
     update: () => ({
@@ -205,6 +209,39 @@ describe("agent auth middleware", () => {
     const read = await request(client).get(endpoint).set("Authorization", `Bearer ${token}`);
     expect(read.status).toBe(200);
     expect(read.body.readable).toBe(true);
+  });
+
+  it.each(["failed", "interrupted", "succeeded", "timed_out"])('rejects writes from a terminal OpenCode run (%s) while permitting reads', async status => {
+    const agentId = randomUUID(), companyId = randomUUID(), runId = randomUUID();
+    const { db } = createDbState({ agent: { id: agentId, companyId }, run: { id: runId, companyId, agentId, status } });
+    const token = createLocalAgentJwt(agentId, companyId, "opencode_local", runId, null);
+    const endpoint = `/companies/${companyId}/issues/${randomUUID()}`;
+    const client = createApp(db);
+    const write = await request(client).patch(endpoint).set("Authorization", `Bearer ${token}`).send({ status: "done" });
+    expect(write.status).toBe(403);
+    expect(write.body.code).toBe("agent_run_not_active");
+    expect((await request(client).get(endpoint).set("Authorization", `Bearer ${token}`)).status).toBe(200);
+  });
+
+  it("fences a still-running predecessor after issue execution transfers to a successor", async () => {
+    const agentId = randomUUID(), companyId = randomUUID(), runId = randomUUID(), issueId = randomUUID();
+    const successor = randomUUID();
+    const { db } = createDbState({ agent: { id: agentId, companyId }, run: { id: runId, companyId, agentId, issueId },
+      issue: { id: issueId, executionRunId: successor, checkoutRunId: runId } });
+    const token = createLocalAgentJwt(agentId, companyId, "opencode_local", runId, null);
+    const client = createApp(db), endpoint = `/companies/${companyId}/issues/${issueId}`;
+    expect((await request(client).patch(endpoint).set("Authorization", `Bearer ${token}`).send({ status: "done" })).status).toBe(403);
+    expect((await request(client).get(endpoint).set("Authorization", `Bearer ${token}`)).status).toBe(200);
+  });
+
+  it("allows the running OpenCode execution owner to write", async () => {
+    const agentId = randomUUID(), companyId = randomUUID(), runId = randomUUID(), issueId = randomUUID();
+    const { db } = createDbState({ agent: { id: agentId, companyId }, run: { id: runId, companyId, agentId, issueId },
+      issue: { id: issueId, executionRunId: runId, checkoutRunId: runId } });
+    const token = createLocalAgentJwt(agentId, companyId, "opencode_local", runId, null);
+    const result = await request(createApp(db)).patch(`/companies/${companyId}/issues/${issueId}`)
+      .set("Authorization", `Bearer ${token}`).send({ status: "done" });
+    expect(result.status).toBe(200);
   });
 
   it("keeps header-less local requests as the implicit board actor with their run id", async () => {

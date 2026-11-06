@@ -12,6 +12,7 @@ import {
   companyMemberships,
   heartbeatRuns,
   instanceUserRoles,
+  issues,
 } from "@paperclipai/db";
 import {
   MAX_ISSUE_PREFIX_ATTEMPTS,
@@ -407,6 +408,31 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         _res.status(403).json({ error: conversation ? "This conversation turn was cancelled" : "This run was cancelled",
           code: conversation ? "conversation_turn_cancelled" : "agent_run_cancelled" });
         return;
+      }
+      // OpenCode's shared provider can continue a former run after its
+      // controller has ended. Its retained handle must not authorize writes
+      // for a terminal or missing run, even though reads remain useful.
+      if (claims.adapter_type === "opencode_local" && identityRun?.status !== "running"
+        && !["GET", "HEAD", "OPTIONS"].includes(req.method)) {
+        _res.status(403).json({ error: "This OpenCode run is no longer active", code: "agent_run_not_active" });
+        return;
+      }
+      if (claims.adapter_type === "opencode_local" && !["GET", "HEAD", "OPTIONS"].includes(req.method)) {
+        const contextIssueId = identityRun?.contextSnapshot?.issueId;
+        const issueId = identityRun?.nativeIssueId ?? identityRun?.issueId
+          ?? (typeof contextIssueId === "string" ? normalizeOptionalString(contextIssueId) : null);
+        if (issueId) {
+          if (!isUuidLike(issueId)) {
+            _res.status(403).json({ error: "This OpenCode run has an invalid issue binding", code: "agent_run_not_active" });
+            return;
+          }
+          const [issue] = await db.select({ executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId })
+            .from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, claims.company_id)));
+          if (!issue || (issue.executionRunId ?? issue.checkoutRunId) !== claims.run_id) {
+            _res.status(403).json({ error: "This OpenCode run no longer owns the issue", code: "agent_run_not_active" });
+            return;
+          }
+        }
       }
       if (identityRun?.activeIdentityContextId && identityRun.status === "running") {
         const captured = await captureRunIdentity(db, { companyId: claims.company_id, agentId: claims.sub, runId: claims.run_id },

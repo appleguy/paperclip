@@ -10,13 +10,16 @@ export function loadAgentRunAuthentication(db: Db, input: {
     activeIdentityContextId: heartbeatRuns.activeIdentityContextId,
     responsibleUserId: heartbeatRuns.responsibleUserId,
     status: heartbeatRuns.status,
+    issueId: heartbeatRuns.issueId,
+    nativeIssueId: heartbeatRuns.nativeIssueId,
     resultJson: sql<Record<string, unknown>>`jsonb_build_object(
       'executionCancellation', jsonb_build_object(
         'state', ${heartbeatRuns.resultJson}->'executionCancellation'->'state'
       )
     )`,
     contextSnapshot: sql<Record<string, unknown>>`jsonb_build_object(
-      'conversationMode', ${heartbeatRuns.contextSnapshot}->'conversationMode'
+      'conversationMode', ${heartbeatRuns.contextSnapshot}->'conversationMode',
+      'issueId', ${heartbeatRuns.contextSnapshot}->'issueId'
     )`,
   }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.id, input.runId),
