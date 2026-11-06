@@ -12,6 +12,7 @@ import { promisify } from "node:util";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { readableRuntimePath } from "@paperclipai/adapter-utils/readable-runtime-paths";
 import { parseHeartbeatPolicy } from "../../services/heartbeat/timer-policy.js";
+import { AGY_HOST_ADMISSION, claimAgyHostAdmission, isAgyAdmissionIdle, isAgyHostLimitedModel } from "./admission.js";
 import { assertAssembledPrompt, preflightSessionPrompt, applyPromptRotation } from "@paperclipai/adapter-utils/token-preflight";
 import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
@@ -511,6 +512,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const issueId = asString(ctx.context.issueId, asString(ctx.context.taskId, ""));
   const timeoutMs = Math.min(3600, Math.max(30, Number(cfg.timeoutSec) || 600)) * 1000;
   let unlock: (() => Promise<void>) | undefined;
+  let releaseHost: (() => Promise<void>) | undefined;
+  let hostMayRelease = true;
   let dispatched = false;
   const failure = (reason: string, timedOut = false): AdapterExecutionResult => ({
     exitCode: 1, signal: null, timedOut, model, provider: "google", biller: "google",
@@ -535,6 +538,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const adopted = adoptableActive(activeRaw, issueId, stateDir);
     if (ctx.context.paperclipRestartReattach === true && (!adopted || adopted.runId !== ctx.runId))
       throw new Error("agy restart checkpoint changed; provider ownership requires reconciliation");
+    if (isAgyHostLimitedModel(model)) {
+      releaseHost = await claimAgyHostAdmission(AGY_HOST_ADMISSION,
+        { runId: adopted?.runId ?? ctx.runId, issueId, stateDir }, Boolean(adopted));
+      if (adopted) hostMayRelease = false;
+    }
     const rcUrl = await ensureSession(socket, session, cwd, stateDir, Boolean(adopted), model);
     if (!rcUrl) throw new Error("agy RC URL unavailable: use /remote-control in its TUI, then retry");
     // Owner 2026-11-03: auto re-pin, logged. The URL rotates on every agy restart; ensureSession only reads it from the
@@ -623,6 +631,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // exists, a crash or uncertain paste still requires reconciliation.
     const preflight = await inputReadiness(socket, session);
     if (!preflight.allowed) throw new Error(`agy input guard refused before dispatch: ${preflight.reason}`);
+    hostMayRelease = false;
     await fs.writeFile(activePath, JSON.stringify({
       runId: ctx.runId, issueId, receiptPath, rcUrl, tmuxSocket: socket, tmuxSession: session,
       conversationId, startedAt: new Date().toISOString(),
@@ -655,6 +664,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
     if (!receipt)
       return failure("agy did not produce a validated completion receipt; checkpoint retained", true);
+    if (releaseHost) {
+      const receiptMtime = (await fs.stat(receiptPath)).mtimeMs;
+      const idleDeadline = Date.now() + 20_000;
+      do {
+        if (isAgyAdmissionIdle(await readStatusSnapshot(stateDir), conversationId, receiptMtime)) {
+          hostMayRelease = true;
+          break;
+        }
+        if (ctx.signal?.aborted) break;
+        await sleep(500);
+      } while (Date.now() < idleDeadline);
+      if (!hostMayRelease)
+        return failure("agy Claude/GPT host admission retained: provider idle was not confirmed after the receipt");
+    }
     const disposition = await deliver(ctx, receipt, undefined, undefined, stateDir);
     const issueClosed = disposition.status === "done";
     await ctx.onLog("stdout", `[agy] ${issueClosed ? "Done" : "Awaiting review"} ${issueId}: ${receipt.summary}; conversation=${conversationId ?? "unknown"}\n`);
@@ -672,6 +695,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     await ctx.onLog("stderr", `[agy] ${error}\n`);
     return failure(error);
   } finally {
-    if (unlock) await unlock();
+    try { if (releaseHost && hostMayRelease) await releaseHost(); }
+    finally { if (unlock) await unlock(); }
   }
 }
