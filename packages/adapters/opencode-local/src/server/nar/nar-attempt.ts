@@ -252,7 +252,10 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
   const { onLog, signal } = input;
   if (input.reattachOnly && input.invalidReattachBinding)
     return held("OpenCode reattach binding is invalid; held without replay", true, null, "reattach_binding_invalid");
-  if (signal?.aborted) return held("OpenCode NAR stopped before provider contact", Boolean(input.reattachOnly), null, "aborted_pre_submit");
+  // This controller has not submitted, but another controller may still have
+  // a delayed POST. A local abort alone is not durable no-submit authority.
+  if (signal?.aborted) return held("OpenCode NAR stopped before provider contact; provider work remains unverified", true,
+    null, "stop_before_dispatch_unverified", undefined, "unverified");
   const f = input.fetchImpl ?? fetch;
   let server: { url: string; passwordFile: string };
   try {
@@ -355,7 +358,8 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
     }
     const payloadSha256 = createHash("sha256").update(input.prompt).digest("hex");
     await input.onBound?.({ sessionId: conversationId, messageId: msgId, kind: "submit", hostPid, providerOrigin: server.url });
-    if (signal?.aborted) return held("OpenCode NAR stopped before sending a new prompt", false, conversationId, "aborted_pre_submit");
+    if (signal?.aborted) return held("OpenCode NAR stopped before sending a new prompt; provider work remains unverified", true,
+      conversationId, "stop_before_dispatch_unverified", undefined, "unverified");
     await onLog("stdout", narEventLine("nar_prompt_dispatch", { sessionId: conversationId, clientMessageId: msgId, promptSha256: payloadSha256 }));
     // Logging is asynchronous. A Stop or restart can arrive after the first
     // check while the dispatch record is being written, before this process
