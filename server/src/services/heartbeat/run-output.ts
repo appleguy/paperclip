@@ -1,5 +1,5 @@
 import { notifyActiveRunSilence } from "../live-run-recovery-notifications.js";
-import { eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { heartbeatRuns, type Db } from "@paperclipai/db";
 import type { AdapterInvocationMeta, AdapterRuntimeEvent } from "../../adapters/index.js";
 import { redactCurrentUserText, type CurrentUserRedactionOptions } from "../../log-redaction.js";
@@ -10,6 +10,7 @@ import { isRunLogStoreType, type RunLogHandle, type RunLogStore } from "../run-l
 import { appendExcerpt, canonicalNativeRunLogRedactionForms, compactRunLogChunk, redactCanonicalNativeRunLogChunk } from "./run-log.js";
 import { createNativeRunLogExporter, nativeRunLogPrefixCursor } from "../native-runtime/native-run-log-export.js";
 import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
+import { LegacyControllerLeaseLostError } from "../legacy-controller-lease.js";
 import {
   isHeartbeatRunRuntimeStatusActive,
   publishHeartbeatRunRuntimeProgress,
@@ -33,6 +34,8 @@ export interface HeartbeatRunOutputInput {
   appendRunEvent: ReturnType<typeof createHeartbeatLifecycle>["appendRunEvent"];
   getCurrentUserRedactionOptions: () => Promise<CurrentUserRedactionOptions>;
   assertWriterAuthority?: () => Promise<void>;
+  /** Present for legacy OpenCode writers, including when the recorded owner is missing. */
+  expectedLegacyControllerBootId?: string | null;
   runtimeLogSecretValues?: readonly string[];
 }
 
@@ -82,6 +85,14 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
   let persistedLogBytes = Number(run.logBytes ?? 0);
   let progressWrite: Promise<void> | null = null;
   let recordingFailureReported = false;
+  const legacyFenceEnabled = Object.hasOwn(input, "expectedLegacyControllerBootId");
+  const legacyOutputFence = () => and(
+    eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+    eq(heartbeatRuns.runtimeMode, "legacy"), eq(heartbeatRuns.status, "running"),
+    input.expectedLegacyControllerBootId
+      ? sql`${heartbeatRuns.controllerBootId} = ${input.expectedLegacyControllerBootId} and ${heartbeatRuns.controllerLeaseExpiresAt} > clock_timestamp()`
+      : sql`false`,
+  );
   const flushOutputProgress = async (opts?: { force?: boolean }) => {
     if (progressWrite) {
       await progressWrite;
@@ -97,8 +108,7 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
         ACTIVE_RUN_OUTPUT_PROGRESS_FLUSH_INTERVAL_MS;
     if (!shouldFlush) return;
     progressWrite = db.transaction(async tx => {
-      await notifyActiveRunSilence(tx, { companyId: run.companyId, runId: run.id });
-      await tx.update(heartbeatRuns)
+      const write = tx.update(heartbeatRuns)
       .set({
         lastOutputAt: pendingOutputProgress.at,
         lastOutputSeq: pendingOutputProgress.seq,
@@ -106,7 +116,12 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
         lastOutputBytes: pendingOutputProgress.bytes,
         updatedAt: new Date(),
       })
-      .where(eq(heartbeatRuns.id, run.id));
+      .where(legacyFenceEnabled ? legacyOutputFence() : eq(heartbeatRuns.id, run.id));
+      if (legacyFenceEnabled) {
+        const rows = await write.returning({ id: heartbeatRuns.id });
+        if (!rows.length) return;
+      } else await write;
+      await notifyActiveRunSilence(tx, { companyId: run.companyId, runId: run.id });
     })
       .then(() => {
         lastOutputFlushAt = pendingOutputProgress.at;
@@ -135,7 +150,7 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
 
     outputSeq = handle.initialSequence ?? outputSeq;
     persistedLogBytes = handle.initialBytes ?? persistedLogBytes;
-    await db
+    const write = db
       .update(heartbeatRuns)
       .set({
         logStore: handle.store,
@@ -143,7 +158,11 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
         ...(handle.store === "s3_segments" ? { logBytes: null, logSha256: null } : {}),
         updatedAt: new Date(),
       })
-      .where(eq(heartbeatRuns.id, runId));
+      .where(legacyFenceEnabled ? legacyOutputFence() : eq(heartbeatRuns.id, runId));
+    if (legacyFenceEnabled) {
+      const rows = await write.returning({ id: heartbeatRuns.id });
+      if (!rows.length) throw new LegacyControllerLeaseLostError("renewal_rejected");
+    } else await write;
 
     const currentUserRedactionOptions = await getCurrentUserRedactionOptions();
     const reportRecordingFailure = async () => {

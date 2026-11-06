@@ -3183,6 +3183,8 @@ export function heartbeatService(
         run, runId, issueId, runLogStore, identityRedactor, secretKeys,
         appendRunEvent, getCurrentUserRedactionOptions,
         assertWriterAuthority: createRunLogWriterAuthority(db, run, runOptions.nativeLeaseOwner),
+        ...(run.runtimeMode === "legacy" && agent.adapterType === "opencode_local"
+          ? { expectedLegacyControllerBootId: run.controllerBootId } : {}),
         runtimeLogSecretValues: observabilitySecretValues(observability),
       });
       const goalCheckpointSession: {

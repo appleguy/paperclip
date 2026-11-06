@@ -184,6 +184,55 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
   }
   const read = (id: string) => db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)).then(rows => rows[0]!);
 
+  it("fences OpenCode log binding after a controller takeover", async () => {
+    const boot = randomUUID();
+    const f = await fixture({ controllerBootId: boot, controllerLeaseExpiresAt: new Date(Date.now() + 60_000),
+      logBytes: 42, logSha256: "successor-digest" });
+    const output = createHeartbeatRunOutput(db, { run: f.run, runId: f.run.id, issueId: null,
+      expectedLegacyControllerBootId: boot,
+      runLogStore: { begin: async () => {
+        await db.update(heartbeatRuns).set({ controllerBootId: randomUUID(), logRef: "successor-log" }).where(eq(heartbeatRuns.id, f.run.id));
+        return { store: "s3_segments", logRef: "stale-log" };
+      }, append: async () => 0 },
+      identityRedactor: { chunk: (_stream, value) => value, redact: value => value }, secretKeys: new Set(),
+      appendRunEvent: f.deps.appendRunEvent, getCurrentUserRedactionOptions: async () => ({ enabled: false }) });
+    await expect(output.begin(f.run)).rejects.toBeInstanceOf(LegacyControllerLeaseLostError);
+    expect(await read(f.run.id)).toMatchObject({ logRef: "successor-log", logBytes: 42, logSha256: "successor-digest" });
+  });
+
+  it.each(["expired", "missing", "native", "terminal"] as const)("holds OpenCode log binding when ownership is %s", async state => {
+    const boot = randomUUID();
+    const f = await fixture({ controllerBootId: state === "missing" ? null : boot,
+      controllerLeaseExpiresAt: new Date(Date.now() + (state === "expired" ? -1_000 : 60_000)) });
+    if (state === "native") await db.update(heartbeatRuns).set({ runtimeMode: "native" }).where(eq(heartbeatRuns.id, f.run.id));
+    if (state === "terminal") await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, f.run.id));
+    const output = createHeartbeatRunOutput(db, { run: f.run, runId: f.run.id, issueId: null,
+      expectedLegacyControllerBootId: f.run.controllerBootId,
+      runLogStore: { begin: async () => ({ store: "local_file", logRef: "stale-log" }), append: async () => 0 },
+      identityRedactor: { chunk: (_stream, value) => value, redact: value => value }, secretKeys: new Set(),
+      appendRunEvent: f.deps.appendRunEvent, getCurrentUserRedactionOptions: async () => ({ enabled: false }) });
+    await expect(output.begin(f.run)).rejects.toBeInstanceOf(LegacyControllerLeaseLostError);
+    expect((await read(f.run.id)).logRef).toBeNull();
+  });
+
+  it("fences stale OpenCode progress but permits the live controller", async () => {
+    const boot = randomUUID();
+    const f = await fixture({ controllerBootId: boot, controllerLeaseExpiresAt: new Date(Date.now() + 60_000) });
+    const output = createHeartbeatRunOutput(db, { run: f.run, runId: f.run.id, issueId: null,
+      expectedLegacyControllerBootId: boot,
+      runLogStore: { begin: async () => ({ store: "local_file", logRef: "owned-log" }), append: async () => 0 },
+      identityRedactor: { chunk: (_stream, value) => value, redact: value => value }, secretKeys: new Set(),
+      appendRunEvent: f.deps.appendRunEvent, getCurrentUserRedactionOptions: async () => ({ enabled: false }) });
+    await output.begin(f.run);
+    output.outputProgressState.pending = { at: new Date(), seq: 2, stream: "stdout", bytes: 8 };
+    await output.flushOutputProgress({ force: true });
+    expect(await read(f.run.id)).toMatchObject({ logRef: "owned-log", lastOutputSeq: 2, lastOutputBytes: 8 });
+    await db.update(heartbeatRuns).set({ controllerBootId: randomUUID(), lastOutputSeq: 10, lastOutputBytes: 50 }).where(eq(heartbeatRuns.id, f.run.id));
+    output.outputProgressState.pending = { at: new Date(), seq: 3, stream: "stdout", bytes: 9 };
+    await output.flushOutputProgress({ force: true });
+    expect(await read(f.run.id)).toMatchObject({ lastOutputSeq: 10, lastOutputBytes: 50 });
+  });
+
   it.each(["replaced", "expired", "missing"] as const)("holds OpenCode completion without a live original controller (%s)", async state => {
     const boot = randomUUID();
     const f = await fixture({ controllerBootId: state === "missing" ? null : boot,
