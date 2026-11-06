@@ -322,6 +322,32 @@ export class OpenCodeHttpDriver implements ProviderDriver {
     }
   }
 
+  async progressMessages(conversationId: string, messageId: string): Promise<Array<{ id: string; content: any[] }>> {
+    const sid = encodeURIComponent(conversationId);
+    const target = await this.json("GET", `/api/session/${sid}/message/${encodeURIComponent(messageId)}`);
+    const created = target.data?.data?.time?.created;
+    if (target.status !== 200 || target.data?.data?.id !== messageId || typeof created !== "number") return [];
+    const messages: any[] = [];
+    let cursor: string | null = null;
+    let foundTarget = false;
+    for (let page = 0; page < INFLIGHT_MESSAGE_MAX_PAGES; page++) {
+      const list = await this.json("GET", `/api/session/${sid}/message?limit=200${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
+      if (list.status !== 200 || !Array.isArray(list.data?.data)) return [];
+      messages.push(...list.data.data);
+      if (messages.some((m: any) => m?.id === messageId && m.type === "user")) { foundTarget = true; break; }
+      const nextCursor = list.data?.cursor?.next;
+      if (typeof nextCursor !== "string" || !nextCursor || nextCursor === cursor) break;
+      cursor = nextCursor;
+    }
+    if (!foundTarget) return [];
+    const next = messages.filter((m: any) => m?.type === "user" && m.id !== messageId && m.time?.created > created)
+      .reduce((min: number, m: any) => Math.min(min, m.time.created), Infinity);
+    return messages.filter((m: any) => m?.type === "assistant" && typeof m.id === "string" &&
+      typeof m.time?.created === "number" && m.time.created >= created && m.time.created < next && Array.isArray(m.content))
+      .sort((a: any, b: any) => a.time.created - b.time.created)
+      .map((m: any) => ({ id: m.id, content: m.content }));
+  }
+
   async readOutcomeMsg(conversationId: string, msgId: string): Promise<OutcomeRead> {
     let log;
     try { log = await this.observe(conversationId); } catch { return "unknown"; }

@@ -323,6 +323,32 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
   const rejoinStallMs = input.rejoinStallMs ?? 20 * 60_000;
   let progressMark: string | null = null;
   let progressAt = Date.now();
+  const loggedParts = new Map<string, string>();
+  let loggedText = false;
+  const logProgress = async () => {
+    let messages: Awaited<ReturnType<OpenCodeHttpDriver["progressMessages"]>>;
+    try { messages = await driver.progressMessages(conversationId, msgId); } catch { return; }
+    for (const message of messages) {
+      for (const [index, part] of message.content.entries()) {
+        const key = `${message.id}:${index}`;
+        if (part?.type === "text" && typeof part.text === "string") {
+          const previous = loggedParts.get(key) ?? "";
+          if (part.text !== previous) {
+            const delta = part.text.startsWith(previous) ? part.text.slice(previous.length) : part.text;
+            if (delta) { await onLog("stdout", delta); loggedText = true; }
+            loggedParts.set(key, part.text);
+          }
+        } else if (part?.type === "tool" && typeof part.name === "string") {
+          const status = typeof part.state?.status === "string" ? part.state.status : "started";
+          const value = `${part.name}:${status}`;
+          if (loggedParts.get(key) !== value) {
+            await onLog("stdout", `\n[opencode] ${part.name}: ${status}\n`);
+            loggedParts.set(key, value);
+          }
+        }
+      }
+    }
+  };
   // A retry can observe a previous run's turn, but observing it does not
   // transfer authority to stop it. The deterministic message id is the
   // provider-side evidence that this run submitted the turn.
@@ -363,6 +389,7 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
         return held(message, true, conversationId, interrupted_ === "uncertain" ? "interrupt_unknown" : "aborted");
       }
       const r = await driver.readOutcomeMsg(conversationId, msgId);
+      await logProgress();
       // Stop may arrive while the outcome read is pending. Settle the Stop
       // request first rather than misreporting a concurrent read as success.
       if (signal?.aborted) continue;
@@ -445,7 +472,7 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
     out = { texts: [], usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, peakContextTokens: 0 }, usageReported: false, costUsd: null, sessionOutcome: null, capacityRefusal: false, cause: null };
   }
   const summary = out.texts.join("\n\n");
-  if (summary) await onLog("stdout", summary + "\n");
+  if (summary && !loggedText) await onLog("stdout", summary + "\n");
   const failed = out.sessionOutcome !== null && /fail|error|interrupt|abort|cancel/i.test(out.sessionOutcome);
   const refused = failed && out.capacityRefusal;
   const cause = failed ? (out.cause ?? { code: "opencode_session_failed", detail: "no error recorded on the session" }) : null;

@@ -12,7 +12,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async (original) => ({
 import { runAdapterExecutionTargetProcess } from "@paperclipai/adapter-utils/execution-target";
 import { execute } from "./execute.js";
 import { OpenCodeHttpDriver, messageIdFor, sessionIdFor } from "./nar/opencode-http-driver.js";
-import { narOpIdFor } from "./nar/nar-attempt.js";
+import { narOpIdFor, runNarOpenCodeAttempt } from "./nar/nar-attempt.js";
 import { estimatePromptTokens } from "@paperclipai/adapter-utils/token-preflight";
 
 const runProcess = vi.mocked(runAdapterExecutionTargetProcess);
@@ -358,22 +358,66 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     sessions.set(sid, { info: { id: sid, location: { directory: root }, model: { providerID: "openai", id: "qwen", variant: "medium" }, time: { created: clock++ } },
       msgs: [{ id: orphan, type: "user", text: "Full assignment", time: { created: clock++ } }] });
     active.add(sid);
-    const finish = setTimeout(() => {
+    const finish = () => {
       const s = sessions.get(sid)!;
       s.msgs.push({ id: "msg_done", type: "assistant", time: { created: clock++, completed: clock++ },
         content: [{ type: "text", text: "orphan finished" }], cost: 0.25, tokens: { input: 50, output: 5, reasoning: 0, cache: { read: 0, write: 0 } } });
       s.info.time.idle = clock++;
       s.info.outcome = "succeeded";
       active.delete(sid);
-    }, 60);
+    };
     const gate = vi.fn(async () => { throw new Error("must never rotate an in-flight rejoin"); });
-    const retry = await execute({ ...context("run-1-retry", { nativeRuntime: "nar", model: "openai/qwen", tokenPreflightShare: 0.000001 }), evaluateSessionPrompt: gate } as never); // one 5s poll
-    clearTimeout(finish);
+    const retry = await execute({ ...context("run-1-retry", { nativeRuntime: "nar", model: "openai/qwen", tokenPreflightShare: 0.000001 }), evaluateSessionPrompt: gate,
+      onLog: async (_stream: string, chunk: string) => { if (chunk.includes("nar_rejoin")) finish(); } } as never);
     expect(promptPosts).toBe(0);
     expect(gate).not.toHaveBeenCalled();
     expect(userMsgs().map((m) => m.id)).toEqual([orphan]);
     expect(retry).toMatchObject({ exitCode: 0, summary: "orphan finished", sessionId: sid, costUsd: 0.25 });
   }, 15_000);
+
+  it("logs new text and tool progress while a rejoined turn is still running", async () => {
+    const sid = sessionIdFor(scope);
+    const message = messageIdFor(narOpIdFor("run-1"));
+    sessions.set(sid, { info: { id: sid, location: { directory: root }, time: { created: clock++ } },
+      msgs: [{ id: message, type: "user", time: { created: clock++ } }] });
+    active.add(sid);
+    const lines: string[] = [];
+    let progressWhileActive = false;
+    let progress: ReturnType<typeof setTimeout> | undefined;
+    let finish: ReturnType<typeof setTimeout> | undefined;
+    const attempt = runNarOpenCodeAttempt({ configPath: cfg, ...scope, taskId: scope.issueId, runId: "run-1", cwd: root,
+      model: "", prompt: "unused", timeoutSec: 5, pollMs: 10,
+      onLog: async (_stream, chunk) => {
+        lines.push(chunk);
+        if (chunk.includes("nar_rejoin")) {
+          progress = setTimeout(() => sessions.get(sid)!.msgs.push({ id: "msg_progress", type: "assistant", time: { created: clock++ },
+            content: [{ type: "text", text: "working" }, { type: "tool", name: "read", state: { status: "running" } }] }), 20);
+          finish = setTimeout(() => { const s = sessions.get(sid)!; s.info.time.idle = clock++; s.info.outcome = "succeeded"; active.delete(sid); }, 200);
+        }
+        if (chunk.includes("working") && active.has(sid)) progressWhileActive = true;
+      } });
+    try {
+      const result = await attempt;
+      expect(result.proc.exitCode).toBe(0);
+      expect(progressWhileActive).toBe(true);
+      expect(lines.join("")).toContain("read: running");
+      expect(lines.join("").match(/working/g)).toHaveLength(1);
+      expect(promptPosts).toBe(0);
+    } finally { clearTimeout(progress); clearTimeout(finish); }
+  });
+
+  it("does not include a successor's progress when the target spans message pages", async () => {
+    messagePageSize = 2;
+    const sid = sessionIdFor(scope);
+    sessions.set(sid, { info: { id: sid, location: { directory: root }, time: { created: clock++ } }, msgs: [
+      { id: "target", type: "user", time: { created: clock++ } },
+      { id: "own", type: "assistant", time: { created: clock++ }, content: [{ type: "text", text: "own work" }] },
+      { id: "successor", type: "user", time: { created: clock++ } },
+      { id: "other", type: "assistant", time: { created: clock++ }, content: [{ type: "text", text: "other work" }] },
+    ] });
+    const driver = new OpenCodeHttpDriver({ url, passwordFile: path.join(root, "pw") });
+    expect(await driver.progressMessages(sid, "target")).toEqual([{ id: "own", content: [{ type: "text", text: "own work" }] }]);
+  });
 
   it("rejoins a long in-flight turn whose user prompt is older than one page of messages", async () => {
     // A turn that has run for hours: hundreds of assistant messages sit after the single user prompt, so the
@@ -385,16 +429,16 @@ describe("OpenCode adapter nativeRuntime nar", () => {
       msgs: [{ id: orphan, type: "user", text: "Full assignment", time: { created: clock++ } },
         ...Array.from({ length: 5 }, (_, i) => ({ id: `msg_work${i}`, type: "assistant", time: { created: clock++ }, content: [{ type: "tool", name: "read" }] }))] });
     active.add(sid);
-    const finish = setTimeout(() => {
+    const finish = () => {
       const s = sessions.get(sid)!;
       s.msgs.push({ id: "msg_done", type: "assistant", time: { created: clock++, completed: clock++ },
         content: [{ type: "text", text: "long turn finished" }], cost: 0.25, tokens: { input: 50, output: 5, reasoning: 0, cache: { read: 0, write: 0 } } });
       s.info.time.idle = clock++;
       s.info.outcome = "succeeded";
       active.delete(sid);
-    }, 60);
-    const retry = await execute(context("run-1-retry", { nativeRuntime: "nar" }) as never);
-    clearTimeout(finish);
+    };
+    const retry = await execute({ ...context("run-1-retry", { nativeRuntime: "nar" }),
+      onLog: async (_stream: string, chunk: string) => { if (chunk.includes("nar_rejoin")) finish(); } } as never);
     expect(promptPosts).toBe(0);
     expect(interruptPosts).toBe(0);
     expect(userMsgs().map((m) => m.id)).toEqual([orphan]);

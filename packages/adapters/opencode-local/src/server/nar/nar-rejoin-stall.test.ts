@@ -24,7 +24,7 @@ vi.mock("./opencode-http-driver.js", async (orig) => {
 import { narOpIdFor, runNarOpenCodeAttempt } from "./nar-attempt.js";
 import { messageIdFor } from "./opencode-http-driver.js";
 
-async function run(extra: Record<string, unknown>) {
+async function run(extra: Record<string, unknown>, onLine?: (line: string) => void) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "nar-stall-"));
   const configPath = path.join(dir, "opencode.json");
   await fs.writeFile(configPath, JSON.stringify({ url: "http://127.0.0.1:4096", passwordFile: path.join(dir, "pw") }));
@@ -34,7 +34,7 @@ async function run(extra: Record<string, unknown>) {
     configPath, agentId: "a", taskId: "t", runId: "run-1", cwd: dir, model: "", prompt: "p", timeoutSec: 0,
     pollMs: 1, probeMs: 0, idleGraceMs: 60_000, rejoinStallMs: 40, ...extra,
     fetchImpl: (async () => { throw new Error("offline"); }) as unknown as typeof fetch,
-    onLog: async (_s, c) => { log.push(c); },
+    onLog: async (_s, c) => { log.push(c); onLine?.(c); },
   });
   await fs.rm(dir, { recursive: true });
   return { res, log: log.join("") };
@@ -71,14 +71,15 @@ describe("NAR rejoin stall watchdog", () => {
   it("holds an explicit stop of an observed foreign turn without interrupting it", async () => {
     d.inflight = messageIdFor(narOpIdFor("other-run"));
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort({ code: "paperclip_explicit_run_stop" }), 10);
-    try {
-      const { res } = await run({ signal: controller.signal, rejoinStallMs: 60_000 });
+    {
+      const { res } = await run({ signal: controller.signal, rejoinStallMs: 60_000 }, line => {
+        if (line.includes("nar_rejoin")) setTimeout(() => controller.abort({ code: "paperclip_explicit_run_stop" }), 0);
+      });
       expect(d.interrupts).toBe(0);
       expect(d.inflight).toBe(messageIdFor(narOpIdFor("other-run")));
       expect(res.providerTermination).toBeUndefined();
       expect(res.executionRecovery).toMatchObject({ providerWorkStarted: true, reason: "unowned_turn" });
-    } finally { clearTimeout(timer); }
+    }
   });
 
   it("leaves a rejoined message alone while it keeps progressing", async () => {
