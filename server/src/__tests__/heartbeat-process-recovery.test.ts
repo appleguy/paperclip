@@ -1,4 +1,8 @@
 import { persistHeartbeatRunProcessMetadata } from "../services/heartbeat/run-lifecycle.js";
+import { createHeartbeatQueueDrive } from "../services/heartbeat/queue-drive.js";
+import { createHeartbeatRunState } from "../services/heartbeat/run-state.js";
+import { evaluateAgentInvokabilityFromDb } from "../services/agent-invokability.js";
+import { issueTreeControlService } from "../services/issue-tree-control.js";
 import { enableRunFailureReporting } from "./helpers/run-failure-reporting.js";
 import { EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { createSystemRecovery } from "../services/system-recovery-state.js";
@@ -13531,6 +13535,43 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(mockAdapterExecute).not.toHaveBeenCalled();
     },
   );
+
+  it("allows fresh Board work after a stop and then drives the remaining assigned issue", async () => {
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({ agentStatus: "idle", runStatus: "cancelled", runtimeMode: "legacy" });
+    await db.update(heartbeatRuns).set({ finishedAt: new Date(Date.now() - 10_000), resultJson: { cancelledByActorType: "user" } }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ executionRunId: null, checkoutRunId: null }).where(eq(issues.id, issueId));
+    let calls = 0;
+    mockAdapterExecute.mockImplementation(async () => {
+      ++calls;
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+      return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Work completed", provider: "test", model: "test" };
+    });
+    const heartbeat = heartbeatService(db);
+    const run = await heartbeat.wakeup(agentId, { source: "on_demand", triggerDetail: "manual", manualUserWake: true,
+      reason: "issue_commented", requestedByActorType: "user", requestedByActorId: "responsible-user",
+      payload: { issueId }, contextSnapshot: { issueId } });
+    expect(run).not.toBeNull();
+    await heartbeat.drainActiveRunExecutions();
+    await db.update(issues).set({ status: "todo", executionRunId: null, checkoutRunId: null }).where(eq(issues.id, issueId));
+    const drive = createHeartbeatQueueDrive(db, {
+      getAgent: createHeartbeatRunState(db).getAgent,
+      getAgentInvokability: agent => evaluateAgentInvokabilityFromDb(db, agent),
+      getSchedulingSuppression: async () => ({ suppressed: false, reason: null }),
+      getWorktreeExecutionCutoff: async () => null,
+      issuesSvc: issueService(db), treeControlSvc: issueTreeControlService(db),
+      enqueueWakeup: heartbeat.wakeup,
+    });
+    await drive.wakeNextAssignedIssueAfterRun({ id: run!.id, companyId, agentId });
+    await heartbeat.drainActiveRunExecutions();
+    const queueRun = await waitForValue(async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId)))
+      .find(row => row.contextSnapshot?.source === "heartbeat.queue_drive" && row.contextSnapshot?.issueId === issueId) ?? null);
+    await heartbeat.drainActiveRunExecutions();
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs.find(row => row.id === run!.id)?.status).toBe("succeeded");
+    expect(queueRun).toBeTruthy();
+    expect(runs.find(row => row.id === queueRun?.id)?.status).toBe("succeeded");
+    expect(calls).toBe(2);
+  });
 
   it.each(["claim", "dispatch", "queued_comments"] as const)(
     "honors close committed at the %s boundary without a provider call",
