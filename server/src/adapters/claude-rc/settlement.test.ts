@@ -21,6 +21,7 @@ let executionState: IssueExecutionState | null;
 let activity: Partial<ActivityEvent>[];
 let failAt: string | null;
 let calls: string[];
+let lastPatch: Record<string, unknown> | null;
 let requestRunId: string;
 let fetchMock: Mock<(url: string, init: RequestInit) => Promise<Response>>;
 const ctx = (issueId = "original") => ({
@@ -52,6 +53,7 @@ beforeEach(async () => {
     }
     if (init.method === "PATCH") {
       const body = JSON.parse(init.body as string);
+      lastPatch = body;
       status = body.status;
       if (executionState?.status === "pending") {
         expect(body.comment).toContain(receipt.summary);
@@ -375,6 +377,7 @@ describe("F07 durable receipt settlement", () => {
   it("requires verified blocked delivery before releasing a foreign block terminal", async () => {
     await settleOutcome(ctx(), dir, sourceRunId, "original", { kind: "block", reason: "Missing input" });
     expect(status).toBe("blocked");
+    expect(lastPatch?.unblockDescriptor).toMatchObject({ owner: "board" });
     calls = [];
     await reconcileForeignSettlement(ctx("next"), dir, activePath);
     expect(calls).toEqual([]);

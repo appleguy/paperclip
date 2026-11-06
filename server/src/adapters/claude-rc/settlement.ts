@@ -169,7 +169,8 @@ export async function settleOutcome(
     // The blocker comment and transition share one issue update, avoiding duplicate comments on recovery.
     const patched = await invoke("PATCH", route, { status, ...(outcome.kind === "block" ? {
       comment: `Claude Remote Control blocked: ${outcome.reason}`,
-      unblockDescriptor: { owner: { agentId: ctx.agent.id }, action: `Resolve the worker-reported blocker, then reassign or reopen:\n${outcome.reason}`.slice(0, 2000) },
+      // A worker-reported block is routed to Board: a self-owned descriptor is rejected (SCO-1105) and would retain the checkpoint.
+      unblockDescriptor: { owner: "board" as const, action: `Resolve the worker-reported blocker, then reassign or reopen:\n${outcome.reason}`.slice(0, 2000) },
     } : intent.review && outcome.kind === "done" ? {
       comment: `Approved: ${outcome.receipt.summary}\n\nClaude Remote Control source run ${sourceRunId}; stage ${intent.review.stageId}.`,
     } : {}) }) as IssueStatus | null;
