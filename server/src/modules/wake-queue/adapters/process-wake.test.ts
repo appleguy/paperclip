@@ -93,7 +93,7 @@ describe.skipIf(!support.supported)("process wake admission and release", () => 
     const f = await fixture();
     const [comment] = await db.insert(issueComments).values({ companyId: f.company.id, issueId: f.issue.id, body: "Reply", authorUserId: "owner" }).returning();
     const [hold] = await db.insert(issueRecoveryActions).values({ companyId: f.company.id, sourceIssueId: f.issue.id,
-      kind: "active_run_watchdog", ownerType: "board", cause: "legacy_execution_requires_reconciliation", status: "open",
+      kind: "active_run_watchdog", ownerType: "board", cause: "legacy_execution_requires_reconciliation", status: "active",
       fingerprint: f.run.id, evidence: { automaticRecovery: { replay: "blocked" } }, nextAction: "Reconcile the external execution." }).returning();
     const [pending] = await db.insert(agentWakeupRequests).values({ companyId: f.company.id, agentId: f.agent.id, source: "automation",
       reason: "issue_reopened_via_comment", status: "deferred_issue_execution", requestedByActorType: "user", requestedByActorId: "owner",

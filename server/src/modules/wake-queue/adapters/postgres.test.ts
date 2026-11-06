@@ -942,7 +942,7 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     const wakeId = await seedDeferredWake({ companyId, agentId, issueId });
     const [hold] = await db.insert(issueRecoveryActions).values({
       companyId, sourceIssueId: issueId, kind: "active_run_watchdog", ownerType: "board",
-      cause: "legacy_execution_requires_reconciliation", status: "resolved",
+      cause: "legacy_execution_requires_reconciliation", status: "active",
       fingerprint: runId, evidence: { automaticRecovery: { replay: "blocked" } },
       nextAction: "Check the stopped execution.",
     }).returning();
@@ -959,7 +959,7 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId)))[0]).toMatchObject({
       status: "deferred_issue_execution", runId: null,
     });
-    await db.update(issueRecoveryActions).set({ evidence: {} }).where(eq(issueRecoveryActions.id, hold!.id));
+    await db.update(issueRecoveryActions).set({ status: "resolved", evidence: {} }).where(eq(issueRecoveryActions.id, hold!.id));
     await adapter.withIssueExecutionLock({ companyId, runId, now: new Date() }, drain);
     expect(drainCalls).toBe(1);
   });
