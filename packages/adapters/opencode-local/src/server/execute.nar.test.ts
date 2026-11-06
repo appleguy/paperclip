@@ -401,7 +401,7 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect(retry).toMatchObject({ exitCode: 0, sessionId: sid });
   }, 15_000);
 
-  it("registers the heartbeat cancellation barrier and interrupts the exact in-flight NAR turn on explicit pause", async () => {
+  it("holds an explicit pause when the active turn cannot be interrupted safely", async () => {
     autoComplete = false;
     const controller = new AbortController();
     const onCancellationReady = vi.fn(async () => {});
@@ -412,15 +412,33 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect(onCancellationReady).toHaveBeenCalledOnce();
     controller.abort(Object.assign(new Error("Cancelled due to agent pause"), { code: "paperclip_explicit_run_stop" }));
     const stopped = await run;
-    // SCO-679: the stop is verified from OpenCode (turn no longer in flight), so cancellation is acknowledged.
-    expect(stopped).toMatchObject({ exitCode: 75, errorCode: "cancelled", resultJson: {
-      executionCancellation: { state: "acknowledged", proof: "session_idle" },
-      executionRecovery: { kind: "interrupted", providerStopped: true, sessionPreserved: true } } });
+    expect(stopped.resultJson).toMatchObject({ executionRecovery: { providerWorkStarted: true } });
+    expect(stopped.resultJson).not.toHaveProperty("executionCancellation.state", "acknowledged");
     expect(promptPosts).toBe(1);
-    expect(interruptPosts).toBe(1);
-    expect(active.size).toBe(0);
+    expect(interruptPosts).toBe(0);
+    expect(active.has(sid)).toBe(true);
     expect(userMsgs()).toHaveLength(1);
     expect(runProcess).not.toHaveBeenCalled();
+  });
+
+  it("does not interrupt a successor that starts after the target is observed", async () => {
+    const driver = new OpenCodeHttpDriver({ url, passwordFile: path.join(root, "pw") });
+    const sid = sessionIdFor(scope);
+    const target = messageIdFor(narOpIdFor("run-target"));
+    const successor = messageIdFor(narOpIdFor("run-successor"));
+    sessions.set(sid, { info: { id: sid, time: { created: clock++ } },
+      msgs: [{ id: target, type: "user", time: { created: clock++ } }] });
+    active.add(sid);
+    vi.spyOn(driver, "inflightMessage").mockImplementationOnce(async () => {
+      sessions.get(sid)!.msgs.push({ id: successor, type: "user", time: { created: clock++ } });
+      return target;
+    });
+    const op = { opId: "stop-target", kind: "interrupt" as const, payloadSha256: "" };
+    const fence = { runId: "run-target", leaseGeneration: 1, hostEpoch: 4242 };
+    expect(await driver.interruptExpectedMessage(sid, target, op, fence)).toBe("uncertain");
+    expect(interruptPosts).toBe(0);
+    expect(active.has(sid)).toBe(true);
+    expect(await driver.inflightMessage(sid)).toBe(successor);
   });
 
   it("does not stop another run's turn when a retry observing it is stopped", async () => {

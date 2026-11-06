@@ -353,16 +353,15 @@ export class OpenCodeHttpDriver implements ProviderDriver {
     return "working";
   }
 
-  // Do not interrupt an idle session or a different (possibly owner-driven) turn.
-  // A repeated Stop after the provider goes idle is a no-op, not a second write.
-  async interruptExpectedMessage(conversationId: string, messageId: string, op: Op, fence: Fence): Promise<"requested" | "uncertain" | "idle"> {
+  // The provider interrupt is session-wide and has no expected-message fence.
+  // A successor can start after this read, so it cannot authorize an interrupt.
+  async interruptExpectedMessage(conversationId: string, messageId: string, _op: Op, _fence: Fence): Promise<"requested" | "uncertain" | "idle"> {
     try {
       if (await this.inflightMessage(conversationId) !== messageId) return "idle";
     } catch {
-      // An unreadable state is not authority to cancel an unverified turn.
       return "uncertain";
     }
-    return this.interrupt(conversationId, op, fence);
+    return "uncertain";
   }
 
   async interrupt(conversationId: string, _op: Op, _f: Fence): Promise<"requested" | "uncertain"> {
