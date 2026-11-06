@@ -13617,6 +13617,81 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     },
   );
 
+  it.each(["claim", "dispatch"] as const)("prevents concurrent queue %s while a real user Stop waits for the issue lock", async (boundary) => {
+    const { agentId, issueId, runId } = await seedRunFixture({
+      adapterType: "opencode_local", runtimeMode: "legacy", agentStatus: "idle", runStatus: "failed",
+    });
+    let releaseLock!: () => void;
+    let releaseReady!: () => void;
+    const lockReady = new Promise<void>((resolve) => { releaseReady = resolve; });
+    const lockHeld = new Promise<void>((resolve) => { releaseLock = resolve; });
+    let blocker: Promise<void> | undefined;
+    let stopping: Promise<unknown> | undefined;
+    let hookUsed = false;
+    const heartbeat = heartbeatService(db, {
+      beforeChatControlRecoveryCheck: async ({ stage }) => {
+        if (stage !== boundary || hookUsed) return;
+        hookUsed = true;
+        await db.update(heartbeatRuns).set({ status: "running", finishedAt: null, resultJson: {} }).where(eq(heartbeatRuns.id, runId));
+        let reportPid!: (pid: number) => void;
+        const pidReady = new Promise<number>((resolve) => { reportPid = resolve; });
+        blocker = db.transaction(async (tx) => {
+          await tx.select({ id: issues.id }).from(issues).where(eq(issues.id, issueId)).for("update");
+          const [row] = await tx.execute<{ pid: number }>(sql`select pg_backend_pid() as pid`);
+          reportPid(row!.pid);
+          await lockHeld;
+        });
+        const pid = await pidReady;
+        stopping = heartbeat.cancelRun(runId, "Operator Stop", { resultJson: {
+          cancelledByActorType: "user", cancelledByUserId: "responsible-user",
+        } }).then(() => null, (error: unknown) => error);
+        await vi.waitFor(async () => {
+          const [row] = await db.execute<{ count: number }>(sql`select count(*)::int as count from pg_stat_activity a
+            where a.datname = current_database() and ${pid} = any(pg_blocking_pids(a.pid)) and a.wait_event_type = 'Lock'`);
+          expect(row!.count).toBeGreaterThan(0);
+        });
+        releaseReady();
+      },
+    });
+    try {
+      const candidate = await heartbeat.wakeup(agentId, {
+        source: "assignment", triggerDetail: "system", reason: "issue_queue_drive",
+        requestedByActorType: "system", requestedByActorId: "heartbeat_queue_drive",
+        payload: { issueId }, contextSnapshot: { issueId, source: "heartbeat.queue_drive" },
+      });
+      await lockReady;
+      expect(candidate).not.toBeNull();
+      if (boundary === "claim") {
+        await heartbeat.drainActiveRunExecutions();
+        expect(await heartbeat.getRun(candidate!.id)).toMatchObject({ status: "queued" });
+      } else {
+        // After bounded NOWAIT retries, dispatch settlement can wait behind
+        // the Stop transaction, which itself is waiting for the issue lock.
+        await vi.waitFor(async () => {
+          const [row] = await db.execute<{ count: number }>(sql`select count(*)::int as count from pg_stat_activity a
+            where a.datname = current_database() and cardinality(pg_blocking_pids(a.pid)) > 0 and a.wait_event_type = 'Lock'`);
+          expect(row!.count).toBeGreaterThanOrEqual(2);
+        }, { timeout: 12_000, interval: 50 });
+      }
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+      expect((await heartbeat.getRun(runId))?.resultJson?.executionCancellation).toBeUndefined();
+      releaseLock();
+      await blocker;
+      expect(await stopping).toMatchObject({ status: 409 });
+      expect((await heartbeat.getRun(runId))?.resultJson?.executionCancellation).toMatchObject({ state: "requested" });
+      if (boundary === "claim") await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
+      if (boundary === "claim") expect(await heartbeat.getRun(candidate!.id)).toMatchObject({ status: "cancelled", errorCode: "queue_drive_recovery_hold" });
+      else expect(await heartbeat.getRun(candidate!.id)).toMatchObject({ status: "failed", errorCode: CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE });
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+    } finally {
+      releaseLock?.();
+      await blocker;
+      await stopping;
+      await heartbeat.drainActiveRunExecutions();
+    }
+  }, 30_000);
+
   it("honors a chat close published at the queue-drive dispatch boundary", async () => {
     const source = await seedCommittedChatControlStop();
     await db.insert(agentWakeupRequests).values({ companyId: source.companyId, agentId: source.agentId,
