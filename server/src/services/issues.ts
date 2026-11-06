@@ -11170,6 +11170,7 @@ export function issueService(db: Db) {
         workspaceSelectionActor?: AuthorizationActor;
         expectedExecutionPolicy?: typeof issues.$inferInsert.executionPolicy;
         expectedStatusVersion?: number;
+        expectedBlockedTransition?: { statusVersion: number; updatedAt: string; blockedTransitionAt: string; blockedByIssueIds: string[] };
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -11221,6 +11222,7 @@ export function issueService(db: Db) {
         workspaceSelectionActor,
         expectedExecutionPolicy,
         expectedStatusVersion,
+        expectedBlockedTransition,
         ...issueData
       } = data;
       if (expectedStatusVersion !== undefined && (
@@ -11229,6 +11231,10 @@ export function issueService(db: Db) {
       )) {
         throw unprocessable("expectedStatusVersion requires a status-only backlog-to-todo promotion");
       }
+      if (expectedBlockedTransition !== undefined && (
+        issueData.status !== "todo" || Object.keys(issueData).some(key => key !== "status") ||
+        nextLabelIds !== undefined || blockedByIssueIds !== undefined || expectedExecutionPolicy !== undefined || expectedStatusVersion !== undefined
+      )) throw unprocessable("expectedBlockedTransition requires a status-only unblock");
       // An explicit edit claims the title, even if it keeps the same text.
       if (issueData.title !== undefined) issueData.titleNeedsGeneration = false;
       if (
@@ -11483,6 +11489,27 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        if (expectedBlockedTransition !== undefined) {
+          const expected = expectedBlockedTransition;
+          const stale = () => conflict("The blocked task changed. Read and review it again.", { code: "blocked_transition_changed" });
+          if (receiptExisting.status !== "blocked" || receiptExisting.statusVersion !== expected.statusVersion ||
+              receiptExisting.updatedAt.toISOString() !== expected.updatedAt ||
+              receiptExisting.blockedTransitionAt?.toISOString() !== expected.blockedTransitionAt ||
+              receiptExisting.checkoutRunId || receiptExisting.executionRunId) throw stale();
+          const readiness = (await listIssueDependencyReadinessMap(tx, receiptExisting.companyId, [id], true)).get(id);
+          if (!readiness || !readiness.isDependencyReady ||
+              !isDeepStrictEqual([...readiness.blockerIssueIds].sort(), [...expected.blockedByIssueIds].sort())) throw stale();
+          const policy = normalizeIssueExecutionPolicy(receiptExisting.executionPolicy ?? null);
+          const transition = applyIssueExecutionPolicyTransition({
+            issue: receiptExisting, policy, previousPolicy: policy, requestedStatus: "todo", requestedAssigneePatch: {},
+            actor: { agentId: actorAgentId ?? null, userId: actorUserId ?? null },
+            allowBoardOverride: workspaceSelectionActor?.type === "board" && workspaceSelectionActor.source !== "mcp_oauth",
+          });
+          if (transition.decision || (transition.patch.status !== undefined && transition.patch.status !== "todo") ||
+              (transition.patch.assigneeAgentId !== undefined && transition.patch.assigneeAgentId !== receiptExisting.assigneeAgentId) ||
+              (transition.patch.assigneeUserId !== undefined && transition.patch.assigneeUserId !== receiptExisting.assigneeUserId)) throw stale();
+          Object.assign(patch, transition.patch);
+        }
         // Compare with the locked owner, not only the pre-transaction read:
         // another assignment may have committed while this update waited.
         if ((patch.assigneeAgentId !== undefined && patch.assigneeAgentId !== receiptExisting.assigneeAgentId) ||

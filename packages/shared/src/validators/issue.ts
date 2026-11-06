@@ -950,6 +950,12 @@ export const updateIssueSchema = objectWithoutDefaults(
   .partial()
   .extend({
     expectedStatusVersion: z.number().int().nonnegative().optional(),
+    expectedBlockedTransition: z.object({
+      statusVersion: z.number().int().nonnegative(),
+      updatedAt: z.string().datetime(),
+      blockedTransitionAt: z.string().datetime(),
+      blockedByIssueIds: z.array(z.string().guid()).max(100),
+    }).strict().optional(),
     /** Reject a policy write if the policy changed after the caller read it. */
     expectedExecutionPolicy: z.record(z.string(), z.unknown()).optional().nullable(),
     requestDepth: issueRequestDepthInputSchema.optional(),

@@ -28,10 +28,15 @@ Board key, Board agent ID, agent ID and run ID in the environment. Apply is
 limited to reviewed self-owned transitions and serially spaced by 12 seconds.
 It rejects missing or changed transitions, descriptor actions and owners, and
 rechecks live dependencies, interactions, approvals, recovery actions and
-monitor timing. It checks the issue again after those reads. The Paperclip
-status PATCH has no atomic transition precondition; a change after the final
-read and before PATCH remains a race, so Board must account for that limitation
-when deciding whether to execute. This tool does not establish clearance.
+monitor timing. It checks the issue again after those reads. The apply request
+uses `PATCH /api/issues/:id/guarded-unblock` with only `status: "todo"` and
+`expectedBlockedTransition`: the observed `statusVersion`, `updatedAt`,
+`blockedTransitionAt`, and complete `blockedByIssueIds` from diagnostics.
+The server checks the blocked issue and dependency readiness under transaction
+locks; a stale snapshot must be reviewed again. A missing endpoint or any
+error is a failed apply, never a reason to fall back to the ordinary PATCH.
+This guard does not make the preceding interaction, approval and recovery reads
+atomic; Board must still review those gates. It does not establish clearance.
 
 `--cleanup-decisions` is inspection-only and requires the Board credential;
 it cannot be combined with apply. Peer redelivery and Board routing appear in

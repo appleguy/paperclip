@@ -69,6 +69,10 @@ func (c *client) routeDescriptor(ctx context.Context, current issue, d blockerDi
 			r.Action, r.Cause = "live_dependency", "self-owned descriptor has an unresolved or uncertain dependency"
 			return r
 		}
+		if d.Truncated {
+			r.Action, r.Cause = "live_dependency", "dependency snapshot is truncated"
+			return r
+		}
 		r.Action, r.Cause = "self_review", "Board must verify that the descriptor action has cleared; dependency readiness alone is insufficient"
 		if !apply {
 			return r
@@ -87,9 +91,20 @@ func (c *client) routeDescriptor(ctx context.Context, current issue, d blockerDi
 			return r
 		}
 		r.Action = "self_unblock"
-		body := map[string]string{"status": "todo", "comment": "Auto-unblocker: Board reviewed this blocked transition and its descriptor action; the live dependency and decision gates were rechecked before resuming."}
+		blockerIDs := make([]string, 0, len(d.Blockers))
+		for _, blocker := range d.Blockers {
+			if blocker.ID == "" {
+				r.Error = "dependency snapshot missing an ID"
+				return r
+			}
+			blockerIDs = append(blockerIDs, blocker.ID)
+		}
+		body := map[string]any{"status": "todo", "expectedBlockedTransition": map[string]any{
+			"statusVersion": current.StatusVersion, "updatedAt": current.UpdatedAt,
+			"blockedTransitionAt": current.BlockedTransitionAt, "blockedByIssueIds": blockerIDs,
+		}}
 		var updated issueResult
-		if err := c.request(ctx, http.MethodPatch, "/api/issues/"+url.PathEscape(current.ID), body, &updated); err != nil {
+		if err := c.request(ctx, http.MethodPatch, "/api/issues/"+url.PathEscape(current.ID)+"/guarded-unblock", body, &updated); err != nil {
 			r.Error = err.Error()
 			return r
 		}

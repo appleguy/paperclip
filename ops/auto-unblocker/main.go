@@ -24,6 +24,7 @@ type issue struct {
 	Identifier          string          `json:"identifier"`
 	Title               string          `json:"title"`
 	Status              string          `json:"status"`
+	StatusVersion       int64           `json:"statusVersion"`
 	AssigneeAgentID     string          `json:"assigneeAgentId"`
 	AssigneeUserID      string          `json:"assigneeUserId"`
 	CreatedAt           string          `json:"createdAt"`

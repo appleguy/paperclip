@@ -52,6 +52,19 @@ func TestReviewedTransitionRechecksGates(t *testing.T) {
 				switch {
 				case r.Method == http.MethodPatch:
 					patches++
+					if r.URL.Path != "/api/issues/one/guarded-unblock" {
+						t.Errorf("unguarded endpoint: %s", r.URL.Path)
+					}
+					var body struct {
+						Status   string `json:"status"`
+						Expected struct {
+							BlockedTransitionAt string   `json:"blockedTransitionAt"`
+							BlockedByIssueIDs   []string `json:"blockedByIssueIds"`
+						} `json:"expectedBlockedTransition"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Status != "todo" || body.Expected.BlockedTransitionAt != transition || body.Expected.BlockedByIssueIDs == nil {
+						t.Errorf("missing guarded snapshot: %+v, %v", body, err)
+					}
 					_, _ = w.Write([]byte(`{"status":"todo"}`))
 				case strings.HasSuffix(r.URL.Path, "/diagnostics/blockers"):
 					_ = json.NewEncoder(w).Encode(map[string]any{"readiness": map[string]any{"isDependencyReady": tc.ready}})

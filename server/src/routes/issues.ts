@@ -14116,8 +14116,14 @@ export function issueRoutes(
   }
 
   router.patch(
-    "/issues/:id",
+    ["/issues/:id", "/issues/:id/guarded-unblock"],
     (req, _res, next) => {
+      const guardedUnblock = req.path.endsWith("/guarded-unblock");
+      if (guardedUnblock !== (req.body?.expectedBlockedTransition !== undefined) ||
+        (guardedUnblock && (req.body.status !== "todo" ||
+          Object.keys(req.body).some(key => key !== "status" && key !== "expectedBlockedTransition")))) {
+        throw unprocessable("Guarded unblock requires only status=todo and expectedBlockedTransition at the guarded-unblock endpoint");
+      }
       if (req.body?.expectedStatusVersion !== undefined && (
         req.body.status !== "todo" ||
         Object.keys(req.body).some(key => key !== "status" && key !== "expectedStatusVersion")
@@ -14232,6 +14238,7 @@ export function issueRoutes(
         hiddenAt: hiddenAtRaw,
         expectedExecutionPolicy,
         expectedStatusVersion,
+        expectedBlockedTransition,
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
         ...updateFields
       } = req.body;
@@ -14604,7 +14611,7 @@ export function issueRoutes(
         req.body.executionPolicy !== undefined && monitorChanged,
       );
 
-      const transition: ReturnType<typeof applyIssueExecutionPolicyTransition> = expectedStatusVersion !== undefined
+      const transition: ReturnType<typeof applyIssueExecutionPolicyTransition> = expectedStatusVersion !== undefined || expectedBlockedTransition !== undefined
         ? { patch: {} }
         : applyIssueExecutionPolicyTransition({
         issue: existing,
@@ -15041,6 +15048,7 @@ export function issueRoutes(
         workspaceSelectionActor: req.actor,
         expectedExecutionPolicy,
         expectedStatusVersion,
+        expectedBlockedTransition,
         actorAgentId: actor.agentId ?? null,
         actorRunId: actor.agentId ? actor.runId : null,
         actorRunStopId: actor.agentId && interruptedRunId === actor.runId ? issueMutationStopId : null,
