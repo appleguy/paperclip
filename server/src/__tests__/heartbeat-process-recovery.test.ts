@@ -12238,7 +12238,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         assigneeAgentId: blockedAssigneeAgentId,
         responsibleUserId: "responsible-user",
         issueNumber: 2,
-        identifier: `${issuePrefix}-2`,
+        identifier: "PROJECT-2",
       },
     ]);
     await db.insert(issueRelations).values({
@@ -12261,7 +12261,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const comments = await selectRecoveryCommentsForIssue(blockerIssueId);
     expect(comments[0]?.body).toContain("Assigned Orphan Blocker");
     expect(comments[0]?.body).toContain(
-      `[${issuePrefix}-2](/${issuePrefix}/issues/${issuePrefix}-2)`,
+      `[PROJECT-2](/${issuePrefix}/issues/PROJECT-2)`,
     );
 
     const wakeups = await selectRecoveryWakesByAgent(creatorAgentId);

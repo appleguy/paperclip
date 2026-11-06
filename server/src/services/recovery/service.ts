@@ -801,6 +801,7 @@ function agentUiLink(
 
 function formatIssueLinksForComment(
   relations: Array<{ identifier?: string | null }>,
+  companyPrefix: string,
 ) {
   const identifiers = [
     ...new Set(
@@ -813,7 +814,7 @@ function formatIssueLinksForComment(
   return identifiers
     .slice(0, 5)
     .map((identifier) => {
-      return `[${identifier}](/issues/${identifier})`;
+      return `[${identifier}](/${companyPrefix}/issues/${identifier})`;
     })
     .join(", ");
 }
@@ -2178,12 +2179,14 @@ export function recoveryService(
       .select({
         id: issues.id,
         companyId: issues.companyId,
+        companyPrefix: companies.issuePrefix,
         identifier: issues.identifier,
         status: issues.status,
         createdByAgentId: issues.createdByAgentId,
       })
       .from(issueRelations)
       .innerJoin(issues, eq(issueRelations.issueId, issues.id))
+      .innerJoin(companies, eq(companies.id, issues.companyId))
       .where(
         and(
           eq(issueRelations.type, "blocks"),
@@ -2228,7 +2231,7 @@ export function recoveryService(
       }
 
       const relations = await issuesSvc.getRelationSummaries(candidate.id);
-      const blockingLinks = formatIssueLinksForComment(relations.blocks);
+      const blockingLinks = formatIssueLinksForComment(relations.blocks, candidate.companyPrefix);
       const updated = await issuesSvc.update(candidate.id, {
         assigneeAgentId: creatorAgent.id,
         assigneeUserId: null,
