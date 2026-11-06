@@ -635,7 +635,7 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
       await writeFile(passwordFile, "fixture-secret");
       await writeFile(configPath, JSON.stringify({ url, passwordFile }));
       await writeFile(command, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-      await db.update(agents).set({ adapterType: "opencode_local" }).where(eq(agents.id, input.agent.id));
+      await db.update(agents).set({ adapterType: "opencode_local", status: "paused" }).where(eq(agents.id, input.agent.id));
       await db.update(heartbeatRuns).set({ controllerBootId: boot, controllerLeaseExpiresAt: new Date(Date.now() + 60_000), executionStage: "dispatching", resultJson: {} }).where(eq(heartbeatRuns.id, run.id));
       input.run.controllerBootId = boot;
       input.run.resultJson = {};
@@ -667,6 +667,24 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
       expect(await read(run.id)).toMatchObject({ status: "running", controllerBootId: successorBoot, resultJson: {
         earlySession: { sessionId: sid, sessionParams: { narBinding: { runId: run.id, messageId } } },
       } });
+      expect(otherWrites).toBe(0);
+      expect(revokeHeartbeatRunGatewayTokens).not.toHaveBeenCalled();
+      expect(input.instructions.releaseInstructionCopy).not.toHaveBeenCalled();
+      await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: sql`clock_timestamp() - interval '1 second'` }).where(eq(heartbeatRuns.id, run.id));
+      const { heartbeatService } = await import("../heartbeat.js");
+      expect((await heartbeatService(db).reapOrphanedRuns()).runIds).not.toContain(run.id);
+      const reaped = await read(run.id);
+      expect(reaped).toMatchObject({ status: "running", resultJson: {
+        earlySession: { sessionId: sid, sessionParams: { narBinding: { runId: run.id, messageId } } },
+      } });
+      expect(reaped.controllerBootId).not.toBe(successorBoot);
+      expect(reaped.resultJson).not.toHaveProperty("executionRecovery");
+      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, input.task.issueId!))).toEqual([
+        expect.objectContaining({ cause: "opencode_controller_lost_provider_unverified", evidence: expect.objectContaining({ runId: run.id }) }),
+      ]);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run.id))).toHaveLength(0);
+      expect(promptPosts).toBe(1);
+      expect(submittedMessageIds).toEqual([messageId]);
       expect(otherWrites).toBe(0);
       expect(revokeHeartbeatRunGatewayTokens).not.toHaveBeenCalled();
       expect(input.instructions.releaseInstructionCopy).not.toHaveBeenCalled();
