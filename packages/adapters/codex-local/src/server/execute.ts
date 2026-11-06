@@ -118,7 +118,12 @@ import {
 } from "./acp.js";
 import { codexShellEnvironmentKeys } from "@paperclipai/adapter-utils/codex-shell-environment";
 import { withCodexRunQuota } from "./run-quota.js";
-import { readSharedCodexThread, settleSharedCodexThread, sharedConversationStateDir } from "./shared-conversation.js";
+import {
+  readSharedCodexThread,
+  settleSharedCodexThread,
+  sharedConversationStateDir,
+  withSharedAcpSession,
+} from "./shared-conversation.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 const executeCodexAcp = createCodexAcpExecutor();
@@ -614,7 +619,19 @@ async function executeCodex(ctx: AdapterExecutionContext): Promise<AdapterExecut
     };
   }
   if (engineSelection.engine === "acp") {
-    return executeCodexAcp(ctx);
+    const acpRemote = adapterExecutionTargetIsRemote(readAdapterExecutionTarget({
+      executionTarget: ctx.executionTarget,
+      legacyRemoteExecution: ctx.executionTransport?.remoteExecution,
+    }));
+    const acpSharedDir = acpRemote ? null : sharedConversationStateDir(ctx.config);
+    if (!acpSharedDir) return executeCodexAcp(ctx);
+    const acpThread = await readSharedCodexThread(acpSharedDir);
+    if (acpThread?.sessionParams) {
+      await ctx.onLog("stdout", `[paperclip] keepConversation: resuming the seat thread "${acpThread.sessionId}".\n`);
+    }
+    const acpResult = await executeCodexAcp(withSharedAcpSession(ctx, acpThread));
+    await settleSharedCodexThread(acpSharedDir, acpResult, asString(acpResult.sessionParams?.cwd, ""));
+    return acpResult;
   }
 
   const { runId, agent, runtime, config, context, onLog, onMeta, onEvent, onSpawn, authToken } = ctx;
