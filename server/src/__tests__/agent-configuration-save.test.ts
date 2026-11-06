@@ -6,7 +6,7 @@ import express from "express";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { and, eq } from "drizzle-orm";
-import { agents, agentConfigRevisions, activityLog, builtInManagedResources, companies, companyMemberships, connectionGrants, createDb, environments, toolConnections, toolConnectionInstalls } from "@paperclipai/db";
+import { agents, agentConfigRevisions, activityLog, builtInManagedResources, companies, companyMemberships, connectionGrants, createDb, environments, heartbeatRuns, toolConnections, toolConnectionInstalls } from "@paperclipai/db";
 import { agentRoutes } from "../routes/agents.js";
 import { aiConnectionService } from "../services/ai-connections.js";
 import * as environmentTests from "../services/agent-environment-test.js";
@@ -66,6 +66,16 @@ describePostgres("agent configuration save latency", () => {
     });
   });
   afterEach(() => vi.restoreAllMocks());
+
+  it("delivers Stop for a status PATCH pause without waiting for the lifecycle worker", async () => {
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: agent.companyId, agentId: agent.id,
+      status: "queued", runtimeMode: "legacy", runtimeModeResolvedAt: new Date() }).returning();
+    const response = await request(app).patch(`/api/agents/${agent.id}`).send({ status: "paused" });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0]?.status).toBe("cancelled");
+    expect((await readAgent()).status).toBe("paused");
+    expect(probe).not.toHaveBeenCalled();
+  });
   afterAll(async () => {
     await database?.cleanup(); vi.unstubAllEnvs();
     if (home) await rm(home, { recursive: true, force: true });

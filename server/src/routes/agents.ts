@@ -5881,6 +5881,9 @@ export function agentRoutes(
     if (expectedStatus && !expectedStatus.includes(agent.status)) {
       throw conflict(`Requested status ${requestedStatus} was not applied; agent status is ${agent.status}`);
     }
+    // Status PATCH is also an explicit pause. Deliver Stop without waiting for
+    // the lifecycle worker, just like POST /agents/:id/pause.
+    if (requestedStatus === "paused") await heartbeat.cancelActiveForAgent(id);
 
     await logActivity(db, {
       companyId: agent.companyId,
