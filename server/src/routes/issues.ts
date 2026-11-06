@@ -56,7 +56,8 @@ import {
   markExecutionReconciliation,
   deliverReconciledExecutions,
 } from "../services/execution-recovery-resolution.js";
-import { settleStrandedLegacyExecutions } from "../services/stranded-execution-recovery.js";
+import { resolveRecoveryAction } from "../services/recovery/resolve-action.js";
+import { isPauseStrandedAction, type ResumeRecoveryResolver } from "../services/recovery/resume-stranded.js";
 import {
   storedSteeringAcknowledgement,
   reconcileSteeredIdentity,
@@ -3439,6 +3440,7 @@ export function issueRoutes(
   db: Db,
   storage: StorageService,
   opts: {
+    onRecoveryActionResolver?: (resolver: ResumeRecoveryResolver) => void;
     chatRunRetries?: Pick<
       ChatChannelService,
       "prepareFailedChatRunRetry" | "processFailedChatRunRetry"
@@ -9939,55 +9941,13 @@ export function issueRoutes(
     res.status(202).json(receipt);
   });
 
-  router.post(
-    "/issues/:id/recovery-actions/resolve",
-    validate(resolveIssueRecoveryActionSchema),
-    async (req, res) => {
-      const id = req.params.id as string;
-      const existing = await getAccessibleResource(
-        req,
-        res,
-        svc.getById(id),
-        "Issue not found",
-      );
-      if (!existing) return;
-      if (!(await assertIssueReadAllowed(req, res, existing))) return;
-      if (
-        await assertLowTrustControlPlaneDenied(
-          req,
-          res,
-          existing.companyId,
-          existing,
-        )
-      )
-        return;
-      if (req.actor.type === "agent") {
-        const boundaryDecision = await decideIssueAccess(
-          req,
-          existing,
-          "issue:mutate",
-        );
-        if (!boundaryDecision.allowed) {
-          await denyIssueWrite(
-            req,
-            res,
-            existing,
-            issueWriteDenialCodeForDecision(boundaryDecision),
-          );
-          return;
-        }
-        if (!requireAgentRunId(req, res)) return;
-        if (
-          !(await assertCrossIssueInfluenceWithinRunCap(
-            req,
-            res,
-            existing,
-            "update",
-          ))
-        )
-          return;
-      }
-
+  async function resolveIssueRecoveryAction(
+    req: Request,
+    existing: NonNullable<Awaited<ReturnType<typeof svc.getById>>>,
+    input: typeof req.body,
+    resumeGuard?: { agentId: string; actionId: string; pausedAt: Date | null },
+  ) {
+    const id = existing.id;
       const {
         actionId,
         outcome,
@@ -9995,7 +9955,7 @@ export function issueRoutes(
         resolutionNote,
         executionReconciliation,
         workspaceBaseRef,
-      } = req.body;
+      } = input;
       if (outcome === "false_positive" || outcome === "cancelled") {
         assertBoard(req);
       }
@@ -10022,6 +9982,14 @@ export function issueRoutes(
           .for("update")
           .then((rows) => rows[0] ?? null);
         if (!lockedIssue) throw notFound("Issue not found");
+        if (resumeGuard) {
+          const [candidate] = await tx.select().from(issueRecoveryActions).where(and(
+            eq(issueRecoveryActions.companyId, lockedIssue.companyId),
+            eq(issueRecoveryActions.sourceIssueId, lockedIssue.id),
+            eq(issueRecoveryActions.id, resumeGuard.actionId),
+          )).for("update");
+          if (!candidate || !isPauseStrandedAction({ issue: lockedIssue, action: candidate, ...resumeGuard })) return null;
+        }
 
         // Retained files are a source-scoped obligation, independent of the
         // current task owner/generation and any newer active recovery incident.
@@ -10496,41 +10464,21 @@ export function issueRoutes(
 
         const strandedRestore = outcome === "restored" && activeRecoveryAction.kind === "stranded_assigned_issue"
           && ["todo", "in_progress"].includes(issue.status) && !!issue.assigneeAgentId
-          && issue.assigneeAgentId === activeRecoveryAction.returnOwnerAgentId && req.actor.type === "board";
-        const settledLegacyActionIds = strandedRestore
-          ? await settleStrandedLegacyExecutions(tx as unknown as Db, { companyId: issue.companyId,
-            issueId: issue.id, recoveryActionId: activeRecoveryAction.id, actorId: actor.actorId }) : [];
-
-        let recoveryAction = await recoveryActionsSvc.resolveActiveForIssue(
-          {
-            companyId: existing.companyId,
-            sourceIssueId: existing.id,
-            actionId: activeRecoveryAction.id,
-            status: actionStatus,
-            outcome: recordedOutcome,
-            resolutionNote: resolutionNote ?? null,
-          },
-          tx,
-        );
-        if (!recoveryAction) throw notFound("Active recovery action not found");
-        if (strandedRestore && !chatRetry) {
-          const [updated] = await tx.update(issueRecoveryActions).set({ evidence: {
-            ...recoveryAction.evidence, continuationDelivery: "pending",
-            strandedRestoreDelivery: { settledLegacyActionIds, actorId: actor.actorId },
-          } }).where(eq(issueRecoveryActions.id, recoveryAction.id)).returning();
-          recoveryAction = issueRecoveryActionReadModel(updated!);
-        }
+          && issue.assigneeAgentId === activeRecoveryAction.returnOwnerAgentId && (req.actor.type === "board" || !!resumeGuard);
+        const recoveryAction = await resolveRecoveryAction({ db, tx, issue, action: activeRecoveryAction,
+          status: actionStatus, outcome: recordedOutcome, resolutionNote: resolutionNote ?? null,
+          actorId: actor.actorId, strandedRestore, chatRetry: !!chatRetry });
 
         return { issue, recoveryAction, chatRetry, strandedRestore };
       });
+      if (!result) return null;
       if (result.replayed) {
-        res.json({
+        return {
           issue: "workspaceRepairOnly" in result
             ? { ...result.issue, activeRecoveryAction: await recoveryActionsSvc.getActiveForIssue(result.issue.companyId, result.issue.id) }
             : result.issue,
           recoveryAction: result.recoveryAction,
-        });
-        return;
+        };
       }
       for (const publication of postCommitActivityPublications)
         publishActivity(publication);
@@ -10636,7 +10584,7 @@ export function issueRoutes(
         }
       }
 
-      res.json({
+      return {
         issue: {
           ...result.issue,
           activeRecoveryAction: "workspaceRepairOnly" in result
@@ -10644,7 +10592,68 @@ export function issueRoutes(
             : null,
         },
         recoveryAction: result.recoveryAction,
-      });
+      };
+  }
+
+  opts.onRecoveryActionResolver?.(async ({ req, companyId, issueId, agentId, actionId, pausedAt }) => {
+    const existing = await svc.getById(issueId);
+    if (!existing || existing.companyId !== companyId) return;
+    await resolveIssueRecoveryAction(req, existing,
+      { actionId, outcome: "restored", sourceIssueStatus: "todo" },
+      { agentId, actionId, pausedAt });
+  });
+
+  router.post(
+    "/issues/:id/recovery-actions/resolve",
+    validate(resolveIssueRecoveryActionSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const existing = await getAccessibleResource(
+        req,
+        res,
+        svc.getById(id),
+        "Issue not found",
+      );
+      if (!existing) return;
+      if (!(await assertIssueReadAllowed(req, res, existing))) return;
+      if (
+        await assertLowTrustControlPlaneDenied(
+          req,
+          res,
+          existing.companyId,
+          existing,
+        )
+      )
+        return;
+      if (req.actor.type === "agent") {
+        const boundaryDecision = await decideIssueAccess(
+          req,
+          existing,
+          "issue:mutate",
+        );
+        if (!boundaryDecision.allowed) {
+          await denyIssueWrite(
+            req,
+            res,
+            existing,
+            issueWriteDenialCodeForDecision(boundaryDecision),
+          );
+          return;
+        }
+        if (!requireAgentRunId(req, res)) return;
+        if (
+          !(await assertCrossIssueInfluenceWithinRunCap(
+            req,
+            res,
+            existing,
+            "update",
+          ))
+        )
+          return;
+      }
+
+      const result = await resolveIssueRecoveryAction(req, existing, req.body);
+      res.json(result);
     },
   );
 

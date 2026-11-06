@@ -772,8 +772,10 @@ export async function createApp(
     // production, so a failed login leaves no log trail.
     log: (line) => logger.info(line),
   });
+  let resolvePauseStrandedIssue: import("./services/recovery/resume-stranded.js").ResumeRecoveryResolver;
   api.use(
     agentRoutes(db, {
+      resolvePauseStrandedIssue: (input) => resolvePauseStrandedIssue(input),
       chatRunRetries: chatChannels,
       pluginWorkerManager: workerManager,
       deploymentMode: opts.deploymentMode,
@@ -890,6 +892,7 @@ export async function createApp(
   // issue approval endpoints delegate to it. The intervening routers use distinct
   // route prefixes, so this dependency does not change issue-route precedence.
   api.use(issueRoutes(db, opts.storageService, {
+    onRecoveryActionResolver: (resolver) => { resolvePauseStrandedIssue = resolver; },
     chatRunRetries: chatChannels,
     pluginWorkerManager: workerManager,
     approveToolActionRequest: (input) => toolGateway.approveActionRequest(input),

@@ -17,6 +17,7 @@ import { PLUGIN_RUNNER_AI_CONNECTION_REQUIRED, pluginEnvironmentRunnerTaskDriver
 import { agentEnvironmentTestService } from "../services/agent-environment-test.js";
 import { qualifyAgentRunner } from "../services/agent-runner-qualification.js";
 import { createAgentLifecycle } from "../services/agent-lifecycle.js";
+import { restorePauseStrandedIssues, type ResumeRecoveryResolver } from "../services/recovery/resume-stranded.js";
 import { isAgentSetupDraft } from "../modules/agent-lifecycle/index.js";
 
 import { agentIdentityService } from "../services/agent-identity.js";
@@ -517,6 +518,7 @@ async function withHireRunLock<T>(key: string, fn: () => Promise<T>): Promise<T>
 export function agentRoutes(
   db: Db,
   options: {
+    resolvePauseStrandedIssue?: ResumeRecoveryResolver;
     chatRunRetries?: Pick<ChatChannelService, "prepareFailedChatRunRetry" | "processFailedChatRunRetry">;
     pluginWorkerManager?: PluginWorkerManager;
     /** The active deployment mode. The confidential transport guard reads it. */
@@ -5969,6 +5971,12 @@ export function agentRoutes(
       entityType: "agent",
       entityId: agent.id,
     });
+
+    if (existing.status === "paused" && agent.status !== "paused" && options.resolvePauseStrandedIssue) {
+      await restorePauseStrandedIssues({ db, companyId: agent.companyId, agentId: agent.id,
+        pausedAt: existing.pausedAt, req, resolve: options.resolvePauseStrandedIssue,
+        onError: (err, issueId) => logger.warn({ err, issueId, agentId: agent.id }, "failed to restore pause-stranded issue") });
+    }
 
     res.json(redactAgentRowForResponse(agent));
   });
