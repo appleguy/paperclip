@@ -1,3 +1,5 @@
+import { RUNNER_REVISION_WAIT_RETRY_REASON } from "./runner-revision-mismatch.js";
+
 type RetryRun = {
   scheduledRetryAttempt?: number | null;
   scheduledRetryReason?: string | null;
@@ -48,7 +50,7 @@ function historicalFailureCount(run: RetryRun): number {
 export const SERVER_SHUTDOWN_REJOIN_RETRY_REASON = "server_shutdown_rejoin";
 export const SERVER_SHUTDOWN_REJOIN_MAX_ATTEMPTS = 12;
 /** Lanes counted only against their own consecutive attempts, never the failure budget. */
-const PER_REASON_LANES = ["workspace_busy", "target_busy", "ai_connection_busy", "ai_connection_pool_wait", SERVER_SHUTDOWN_REJOIN_RETRY_REASON];
+const PER_REASON_LANES = ["workspace_busy", "target_busy", "ai_connection_busy", "ai_connection_pool_wait", SERVER_SHUTDOWN_REJOIN_RETRY_REASON, RUNNER_REVISION_WAIT_RETRY_REASON];
 
 export function executionRetryAccounting(run: RetryRun): ExecutionRetryAccounting {
   const saved = savedAccounting(run);

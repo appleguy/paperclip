@@ -13,6 +13,7 @@ import { agentHarnessType, isEnvironmentDriverSupportedForAdapter, normalizeClau
 import { resolveNewAgentRunnerForCompany } from "../services/agent-runner-selection.js";
 import { readAgentEngineTelemetry } from "../services/agent-engine-telemetry.js";
 import { openCodeSessionIdFromRunLog, readNativeReasoning } from "../services/agent-native-reasoning.js";
+import { PLUGIN_RUNNER_AI_CONNECTION_REQUIRED, pluginEnvironmentRunnerTaskDriver, pluginRunnerAiConnectionRequiredMessage, pluginRunnerAiConnectionRequiredTestResult } from "../services/plugin-runner-ai-connection.js";
 import { agentEnvironmentTestService } from "../services/agent-environment-test.js";
 import { qualifyAgentRunner } from "../services/agent-runner-qualification.js";
 import { createAgentLifecycle } from "../services/agent-lifecycle.js";
@@ -3250,6 +3251,11 @@ export function agentRoutes(
         // The lifecycle verifies the saved agent after its plugin can create the agent-owned computer.
         return { connectionId: selection.connection.id };
       }
+      const testEnvironment = testEnvironmentId ? await environmentsSvc.getById(testEnvironmentId) : null;
+      if (adapterType === "paperclip_runner" && config.homeMode === "preconfigured" && testEnvironment
+        && await pluginEnvironmentRunnerTaskDriver(db, testEnvironment)) {
+        throw unprocessable(pluginRunnerAiConnectionRequiredMessage(true), { code: PLUGIN_RUNNER_AI_CONNECTION_REQUIRED });
+      }
       const target = await resolveAdapterTestExecutionContext({ companyId, adapterType,
         agentId: hasSavedAgent ? agentId : undefined, environmentId: testEnvironmentId });
       try {
@@ -3397,6 +3403,14 @@ export function agentRoutes(
             ? [{ code: "dot_workspace", level: "error" as const, message: "Managed Dot runners do not expose workspace access. Turn off workspace access before assigning work." }] : []),
         ];
         res.json({ adapterType: type, status: checks.some(c => c.level === "error") ? "fail" : checks.some(c => c.level === "warn") ? "warn" : "pass", testedAt: new Date().toISOString(), checks });
+        return;
+      }
+      // A plugin Runner-task environment runs only managed AI connections in an isolated
+      // home. Refuse before secret resolution or a computer allocation it cannot use.
+      const preconfiguredTestHome = type === "paperclip_runner" && adapterConfigForTest.homeMode === "preconfigured";
+      if (type === "paperclip_runner" && requestedEnvironment && (preconfiguredTestHome || !aiBinding)
+        && await pluginEnvironmentRunnerTaskDriver(db, requestedEnvironment)) {
+        res.json(pluginRunnerAiConnectionRequiredTestResult(type, preconfiguredTestHome));
         return;
       }
       const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(

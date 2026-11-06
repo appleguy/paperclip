@@ -4,6 +4,7 @@ import {
   Component,
   type ClipboardEvent,
   type ErrorInfo,
+  type KeyboardEvent,
   forwardRef,
   useCallback,
   useEffect,
@@ -58,7 +59,6 @@ import {
 } from "../lib/angle-bracket-markdown";
 import { unescapeBlockquoteMarkers } from "../lib/blockquote-markdown";
 import { pasteNormalizationPlugin } from "../lib/paste-normalization";
-import { isPlainEnterSend } from "../lib/composer-keys";
 import { cn } from "../lib/utils";
 import { useEditorAutocomplete, type SlashCommandOption } from "../context/EditorAutocompleteContext";
 
@@ -99,14 +99,10 @@ interface MarkdownEditorProps {
   mentions?: MentionOption[];
   /** Capability-aware action commands supplied by the owning composer. */
   actionCommands?: SlashCommandOption[];
-  /** Called on Cmd/Ctrl+Enter (and on plain Enter when `submitOnEnter` is set) */
+  /** Called on the configured submit shortcut. */
   onSubmit?: () => void;
-  /**
-   * Make plain Enter call `onSubmit`; Shift+Enter keeps inserting a newline.
-   * An open mention/slash menu still consumes Enter first, and IME
-   * composition Enter is never treated as a send.
-   */
-  submitOnEnter?: boolean;
+  /** Task composers use Enter; document editors retain Cmd/Ctrl+Enter by default. */
+  submitKey?: "enter" | "mod-enter";
   /** Render the rich editor without allowing edits. */
   readOnly?: boolean;
 }
@@ -750,10 +746,19 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
   mentions,
   actionCommands = [],
   onSubmit,
-  submitOnEnter = false,
+  submitKey = "mod-enter",
   readOnly = false,
 }: MarkdownEditorProps, forwardedRef) {
   const editorValue = useMemo(() => prepareMarkdownForEditor(value), [value]);
+  function isSubmitShortcut(event: KeyboardEvent<HTMLElement>): boolean {
+    return !readOnly
+      && event.key === "Enter"
+      && !event.nativeEvent.isComposing
+      && event.keyCode !== 229
+      && !event.shiftKey
+      && !event.altKey
+      && (submitKey === "enter" || event.metaKey || event.ctrlKey);
+  }
   const { slashCommands: sharedSlashCommands } = useEditorAutocomplete();
   const slashCommands = useMemo(
     () => [...actionCommands, ...sharedSlashCommands],
@@ -1376,13 +1381,9 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
           }}
           onBlur={() => onBlur?.()}
           onKeyDown={(event) => {
-            if (onSubmit && event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+            if (onSubmit && isSubmitShortcut(event)) {
               event.preventDefault();
-              onSubmit();
-              return;
-            }
-            if (onSubmit && submitOnEnter && isPlainEnterSend(event)) {
-              event.preventDefault();
+              event.stopPropagation();
               onSubmit();
             }
           }}
@@ -1417,7 +1418,8 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
         }
       }}
       onKeyDownCapture={(e) => {
-        if (readOnly) return;
+        if (readOnly || e.nativeEvent.isComposing || e.keyCode === 229) return;
+        if (e.key === "Enter" && (e.shiftKey || e.altKey)) return;
         if (
           (e.key === "Backspace" || e.key === "Delete")
           && e.target instanceof HTMLElement
@@ -1426,8 +1428,8 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
           // Lexical handles deletion on keydown and may suppress DOM input.
           initialChildOnChangeRef.current = false;
         }
-        // Cmd/Ctrl+Enter to submit
-        if (onSubmit && e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+        // An explicit Cmd/Ctrl+Enter sends even while autocomplete is open.
+        if (onSubmit && isSubmitShortcut(e) && (e.metaKey || e.ctrlKey)) {
           e.preventDefault();
           e.stopPropagation();
           onSubmit();
@@ -1482,12 +1484,10 @@ export const MarkdownEditor = forwardRef<MarkdownEditorRef, MarkdownEditorProps>
           }
         }
 
-        // Plain Enter sends when the composer opted in. Runs after the mention
-        // menu so Enter still picks the highlighted suggestion.
+        // Leave an unselected slash menu's Enter with the editor.
         if (
-          onSubmit
-          && submitOnEnter
-          && isPlainEnterSend(e)
+          onSubmit && isSubmitShortcut(e)
+          && !(mentionActive && filteredMentions.length > 0)
           && e.target instanceof HTMLElement
           && e.target.closest('[contenteditable="true"]')
         ) {

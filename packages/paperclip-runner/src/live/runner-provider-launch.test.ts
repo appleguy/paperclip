@@ -1,7 +1,7 @@
 import { createSharedCodexThreadConfig } from "./shared-codex-thread-config-builder.js";
 import { sharedThreadConfigViolation } from "./shared-codex-thread-config.js";
 import { describe, expect, it } from "vitest";
-import { createRunnerProviderLaunch, preparedRunnerLaunchWorkingDirectory, runnerLaunchRequirementsDigest, validatePreparedRunnerLaunch,
+import { createRunnerProviderLaunch, preparedRunnerLaunchWorkingDirectory, runnerLaunchRequirementsDigest, runnerLaunchSettingsMatch, validatePreparedRunnerLaunch,
   runnerProviderLaunchRequirements, type RunnerProviderLaunchEnvironment, type RunnerProviderLaunchRequirements } from "./runner-provider-launch.js";
 
 const requirements: RunnerProviderLaunchRequirements = {
@@ -120,6 +120,13 @@ describe("built-in provider launch preparation", () => {
     // The host cannot generate a policy of its own: a bootstrap without the server's config is refused at creation.
     const missing=structuredClone(bootstrap) as Record<string,any>; delete missing.writer.threadConfig;
     expect(()=>createRunnerProviderLaunch(runnerProviderLaunchRequirements({provider:"codex",disableCodexWebSearch:true,sharedCodexDaemon:missing as typeof bootstrap},requirements.identity,{model:"selected-model",permissions:readOnly?"paperclip-runner-workspace-read-only":"paperclip-runner-workspace-only"},null,"Follow the assigned instructions."),env)).toThrow("runner_shared_codex_launch_requirements_invalid");
+  });
+  it("compares effective ACPX defaults without changing the saved requirements", () => {
+    const frozen = { ...requirements, provider: "acpx" as const, model: "gpt-5.4", settings: {} };
+    expect(runnerLaunchSettingsMatch(frozen, { acpxAgent: "codex", acpxPermissionMode: "approve-all", acpxPermissionModePinned: true })).toBe(true);
+    expect(runnerLaunchSettingsMatch(frozen, { acpxPermissionMode: "approve-reads" })).toBe(false);
+    expect(runnerLaunchSettingsMatch(frozen, { acpxPermissionModePinned: false })).toBe(false);
+    expect(frozen.settings).toEqual({});
   });
 
   it("preserves probe project-instruction suppression through a prepared launch", () => {

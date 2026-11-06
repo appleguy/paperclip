@@ -22,12 +22,11 @@ import { logger } from "../middleware/logger.js";
 import { createGitRemoteAuthProvider } from "./git-credentials.js";
 import { notifyCancelledWorkspacePreservation } from "./cancelled-workspace-preservation-notifications.js";
 import { assertExecutionWorkspaceRecordAccess, assertTaskWorkspaceExecutionAccess } from "./task-workspace-access.js";
-import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
-import { canonicalExecutionUuid } from "./execution-identity.js";
+import { readRemoteWorkspaceWriterHold, type RemoteWorkspaceWriter } from "./remote-workspace-writer-hold.js";
 import { persistActivity } from "./activity-log.js";
 import {
   captureRemoteWorkspaceArchive, cleanupRemoteWorkspaceArchive, prepareRemoteWorkspaceDirectory, prepareRemoteRepository, remoteWorkspaceRepositoryPath,
-  REMOTE_WORKSPACE_PREPARATION_TIMEOUT_CODE, RemoteWorkspaceOperationTimeoutError, RemoteWorkspacePreparationTimeoutError, remoteWorkspaceFailureCause,
+  RemoteWorkspaceOperationTimeoutError, RemoteWorkspacePreparationTimeoutError, remoteWorkspaceFailureCause,
   requireRemoteWorkspaceTarget, restoreRemoteWorkspaceDirectory, RemoteWorkspaceRestoreError, type RemoteWorkspaceRestoreStep,
 } from "./remote-workspace-transport.js";
 import {
@@ -153,11 +152,7 @@ async function lockWorkspaceRunParents(tx: Transaction, companyId: string, runId
 export class RemoteWorkspaceWriterActiveError extends HttpError {
   constructor(
     readonly workspaceId: string,
-    readonly writer: {
-      runId: string; agentId: string; issueId: string; issueIdentifier: string | null; lastActivityAt: Date;
-      /** The writer run ended; its workspace save or sandbox release has not settled. */
-      ended?: boolean;
-    },
+    readonly writer: RemoteWorkspaceWriter,
   ) {
     super(409, "The workspace still has an unfinished writer or save operation.", { code: "remote_workspace_writer_pending" });
   }
@@ -215,44 +210,9 @@ export async function reserveRemoteWorkspace(input: {
         sql`${workspaceOperations.heartbeatRunId} is distinct from ${input.runId}::uuid`,
       )).limit(1);
       if (uncertain) throw conflict("The prior provisioning operation needs verification before this workspace can run again.", { code: "remote_workspace_provision_unverified" });
-      if (authority.writerRunId && authority.writerRunId !== input.runId) {
-        const [prior] = await tx.select({ status: heartbeatRuns.status, agentId: heartbeatRuns.agentId,
-          issueId: heartbeatRuns.issueId, nativeIssueId: heartbeatRuns.nativeIssueId,
-          runtimeMode: heartbeatRuns.runtimeMode, nativeSessionId: heartbeatRuns.nativeSessionId, runnerInstanceId: heartbeatRuns.runnerInstanceId,
-          errorCode: heartbeatRuns.errorCode, executionRecovery: sql<unknown>`${heartbeatRuns.resultJson}->'executionRecovery'`,
-          contextIssueId: sql<string | null>`coalesce(${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId')`,
-          lastOutputAt: heartbeatRuns.lastOutputAt, startedAt: heartbeatRuns.startedAt, createdAt: heartbeatRuns.createdAt,
-          finishedAt: heartbeatRuns.finishedAt,
-        }).from(heartbeatRuns).where(and(
-          eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.id, authority.writerRunId)));
-        const writerIssueId = prior ? prior.nativeIssueId ?? prior.issueId ?? prior.contextIssueId : null;
-        const [writerIssue] = writerIssueId ? await tx.select({ id: issues.id, identifier: issues.identifier }).from(issues)
-          .where(and(eq(issues.companyId, input.companyId), eq(issues.id, canonicalExecutionUuid(sql`${writerIssueId}::text`)))) : [];
-        if (prior?.status === "running" && writerIssue) throw new RemoteWorkspaceWriterActiveError(existing.id, {
-          runId: authority.writerRunId, agentId: prior.agentId, issueId: writerIssue.id, issueIdentifier: writerIssue.identifier,
-          lastActivityAt: prior.lastOutputAt ?? prior.startedAt ?? prior.createdAt,
-        });
-        const leases = await tx.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, input.companyId),
-          eq(environmentLeases.heartbeatRunId, authority.writerRunId)));
-        const bootstrap = object(prior?.executionRecovery);
-        const pristinePreparation = !authority.location && !authority.snapshotId && prior?.status === "failed"
-          && prior.runtimeMode === "legacy" && prior.nativeSessionId === null && prior.runnerInstanceId === null
-          && prior.errorCode === REMOTE_WORKSPACE_PREPARATION_TIMEOUT_CODE
-          && bootstrap.kind === "bootstrap" && bootstrap.providerWorkStarted === false;
-        const unusedReservation = !authority.dirty && prior && ["failed", "cancelled", "interrupted", "timed_out", "succeeded"].includes(prior.status)
-          && leases.every(lease => hasRemoteTerminationReceipt(lease) || (pristinePreparation
-            && lease.releasedAt && lease.cleanupStatus === "success" && ["released", "expired", "failed"].includes(lease.status)));
-        if (!unusedReservation) {
-          // An ended writer still holds the workspace until its save and sandbox
-          // release settle. Report it as the holder so preparation waits within
-          // the same bounded cutoff as a live writer instead of failing setup.
-          if (prior && writerIssue) throw new RemoteWorkspaceWriterActiveError(existing.id, {
-            runId: authority.writerRunId, agentId: prior.agentId, issueId: writerIssue.id, issueIdentifier: writerIssue.identifier,
-            lastActivityAt: prior.finishedAt ?? prior.lastOutputAt ?? prior.startedAt ?? prior.createdAt, ended: true,
-          });
-          throw conflict("The workspace still has an unfinished writer or save operation.", { code: "remote_workspace_writer_pending" });
-        }
-      }
+      const hold = await readRemoteWorkspaceWriterHold(tx as unknown as Db, { companyId: input.companyId, authority, runId: input.runId });
+      if (hold.kind === "held") throw new RemoteWorkspaceWriterActiveError(existing.id, hold.writer);
+      if (hold.kind === "unattributed") throw conflict("The workspace still has an unfinished writer or save operation.", { code: "remote_workspace_writer_pending" });
       if (authority.writerRunId === input.runId) return existing;
       const next: RemoteWorkspaceAuthority = { ...authority, source, epoch: authority.epoch + 1, writerRunId: input.runId };
       const [saved] = await tx.update(executionWorkspaces).set({ metadata: { ...existing.metadata, remoteWorkspace: next,
@@ -370,6 +330,41 @@ function publishedWorkspaceDirectory(workspace: Workspace & Pick<typeof executio
   return directory;
 }
 
+/**
+ * Whether the root at `remoteRoot` on this lease's sandbox is this workspace's
+ * own earlier allocation whose last use ended in a completed final save. A
+ * retained sandbox keeps that root after the workspace moves on, for example
+ * when child tasks inherit the workspace and save newer work elsewhere. Its
+ * files are then already part of the saved lineage being restored.
+ */
+async function isRetiredOwnAllocation(db: Db, workspace: Workspace, lease: EnvironmentLease, remoteRoot: string, epoch: number) {
+  if (!lease.environmentId || !lease.providerLeaseId) return false;
+  const rows = await db.select({ id: workspaceOperations.id, phase: workspaceOperations.phase, status: workspaceOperations.status,
+    metadata: workspaceOperations.metadata }).from(workspaceOperations).where(and(
+    eq(workspaceOperations.companyId, workspace.companyId), eq(workspaceOperations.executionWorkspaceId, workspace.id),
+    inArray(workspaceOperations.phase, ["remote_workspace_snapshot", "remote_workspace_restore"]),
+    sql`${workspaceOperations.metadata}->'exportCleanup'->>'environmentId' = ${lease.environmentId}`,
+    sql`${workspaceOperations.metadata}->'exportCleanup'->>'providerLeaseId' = ${lease.providerLeaseId}`,
+    sql`${workspaceOperations.metadata}->'exportCleanup'->>'remoteCwd' = ${remoteRoot}`));
+  const epochOf = (metadata: Record<string, unknown> | null) => Number(metadata?.epoch);
+  if (!rows.length || rows.some(row => !Number.isSafeInteger(epochOf(row.metadata)))) return false;
+  // Every later writer must have used another allocation.
+  const last = Math.max(...rows.map(row => epochOf(row.metadata)));
+  if (last >= epoch) return false;
+  const lastUse = rows.filter(row => epochOf(row.metadata) === last);
+  const saves = lastUse.filter(row => row.phase === "remote_workspace_snapshot" && object(row.metadata?.retiredSave).schema !== RETIRED_SAVE_SCHEMA);
+  if (saves.some(row => row.status !== "succeeded" && row.status !== "failed")) return false;
+  const generation = (row: typeof rows[number]) => Number(row.metadata?.generation);
+  const final = saves.filter(row => row.status === "succeeded").sort((a, b) => generation(b) - generation(a))[0];
+  const work = readSaveWork(final?.metadata);
+  if (!final || final.metadata?.boundary !== "final" || !work || work.unknown || work.activeIds.length
+    || saves.some(row => row !== final && !(generation(row) < generation(final)))) return false;
+  const [snapshot] = await db.select({ status: executionWorkspaceSnapshots.status }).from(executionWorkspaceSnapshots).where(and(
+    eq(executionWorkspaceSnapshots.companyId, workspace.companyId), eq(executionWorkspaceSnapshots.executionWorkspaceId, workspace.id),
+    eq(executionWorkspaceSnapshots.sourceOperationId, final.id)));
+  return Boolean(snapshot && !["pending", "uploaded"].includes(snapshot.status));
+}
+
 export async function prepareRemoteWorkspace(input: {
   db: Db; workspace: Workspace & Pick<typeof executionWorkspaces.$inferSelect, "providerRef">;
   runId: string; lease: EnvironmentLease; target: AdapterExecutionTarget | null;
@@ -405,6 +400,8 @@ export async function prepareRemoteWorkspace(input: {
       try {
         const snapshot = await getWorkspaceSnapshot(input.db, { companyId: input.workspace.companyId, workspaceId: input.workspace.id, snapshotId: initial.snapshotId });
         if (!snapshot) throw new Error("remote_workspace_snapshot_missing");
+        const replaceRetiredRoot = migration === null && !initial.dirty
+          && await isRetiredOwnAllocation(input.db, input.workspace, input.lease, remoteRoot, initial.epoch);
         const scratch = await mkdtemp(path.join(os.tmpdir(), "pc-workspace-restore-"));
         try {
           const archivePath = path.join(scratch, "workspace.pcws");
@@ -413,7 +410,8 @@ export async function prepareRemoteWorkspace(input: {
           step = "sandbox_restore";
           restoredExport = await restoreRemoteWorkspaceDirectory({ target, remoteCwd: remoteRoot, archivePath, manifestDigest: snapshot.manifestDigest,
             restorationIdentity: preparationIdentity, allowEmptyRoot: migration !== null,
-            allocationFiles: migration ? workspaceAllocationFiles(input.lease, remoteRoot) : [] });
+            allocationFiles: migration ? workspaceAllocationFiles(input.lease, remoteRoot) : [],
+            replaceRetiredRoot });
         } finally { await rm(scratch, { recursive: true, force: true }); }
       } catch (error) {
         // Cancellation keeps its own handling, as do lookup refusals.
