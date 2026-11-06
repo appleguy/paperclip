@@ -912,6 +912,15 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect((await read(f.run.id)).resultJson).toEqual(resultJson);
   });
 
+  it("ends the run log with one terminal line before finalizing it", async () => {
+    const f = await fixture({ runtimeMode: "native", costAccountingPending: true });
+    await reserveRunBudget(db, f.run.companyId, f.run.id, null);
+    const onLog = vi.fn(async () => {});
+    await f.completion.completeRun({ ...f.input, output: { ...f.input.output, onLog }, adapterResult: { exitCode: 1, signal: null, timedOut: false,
+      errorCode: "provider_not_started", executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } });
+    expect(onLog).toHaveBeenLastCalledWith("stdout", "[paperclip] run terminal: failed provider_not_started\n");
+  });
+
   it("keeps ordinary adapter pre-provider receipts outside setup-history checks", async () => {
     const f = await fixture({ runtimeMode: "native", costAccountingPending: true,
       runnerProfileJson: { nativeExecutionInput: { schema: "paperclip.native-execution-input.v1" } } });

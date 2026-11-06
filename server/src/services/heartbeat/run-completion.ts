@@ -96,6 +96,8 @@ export interface HeartbeatRunCompletionDependencies extends Pick<RunState,
 
 interface RunCompletionOutput {
   handle: RunLogHandle | null;
+  // The run's ordered log writer; completion ends every log with one terminal line.
+  onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   outputProgressState: { pending: { bytes: number } | null };
   flushOutputProgress: (options?: { force?: boolean }) => Promise<void>;
   // Getters in the executor retain output that arrives while finalization awaits I/O.
@@ -157,6 +159,12 @@ export interface FailHeartbeatRunSetupInput {
   providerDispatchStarted: boolean;
   identityRedactor: Pick<ReturnType<typeof createAgentIdentityRedactor>, "redact">;
   readFailureReportSecrets: () => string[];
+}
+
+// A log-only census (pathology slice-a) can tell a finished run from a killed one only by an
+// explicit last line; adapters that end without an acpx result or error otherwise look killed.
+async function appendTerminalMarker(output: RunCompletionOutput, outcome: string, errorCode?: string | null) {
+  await output.onLog?.("stdout", `[paperclip] run terminal: ${outcome}${errorCode ? ` ${errorCode}` : ""}\n`).catch(() => undefined);
 }
 
 function nonRetryablePreflightFailureCode(error: unknown): string | null {
@@ -558,6 +566,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       sha256?: string | null;
       compressed: boolean;
     } | null = null;
+    await appendTerminalMarker(output, outcome, adapterResult.errorCode);
     if (handle) {
       logSummary = await measureRunPhase("completion.output", () => runLogStore.finalize(handle));
     }
@@ -1172,6 +1181,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       sha256?: string | null;
       compressed: boolean;
     } | null = null;
+    await appendTerminalMarker(output, signal.aborted ? "cancelled" : "failed", failureErrorCode);
     if (handle) {
       try {
         logSummary = await measureRunPhase("completion.output", () => runLogStore.finalize(handle));
