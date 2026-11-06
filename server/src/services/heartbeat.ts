@@ -3806,6 +3806,16 @@ export function heartbeatService(
     } finally {
       const nativeExecutionEstablished = !legacyAdapterEntered &&
         (nativeDispatchStarted || nativeOwnershipHeld || nativeSessionResumeScheduled || nativeWorkspaceFinalizeScheduled);
+      if (legacyOpenCode && !legacyOpenCodeTerminalWriteOwned && !nativeExecutionEstablished && run.controllerBootId) {
+        // Another path (cancel, watchdog, done gate) may have terminalized the run with no
+        // takeover. Both boot-id writers require status running, so a terminal row that still
+        // carries this executor's boot id was never claimed by a successor; its cleanup is ours.
+        const settledRow = await db.select({ status: heartbeatRuns.status, controllerBootId: heartbeatRuns.controllerBootId })
+          .from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)).then(rows => rows[0] ?? null)
+          .catch(() => null);
+        if (settledRow && settledRow.status !== "running" && settledRow.status !== "queued" &&
+          settledRow.controllerBootId === run.controllerBootId) legacyOpenCodeTerminalWriteOwned = true;
+      }
       if (legacyOpenCode && !legacyOpenCodeTerminalWriteOwned && !nativeExecutionEstablished) {
         // A read of the row cannot authorize cleanup: another controller can
         // take over before an external release starts. Only our successful
