@@ -305,7 +305,8 @@ export class OpenCodeHttpDriver implements ProviderDriver {
     const last = pending[pending.length - 1];
     if (typeof last?.id === "string") return last.id;
     const active = await this.json("GET", "/api/session/active");
-    if (active.status !== 200 || typeof active.data?.data !== "object") throw new OpenCodeHttpError("http", `session.active HTTP ${active.status}`, active.status);
+    if (active.status !== 200 || !active.data?.data || typeof active.data.data !== "object" || Array.isArray(active.data.data))
+      throw new OpenCodeHttpError("http", `session.active HTTP ${active.status} or malformed response`, active.status);
     if (!active.data.data?.[conversationId]) return null;
     // The list is newest first. A turn that has run for hours is hundreds of assistant/tool messages after its one
     // user prompt, so the newest page holds no user message: walk older pages (`cursor.next`) until one does.
@@ -412,16 +413,19 @@ export class OpenCodeHttpDriver implements ProviderDriver {
     const m = await this.json("GET", `/api/session/${sid}/message/${encodeURIComponent(msgId)}`);
     if (m.status === 404) return (await this.messageExists(conversationId, msgId)) ? "working" : "unknown";
     const created = m.data?.data?.time?.created;
-    if (m.status !== 200 || m.data?.data?.id !== msgId || typeof created !== "number") return "unknown";
+    if (m.status !== 200 || m.data?.data?.id !== msgId || m.data.data.type !== "user" ||
+        typeof created !== "number" || !Number.isFinite(created)) return "unknown";
     const inbox = await this.json("GET", `/api/session/${sid}/inbox`);
-    if (inbox.status !== 200 || !Array.isArray(inbox.data?.data)) return "working";
+    if (inbox.status !== 200 || !Array.isArray(inbox.data?.data) ||
+        inbox.data.data.some((item: unknown) => !item || typeof item !== "object" || typeof (item as { id?: unknown }).id !== "string")) return "working";
     if (inbox.data.data.some((i: any) => i?.id === msgId)) return "working";
     const active = await this.json("GET", "/api/session/active"); // read before info: idle seen after inactive is real
-    if (active.status !== 200 || typeof active.data?.data !== "object") return "working";
+    if (active.status !== 200 || !active.data?.data || typeof active.data.data !== "object" || Array.isArray(active.data.data)) return "working";
     if (active.data.data?.[conversationId]) return "working";
     const s = await this.json("GET", `/api/session/${sid}`);
     const t = s.data?.data?.time;
-    if (s.status === 200 && typeof t?.idle === "number" && t.idle >= created && s.data.data.outcome) return "hook_observed";
+    if (s.status === 200 && typeof t?.idle === "number" && Number.isFinite(t.idle) && t.idle >= created &&
+        typeof s.data.data.outcome === "string" && s.data.data.outcome.length > 0) return "hook_observed";
     return "working";
   }
 

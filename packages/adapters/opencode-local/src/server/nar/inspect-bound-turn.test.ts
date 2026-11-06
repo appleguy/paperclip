@@ -10,7 +10,8 @@ let dir: string;
 beforeEach(async () => { dir = await mkdtemp(path.join(process.env.PAPERCLIP_TMPDIR ?? os.tmpdir(), "opencode-inspect-")); });
 afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
 
-async function fixture(options: { successorAt?: number; pid?: number; active?: boolean } = {}) {
+async function fixture(options: { successorAt?: number; pid?: number; active?: boolean;
+  malformed?: "active_null" | "active_array" | "inbox" | "outcome" | "message_type" } = {}) {
   const configPath = path.join(dir, "config.json"), passwordFile = path.join(dir, "password");
   const origin = "http://127.0.0.1:4096", runId = "run-one", agentId = "agent-one", taskId = "task-one";
   const sessionId = sessionIdFor({ agentId, issueId: taskId }), messageId = messageIdFor(narOpIdFor(runId));
@@ -22,16 +23,17 @@ async function fixture(options: { successorAt?: number; pid?: number; active?: b
     const pathname = new URL(String(url)).pathname;
     calls.push(`${init?.method} ${pathname}`);
     if (pathname === "/api/info") return Response.json({ version: "2.2.5", pid: options.pid ?? 123, urls: [origin] });
-    if (pathname === "/api/session/active") return Response.json({ data: options.active ? { [sessionId]: {} } : {} });
+    if (pathname === "/api/session/active") return Response.json({ data: options.malformed === "active_null" ? null
+      : options.malformed === "active_array" ? [] : options.active ? { [sessionId]: {} } : {} });
     if (pathname === `/api/session/${sessionId}/message`) return Response.json({ data: [
       ...(++historyReads >= (options.successorAt ?? Infinity) ? [{ id: "msg_successor", type: "user" }] : []),
       { id: messageId, type: "user", time: { created: 1 } },
     ] });
     if (pathname === `/api/session/${sessionId}/message/${messageId}`)
-      return Response.json({ data: { id: messageId, type: "user", time: { created: 1 } } });
-    if (pathname === `/api/session/${sessionId}/inbox`) return Response.json({ data: [] });
+      return Response.json({ data: { id: messageId, type: options.malformed === "message_type" ? "assistant" : "user", time: { created: 1 } } });
+    if (pathname === `/api/session/${sessionId}/inbox`) return Response.json({ data: options.malformed === "inbox" ? [{}] : [] });
     if (pathname === `/api/session/${sessionId}`) return Response.json({ data: {
-      id: sessionId, location: { directory: dir }, time: { idle: 2 }, outcome: "interrupted",
+      id: sessionId, location: { directory: dir }, time: { idle: 2 }, outcome: options.malformed === "outcome" ? {} : "interrupted",
     } });
     return new Response(null, { status: 404 });
   };
@@ -91,3 +93,11 @@ it("holds when the provider process identity changes", async () => {
   expect(await inspectBoundOpenCodeTurn(f.input)).toMatchObject({ state: "unverified", reason: "provider_unavailable_or_changed" });
   expect(f.calls.every(call => call.startsWith("GET "))).toBe(true);
 });
+
+it.each(["active_null", "active_array", "inbox", "outcome", "message_type"] as const)(
+  "holds when the provider returns malformed %s evidence", async malformed => {
+    const f = await fixture({ malformed });
+    expect(await inspectBoundOpenCodeTurn(f.input)).toMatchObject({ state: "unverified" });
+    expect(f.calls.every(call => call.startsWith("GET "))).toBe(true);
+  },
+);
