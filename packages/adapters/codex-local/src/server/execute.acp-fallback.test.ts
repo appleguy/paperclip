@@ -158,6 +158,18 @@ describe("codex_local ACP startup fallback", () => {
     }));
   });
 
+  it("runs a keepConversation seat in its own cwd when the issue workspace differs", async () => {
+    // The ACP fingerprint includes cwd; a project workspace would otherwise get its own thread.
+    const ctx = { ...buildContext({ engine: "acp", keepConversation: true, stateDir: "/tmp/codex-seat-absent", cwd: "/seat" }),
+      context: { issueId: "issue-a", paperclipWorkspace: { cwd: "/project", source: "project_primary" } } };
+    await expect(execute(ctx as never)).rejects.toThrow('Unexpected "<<"');
+    expect(executeCodexAcp).toHaveBeenCalledWith(expect.objectContaining({
+      context: expect.objectContaining({
+        paperclipWorkspace: { cwd: "/seat", issueCwd: "/project", source: "project_primary" },
+      }),
+    }));
+  });
+
   it("does not resume another issue's session on a seat without keepConversation", async () => {
     const ctx = { ...buildContext({ engine: "acp" }),
       context: { issueId: "issue-a", projectId: "project-a" },

@@ -69,15 +69,23 @@ export async function settleSharedCodexThread(
 }
 
 /**
- * ACP engine view of a keepConversation seat: one task key for every issue and the saved
- * session in place of the per-task one. Returns the context unchanged when no thread is saved yet.
+ * ACP engine view of a keepConversation seat: one task key for every issue, the saved session in
+ * place of the per-task one, and the seat's configured cwd. The engine folds cwd into the session
+ * fingerprint, so an issue wake in a project workspace would otherwise land on that workspace's
+ * own thread. The issue workspace stays readable as `paperclipWorkspace.issueCwd`.
  */
 export function withSharedAcpSession(
   ctx: AdapterExecutionContext,
   thread: SharedCodexThread | null,
 ): AdapterExecutionContext {
+  const seatCwd = typeof ctx.config?.cwd === "string" ? ctx.config.cwd : "";
+  const workspace = (ctx.context?.paperclipWorkspace ?? {}) as Record<string, unknown>;
+  const issueCwd = typeof workspace.cwd === "string" ? workspace.cwd : "";
   return {
     ...ctx,
+    ...(seatCwd && issueCwd && issueCwd !== seatCwd
+      ? { context: { ...ctx.context, paperclipWorkspace: { ...workspace, cwd: seatCwd, issueCwd } } }
+      : {}),
     runtime: {
       ...ctx.runtime,
       taskKey: SHARED_CONVERSATION_TASK_KEY,
