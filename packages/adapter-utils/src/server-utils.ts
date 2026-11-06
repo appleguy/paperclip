@@ -4344,8 +4344,9 @@ export function resolvePaperclipDesiredSkillNames(
 
 /**
  * Legacy adapters call the Paperclip API through the operational skill. Keep
- * that skill mounted even when an agent predates skill preferences or carries
- * an explicit empty desired set. Native runners provide the same authority
+ * that skill mounted by default even when an agent predates skill preferences or carries
+ * an explicit empty desired set. Agents may opt out with autoMountLegacySkills=false.
+ * Native runners provide the same authority
  * through their protocol and must continue to use the configurable-only
  * resolver above.
  */
@@ -4416,6 +4417,9 @@ export function resolveLegacyPaperclipDesiredSkillNames(
     config,
     availableEntries,
   );
+  if (parseObject(config.paperclipSkillSync).autoMountLegacySkills === false) {
+    return desiredSkills;
+  }
   const operationalEntry = availableEntries.find(
     (entry) =>
       entry.key.trim().toLowerCase() === PAPERCLIP_OPERATIONAL_SKILL_KEY,

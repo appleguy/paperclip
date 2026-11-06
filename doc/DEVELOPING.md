@@ -3409,7 +3409,7 @@ Server and CLI import the generated manifest; they do not crawl repository
 paths at request time. Root `skills/` remains reserved for Paperclip runtime
 skills and is not part of the catalog.
 
-Skill-capable legacy local adapters always select the bundled
+Skill-capable legacy local adapters select by default the bundled
 `paperclipai/paperclip/paperclip` operational skill when it is present in the
 runtime inventory. This applies to existing agents without a stored skill
 preference and to explicit empty optional-skill selections. The operational
@@ -3419,6 +3419,11 @@ automatically alongside it; see [Agent commentary](agent-commentary.md).
 Other runtime skills remain controlled by
 `paperclipSkillSync.desiredSkills`. The native `paperclip_runner` does not use
 this legacy default because its protocol supplies the control-plane contract.
+Set `adapterConfig.paperclipSkillSync.autoMountLegacySkills` to `false` to opt
+out per agent; explicitly selected skills remain selected. This removes the
+legacy operational workflow as well as the automatic feedback skills. Provider
+homes, workspace instructions, and resumed sessions can still contain context
+outside Paperclip's skill selection, so this setting alone is not a clean-context guarantee.
 An empty native runtime selection returns before company skill inventory work.
 An explicit empty stored key set does the same. Nonempty selections still use
 the current inventory, version and access checks. Legacy automatic selections

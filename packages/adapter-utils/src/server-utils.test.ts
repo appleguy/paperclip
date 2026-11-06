@@ -187,6 +187,19 @@ describe("legacy adapter skill selection", () => {
     );
   });
 
+  it("opts out of automatic skills without removing explicitly selected skills", () => {
+    const inventory = [operationalEntry, optionalEntry, ...PAPERCLIP_FEEDBACK_SKILL_KEYS.map((key) => ({ key }))];
+    expect(resolveLegacyPaperclipDesiredSkillNames({
+      paperclipSkillSync: { autoMountLegacySkills: false, desiredSkills: [] },
+    }, inventory)).toEqual([]);
+    expect(resolveLegacyPaperclipDesiredSkillNames({
+      paperclipSkillSync: { autoMountLegacySkills: false, desiredSkills: [operationalEntry.key, optionalEntry.key] },
+    }, inventory)).toEqual([operationalEntry.key, optionalEntry.key]);
+    expect(resolveLegacyPaperclipDesiredSkillNames({
+      paperclipSkillSync: { autoMountLegacySkills: "false" },
+    }, inventory)).toEqual([PAPERCLIP_OPERATIONAL_SKILL_KEY, ...PAPERCLIP_FEEDBACK_SKILL_KEYS]);
+  });
+
   it("makes feedback available to existing legacy agents without opting native agents into API skills", () => {
     const inventory = [operationalEntry, ...PAPERCLIP_FEEDBACK_SKILL_KEYS.map((key) => ({ key }))];
     for (const config of [{}, { paperclipSkillSync: { desiredSkills: [] } }]) {
