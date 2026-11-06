@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { AntigravityInteractiveControl, emptyAgyEditor } from "./interactive-control.js";
@@ -133,6 +133,37 @@ describe("Antigravity interactive seat", () => {
         return false;
       }, now: () => clock, wait: async ms => { clock += ms; }, timeoutMs: 1000 })).rejects.toThrow(/ownership/);
     } finally { await rm(stateDir, { recursive: true, force: true }); }
+  });
+
+  it("restarts only the owned session and resumes its conversation", async () => {
+    const root = await mkdtemp(path.join(scratch, "agy-interactive-"));
+    const stateDir = path.join(root, "state");
+    const calls: string[][] = [];
+    let exists = true;
+    const tmux = async (args: string[]) => {
+      calls.push(args);
+      if (args[0] === "has-session" && !exists) throw new Error("no session");
+      if (args[0] === "kill-session") exists = false;
+      if (args[0] === "new-session") exists = true;
+      if (args[0] === "display-message") return "%42 123 agy";
+      if (args[0] === "capture-pane") return screen;
+      return "";
+    };
+    const launch = { cwd: path.join(root, "workspace"), tmpDir: path.join(root, "tmp"),
+      executable: "/opt/homebrew/bin/agy", model: "gemini-4-argon-high", conversationId: "conversation-1" };
+    try {
+      await mkdir(stateDir, { mode: 0o700 });
+      await writeFile(path.join(stateDir, "active.json"), JSON.stringify({ runId: "run-1", conversationId: "conversation-1" }));
+      const control = await AntigravityInteractiveControl.attach({ socket: "socket", session: "seat", stateDir, authorize: () => true, tmux });
+      await expect(control.restartRunSeat("run-2", launch)).rejects.toThrow(/ownership/);
+      await expect(control.restartRunSeat("run-1", { ...launch, conversationId: "--bad" })).rejects.toThrow(/Invalid/);
+      await expect(control.restartRunSeat("run-1", { ...launch, conversationId: "other" })).rejects.toThrow(/conversation/);
+      expect(calls.some(args => args[0] === "kill-session")).toBe(false);
+      const relaunched = await control.restartRunSeat("run-1", launch);
+      expect(relaunched.remoteControlUrl).toBe("https://antigravity.google.com/r/seat-1");
+      expect(calls.find(args => args[0] === "kill-session")).toEqual(["kill-session", "-t", "=seat:"]);
+      expect(calls.find(args => args[0] === "new-session")?.slice(-2)).toEqual(["--conversation", "conversation-1"]);
+    } finally { await rm(root, { recursive: true, force: true }); }
   });
 
   it("recognizes only an empty current editor", () => {

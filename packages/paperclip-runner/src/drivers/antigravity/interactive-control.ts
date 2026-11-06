@@ -8,6 +8,13 @@ const exec = promisify(execFile);
 const idPattern = /^[a-zA-Z0-9_-]{1,55}$/;
 const remotePattern = /https:\/\/antigravity\.google\.com\/r\/[a-zA-Z0-9-]+/;
 type Tmux = (args: string[]) => Promise<string>;
+function validateLaunch(input: { socket: string; session: string; stateDir: string; cwd: string; tmpDir: string; executable: string; model: string; conversationId?: string }): void {
+  if (!idPattern.test(input.socket) || !idPattern.test(input.session) ||
+    ![input.stateDir, input.cwd, input.tmpDir, input.executable].every(path.isAbsolute) ||
+    input.cwd === "/" || input.cwd.startsWith("/private/var/folders/") || input.cwd.startsWith("/var/folders/") ||
+    !/^[a-zA-Z0-9][a-zA-Z0-9.-]{0,199}$/.test(input.model) ||
+    (input.conversationId !== undefined && !/^[a-zA-Z0-9][a-zA-Z0-9-]{0,199}$/.test(input.conversationId))) throw new Error("Invalid Antigravity seat launch");
+}
 
 export function emptyAgyEditor(screen: string): boolean {
   const lines = screen.replace(/\r/g, "").trimEnd().split("\n").slice(-35);
@@ -30,20 +37,24 @@ export class AntigravityInteractiveControl {
     tmux: Tmux; authorize: (operationId: string) => boolean;
   }, readonly remoteControlUrl: string) {}
 
+  private async assertRunOwner(runId: string): Promise<void> {
+    const active = JSON.parse(await fs.readFile(path.join(this.input.stateDir, "active.json"), "utf8")) as { runId?: unknown };
+    if (!runId || active.runId !== runId) throw new Error("Antigravity stop checkpoint ownership changed");
+    const identity = (await this.input.tmux(["display-message", "-p", "-t", `=${this.input.session}:`, "#{pane_id} #{pane_pid} #{pane_current_command}"])).trim();
+    if (identity !== `${this.input.paneId} ${this.input.panePid} agy`) throw new Error("Antigravity seat identity changed");
+  }
+
   static async open(input: {
     socket: string; session: string; stateDir: string; cwd: string; tmpDir: string; executable: string; model: string;
-    rejoinOnly: boolean; expectedRemoteControlUrl?: string; conversationId?: string; authorize: (operationId: string) => boolean; tmux?: Tmux;
+    rejoinOnly: boolean; requireNew?: boolean; expectedRemoteControlUrl?: string; conversationId?: string; authorize: (operationId: string) => boolean; tmux?: Tmux;
     wait?: (ms: number) => Promise<void>; startupTimeoutMs?: number;
   }): Promise<AntigravityInteractiveControl> {
-    if (!idPattern.test(input.socket) || !idPattern.test(input.session) ||
-      ![input.stateDir, input.cwd, input.tmpDir, input.executable].every(path.isAbsolute) ||
-      input.cwd === "/" || input.cwd.startsWith("/private/var/folders/") || input.cwd.startsWith("/var/folders/") ||
-      !/^[a-zA-Z0-9][a-zA-Z0-9.-]{0,199}$/.test(input.model) ||
-      (input.conversationId !== undefined && !/^[a-zA-Z0-9][a-zA-Z0-9-]{0,199}$/.test(input.conversationId))) throw new Error("Invalid Antigravity seat launch");
+    validateLaunch(input);
     const tmux = input.tmux ?? (async (args: string[]) =>
       (await exec("/opt/homebrew/bin/tmux", ["-L", input.socket, ...args], { timeout: 10_000, maxBuffer: 2_000_000 })).stdout);
     let exists = true;
     try { await tmux(["has-session", "-t", `=${input.session}:`]); } catch { exists = false; }
+    if (exists && input.requireNew) throw new Error("Antigravity seat unexpectedly exists after stop");
     if (!exists) {
       if (input.rejoinOnly) throw new Error("Antigravity active seat unavailable; reconcile without replay");
       await fs.mkdir(input.cwd, { recursive: true });
@@ -73,12 +84,7 @@ export class AntigravityInteractiveControl {
     const wait = options.wait ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
     const started = now();
     const deadline = started + (options.timeoutMs ?? 60_000);
-    const check = async () => {
-      const active = JSON.parse(await fs.readFile(path.join(this.input.stateDir, "active.json"), "utf8")) as { runId?: unknown };
-      if (!runId || active.runId !== runId) throw new Error("Antigravity stop checkpoint ownership changed");
-      const identity = (await this.input.tmux(["display-message", "-p", "-t", `=${this.input.session}:`, "#{pane_id} #{pane_pid} #{pane_current_command}"])).trim();
-      if (identity !== `${this.input.paneId} ${this.input.panePid} agy`) throw new Error("Antigravity seat identity changed");
-    };
+    const check = () => this.assertRunOwner(runId);
     await check();
     await this.input.tmux(["send-keys", "-t", this.input.paneId, "Escape"]);
     let sentControlC = false;
@@ -94,6 +100,23 @@ export class AntigravityInteractiveControl {
     }
     await check();
     return "restart_required";
+  }
+
+  /** The caller holds the seat lock and records the outcome on the run. */
+  async restartRunSeat(runId: string, input: {
+    cwd: string; tmpDir: string; executable: string; model: string; conversationId?: string;
+    wait?: (ms: number) => Promise<void>; startupTimeoutMs?: number;
+  }): Promise<AntigravityInteractiveControl> {
+    validateLaunch({ ...input, socket: this.input.socket, session: this.input.session, stateDir: this.input.stateDir });
+    await this.assertRunOwner(runId);
+    const checkpoint = JSON.parse(await fs.readFile(path.join(this.input.stateDir, "active.json"), "utf8")) as { conversationId?: unknown };
+    if ((input.conversationId ?? null) !== (checkpoint.conversationId ?? null))
+      throw new Error("Antigravity restart conversation does not match checkpoint");
+    await this.input.tmux(["kill-session", "-t", `=${this.input.session}:`]);
+    const active = JSON.parse(await fs.readFile(path.join(this.input.stateDir, "active.json"), "utf8")) as { runId?: unknown };
+    if (active.runId !== runId) throw new Error("Antigravity stop checkpoint ownership changed");
+    return AntigravityInteractiveControl.open({ ...input, socket: this.input.socket, session: this.input.session,
+      stateDir: this.input.stateDir, authorize: this.input.authorize, tmux: this.input.tmux, rejoinOnly: false, requireNew: true });
   }
 
   static async attach(input: {
