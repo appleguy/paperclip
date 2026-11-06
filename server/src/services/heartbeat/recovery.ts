@@ -2733,8 +2733,9 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         continue;
       }
       // A legacy controller persists "dispatching" in the same lease renewal
-      // that admits the adapter. An expired lease from another boot that is
-      // still "preparing" proves a restart stopped setup before provider work.
+      // that admits the adapter. A restart claim can reset that stage to
+      // "preparing" for an already dispatched run, so it is not no-submit
+      // evidence for an OpenCode re-entry even if its later hold write failed.
       // Use the state committed with the revocation, not the earlier snapshot:
       // the old controller may have dispatched before its lease expired.
       // The revocation matched the snapshot's boot ID before replacing it.
@@ -2743,7 +2744,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         revokedState.executionStage === "preparing" &&
         !!run.controllerBootId &&
         run.controllerBootId !== legacyControllerBootId &&
-        (!openCodeLegacyRun || (parseObject(latestResult.executionRecovery).providerWorkStarted !== true &&
+        (!openCodeLegacyRun || (!Object.hasOwn(latestResult, "restartReattach") &&
+          parseObject(latestResult.executionRecovery).providerWorkStarted !== true &&
           parseObject(latestResult.executionRecovery).providerWorkEvidence !== "unverified")) &&
         !revokedState.processPid &&
         !revokedState.processGroupId;

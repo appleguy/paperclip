@@ -197,6 +197,28 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run.id))).toHaveLength(0);
   });
 
+  it("holds a re-entered OpenCode orphan whose hold write misses after its preparing-stage claim", async () => {
+    const { heartbeatService } = await import("../heartbeat.js");
+    const { claimLegacyRestartController } = await import("./legacy-restart-claim.js");
+    const { persistUnverifiedSharedOpenCode } = await import("./opencode-unverified-hold.js");
+    const { input, run } = await fixture();
+    await db.update(agents).set({ adapterType: "opencode_local", status: "paused" }).where(eq(agents.id, input.agent.id));
+    const earlySession = { sessionId: "session-original", sessionParams: { narBinding: { messageId: "message-original" } } };
+    const [original] = await db.update(heartbeatRuns).set({ controllerBootId: randomUUID(),
+      executionStage: "dispatching", resultJson: { earlySession } }).where(eq(heartbeatRuns.id, run.id)).returning();
+    const claimed = await claimLegacyRestartController(db, original, { count: 1, previousServerPid: 10, newServerPid: 20, at: new Date() });
+    expect(claimed).toMatchObject({ executionStage: "preparing", resultJson: { earlySession, restartReattach: { count: 1 } } });
+    // Simulate a later process observing the expired adoption lease.
+    const [expired] = await db.update(heartbeatRuns).set({ controllerBootId: randomUUID(),
+      controllerLeaseExpiresAt: sql`clock_timestamp() - interval '1 second'` }).where(eq(heartbeatRuns.id, run.id)).returning();
+    expect(await persistUnverifiedSharedOpenCode(db, { run: expired, resultJson: { executionRecovery: {
+      kind: "bootstrap", reason: "outcome_unknown", providerWorkEvidence: "unverified",
+    } } })).toBe(false);
+    expect((await heartbeatService(db).reapOrphanedRuns()).runIds).not.toContain(run.id);
+    expect(await read(run.id)).toMatchObject({ status: "running", resultJson: { earlySession, restartReattach: { count: 1 } } });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run.id))).toHaveLength(0);
+  });
+
   it("re-enters the original OpenCode message through host execution and preserves resources on untagged shutdown", async () => {
     const { input, adapter, run } = await fixture();
     const boot = randomUUID();
