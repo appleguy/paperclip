@@ -6,14 +6,14 @@ export const QUEUE_DRIVE_HISTORY_HOLD_CODE = "queue_drive_recovery_hold";
 
 /** A completed automatic successor cannot authorize a new attempt after a stop. */
 export async function hasQueueDriveRecoveryHold(db: Db, scope: { companyId: string; agentId: string; issueId: string }, lockConversation = false) {
-  // A user Stop commits its issue-locked intent before provider termination.
+  // An operator Stop can commit its intent before provider termination.
   // Do not admit an automatic successor during that settlement window.
   const [pendingStop] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, scope.companyId), eq(heartbeatRuns.agentId, scope.agentId),
     inArray(heartbeatRuns.status, ["queued", "running", "scheduled_retry"]),
     sql`coalesce(${heartbeatRuns.issueId}::text, ${heartbeatRuns.nativeIssueId}::text,
       ${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId') = ${scope.issueId}`,
-    sql`${heartbeatRuns.resultJson}->>'cancelledByActorType' = 'user'`,
+    sql`${heartbeatRuns.resultJson}->>'cancelledByActorType' in ('user', 'board', 'agent')`,
     sql`${heartbeatRuns.resultJson} #>> '{executionCancellation,state}' = 'requested'`,
   )).limit(1);
   if (pendingStop) return true;

@@ -3544,13 +3544,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(await heartbeatService(db).getRun(runId)).toMatchObject({ status: "running" });
   });
 
-  it("holds queue drive while a real user Stop intent awaits provider acknowledgement", async () => {
+  it.each(["user", "board", "agent"] as const)("holds queue drive while a real %s Stop intent awaits provider acknowledgement", async (actorType) => {
     const { companyId, agentId, issueId, runId } = await seedRunFixture({ adapterType: "opencode_local", runtimeMode: "legacy", agentStatus: "running" });
     const heartbeat = heartbeatService(db);
-    await expect(heartbeat.cancelRun(runId, "Operator Stop", { resultJson: { cancelledByActorType: "user", cancelledByUserId: "responsible-user" } }))
+    await expect(heartbeat.cancelRun(runId, "Operator Stop", { resultJson: { cancelledByActorType: actorType, ...(actorType === "user" ? { cancelledByUserId: "responsible-user" } : {}) } }))
       .rejects.toThrow("Stop is recorded");
     const run = await heartbeat.getRun(runId);
     expect(run?.status).toBe("running");
+    expect(run?.resultJson?.cancelledByActorType).toBe(actorType);
     expect(run?.resultJson?.executionCancellation).toMatchObject({ state: "requested" });
     expect(await hasQueueDriveRecoveryHold(db, { companyId, agentId, issueId })).toBe(true);
   });
@@ -13577,6 +13578,40 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(run).not.toBeNull();
       await heartbeat.drainActiveRunExecutions();
       expect(checked).toBe(true);
+      expect(await heartbeat.getRun(run!.id)).toMatchObject({ status: "cancelled", errorCode: "queue_drive_recovery_hold" });
+      expect(mockAdapterExecute).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each((["user", "board", "agent"] as const).flatMap((actor) =>
+    (["claim", "dispatch"] as const).map((stage) => [actor, stage] as const)))(
+    "holds queue-drive admission for a pending %s Stop at %s",
+    async (actorType, boundary) => {
+      const { agentId, issueId, runId } = await seedRunFixture({
+        adapterType: "opencode_local", runtimeMode: "legacy", agentStatus: "idle", runStatus: "failed",
+      });
+      let stopped = false;
+      const heartbeat = heartbeatService(db, {
+        beforeChatControlRecoveryCheck: async ({ stage }) => {
+          if (stage !== boundary || stopped) return;
+          stopped = true;
+          await db.update(heartbeatRuns).set({ status: "running", finishedAt: null, resultJson: {} }).where(eq(heartbeatRuns.id, runId));
+          await expect(heartbeat.cancelRun(runId, "Operator Stop", {
+            resultJson: { cancelledByActorType: actorType, ...(actorType === "user" ? { cancelledByUserId: "responsible-user" } : {}) },
+          })).rejects.toThrow("Stop is recorded");
+        },
+      });
+      const run = await heartbeat.wakeup(agentId, {
+        source: "assignment", triggerDetail: "system", reason: "issue_queue_drive",
+        requestedByActorType: "system", requestedByActorId: "heartbeat_queue_drive",
+        payload: { issueId }, contextSnapshot: { issueId, source: "heartbeat.queue_drive" },
+      });
+      expect(run).not.toBeNull();
+      await heartbeat.drainActiveRunExecutions();
+      expect(stopped).toBe(true);
+      expect(await heartbeat.getRun(runId)).toMatchObject({ status: "running", resultJson: {
+        cancelledByActorType: actorType, executionCancellation: { state: "requested" },
+      } });
       expect(await heartbeat.getRun(run!.id)).toMatchObject({ status: "cancelled", errorCode: "queue_drive_recovery_hold" });
       expect(mockAdapterExecute).not.toHaveBeenCalled();
     },
