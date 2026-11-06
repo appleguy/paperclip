@@ -417,6 +417,57 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect(retry).toMatchObject({ exitCode: 0, summary: "orphan finished", sessionId: sid, costUsd: 0.25 });
   }, 15_000);
 
+  it("holds a restart before the prompt POST when no durable no-dispatch proof is available", async () => {
+    const abort = new AbortController();
+    const input = { configPath: cfg, agentId: scope.agentId, taskId: scope.issueId, runId: "before-post", cwd: root,
+      model: "", prompt: "original", timeoutSec: 5, pollMs: 1, onLog: async () => {} };
+    const original = await runNarOpenCodeAttempt({ ...input, signal: abort.signal, onBound: async () => { abort.abort(); } });
+    expect(original.executionRecovery).toMatchObject({ providerWorkStarted: false, reason: "aborted_pre_submit" });
+    expect(promptPosts).toBe(0);
+
+    // The restarted controller cannot rely on another process's local abort.
+    const restarted = await runNarOpenCodeAttempt({ ...input, reattachOnly: true });
+    expect(restarted.executionRecovery).toMatchObject({ providerWorkStarted: true, providerWorkEvidence: "unverified", reason: "reattach_message_missing" });
+    expect(promptPosts).toBe(0);
+  });
+
+  it("does not retry an absent message while the old controller is about to POST", async () => {
+    let releasePost!: () => void;
+    let reachedDispatch!: () => void;
+    const dispatch = new Promise<void>((resolve) => { reachedDispatch = resolve; });
+    const postGate = new Promise<void>((resolve) => { releasePost = resolve; });
+    const input = { configPath: cfg, agentId: scope.agentId, taskId: scope.issueId, runId: "delayed-post", cwd: root,
+      model: "", prompt: "original", timeoutSec: 5, pollMs: 1 };
+    const original = runNarOpenCodeAttempt({ ...input, onLog: async (_stream, chunk) => {
+      if (chunk.includes("nar_prompt_dispatch")) { reachedDispatch(); await postGate; }
+    } });
+    try {
+      await dispatch;
+      const restarted = await runNarOpenCodeAttempt({ ...input, reattachOnly: true, onLog: async () => {} });
+      expect(restarted.executionRecovery).toMatchObject({ providerWorkStarted: true, providerWorkEvidence: "unverified", reason: "reattach_message_missing" });
+      expect(promptPosts).toBe(0);
+    } finally {
+      releasePost();
+      await original;
+    }
+    expect(promptPosts).toBe(1);
+    expect(userMsgs().map((message) => message.id)).toEqual([messageIdFor(narOpIdFor("delayed-post"))]);
+  }, 15_000);
+
+  it("distinguishes an original message found in multiple generations", async () => {
+    const message = messageIdFor(narOpIdFor("duplicate-run"));
+    for (const generation of [0, 1]) {
+      const sid = sessionIdFor(scope, generation);
+      sessions.set(sid, { info: { id: sid, location: { directory: root }, time: { created: clock++ } },
+        msgs: [{ id: message, type: "user", time: { created: clock++ } }] });
+    }
+    const result = await runNarOpenCodeAttempt({ configPath: cfg, agentId: scope.agentId, taskId: scope.issueId,
+      runId: "duplicate-run", cwd: root, model: "", prompt: "unused", timeoutSec: 5, reattachOnly: true,
+      onLog: async () => {} });
+    expect(result.executionRecovery).toMatchObject({ providerWorkStarted: true, reason: "reattach_message_ambiguous" });
+    expect(promptPosts).toBe(0);
+  });
+
   it("reattaches to its persisted rejoined message, without taking Stop ownership", async () => {
     const sid = sessionIdFor(scope);
     const orphan = messageIdFor(narOpIdFor("original-run"));

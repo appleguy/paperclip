@@ -15,7 +15,7 @@ export type NarAttempt = {
   possibleWork: boolean;
   capacityRefusal: boolean;
   /** Merged into resultJson by execute.ts; absent on success. */
-  executionRecovery?: { kind: "bootstrap"; providerWorkStarted: boolean; reason: string };
+  executionRecovery?: { kind: "bootstrap"; providerWorkStarted: boolean; reason: string; providerWorkEvidence?: "unverified" };
   /** Set when OpenCode itself proved the provider turn is gone (SCO-679); execute.ts acknowledges the cancellation. */
   providerTermination?: { proof: "server_restarted" | "session_idle"; reason: string };
 };
@@ -75,13 +75,14 @@ const emptyParsed = (sessionId: string | null, errorMessage: string | null): Ret
 
 const held = (
   message: string, providerWorkStarted: boolean, sessionId: string | null, reason: string, extra?: Partial<NarAttempt["proc"]>,
+  providerWorkEvidence?: "unverified",
 ): NarAttempt => ({
   proc: { exitCode: 75, signal: null, timedOut: false, stdout: "", stderr: message, ...extra },
   rawStderr: message,
   parsed: emptyParsed(sessionId, message),
   possibleWork: providerWorkStarted,
   capacityRefusal: false,
-  executionRecovery: { kind: "bootstrap", providerWorkStarted, reason },
+  executionRecovery: { kind: "bootstrap", providerWorkStarted, reason, ...(providerWorkEvidence ? { providerWorkEvidence } : {}) },
 });
 
 /** Provider turn is gone and verified from OpenCode: the session resumes, so replay is safe (SCO-679). */
@@ -276,7 +277,13 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
         const candidate = sessionIdFor(scope, g);
         if (await driver.messageExists(candidate, msgId)) matches.push(candidate);
       }
-      if (matches.length !== 1) return held("OpenCode reattach could not uniquely locate this run's message; held without replay", true, null, "reattach_message_unknown");
+      // A missing message is different from duplicate matches, but neither
+      // proves non-dispatch. A prior POST may still be in transit, a queued
+      // message may have been deleted, and historical writers did not all
+      // persist a binding. `true` is the conservative possible-work flag
+      // consumed by existing recovery code, not a claim of observed work.
+      if (matches.length === 0) return held("OpenCode reattach found no original message; dispatch remains unverified and is held without replay", true, null, "reattach_message_missing", undefined, "unverified");
+      if (matches.length > 1) return held("OpenCode reattach found the original message in multiple sessions; held without replay", true, null, "reattach_message_ambiguous");
       if (input.reattachBinding && matches[0] !== input.reattachBinding.sessionId)
         return held("OpenCode reattach binding does not match its recorded session; held without replay", true, null, "reattach_binding_mismatch");
       targetSession = matches[0]!;
