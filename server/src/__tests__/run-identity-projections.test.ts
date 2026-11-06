@@ -115,4 +115,14 @@ const scopes = ["identity", "task_authorization", "token_broker"] as const;
     await expect(projectToolContext(db, actor)).rejects.toThrow("session has changed");
     await expect(projectToolContext(db, actor, true, "Project", { includeExecutionInput: true })).rejects.toThrow("session has changed");
   });
+
+  it("does not substitute a successor run for a finished project-tool caller", async () => {
+    const f = await seedIdentityProjection(db), successorId = randomUUID();
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.runId));
+    await db.insert(heartbeatRuns).values({ id: successorId, companyId: f.companyId, agentId: f.agentId,
+      status: "running", nativeIssueId: f.issueId, contextSnapshot: f.payloads.contextSnapshot });
+    const actor = { type: "agent" as const, source: "agent_jwt" as const, companyId: f.companyId, agentId: f.agentId, runId: f.runId };
+    await expect(projectToolContext(db, actor)).rejects.toMatchObject({ status: 403, details: { code: "agent_run_inactive" } });
+    expect((await projectToolContext(db, { ...actor, runId: successorId })).run.id).toBe(successorId);
+  });
 });
