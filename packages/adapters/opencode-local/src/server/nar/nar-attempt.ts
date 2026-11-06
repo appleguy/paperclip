@@ -63,8 +63,11 @@ export interface NarAttemptInput {
 export const narOpIdFor = (runId: string) => `nar-run-${runId}`;
 
 // Machine-parseable run-log event: one `[paperclip:event] {json}` stdout line, so audits stop inferring
-// rejoin vs fresh prompt from prose (SCO-495).
-export const narEventLine = (event: "nar_rejoin" | "nar_prompt_dispatch", fields: Record<string, string>) =>
+// rejoin vs fresh prompt from prose (SCO-495). Metadata only: ids and counts, never prompt or generated text.
+export const narEventLine = (
+  event: "nar_rejoin" | "nar_prompt_dispatch" | "nar_usage",
+  fields: Record<string, string | number>,
+) =>
   `[paperclip:event] ${JSON.stringify({ event, ...fields })}\n`;
 
 // run-control tags explicit Stop; shutdown/recovery uses an untagged abort so
@@ -169,7 +172,7 @@ export function classifyOpenCodeError(err: unknown): { code: string; detail: str
 /** Read this op's usage from the session message log: messages created at/after our user message. */
 async function collectOutcome(
   driverFetch: typeof fetch, url: string, passwordFile: string, sessionId: string, msgId: string,
-): Promise<{ texts: string[]; usage: ReturnType<typeof parseOpenCodeJsonl>["usage"]; usageReported: boolean; costUsd: number | null; sessionOutcome: string | null; capacityRefusal: boolean; cause: { code: string; detail: string } | null }> {
+): Promise<{ texts: string[]; usage: ReturnType<typeof parseOpenCodeJsonl>["usage"]; usageReported: boolean; costUsd: number | null; sessionOutcome: string | null; capacityRefusal: boolean; cause: { code: string; detail: string } | null; requests: { usageMessageId: string; promptTokens: number; cachedTokens: number }[] }> {
   const pw = (await fs.readFile(passwordFile, "utf8")).trim();
   const headers = { authorization: "Basic " + Buffer.from(`opencode:${pw}`).toString("base64"), accept: "application/json" };
   const get = async (p: string) => {
@@ -195,6 +198,9 @@ async function collectOutcome(
   let usageReported = false;
   let cost: number | null = 0;
   const texts: string[] = [];
+  // Per-request rows for the nar_usage event (SCO-1136): a request qualifies only when it completed with a
+  // terminal finish, no error, and valid non-negative prompt counts (same gate as the Go receipt reader).
+  const requests: { usageMessageId: string; promptTokens: number; cachedTokens: number }[] = [];
   for (const m of ops) {
     for (const c of Array.isArray(m.content) ? m.content : []) {
       if (c?.type === "text" && typeof c.text === "string" && c.text.trim()) texts.push(c.text.trim());
@@ -207,6 +213,17 @@ async function collectOutcome(
       usage.cachedInputTokens += nums[2];
       usage.peakContextTokens = Math.max(usage.peakContextTokens, nums[0] + nums[2] + nums[3]);
       usageReported = true;
+    }
+    const ti = t?.input, tr = t?.cache?.read, tw = t?.cache?.write;
+    if (
+      typeof m.time?.completed === "number" && m.time.completed > 0 &&
+      (m.finish === "stop" || m.finish === "tool-calls" || m.finish === "length") &&
+      m.error == null &&
+      Number.isSafeInteger(ti) && Number.isSafeInteger(tr) && Number.isSafeInteger(tw) &&
+      ti >= 0 && tr >= 0 && tw >= 0
+    ) {
+      const promptTokens = ti + tr + tw;
+      if (promptTokens > 0) requests.push({ usageMessageId: m.id, promptTokens, cachedTokens: tr });
     }
     if (typeof m.cost === "number" && Number.isFinite(m.cost) && m.cost >= 0) cost = (cost ?? 0) + m.cost;
     else cost = null;
@@ -228,7 +245,7 @@ async function collectOutcome(
     const o = sess?.outcome;
     sessionOutcome = typeof o === "string" ? o : typeof o?.type === "string" ? o.type : typeof o?.status === "string" ? o.status : null;
   } catch { /* outcome detail is advisory */ }
-  return { texts, usage, usageReported, costUsd: ops.length ? cost : null, sessionOutcome, capacityRefusal: capacityRefusal || cause?.code === "opencode_provider_rate_limit", cause };
+  return { texts, usage, usageReported, costUsd: ops.length ? cost : null, sessionOutcome, capacityRefusal: capacityRefusal || cause?.code === "opencode_provider_rate_limit", cause, requests };
 }
 
 /**
@@ -571,6 +588,18 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
   } catch {
     return held("OpenCode outcome could not be verified; held without replay", true, conversationId,
       input.reattachOnly ? "reattach_outcome_unknown" : "outcome_unknown");
+  }
+  // One metadata-only usage event per completed request (SCO-1136): the stable native assistant message id
+  // plus run/turn/order and prompt counts. No text ever leaves on this path.
+  for (const [i, req] of out.requests.entries()) {
+    await onLog("stdout", narEventLine("nar_usage", {
+      usageMessageId: req.usageMessageId,
+      runId: input.runId,
+      turn: `run-${input.runId.split("-")[0]}`,
+      order: i + 1,
+      promptTokens: req.promptTokens,
+      cachedTokens: req.cachedTokens,
+    }));
   }
   const summary = out.texts.join("\n\n");
   if (summary && !loggedText) await onLog("stdout", summary + "\n");
