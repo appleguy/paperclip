@@ -576,7 +576,7 @@ async function derivedRcName(ctx: AdapterExecutionContext): Promise<string> {
   } catch (e) {
     await ctx.onLog("stderr", `[claude-rc] RC name depth lookup failed (${(e as Error).message}); using depth 0\n`);
   }
-  const name = deriveRcName(ctx.agent.name, depth);
+  const name = deriveRcName(ctx.agent.name, depth, 0, asString(ctx.config.model, "claude-sonnet-5-5"), asString(ctx.config.effort, "medium"));
   const configured = typeof ctx.config.remoteControlName === "string" ? ctx.config.remoteControlName.trim() : "";
   if (configured && sanitizeRcName(configured) !== name)
     await ctx.onLog("stdout", `[claude-rc] Ignoring configured remoteControlName "${configured}"; Remote Control name is derived: "${name}"\n`);
