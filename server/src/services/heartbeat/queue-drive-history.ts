@@ -11,7 +11,10 @@ export async function hasQueueDriveRecoveryHold(db: Db, scope: { companyId: stri
     isNotNull(heartbeatRuns.finishedAt),
     sql`coalesce(${heartbeatRuns.issueId}::text, ${heartbeatRuns.nativeIssueId}::text,
       ${heartbeatRuns.contextSnapshot}->>'issueId', ${heartbeatRuns.contextSnapshot}->>'taskId') = ${scope.issueId}`,
-    sql`(${heartbeatRuns.errorCode} in (${CHAT_CONTROL_RECOVERY_STOP_CODE}, ${CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE}, ${QUEUE_DRIVE_HISTORY_HOLD_CODE}, 'process_lost')
+    sql`(${heartbeatRuns.errorCode} in (${CHAT_CONTROL_RECOVERY_STOP_CODE}, ${CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE}, ${QUEUE_DRIVE_HISTORY_HOLD_CODE})
+      or (${heartbeatRuns.errorCode} = 'process_lost' and
+        (coalesce(${heartbeatRuns.processLossRetryCount}, 0) >= 1
+          or coalesce(${heartbeatRuns.resultJson} #>> '{processLossDiagnostic,retryEligible}', '') <> 'true'))
       or (${heartbeatRuns.status} = 'cancelled' and (
         ${heartbeatRuns.errorCode} = 'operator_interrupted'
         or ${heartbeatRuns.resultJson}->>'cancelledByActorType' in ('user', 'board', 'agent')
@@ -37,8 +40,15 @@ export async function hasQueueDriveRecoveryHold(db: Db, scope: { companyId: stri
     )).limit(1);
     if (!run) continue;
     if (!actionId && wake.requestedByActorType === "user" && wake.requestedByActorId) return false;
-    if (actionId && run.wakeupRequestId === wake.id &&
-        (await readChatControlRecoveryStop(db, { ...scope, sourceRunId: run.id })).kind === "clear") return false;
+    if (actionId && run.wakeupRequestId) {
+      // The chat proof validates all coalesced inbound sources when the run's
+      // own wake is a chat action; an unrelated automatic owner is not proof.
+      const [owner] = await db.select({ id: chatActions.id }).from(chatActions).where(and(
+        eq(chatActions.id, run.wakeupRequestId), eq(chatActions.companyId, scope.companyId),
+        inArray(chatActions.kind, ["inbound_wakeup", "failed_run_retry"]),
+      )).limit(1);
+      if (owner && (await readChatControlRecoveryStop(db, { ...scope, sourceRunId: run.id })).kind === "clear") return false;
+    }
   }
   return true;
 }

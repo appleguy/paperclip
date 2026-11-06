@@ -236,6 +236,16 @@ describe.skipIf(!postgres.supported)("queue drive persisted selection and deboun
     expect(deps.enqueueWakeup).not.toHaveBeenCalled();
   });
 
+  it("keeps the eligible first process-loss retry lane drivable after it succeeds", async () => {
+    const ready = await issue();
+    const lost = await attempt(ready.id, "failed", 1_000);
+    await db.update(heartbeatRuns).set({ errorCode: "process_lost", processLossRetryCount: 0,
+      resultJson: { processLossDiagnostic: { retryEligible: true } } }).where(eq(heartbeatRuns.id, lost.id));
+    await attempt(ready.id, "succeeded", 3_000);
+    await drive.wakeNextAssignedIssueAfterRun(source);
+    expect(picked()).toBe(ready.id);
+  });
+
   it.each(["chat_control_completed_source", "chat_control_recovery_proof_unresolved"])(
     "skips a nonretrying chat recovery outcome %s while driving other work", async errorCode => {
       const held = await issue({ priority: "critical" });
@@ -282,7 +292,7 @@ describe.skipIf(!postgres.supported)("queue drive persisted selection and deboun
 
     const fresh = await attempt(held.id, "succeeded", 5_000);
     await db.insert(agentWakeupRequests).values({ companyId: source.companyId, agentId: source.agentId,
-      source: "automation", reason: "issue_commented", status: "completed", runId: fresh.id,
+      source: "automation", reason: "issue_commented", status: outcome.errorCode === "process_lost" ? "coalesced" : "completed", runId: fresh.id,
       requestedAt: new Date(5_000), requestedByActorType: "user", requestedByActorId: "responsible-user",
       payload: { issueId: held.id } });
     await drive.wakeNextAssignedIssueAfterRun(source);

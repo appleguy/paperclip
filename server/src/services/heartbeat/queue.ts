@@ -556,14 +556,20 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     const issueId = readNonEmptyString(
       parseObject(run.contextSnapshot).issueId,
     );
-    const queueDrive = parseObject(run.contextSnapshot).source === "heartbeat.queue_drive";
+    const [queueDriveReceipt] = run.invocationSource === "assignment" && run.wakeupRequestId
+      ? await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.id, run.wakeupRequestId), eq(agentWakeupRequests.companyId, run.companyId),
+        eq(agentWakeupRequests.agentId, run.agentId), eq(agentWakeupRequests.reason, "issue_queue_drive"),
+        eq(agentWakeupRequests.requestedByActorType, "system"), eq(agentWakeupRequests.requestedByActorId, "heartbeat_queue_drive"),
+      )).limit(1) : [];
+    const queueDrive = Boolean(queueDriveReceipt) || parseObject(run.contextSnapshot).source === "heartbeat.queue_drive";
     if (!issueId || (!queueDrive && run.invocationSource !== "automation")) return onClear(db);
     await options.beforeChatControlRecoveryCheck?.({
       runId: run.id,
       issueId,
       stage,
     });
-    if (stage === "dispatch" && nativeRecovery && !queueDrive) {
+    if (stage === "dispatch" && nativeRecovery) {
       // Protected historical/already-admitted owners did not previously take
       // this fence's locks. A fresh exact read keeps unrelated Board contention
       // from turning their recovery into a new admission failure.
@@ -646,7 +652,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           expectedAdmission !== "historical" && admission === "historical";
         if (
           stage === "dispatch" &&
-          nativeRecovery && !queueDrive &&
+          nativeRecovery &&
           !admissionLost &&
           (admission === "historical" || admission === "admitted")
         )
@@ -655,12 +661,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         // Those fields do not prove this run's turn was dispatched.
         // Exact admitted/historical recovery retains its existing ownership;
         // a marked, unadmitted bootstrap must earn admission even after crash.
-        const proof = queueDrive
+        const proof = admission === "invalid" || admissionLost
+          ? { kind: "unresolved" as const }
+          : queueDrive
           ? (await hasQueueDriveRecoveryHold(tx as unknown as Db, { companyId: run.companyId, agentId: run.agentId, issueId }))
             ? { kind: "queue_hold" as const } : { kind: "clear" as const }
-          : admission === "invalid" || admissionLost
-            ? { kind: "unresolved" as const }
-            : await readChatControlRecoveryStop(
+          : await readChatControlRecoveryStop(
                 tx as unknown as Db,
                 {
                   companyId: run.companyId,
@@ -671,7 +677,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 true,
               );
         if (proof.kind === "clear") {
-          if (!queueDrive && (stage === "claim" || admission === "required"))
+          if (stage === "claim" || admission === "required")
             await tx
               .update(heartbeatRuns)
               .set({
