@@ -44,6 +44,8 @@ vi.mock("../hot-restart.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../hot-restart.js")>(),
   readHotRestartIntent: hotRestart.read,
   writeHotRestartShutdownSnapshot: hotRestart.write,
+  writeHotRestartReport: vi.fn(async (report: import("../hot-restart.js").HotRestartReport) => report),
+  removeHotRestartIntent: vi.fn(async () => undefined),
 }));
 vi.mock("../native-runtime/index.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../native-runtime/index.js")>(),
@@ -229,6 +231,27 @@ describePostgres("heartbeat recovery module ownership", () => {
     await db.insert(issues).values({ id: issueId, companyId, title: "Recover this run", status: "in_progress", assigneeAgentId: agentId });
     return (await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, issueId, invocationSource: "automation", status: "running", runtimeMode: "legacy" }).returning())[0];
   }
+
+  it("re-enters the same OpenCode run after a persisted unverified restart hold", async () => {
+    const run = await seedRun();
+    const previousBoot = randomUUID();
+    const recovery = { kind: "bootstrap", reason: "aborted", providerWorkStarted: true, providerWorkEvidence: "unverified" };
+    await db.update(agents).set({ adapterType: "opencode_local", adapterConfig: { nativeRuntime: "nar" } }).where(eq(agents.id, run.agentId));
+    await db.update(heartbeatRuns).set({ controllerBootId: previousBoot, resultJson: { executionRecovery: recovery } }).where(eq(heartbeatRuns.id, run.id));
+    const now = new Date();
+    hotRestart.read.mockResolvedValueOnce({ version: 1, requestedAt: now.toISOString(), previousServerPid: process.pid,
+      previousServerVersion: "fixture", requestedByRunId: null, drainRequired: false, preflightActiveRunIds: [run.id],
+      shutdownSnapshot: { capturedAt: now.toISOString(), signal: "SIGTERM", activeRuns: [{ runId: run.id,
+        companyId: run.companyId, agentId: run.agentId, issueId: run.issueId, adapterType: "opencode_local",
+        status: "running", runtimeMode: "legacy", processPid: null, processGroupId: null }] } });
+    const deps = callbacks(db);
+    const adoption = await createHeartbeatRecovery(db, deps).reconcileHotRestartAdoption(now);
+    expect(adoption).toMatchObject({ mode: "reported", adoptedRunIds: [run.id], lostRunIds: [], skippedRunIds: [] });
+    expect(deps.executeRun).toHaveBeenCalledExactlyOnceWith(run.id);
+    const [claimed] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+    expect(claimed).toMatchObject({ status: "running", resultJson: { executionRecovery: recovery, restartReattach: { count: 1 } } });
+    expect(claimed.controllerBootId).not.toBe(previousBoot);
+  });
 
   it("routes an expired pre-capability startup to cleanup before generic orphan ownership holds", async () => {
     const run = await seedRun(), leaseId = randomUUID(), environmentId = randomUUID(), leaseOwner = randomUUID();
