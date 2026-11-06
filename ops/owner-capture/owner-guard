@@ -18,6 +18,12 @@ OWNER_JQ='def owner: (. // "") | select(type=="string" and length>0);'
 CODEX_ORIGIN_JQ='def codex_injected:
   ([.payload.internal_chat_message_metadata_passthrough.content_item_metadata[]?.provenance.type] as $p |
     (($p | length) > 0 and all($p[]; . == "agents_md" or . == "harness")));'
+# Claude harness-injected user turns (task-notification envelopes, restart continuation
+# summaries, interrupt markers) are not owner typing; only a leading occurrence counts,
+# a quoted occurrence mid-text stays owner.
+CLAUDE_HARNESS_JQ='def harness_injected: startswith("<task-notification>")
+  or startswith("This session is being continued from a previous conversation")
+  or startswith("[Request interrupted by user");'
 STATE=${OWNER_GUARD_STATE:-/Volumes/NVM/Paperclip/ops/owner-capture/state}
 API=/Volumes/NVM/Paperclip/bin/api
 mkdir -p "$STATE"
@@ -77,13 +83,24 @@ scan_opencode() { # SESSION_ID[@DB] [FROM_N]: user text (n = ordinal within sess
   fi |
   jq -c --arg auto "$AUTO" --arg from "${2:-0}" "$OWNER_JQ$NAR_JQ"'.[]? | select(.line > ($from|tonumber)) | select(nar_injected|not) | del(.message_id,.session_metadata) | (.text|owner) as $t | .'
 }
+scan_agy() { # antigravity-cli history.jsonl: owner-typed TUI turns ({display,timestamp,workspace,conversationId});
+  # slash-command rows and rows without a conversation are not steering. Line n is the stable occurrence identity.
+  jq -c -n --arg from "${2:-0}" "$OWNER_JQ"'
+    [inputs] | to_entries[] | .value as $r | (.key+1) as $ln
+    | select($ln > ($from|tonumber))
+    | select(($r.conversationId // "") != "")
+    | select(($r.type // "") != "slash_command")
+    | (($r.display // "")|owner) as $t
+    | {line:$ln, event:("line:"+($ln|tostring)), ts:$r.timestamp, sid:$r.conversationId, cwd:($r.workspace//""), src:"agy", text:$t}' < "$1" | jq -c --arg tr "$1" '.+{transcript:$tr}'
+}
 
 scan() { # TRANSCRIPT [FROM_LINE]
   case "$1" in
     */rollout-*.jsonl) scan_codex "$@"; return ;;
     opencode:*) scan_opencode "${1#opencode:}" "${2:-0}"; return ;;
+    agy:*) scan_agy "${1#agy:}" "${2:-0}"; return ;;
   esac
-  jq -c -n --arg auto "$AUTO" --arg from "${2:-0}" "$OWNER_JQ"'
+  jq -c -n --arg auto "$AUTO" --arg from "${2:-0}" "$OWNER_JQ$CLAUDE_HARNESS_JQ"'
     def txt: if type=="string" then . else ([.[]?|select(.type=="text")|.text]|join("\n")) end;
     [inputs] as $all | range(0;$all|length) as $i | $all[$i] as $r | ($i+1) as $ln
     | select($ln > ($from|tonumber))
@@ -92,11 +109,14 @@ scan() { # TRANSCRIPT [FROM_LINE]
         elif ($r.attachment.type=="queued_command" and ($r.attachment.origin.kind=="human" or $r.attachment.humanTurn==true))
           then ($r.attachment.prompt|txt|owner)
         else empty end ) as $t
+    | select(($t|harness_injected)|not)
     | {line:$ln, event:("message:"+($r.uuid // $r.attachment.uuid // ("line:"+($ln|tostring)))), ts:($r.timestamp//$r.attachment.timestamp), sid:$r.sessionId, cwd:($r.cwd//""), src:"claude", text:$t}' < "$1" | jq -c --arg tr "$1" '.+{transcript:$tr}'
 }
 
 sid_of() { # TRANSCRIPT-or-opencode:ID -> session id
   if [ "${1#opencode:}" != "$1" ]; then x=${1#opencode:}; printf '%s' "${x%%@*}"; return; fi
+  # One global append-only history file: one pseudo-session holds the single line cursor.
+  if [ "${1#agy:}" != "$1" ]; then printf '%s' "agy-history"; return; fi
   b=$(basename "$1" .jsonl)
   case "$b" in rollout-*) printf '%s' "$b" | sed -E 's/^.*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/\1/';; *) printf '%s' "$b";; esac
 }
@@ -107,6 +127,8 @@ transcripts() { # DAYS [NEWER_THAN_FILE]: candidate transcripts for fleet sync
   find "$HOME/.claude/projects" -maxdepth 2 -name '*.jsonl' -mtime -"$1" $nw 2>/dev/null || true
   for h in $(codex_homes); do find "$h/sessions" -name 'rollout-*.jsonl' -mtime -"$1" $nw 2>/dev/null || true; done
   for d in $(ocdbs); do sqlite3 -readonly "$d" "select 'opencode:'||id||'@$d' from $(ocsess "$d") where time_updated > (strftime('%s','now')-$1*86400)*1000" 2>/dev/null || true; done
+  # antigravity-cli (agy) keeps one append-only global history: token it for scan_agy (its rows carry the real conversationId)
+  find "$HOME/.gemini/antigravity-cli/history.jsonl" -maxdepth 0 -mtime -"$1" $nw 2>/dev/null | sed 's|^|agy:|' || true
 }
 
 # ---- durable ledger: {id:"<s8>:<h6>",ts,sid,cwd,proc,src,text} opens; {id,close,ts} closes; {id,adopt,proc,ts} hand-overs; {id,escalated,ts}.
@@ -169,7 +191,8 @@ capture() { # UserPromptSubmit hook: record the owner prompt at receipt, before 
     # Only an exact transport occurrence can attribute an already persisted row.
     eid=$(printf '%s' "$in" | jq -r '.event_id // .message_id // .turn_id // .prompt_id // .uuid // empty')
     if [ -n "$eid" ] && [ -r "$rt" ] && jq -e --arg e "$eid" "$CODEX_ORIGIN_JQ"'select(.type=="response_item" and (.payload.id==$e or .payload.internal_chat_message_metadata_passthrough.turn_id==$e)) | select(codex_injected)' "$rt" >/dev/null; then exit 0; fi;; esac
-  m=$(printf '%s' "$in" | jq -c --arg auto "$AUTO" --arg ts "$(nowz)" --arg proc "$(proc_key)" --arg agent "${PAPERCLIP_AGENT_ID:-}" --arg src "${OWNER_GUARD_SRC:-}" "$OWNER_JQ"' (.prompt|owner) as $t
+  m=$(printf '%s' "$in" | jq -c --arg auto "$AUTO" --arg ts "$(nowz)" --arg proc "$(proc_key)" --arg agent "${PAPERCLIP_AGENT_ID:-}" --arg src "${OWNER_GUARD_SRC:-}" "$OWNER_JQ$CLAUDE_HARNESS_JQ"' (.prompt|owner) as $t
+    | select(($t|harness_injected)|not)
     | {ts:$ts,sid:.session_id,text:$t,event:((.event_id // .message_id // .turn_id // .prompt_id // .uuid // "")|if .=="" then null else "message:"+. end),cwd:(.cwd//""),proc:$proc,agent:$agent,src:(if $src != "" then $src elif ((.transcript_path//"")|test("rollout-")) then "codex" else "claude" end)}' 2>/dev/null) || exit 0
   [ -n "$m" ] || exit 0
   # Without a source ID, text is the best available fallback.
@@ -349,12 +372,12 @@ WEND
 guard() {
   in=$(cat 2>/dev/null || true); tr=${1:-}
   [ -n "$tr" ] || tr=$(printf '%s' "$in" | jq -r '.transcript_path // empty')
-  case "$tr" in opencode:*) ;; *) [ -r "$tr" ] || exit 0;; esac
+  case "$tr" in opencode:*|agy:*) ;; *) [ -r "$tr" ] || exit 0;; esac
   sid=$(sid_of "$tr")
   s8=$(printf %.8s "$sid"); cur="$STATE/$sid.cursor"
   from=0; [ -r "$cur" ] && from=$(cat "$cur")
   msgs=$(scan "$tr" "$from")
-  case "$tr" in opencode:*) last=$(printf '%s\n' "$msgs" | jq -s 'map(.line)|max // 0');; *) last=$(wc -l < "$tr" | tr -d ' ');; esac
+  case "$tr" in opencode:*|agy:*) last=$(printf '%s\n' "$msgs" | jq -s 'map(.line)|max // 0');; *) last=$(wc -l < "$tr" | tr -d ' ');; esac
   [ -n "$msgs" ] || { echo "$last" > "$cur"; exit 0; }
   printf '%s\n' "$msgs" | ledger_add "$(printf '%s' "$in" | jq -r '.cwd // empty' 2>/dev/null)"
   body=$(printf '%s\n' "$msgs" | jq -rs --arg s8 "$s8" --arg tr "$tr" '
@@ -391,6 +414,7 @@ seed() { # DAYS: one-time baseline, set every session cursor to its current end 
   days=${1:-30}
   for tr in $(transcripts "$days"); do
     case "$tr" in opencode:*) scan_opencode "${tr#opencode:}" 0 | jq -s 'map(.line)|max // 0' > "$STATE/$(sid_of "$tr").cursor";;
+      agy:*) wc -l < "${tr#agy:}" | tr -d ' ' > "$STATE/$(sid_of "$tr").cursor";;
       *) wc -l < "$tr" | tr -d ' ' > "$STATE/$(sid_of "$tr").cursor";; esac
   done
 }

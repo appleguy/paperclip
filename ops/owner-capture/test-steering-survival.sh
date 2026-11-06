@@ -136,6 +136,42 @@ jq -nc '{session_id:"ses_managed",cwd:"/test",prompt:"instructions with any pers
   OPENCODE_DB="$OC" OWNER_GUARD_SRC=opencode $G capture
 ck "opencode legacy receipt without message ID matches persisted NAR injection" '[ "$(nopen)" = "$before" ]'
 for id in $($G list | jq -r .id); do $G close "$id" "covered by SCO-1080 test"; done
+# Claude harness-injected turns (task-notification envelopes, restart continuation summaries,
+# interrupt markers) are not owner typing when they lead the prompt; a quoted occurrence
+# mid-text stays owner.
+for p in '<task-notification>' 'This session is being continued from a previous conversation' '[Request interrupted by user'; do
+  before=$(nopen)
+  cap claude-harness /test "$p" $$
+  ck "claude harness: leading marker not captured" '[ "$(nopen)" = "$before" ]'
+  cap claude-harness /test "fix the cadence after $p ended" $$
+  ck "claude harness: mid-text marker stays owner" '[ "$(nopen)" = "$((before+1))" ]'
+  for id in $($G list | jq -r .id); do $G close "$id" "covered by harness skip test"; done
+done
+# agy (antigravity-cli) keeps one append-only global history.jsonl: owner TUI turns reach the
+# ledger with their real conversationId; slash-command and conversation-less rows do not;
+# line n is the stable idempotent occurrence.
+FIX=$OWNER_GUARD_STATE/agy-history.jsonl
+cat > "$FIX" <<'EOF'
+{"display":"make the deploy gate stricter","timestamp":1760000000000,"workspace":"/tmp/w1","conversationId":"conv-1"}
+{"display":"/clear","timestamp":1760000001000,"workspace":"/tmp/w1","conversationId":"conv-1","type":"slash_command"}
+{"display":"orphan turn","timestamp":1760000002000,"workspace":"/tmp/w1"}
+{"display":"and keep the ledger idempotent","timestamp":1760000003000,"workspace":"/tmp/w2","conversationId":"conv-2"}
+{"display":"/compact","timestamp":1760000004000,"workspace":"/tmp/w2","conversationId":"conv-2","type":"slash_command"}
+EOF
+ck 'agy scan: owner turns kept, slash and orphan rows dropped' '[ "$($G scan "agy:$FIX" | jq -sr "map(.line)==[1,4]")" = true ]'
+ck 'agy scan: incremental from line 1 keeps only the new turn' '[ "$($G scan "agy:$FIX" 1 | jq -sr "map(.line)==[4]")" = true ]'
+ck 'agy scan: records carry conversation id, workspace and source' '$G scan "agy:$FIX" | jq -se "[.[]|select(.line==4)]|.[0]|.sid==\"conv-2\" and .cwd==\"/tmp/w2\" and .src==\"agy\"" >/dev/null'
+$G scan "agy:$FIX" | $G _ledger_add ""
+ck 'agy ledger: both owner turns open' '[ "$(nopen)" = 2 ] && $G open 0 2>/dev/null | grep -q "deploy gate stricter" && $G open 0 2>/dev/null | grep -q "keep the ledger idempotent"'
+$G scan "agy:$FIX" | $G _ledger_add ""
+ck 'agy ledger: re-scan does not duplicate' '[ "$(nopen)" = 2 ]'
+# Fleet discovery (tick/sync path): a fixture HOME with a fresh history file reaches the ledger
+FXH=$OWNER_GUARD_STATE/agy-home; mkdir -p "$FXH/.gemini/antigravity-cli"
+jq -nc '{display:"fixture home agy turn",timestamp:1760000005000,workspace:"/tmp/w3",conversationId:"conv-fx"}' > "$FXH/.gemini/antigravity-cli/history.jsonl"
+EMDB=$OWNER_GUARD_STATE/empty.db; : > "$EMDB" # pin ocdbs: the absolute per-backend globs must not reach real opencode dbs
+HOME="$FXH" OPENCODE_DB="$EMDB" $G sync 2
+ck 'agy sync: fixture HOME history reaches the ledger' '[ "$(nopen)" = 3 ] && $G open 0 2>/dev/null | grep -q "fixture home agy turn"'
+for id in $($G list | jq -r .id); do $G close "$id" "covered by agy test"; done
 # escalation: records open past N minutes fire the webhook once, with every record in the payload
 cap dddddddd-1111-2222-3333-esc /tmp/seat-esc "esc test message" $$
 # Private chat fixtures are synthetic; no actual z-voice content is read/logged.
