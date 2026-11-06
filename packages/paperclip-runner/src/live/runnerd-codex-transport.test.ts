@@ -3135,6 +3135,26 @@ it("keeps reported context-window occupancy on rehydrated usage", () => {
   }
 });
 
+it("keeps the last Codex step without requiring a context window", () => {
+  const base = { cumulative: { inputTokens: 1000 }, runDelta: { inputTokens: 100 }, runDeltaAvailable: true };
+  const params = rehydrateRunnerdUsageNotification(
+    { ...base, last: { totalTokens: 120 } }, "opened-thread-1", "active-turn-1",
+  );
+  expect(params.tokenUsage).toMatchObject({
+    total: { inputTokens: 1000 },
+    runDelta: { inputTokens: 100 },
+    last: { totalTokens: 120 },
+  });
+  expect(params.tokenUsage).not.toHaveProperty("context");
+
+  for (const last of [undefined, {}, { totalTokens: -1 }, { totalTokens: 1.5 }, { totalTokens: 2147483648 }]) {
+    const rehydrated = rehydrateRunnerdUsageNotification({ ...base, last }, "opened-thread-1", "active-turn-1");
+    expect(rehydrated.tokenUsage).not.toHaveProperty("last");
+  }
+  const zero = rehydrateRunnerdUsageNotification({ ...base, last: { totalTokens: 0 } }, "opened-thread-1", "active-turn-1");
+  expect(zero.tokenUsage).toHaveProperty("last.totalTokens", 0);
+});
+
 it("rehydrates durable cumulative usage for a cold thread read", () => {
   expect(
     rehydrateRunnerdThreadTokenUsage({ inputTokens: 12, outputTokens: 3 }),
