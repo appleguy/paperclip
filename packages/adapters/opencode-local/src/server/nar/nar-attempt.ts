@@ -32,6 +32,8 @@ export interface NarAttemptInput {
   title?: string;
   /** Session Paperclip chose to resume; null/absent means it rotated (or this is the first wake). */
   resumeSessionId?: string | null;
+  /** Re-entering an existing run must observe its own prompt only, never submit another. */
+  reattachOnly?: boolean;
   prompt: string;
   /** Check only new submissions; an in-flight recovery must remain observable. */
   preflight?: (sessionId?: string) => void | { rotate: boolean; prompt: string } | Promise<void | { rotate: boolean; prompt: string }>;
@@ -154,7 +156,7 @@ export function classifyOpenCodeError(err: unknown): { code: string; detail: str
 
 /** Read this op's usage from the session message log: messages created at/after our user message. */
 async function collectOutcome(
-  driverFetch: typeof fetch, url: string, passwordFile: string, sessionId: string, msgId: string,
+  driverFetch: typeof fetch, url: string, passwordFile: string, sessionId: string, msgId: string, requireTarget = false,
 ): Promise<{ texts: string[]; usage: ReturnType<typeof parseOpenCodeJsonl>["usage"]; usageReported: boolean; costUsd: number | null; sessionOutcome: string | null; capacityRefusal: boolean; cause: { code: string; detail: string } | null }> {
   const pw = (await fs.readFile(passwordFile, "utf8")).trim();
   const headers = { authorization: "Basic " + Buffer.from(`opencode:${pw}`).toString("base64"), accept: "application/json" };
@@ -167,6 +169,7 @@ async function collectOutcome(
   const list: any[] = (await get(`/api/session/${sid}/message?limit=200`))?.data ?? [];
   const mine = list.find((m) => m?.id === msgId);
   const created = mine?.time?.created;
+  if (requireTarget && typeof created !== "number") throw new Error("recovered message absent from outcome window");
   const ops = typeof created === "number" ? list.filter((m) => m?.type === "assistant" && (m?.time?.created ?? 0) >= created) : [];
   ops.sort((a, b) => (a.time?.created ?? 0) - (b.time?.created ?? 0));
   const usage = { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, peakContextTokens: 0 };
@@ -231,14 +234,14 @@ async function chooseSessionId(
 
 export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<NarAttempt> {
   const { onLog, signal } = input;
-  if (signal?.aborted) return held("OpenCode NAR stopped before provider contact", false, null, "aborted_pre_submit");
+  if (signal?.aborted) return held("OpenCode NAR stopped before provider contact", Boolean(input.reattachOnly), null, "aborted_pre_submit");
   const f = input.fetchImpl ?? fetch;
   let server: { url: string; passwordFile: string };
   try {
     server = await readServer(input.configPath);
   } catch {
     await onLog("stderr", "[paperclip] NAR OpenCode server config unavailable; no inference sent.\n");
-    return held("OpenCode NAR server config unavailable; no inference sent", false, null, "config");
+    return held("OpenCode NAR server config unavailable; no new inference sent", Boolean(input.reattachOnly), null, "config");
   }
   const driver = new OpenCodeHttpDriver({ url: server.url, passwordFile: server.passwordFile, fetchImpl: f });
   const opId = narOpIdFor(input.runId);
@@ -253,15 +256,31 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
     hostPid = Number.isInteger(hostDetail?.pid) ? Number(hostDetail?.pid) : null;
     const fence = { runId: input.runId, leaseGeneration: 1, hostEpoch: host.hostEpoch };
     const scope = { agentId: input.agentId, issueId: input.taskId };
+    let targetSession: string;
+    if (input.reattachOnly) {
+      // Session rotation may have happened since the original dispatch. Find
+      // this run's deterministic message, rather than adopting a successor.
+      const latest = await driver.latestGeneration(scope);
+      const matches: string[] = [];
+      for (let g = 0; g <= latest; g++) {
+        const candidate = sessionIdFor(scope, g);
+        if (await driver.messageExists(candidate, ownMessageId)) matches.push(candidate);
+      }
+      if (matches.length !== 1) return held("OpenCode reattach could not uniquely locate this run's message; held without replay", true, null, "reattach_message_unknown");
+      targetSession = matches[0]!;
+    } else targetSession = await chooseSessionId(driver, scope, input.resumeSessionId, msgId);
     const bound = await driver.bindConversation(
-      host, { ...scope, cwd: input.cwd, model: input.model || undefined, title: input.title }, "new", fence,
-      await chooseSessionId(driver, scope, input.resumeSessionId, msgId),
+      host, { ...scope, cwd: input.cwd, model: input.model || undefined, title: input.title }, input.reattachOnly ? "resume" : "new", fence,
+      targetSession,
     );
     conversationId = bound.conversationId;
     await onLog("stdout", `[paperclip] NAR OpenCode session ${conversationId} (run ${input.runId})\n`);
     // Rejoin: the conversation is per agent+issue, so a busy one is still working an earlier run's prompt
     // (e.g. Paperclip restarted mid-run). Settle on that message; never queue a second prompt behind it.
     const inflight = await driver.inflightMessage(conversationId);
+    if (input.reattachOnly && inflight && inflight !== ownMessageId) {
+      return held("OpenCode reattach found a different in-flight message; held without interrupting it", true, conversationId, "unowned_turn");
+    }
     if (signal?.aborted) {
       // An old in-flight message may have been adopted during rejoin. Only a
       // deliberate Stop may interrupt it; an ordinary shutdown must leave it.
@@ -269,9 +288,15 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
         await driver.interruptExpectedMessage(conversationId, inflight,
           { opId: `${opId}-interrupt`, kind: "interrupt", payloadSha256: "" }, fence);
       }
-      return held("OpenCode NAR stopped before sending a new prompt", Boolean(inflight), conversationId, "aborted");
+      return held("OpenCode NAR stopped before sending a new prompt", Boolean(inflight) || Boolean(input.reattachOnly), conversationId, "aborted");
     }
-    if (inflight) {
+    if (input.reattachOnly) {
+      // A successor can already be active, or our message can have completed
+      // while the controller was down. Observe only the original message.
+      msgId = ownMessageId;
+      rejoined = true;
+      await onLog("stdout", narEventLine("nar_rejoin", { sessionId: conversationId, messageId: msgId }));
+    } else if (inflight) {
       msgId = inflight;
       rejoined = true;
       await onLog("stdout", `[paperclip] NAR rejoined in-flight message ${inflight}; prompt not resent\n`);
@@ -307,9 +332,9 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
   } catch (e) {
     const msg = e instanceof OpenCodeHttpError ? `${e.code}: ${e.message}` : (e as Error).message;
     // Before submit nothing was sent. A rejection (4xx) or auth failure is also pre-admission.
-    const safe = `OpenCode NAR attempt failed before inference: ${msg.slice(0, 300)}`;
+    const safe = `OpenCode NAR ${input.reattachOnly ? "reattach failed" : "attempt failed before inference"}: ${msg.slice(0, 300)}`;
     await onLog("stderr", `[paperclip] ${safe}\n`);
-    return held(safe, false, conversationId, "pre_submit");
+    return held(safe, Boolean(input.reattachOnly), conversationId, input.reattachOnly ? "reattach_unavailable" : "pre_submit");
   }
 
   const deadline = input.timeoutSec > 0 ? Date.now() + input.timeoutSec * 1000 : Infinity;
@@ -468,8 +493,13 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
 
   let out: Awaited<ReturnType<typeof collectOutcome>>;
   try {
-    out = await collectOutcome(f, server.url, server.passwordFile, conversationId, msgId);
+    if (input.reattachOnly && await driver.hasSuccessor(conversationId, msgId))
+      return held("OpenCode reattach found a successor in message history; outcome held", true, conversationId, "unowned_successor");
+    out = await collectOutcome(f, server.url, server.passwordFile, conversationId, msgId, Boolean(input.reattachOnly));
+    if (input.reattachOnly && await driver.hasSuccessor(conversationId, msgId))
+      return held("OpenCode reattach found a successor while reading the outcome; outcome held", true, conversationId, "unowned_successor");
   } catch {
+    if (input.reattachOnly) return held("OpenCode reattach outcome could not be verified; held without replay", true, conversationId, "reattach_outcome_unknown");
     out = { texts: [], usage: { inputTokens: 0, cachedInputTokens: 0, outputTokens: 0, peakContextTokens: 0 }, usageReported: false, costUsd: null, sessionOutcome: null, capacityRefusal: false, cause: null };
   }
   const summary = out.texts.join("\n\n");

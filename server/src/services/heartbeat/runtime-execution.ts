@@ -818,8 +818,8 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       const adapterContext: Record<string, unknown> = {
         ...context,
         // This value comes from the claimed run, not the incoming wake payload.
-        // An agy reattach must not submit again if its checkpoint is missing.
-        ...(agent.adapterType === "agy_local" ? {
+        // Reattachment must not submit again if its original work is missing.
+        ...(["agy_local", "opencode_local"].includes(agent.adapterType) ? {
           paperclipRestartReattach: typeof parseObject(parseObject(run.resultJson).restartReattach).count === "number",
         } : {}),
         // SCO-1098: a re-entered codex_local run waits for the daemon turn its thread already holds.

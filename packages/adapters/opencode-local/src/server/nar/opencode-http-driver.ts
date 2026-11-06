@@ -345,6 +345,30 @@ export class OpenCodeHttpDriver implements ProviderDriver {
       .map((m: any) => ({ id: m.id, content: m.content }));
   }
 
+  /** Prove that no newer user message can contaminate a recovered turn's result. */
+  async hasSuccessor(conversationId: string, messageId: string): Promise<boolean> {
+    const sid = encodeURIComponent(conversationId);
+    let cursor: string | null = null;
+    for (let page = 0; page < INFLIGHT_MESSAGE_MAX_PAGES; page++) {
+      const list = await this.json("GET", `/api/session/${sid}/message?limit=200${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
+      if (list.status !== 200 || !Array.isArray(list.data?.data)) throw new OpenCodeHttpError("mismatch", "cannot inspect successor messages");
+      for (const message of list.data.data) {
+        if (!message || typeof message !== "object" || typeof message.id !== "string" || typeof message.type !== "string") {
+          throw new OpenCodeHttpError("mismatch", "malformed message during successor inspection");
+        }
+        if (message.id === messageId) {
+          if (message.type !== "user") throw new OpenCodeHttpError("mismatch", "recovered message is not a user prompt");
+          return false;
+        }
+        if (message.type === "user") return true;
+      }
+      const next = list.data?.cursor?.next;
+      if (typeof next !== "string" || !next || next === cursor) break;
+      cursor = next;
+    }
+    throw new OpenCodeHttpError("mismatch", "recovered message not found in message history");
+  }
+
   async readOutcomeMsg(conversationId: string, msgId: string): Promise<OutcomeRead> {
     let log;
     try { log = await this.observe(conversationId); } catch { return "unknown"; }

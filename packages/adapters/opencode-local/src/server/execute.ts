@@ -760,6 +760,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         return runNarOpenCodeAttempt({
           configPath: sharedConfigPath, agentId: agent.id, taskId: narTaskId, runId, cwd: effectiveExecutionCwd, resumeSessionId: sessionId,
           model: model && variant ? `${model}#${variant}` : model, prompt, timeoutSec, signal: ctx.signal, onLog, preflight,
+          reattachOnly: context.paperclipRestartReattach === true,
           title: sessionTitleFor(wakeIssue.identifier, wakeIssue.title),
         });
       }

@@ -4,30 +4,33 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const driver = vi.hoisted(() => ({ inflight: null as string | null }));
+const driver = vi.hoisted(() => ({ inflight: null as string | null, exists: false, submits: 0, interrupts: 0 }));
 vi.mock("./opencode-http-driver.js", async (orig) => {
   const real = await orig<typeof import("./opencode-http-driver.js")>();
   class FakeDriver {
     async attestHost() { return { hostEpoch: 1, detail: { pid: 7 } }; }
-    async latestGeneration() { return -1; }
+    async latestGeneration() { return driver.exists ? 0 : -1; }
     async bindConversation() { return { conversationId: "ses_test" }; }
     async inflightMessage() { return driver.inflight; }
-    async submit() { return { grade: "outcome_unknown", evidence: "test" }; }
+    async messageExists() { return driver.exists; }
+    async hasSuccessor() { return false; }
+    async submit() { driver.submits++; return { grade: "outcome_unknown", evidence: "test" }; }
     async readOutcomeMsg() { return "hook_observed"; }
-    async interruptExpectedMessage() { return "idle"; }
+    async interruptExpectedMessage() { driver.interrupts++; return "idle"; }
     async probePid() { return 7; }
   }
   return { ...real, OpenCodeHttpDriver: FakeDriver };
 });
 import { narEventLine, runNarOpenCodeAttempt } from "./nar-attempt.js";
+import { messageIdFor } from "./opencode-http-driver.js";
 
-async function run(prompt: string) {
+async function run(prompt: string, reattachOnly = false) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "nar-ev-"));
   const configPath = path.join(dir, "opencode.json");
   await fs.writeFile(configPath, JSON.stringify({ url: "http://127.0.0.1:4096" }));
   const out: string[] = [];
   await runNarOpenCodeAttempt({
-    configPath, agentId: "a", taskId: "t", runId: "run-1", cwd: dir, model: "", prompt, timeoutSec: 5, pollMs: 1,
+    configPath, agentId: "a", taskId: "t", runId: "run-1", cwd: dir, model: "", prompt, timeoutSec: 5, pollMs: 1, reattachOnly,
     fetchImpl: (async () => { throw new Error("offline"); }) as unknown as typeof fetch,
     onLog: async (_s, c) => { out.push(c); },
   });
@@ -36,7 +39,7 @@ async function run(prompt: string) {
 }
 
 describe("NAR structured telemetry events", () => {
-  beforeEach(() => { driver.inflight = null; });
+  beforeEach(() => { Object.assign(driver, { inflight: null, exists: false, submits: 0, interrupts: 0 }); });
 
   it("formats a single parseable line", () => {
     const line = narEventLine("nar_rejoin", { sessionId: "s", messageId: "m" });
@@ -58,5 +61,34 @@ describe("NAR structured telemetry events", () => {
     driver.inflight = "msg_old";
     const events = await run("hello");
     expect(events).toEqual([{ event: "nar_rejoin", sessionId: "ses_test", messageId: "msg_old" }]);
+  });
+
+  it("reattaches a completed original without submitting a new prompt", async () => {
+    driver.exists = true;
+    const events = await run("hello", true);
+    expect(events).toHaveLength(1);
+    expect(events[0].event).toBe("nar_rejoin");
+    expect(driver.submits).toBe(0);
+  });
+
+  it("reattaches the original active turn without submitting again", async () => {
+    driver.exists = true;
+    driver.inflight = messageIdFor("nar-run-run-1");
+    const events = await run("hello", true);
+    expect(events[0]).toMatchObject({ event: "nar_rejoin", messageId: driver.inflight });
+    expect(driver.submits).toBe(0);
+  });
+
+  it("does not adopt or interrupt a successor during reattach", async () => {
+    driver.exists = true;
+    driver.inflight = "msg_successor";
+    expect(await run("hello", true)).toEqual([]);
+    expect(driver.submits).toBe(0);
+    expect(driver.interrupts).toBe(0);
+  });
+
+  it("does not submit when the original message cannot be found", async () => {
+    expect(await run("hello", true)).toEqual([]);
+    expect(driver.submits).toBe(0);
   });
 });
