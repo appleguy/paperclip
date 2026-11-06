@@ -25,7 +25,7 @@ import {
   environmentLeases, heartbeatRuns, issueComments, issueRecoveryActions,
   issues, nativeRunFinalizations, nativeRunResults, type Db,
 } from "@paperclipai/db";
-import { executionBlockerPredicate, getExecutionBlocker, hasPendingRunCleanup, nativeExecutionRecoveryActionPredicate, restoreHoldReleasedForCurrentOwnerPredicate } from "./execution-blocker.js";
+import { executionContinuationSourcePredicate, getExecutionBlocker, hasPendingRunCleanup, nativeExecutionRecoveryActionPredicate, restoreHoldReleasedForCurrentOwnerPredicate } from "./execution-blocker.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
 import { adapterExecutionControls } from "./adapter-execution-control.js";
 import { persistActivity } from "./activity-log.js";
@@ -233,7 +233,7 @@ export async function admitExplicitNativeContinuation(input: {
     boundary ? or(gt(issueRecoveryActions.createdAt, boundary.createdAt), nativeExecutionRecoveryActionPredicate(),
       blocker?.recoveryActionId ? eq(issueRecoveryActions.id, blocker.recoveryActionId) : undefined) : undefined,
     not(restoreHoldReleasedForCurrentOwnerPredicate()),
-    or(executionBlockerPredicate(), and(
+    or(executionContinuationSourcePredicate(), and(
       inArray(issueRecoveryActions.cause, ["native_workspace_sync_out_unrecoverable", "native_workspace_sync_out_retry_exhausted"]),
       sql`${issueRecoveryActions.evidence}#>>'{workspaceRecovery,status}' = 'recovered'`,
       sql`${issueRecoveryActions.evidence}->'executionReconciliation' is null`,

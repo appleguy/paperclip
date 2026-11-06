@@ -760,19 +760,19 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     });
   });
 
-  async function seedExecutionWait(status: "active" | "resolved" = "resolved") {
+  async function seedExecutionWait(status: "active" | "escalated" = "active") {
     const fixture = await seedResolvedDependencyBackstopFixture({ workspaceState: "none" });
     const [action] = await db.insert(issueRecoveryActions).values({
       companyId: fixture.companyId, sourceIssueId: fixture.blockedIssueId,
       kind: "active_run_watchdog", ownerType: "board", returnOwnerAgentId: fixture.agentId,
       cause: "legacy_execution_requires_reconciliation", status,
-      evidence: status === "resolved" ? { automaticRecovery: { replay: "blocked" } } : {},
+      evidence: { automaticRecovery: { replay: "blocked" } },
       fingerprint: randomUUID(), nextAction: "Check the stopped execution before resuming.",
     }).returning();
     return { ...fixture, action: action! };
   }
 
-  it.each(["active", "resolved"] as const)("keeps repeated wakes behind a %s execution hold run-free, then resumes once", async (status) => {
+  it.each(["active", "escalated"] as const)("keeps repeated wakes behind a %s execution hold run-free, then resumes once", async (status) => {
     const { companyId, agentId, blockedIssueId, action } = await seedExecutionWait(status);
     const heartbeat = heartbeatService(db);
     // Different producers and wake keys must not create new attempts or notices.
@@ -803,7 +803,8 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
       return { exitCode: 0, signal: null, timedOut: false, errorMessage: null,
         summary: "Finished the dependency-ready task.", provider: "test", model: "test-model" };
     });
-    await db.update(issueRecoveryActions).set({ status: "resolved", evidence: {} }).where(eq(issueRecoveryActions.id, action.id));
+    // Resolution releases the wait even when old automatic-recovery evidence remains.
+    await db.update(issueRecoveryActions).set({ status: "resolved" }).where(eq(issueRecoveryActions.id, action.id));
     expect((await heartbeat.reconcileResolvedDependencyWakes()).healed).toBe(1);
     expect((await heartbeat.reconcileResolvedDependencyWakes()).healed).toBe(0);
     await heartbeat.drainActiveRunExecutions();
@@ -820,7 +821,7 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     });
     await wake();
     await db.update(issues).set({ status: "todo" }).where(eq(issues.id, blockerIssueId));
-    await db.update(issueRecoveryActions).set({ evidence: {} }).where(eq(issueRecoveryActions.id, action.id));
+    await db.update(issueRecoveryActions).set({ status: "resolved" }).where(eq(issueRecoveryActions.id, action.id));
     await wake();
     await wake();
     const waits = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
@@ -851,7 +852,7 @@ describeEmbeddedPostgres("heartbeat resolved dependency wake reconciliation", ()
     expect(deferred).toHaveLength(2);
     expect(deferred.every((row) => row.status === "deferred_issue_execution" && row.runId === null)).toBe(true);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(0);
-    await db.update(issueRecoveryActions).set({ evidence: {} }).where(eq(issueRecoveryActions.id, action.id));
+    await db.update(issueRecoveryActions).set({ status: "resolved" }).where(eq(issueRecoveryActions.id, action.id));
     const resumed = await heartbeat.wakeup(agentId, {
       source: "on_demand", triggerDetail: "manual", reason: "issue_resumed",
       requestedByActorType: "user", requestedByActorId: "board-user",

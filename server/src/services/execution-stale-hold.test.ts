@@ -35,7 +35,7 @@ describe("stale resolved no-replay holds", () => {
 
   it("releases the hold of a deploy-interrupted claude_rc run, idempotently", async () => {
     const { companyId, issueId, action } = await seed("claude_rc", "server_shutdown_interrupted");
-    expect(await getExecutionBlocker(db, companyId, issueId)).not.toBeNull();
+    expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
     await settleUnrecoverableExecutions(db);
     expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
     const [after] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
@@ -53,13 +53,15 @@ describe("stale resolved no-replay holds", () => {
     expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
     const unverified = await seed("opencode_local", "cancelled", false, { executionRecovery: { kind: "interrupted" } });
     await settleUnrecoverableExecutions(db);
-    expect(await getExecutionBlocker(db, unverified.companyId, unverified.issueId)).not.toBeNull();
+    expect(await getExecutionBlocker(db, unverified.companyId, unverified.issueId)).toBeNull();
   });
 
-  it("keeps the hold for other adapters and other failures", async () => {
+  it("releases resolved actions for other failures while retaining active recovery", async () => {
     for (const [adapter, code] of [["paperclip_runner", "server_shutdown_interrupted"], ["claude_rc", "adapter_failed"]]) {
       const { companyId, issueId } = await seed(adapter, code);
       await settleUnrecoverableExecutions(db);
+      expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+      await db.update(issueRecoveryActions).set({ status: "active" }).where(eq(issueRecoveryActions.sourceIssueId, issueId));
       expect(await getExecutionBlocker(db, companyId, issueId)).not.toBeNull();
     }
   });

@@ -102,20 +102,40 @@ export async function hasPendingRunCleanup(db: Db, companyId: string, runId: str
   return state?.pending !== false;
 }
 
-/** Resolved recovery bookkeeping can still carry an effective no-replay hold. */
+/** Only unresolved execution or explicit workspace recovery obligations hold dispatch. */
 export function executionBlockerPredicate() {
+  return executionRecoveryActionPredicate(false);
+}
+
+/** An explicit continuation still needs resolved source history to preserve its receipts. */
+export function executionContinuationSourcePredicate() {
+  return executionRecoveryActionPredicate(true);
+}
+
+function executionRecoveryActionPredicate(includeResolvedSources: boolean) {
   return and(
     not(conversationRecoveryActionPredicate()!),
     not(preDispatchExecutionWaitRecoveryActionPredicate()),
     // A deploy-interrupted claude_rc run leaves its TUI and checkpoint intact: nothing to reconcile, including
     // actions recorded before the classifier knew that (SCO-817).
     sql`not (${issueRecoveryActions.cause} = 'legacy_execution_requires_reconciliation' and exists (
-      select 1 from ${heartbeatRuns} join ${agents} on ${agents.id} = ${heartbeatRuns.agentId}
+      select 1 from ${heartbeatRuns} join ${agents}
+        on ${agents.id} = ${heartbeatRuns.agentId} and ${agents.companyId} = ${heartbeatRuns.companyId}
       where ${heartbeatRuns.companyId} = ${issueRecoveryActions.companyId}
         and ${heartbeatRuns.id} = ${canonicalExecutionUuid(sql`coalesce(${issueRecoveryActions.evidence}->>'runId', ${issueRecoveryActions.evidence}->>'sourceRunId')`)}
         and ${heartbeatRuns.errorCode} = 'server_shutdown_interrupted'
         and ${heartbeatRuns.status} in ('interrupted', 'cancelled')
-        and ${agents.adapterType} in ('claude_rc_local', 'claude_rc')
+        and coalesce(${issueRecoveryActions.evidence}->>'workspaceRestoreFailure', '') <> 'restore_unsafe_archive'
+        and coalesce(${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema', '') <> ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}
+        and coalesce(${heartbeatRuns.resultJson}->>'workspaceRestoreFailure', '') <> 'restore_unsafe_archive'
+        and coalesce(${heartbeatRuns.resultJson}->'workspaceRestoreRecovery'->>'schema', '') <> ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}
+        -- The dispatch claim belongs to this run. Agent settings can change
+        -- after it stops; use them only for old runs without adapter evidence.
+        and coalesce(${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType',
+          (select invoked.payload->>'adapterType' from ${heartbeatRunEvents} invoked
+            where invoked.company_id = ${heartbeatRuns.companyId} and invoked.run_id = ${heartbeatRuns.id}
+              and invoked.event_type = 'adapter.invoke' order by invoked.seq desc limit 1),
+          ${agents.adapterType}) in ('claude_rc_local', 'claude_rc')
     ))`,
     sql`not (${issueRecoveryActions.cause} = 'legacy_execution_requires_reconciliation' and exists (
       select 1 from ${heartbeatRuns}
@@ -131,7 +151,16 @@ export function executionBlockerPredicate() {
     or(unreconciledNativeExportPredicate(), and(
       inArray(issueRecoveryActions.cause, [...EXECUTION_RECONCILIATION_CAUSES]),
       or(inArray(issueRecoveryActions.status, ["active", "escalated"]),
-        sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`),
+        // Resolved bookkeeping and its stale replay flag cannot re-arm an
+        // ordinary execution hold. Retained files remain an explicit repair
+        // obligation, independently of automatic recovery's terminal status.
+        and(eq(issueRecoveryActions.status, "resolved"),
+          sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+          includeResolvedSources ? sql`true` : or(
+            sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
+            sql`${issueRecoveryActions.evidence}->'workspaceRestoreRecovery'->>'schema' = ${LEGACY_WORKSPACE_RECOVERY_SCHEMA}`,
+          ),
+        )),
     )),
   );
 }
