@@ -2411,7 +2411,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
 
   }
 
-  async function surfaceHeldOpenCodeStop(run: HeartbeatRun, requireExpiredController = false) {
+  async function surfaceHeldOpenCodeRun(run: HeartbeatRun, requireExpiredController = false, pendingStop = true) {
     const issueId = run.issueId ?? readNonEmptyString(parseObject(run.contextSnapshot).issueId);
     if (!issueId) return;
     await db.transaction(async tx => {
@@ -2422,7 +2422,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       const [held] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
         eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
         eq(heartbeatRuns.status, "running"), eq(heartbeatRuns.runtimeMode, "legacy"),
-        sql`${heartbeatRuns.resultJson}->'executionCancellation'->>'state' = 'requested'`,
+        ...(pendingStop ? [sql`${heartbeatRuns.resultJson}->'executionCancellation'->>'state' = 'requested'`] : []),
         ...(requireExpiredController ? [
           run.controllerBootId ? eq(heartbeatRuns.controllerBootId, run.controllerBootId) : isNull(heartbeatRuns.controllerBootId),
           or(isNull(heartbeatRuns.controllerLeaseExpiresAt), lte(heartbeatRuns.controllerLeaseExpiresAt, sql`clock_timestamp()`)),
@@ -2433,8 +2433,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         companyId: run.companyId, sourceIssueId: issueId,
         kind: "active_run_watchdog", ownerType: "board",
         returnOwnerAgentId: task.assigneeAgentId ?? run.agentId,
-        cause: "opencode_stop_provider_unverified",
-        fingerprint: `opencode-stop:${run.id}`,
+        cause: pendingStop ? "opencode_stop_provider_unverified" : "opencode_controller_lost_provider_unverified",
+        fingerprint: pendingStop ? `opencode-stop:${run.id}` : `opencode-orphan:${run.id}`,
         evidence: { runId: run.id, agentId: run.agentId, providerTermination: "unverified" },
         nextAction: "Inspect the original OpenCode provider turn and establish whether it ended; preserve the run and its resources until termination and ownership are verified.",
         wakePolicy: null, createOnly: true,
@@ -2667,7 +2667,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         (adapterType === "opencode_local" || parseObject(run.runnerProfileJson?.adapterDispatch).adapterType === "opencode_local");
       if ((processPidAlive || processGroupAlive) && openCodeLegacyRun &&
           parseObject(parseObject((await getRun(run.id))?.resultJson).executionCancellation).state === "requested") {
-        await surfaceHeldOpenCodeStop(run, true);
+        await surfaceHeldOpenCodeRun(run, true);
         scope.onDeferredDeadline?.(Date.now() + 60_000);
         continue;
       }
@@ -2722,7 +2722,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         // Controller loss does not prove that a shared provider turn ended.
         // Make the retained Stop visible to an operator, without displacing an
         // existing recovery action or releasing the run's execution resources.
-        await surfaceHeldOpenCodeStop(run);
+        await surfaceHeldOpenCodeRun(run);
         scope.onDeferredDeadline?.(Date.now() + 60_000);
         continue;
       }
@@ -2739,6 +2739,13 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         run.controllerBootId !== legacyControllerBootId &&
         !revokedState.processPid &&
         !revokedState.processGroupId;
+      if (openCodeLegacyRun && !restartInterruptedBeforeDispatch) {
+        // A lost controller does not terminate its shared provider turn.
+        // Retain the run and its resources until its exact turn is known.
+        await surfaceHeldOpenCodeRun(run, false, false);
+        scope.onDeferredDeadline?.(Date.now() + 60_000);
+        continue;
+      }
       const shouldRetry =
         !await pendingCaseHandoffForRun(db, run.id, run.companyId) &&
         (run.processLossRetryCount ?? 0) < 1 &&
