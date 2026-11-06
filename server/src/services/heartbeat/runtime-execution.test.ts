@@ -516,7 +516,7 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     }
   });
 
-  it("documents a stale OpenCode controller deleting the original queued message after takeover", async () => {
+  it("holds the original OpenCode queued message when a stale controller stops after takeover", async () => {
     const { input, adapter, run } = await fixture();
     const boot = randomUUID();
     const successorBoot = randomUUID();
@@ -577,9 +577,8 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
       const result = await executeHeartbeatRuntime(db, input);
       expect(tookOver).toBe(true);
       expect((await read(run.id)).controllerBootId).toBe(successorBoot);
-      // Known gap: the exact DELETE is not fenced against controller takeover.
-      // Replace this assertion with zero when atomic Stop authority exists.
-      expect(deletes).toBe(1);
+      expect(deletes).toBe(0);
+      expect(queued).toBe(true);
       expect(otherWrites).toBe(0);
       expect(result).toMatchObject({ dispatched: true, adapterResult: { resultJson: { executionRecovery: { providerWorkEvidence: "unverified" } } } });
       if (!result.dispatched) throw new Error("expected re-entry attempt");

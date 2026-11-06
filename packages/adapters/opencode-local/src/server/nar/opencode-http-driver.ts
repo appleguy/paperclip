@@ -287,7 +287,7 @@ export class OpenCodeHttpDriver implements ProviderDriver {
   // Rejoin (spec: restart resumes, never replays): the user message the conversation is still working on, or
   // null when it is idle. A retry run after a Paperclip restart settles on this message instead of submitting
   // a second prompt into the same conversation.
-  async inflightMessage(conversationId: string, options?: { cancelPendingMessageId: string }): Promise<string | null> {
+  async inflightMessage(conversationId: string): Promise<string | null> {
     const sid = encodeURIComponent(conversationId);
     const inbox = await this.json("GET", `/api/session/${sid}/inbox`);
     if (inbox.status !== 200 || !Array.isArray(inbox.data?.data)) {
@@ -296,11 +296,6 @@ export class OpenCodeHttpDriver implements ProviderDriver {
     const pending = inbox.data.data;
     if (pending.some((item: unknown) => !item || typeof item !== "object" || typeof (item as { id?: unknown }).id !== "string")) {
       throw new OpenCodeHttpError("mismatch", "session.inbox contains an item without an id");
-    }
-    if (options && pending.some((item: any) => item.id === options.cancelPendingMessageId)) {
-      const cancelled = await this.json("DELETE", `/api/session/${sid}/inbox/${encodeURIComponent(options.cancelPendingMessageId)}`);
-      if (cancelled.status !== 204) throw new OpenCodeHttpError("http", `session.inbox cancellation HTTP ${cancelled.status}`, cancelled.status);
-      return this.inflightMessage(conversationId);
     }
     const last = pending[pending.length - 1];
     if (typeof last?.id === "string") return last.id;
@@ -452,13 +447,16 @@ export class OpenCodeHttpDriver implements ProviderDriver {
     }
   }
 
-  // The inbox DELETE names the exact queued message. Session interrupt has no
-  // atomic expected-message condition: even a matching read can race a direct
-  // client or a successor. Hold active work until the provider offers that
-  // condition, rather than interrupting a potentially different turn.
+  // The provider does not enforce controller ownership on an inbox DELETE or
+  // an interrupt. Even the exact queued message can now belong to a successor
+  // controller. Hold until Stop authority can be fenced atomically.
   async interruptExpectedMessage(conversationId: string, messageId: string, _op: Op, _fence: Fence): Promise<"requested" | "uncertain" | "idle"> {
     try {
-      if (await this.inflightMessage(conversationId, { cancelPendingMessageId: messageId }) !== messageId) return "idle";
+      const inbox = await this.json("GET", `/api/session/${encodeURIComponent(conversationId)}/inbox`);
+      if (inbox.status !== 200 || !Array.isArray(inbox.data?.data) ||
+          inbox.data.data.some((item: unknown) => !item || typeof item !== "object" || typeof (item as { id?: unknown }).id !== "string")) return "uncertain";
+      if (inbox.data.data.some((item: { id: string }) => item.id === messageId)) return "uncertain";
+      if (await this.inflightMessage(conversationId) !== messageId) return "idle";
     } catch {
       // An unreadable state is not authority to cancel an unverified turn.
       return "uncertain";

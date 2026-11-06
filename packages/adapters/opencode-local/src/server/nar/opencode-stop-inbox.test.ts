@@ -8,8 +8,7 @@ describe("OpenCode stop inbox cancellation", () => {
   let dir: string;
   let pending: string[];
   let active: string | null;
-  let deliveredDuringCancel: boolean;
-  let cancellationFails: boolean;
+  let malformedInbox: boolean;
   let targetRecorded: boolean;
   let historicalSuccessor: boolean;
   let unreadableHistory: boolean;
@@ -27,8 +26,7 @@ describe("OpenCode stop inbox cancellation", () => {
     await writeFile(passwordFile, "fixture");
     pending = [];
     active = null;
-    deliveredDuringCancel = false;
-    cancellationFails = false;
+    malformedInbox = false;
     targetRecorded = true;
     historicalSuccessor = false;
     unreadableHistory = false;
@@ -39,12 +37,10 @@ describe("OpenCode stop inbox cancellation", () => {
     const fetchImpl = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       const pathname = new URL(String(url)).pathname;
       calls.push(`${init?.method} ${pathname}`);
-      if (pathname.endsWith("/inbox") && init?.method === "GET") return Response.json({ data: pending.map((id) => ({ id })) });
+      if (pathname.endsWith("/inbox") && init?.method === "GET") return Response.json({ data: malformedInbox ? [{}] : pending.map((id) => ({ id })) });
       if (pathname.includes("/inbox/") && init?.method === "DELETE") {
-        if (cancellationFails) return new Response(null, { status: 500 });
         const id = decodeURIComponent(pathname.split("/").pop()!);
         pending = pending.filter((item) => item !== id);
-        if (deliveredDuringCancel) active = id;
         return new Response(null, { status: 204 });
       }
       if (pathname === "/api/session/active") return Response.json({ data: active ? { ses_fixture: { type: "running" } } : {} });
@@ -68,26 +64,27 @@ describe("OpenCode stop inbox cancellation", () => {
 
   afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
 
-  it("cancels only the target queued item without interrupting another turn", async () => {
+  it("holds the target queued item without interrupting another turn", async () => {
     pending = ["msg_other", "msg_target"];
     active = "msg_active";
-    expect(await driver.interruptExpectedMessage("ses_fixture", "msg_target", op, fence)).toBe("idle");
-    expect(pending).toEqual(["msg_other"]);
-    expect(calls).toContain("DELETE /api/session/ses_fixture/inbox/msg_target");
-    expect(calls.some((call) => call.endsWith("/interrupt"))).toBe(false);
-  });
-
-  it("holds if the target was delivered during cancellation", async () => {
-    pending = ["msg_target"];
-    deliveredDuringCancel = true;
     expect(await driver.interruptExpectedMessage("ses_fixture", "msg_target", op, fence)).toBe("uncertain");
+    expect(pending).toEqual(["msg_other", "msg_target"]);
+    expect(calls.some((call) => call.startsWith("DELETE "))).toBe(false);
     expect(calls.some((call) => call.endsWith("/interrupt"))).toBe(false);
   });
 
-  it("does not interrupt an unrelated active turn when queued cancellation fails", async () => {
+  it("holds a queued target even when another message is later in the inbox", async () => {
+    pending = ["msg_target", "msg_other"];
+    expect(await driver.interruptExpectedMessage("ses_fixture", "msg_target", op, fence)).toBe("uncertain");
+    expect(pending).toEqual(["msg_target", "msg_other"]);
+    expect(calls.some((call) => call.startsWith("DELETE "))).toBe(false);
+    expect(calls.some((call) => call.endsWith("/interrupt"))).toBe(false);
+  });
+
+  it("holds when the inbox cannot identify its queued messages", async () => {
     pending = ["msg_target"];
     active = "msg_other";
-    cancellationFails = true;
+    malformedInbox = true;
     expect(await driver.interruptExpectedMessage("ses_fixture", "msg_target", op, fence)).toBe("uncertain");
     expect(pending).toEqual(["msg_target"]);
     expect(calls.some((call) => call.endsWith("/interrupt"))).toBe(false);
