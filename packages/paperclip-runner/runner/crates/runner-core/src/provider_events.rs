@@ -1149,6 +1149,11 @@ pub fn normalize_codex_notification_in(
                     "runDelta": measurement(run_delta.unwrap_or(&Value::Null)),
                 }),
             );
+            if let Some(context) = codex_context_usage(params) {
+                if let Some(event) = events.last_mut() {
+                    event.payload["context"] = context;
+                }
+            }
         }
         "warning"
             if params.get("classification").and_then(Value::as_str)
@@ -2424,6 +2429,16 @@ mod tests {
         assert_eq!(
             codex_context_usage(&json!({"tokenUsage": {"last": {"totalTokens": 5}}})),
             None
+        );
+        let events = normalize_codex_notification(
+            "thread/tokenUsage/updated",
+            &json!({"tokenUsage": {"total": {"inputTokens": 1000, "outputTokens": 60},
+                "last": {"inputTokens": 100, "outputTokens": 20, "totalTokens": 120},
+                "modelContextWindow": 10000}}),
+        );
+        assert_eq!(
+            events[0].payload["context"],
+            json!({"usedTokens": 120, "windowTokens": 10000})
         );
     }
 

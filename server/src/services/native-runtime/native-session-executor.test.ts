@@ -8007,6 +8007,26 @@ describe("native terminal-turn accounting", () => {
     else expect(usageRecorder.capture).toHaveBeenCalledOnce();
   });
 
+  it("keeps the largest Codex request context in local usage checkpoints", async () => {
+    const onUsage = vi.fn(async (_receipt: AdapterUsageCheckpoint) => {});
+    const runDelta = { inputTokens: 500, cacheReadTokens: 100, outputTokens: 20 };
+    state.execute.mockReset().mockImplementationOnce(async () => {
+      for (const usage of [
+        { runDelta, runDeltaComplete: true, last: { totalTokens: 300 } },
+        { runDelta, runDeltaComplete: true, context: { usedTokens: 200, windowTokens: 1000 } },
+        { runDelta, runDeltaComplete: true, last: { totalTokens: -1 } },
+      ]) await accountingEvents.committed!({ eventType: "item.completed", turnId: "turn", payload: { kind: "usage", usage } } as unknown as PrpEvent);
+      await accountingEvents.committed!({ eventType: "turn.completed", turnId: "turn", payload: {} } as unknown as PrpEvent);
+      return { result: { summary: "done" }, terminal: { runTerminalState: "succeeded" }, turnId: "turn",
+        normalizedSessionId: "session", providerSessionId: null, driverKind: "test", driverVersion: "1",
+        nativeEventCount: 4, highestContiguousSourceSeq: 4, usage: { runDelta } };
+    });
+    await executePaperclipNativeSession({ db: leaseDb(), execution: { ...execution, provider: { kind: "codex", model: "gpt-6-astra" } } as NativeExecutionInput,
+      runnerInstanceId: "runner", onUsage });
+    expect(onUsage).toHaveBeenLastCalledWith(expect.objectContaining({ complete: true,
+      usage: { inputTokens: 400, cachedInputTokens: 100, outputTokens: 20, peakContextTokens: 300 } }));
+  });
+
   it.each(["stale_warm_zero", "partial", "fresh", "fresh_zero", "new_turn", "later_partial", "merged_partial"])("requires fresh complete usage at native completion (%s)", async scenario => {
     const onUsage = vi.fn(async (_receipt: import("@paperclipai/adapter-utils").AdapterUsageCheckpoint) => {});
     const usage = { inputTokens: 120, cacheReadTokens: 100, outputTokens: 10, providerCostUsd: 0 };

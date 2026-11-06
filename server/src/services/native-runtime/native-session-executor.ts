@@ -9603,6 +9603,7 @@ async function executePaperclipNativeSessionWithinScope(
     }
   }
   let fallbackUsageRecorder: ReturnType<typeof createRunUsageRecorder> | undefined;
+  let observedPeakContextTokens = 0;
   const producerOwnsUsage = usesNativeUsageDelivery({ runnerd: input.useRunnerd === true,
     remote: input.runnerExecutionTarget?.kind === "remote", provider: input.execution.provider });
   const producerUsage = producerOwnsUsage ? await createNativeUsageDelivery(input.db, {
@@ -9620,7 +9621,8 @@ async function executePaperclipNativeSessionWithinScope(
       : "unpriced" as const;
     const billing = resolveNativeBilling(input.execution.provider, input.runnerEnvironment, input.billingIdentity);
     const costUsdExact = input.execution.provider.kind !== "cursor_cloud" && typeof usage?.accountingCostUsdExact === "string" ? usage.accountingCostUsdExact : undefined;
-    const checkpoint: AdapterUsageCheckpoint = { usage: accountingUsage, ...billing, complete, usageBasis: "per_run", costUsdExact,
+    const checkpoint: AdapterUsageCheckpoint = { usage: accountingUsage && observedPeakContextTokens > 0
+      ? { ...accountingUsage, peakContextTokens: observedPeakContextTokens } : accountingUsage, ...billing, complete, usageBasis: "per_run", costUsdExact,
       model: input.execution.provider.model ?? "unknown", costUsd: accountingCost ?? null, costStatus };
     if (input.onUsage) await input.onUsage(checkpoint);
     else {
@@ -9648,6 +9650,16 @@ async function executePaperclipNativeSessionWithinScope(
     const payload = record(event.payload);
     const usage = record(payload.usage);
     const delta = record(usage.runDelta);
+    if (payload.kind === "usage" && input.execution.provider.kind === "codex") {
+      const context = record(usage.context);
+      const last = record(usage.last);
+      const used = context.usedTokens ?? last.totalTokens ?? (typeof last.inputTokens === "number" && Number.isSafeInteger(last.inputTokens) && last.inputTokens >= 0
+        && typeof last.outputTokens === "number" && Number.isSafeInteger(last.outputTokens) && last.outputTokens >= 0
+        ? last.inputTokens + last.outputTokens : undefined);
+      if (typeof used === "number" && Number.isSafeInteger(used) && used > 0 && used <= 2_147_483_647) {
+        observedPeakContextTokens = Math.max(observedPeakContextTokens, used);
+      }
+    }
     if (event.eventType === "turn.started") {
       observedAccountingTurn = undefined;
       if (observedAccountingUsage) await persistAccountingUsage(observedAccountingUsage, false);
