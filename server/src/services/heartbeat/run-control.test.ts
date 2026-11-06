@@ -171,6 +171,7 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
         .rejects.toMatchObject({ status: 409 });
       expect(await deps.getRun(run.id)).toMatchObject({ status: "running", resultJson: { executionCancellation: { state: "requested" } } });
       expect(execution.controller.signal.aborted).toBe(false);
+      expect(execution.isOpenCodeHeldBeforeMode()).toBe(ownership === "unbound");
       expect(terminateLocalService).not.toHaveBeenCalled();
       expect(deps.setRunStatusFromLive).not.toHaveBeenCalled();
       expect(deps.envOrchestrator.releaseForRun).not.toHaveBeenCalled();

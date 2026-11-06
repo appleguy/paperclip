@@ -904,6 +904,13 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               return Promise.resolve(quotaPause);
             }
             if (adapter.type === "opencode_local") {
+              if (executionControl.isOpenCodeHeldBeforeMode?.()) {
+                return Promise.resolve({
+                  exitCode: 75, signal: null, timedOut: false,
+                  errorMessage: "OpenCode Stop was requested before adapter dispatch; provider work remains unverified",
+                  resultJson: { executionRecovery: { kind: "bootstrap", reason: "stop_before_dispatch_unverified", providerWorkStarted: true, providerWorkEvidence: "unverified" } },
+                });
+              }
               // Freeze the effective per-run config, not mutable agent settings,
               // before Stop can rely on this controller to own a plain CLI.
               const sharedConfig = runtimeConfig.sharedServerRecoveryConfigPath;

@@ -11,7 +11,7 @@ export function isUnverifiedSharedOpenCode(input: {
   const recovery = input.resultJson?.executionRecovery;
   if (input.run.runtimeMode !== "legacy" || input.adapterType !== "opencode_local" ||
       !recovery || typeof recovery !== "object" || Array.isArray(recovery) ||
-      (recovery as Record<string, unknown>).reason !== "shared_session_unverified" ||
+      !["shared_session_unverified", "stop_before_dispatch_unverified"].some(reason => reason === (recovery as Record<string, unknown>).reason) ||
       (recovery as Record<string, unknown>).providerWorkStarted !== true) return false;
   return true;
 }

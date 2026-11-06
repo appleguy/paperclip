@@ -143,6 +143,22 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     await executeHeartbeatRuntime(db, input);
   });
 
+  it("does not enter the OpenCode adapter after an unknown-mode Stop is held", async () => {
+    const { input, adapter } = await fixture();
+    adapter.type = "opencode_local";
+    input.agent.adapterType = "opencode_local";
+    input.control.executionControl.holdOpenCodeBeforeMode();
+    expect(await executeHeartbeatRuntime(db, input)).toMatchObject({
+      dispatched: true,
+      adapterResult: { resultJson: { executionRecovery: {
+        reason: "stop_before_dispatch_unverified", providerWorkStarted: true,
+      } } },
+    });
+    expect(adapter.execute).not.toHaveBeenCalled();
+    expect(input.effects.onLegacyAdapterEntered).not.toHaveBeenCalled();
+    expect(input.instructions.releaseInstructionCopy).not.toHaveBeenCalled();
+  });
+
   it("persists a provider session while the legacy adapter is still running and fences late callbacks", async () => {
     const { input, adapter, run } = await fixture();
     adapter.execute.mockImplementationOnce(async ctx => {

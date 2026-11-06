@@ -6,6 +6,7 @@ export function createAdapterExecutionControl() {
   const controller = new AbortController();
   const phases = createAdapterExecutionPhaseTracker();
   let openCodeExecutionMode: "unknown" | "plain_cli" | "shared" = "unknown";
+  let openCodeStopBeforeMode = false;
   let finish!: () => void;
   const settled = new Promise<void>((resolve) => {
     finish = resolve;
@@ -13,6 +14,8 @@ export function createAdapterExecutionControl() {
   return {
     controller, settled, phases,
     getOpenCodeExecutionMode: () => openCodeExecutionMode,
+    holdOpenCodeBeforeMode: () => { openCodeStopBeforeMode = true; },
+    isOpenCodeHeldBeforeMode: () => openCodeStopBeforeMode,
     setOpenCodeExecutionMode: (mode: "plain_cli" | "shared") => {
       if (openCodeExecutionMode !== "unknown" && openCodeExecutionMode !== mode) {
         throw new Error("OpenCode execution mode changed during a run");

@@ -1371,6 +1371,9 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     if (run.runtimeMode === "legacy" && run.status === "running" &&
         (agent?.adapterType === "opencode_local" || parseObject(run.runnerProfileJson?.adapterDispatch).adapterType === "opencode_local") &&
         (!control || (!ownedNarBinding && control.getOpenCodeExecutionMode?.() !== "plain_cli"))) {
+      // Do this synchronously before the database await: this controller must
+      // not enter an as-yet-unclassified adapter while Stop is being recorded.
+      if (control?.getOpenCodeExecutionMode?.() === "unknown") control.holdOpenCodeBeforeMode?.();
       let held: { id: string } | undefined;
       try {
         [held] = await db.update(heartbeatRuns).set({
