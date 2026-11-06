@@ -10172,6 +10172,22 @@ export function issueRoutes(
             !activeRecoveryAction.returnOwnerAgentId ||
             lockedIssue.assigneeAgentId !== activeRecoveryAction.returnOwnerAgentId
           ) {
+            if (!workspaceBaseRef && !workspaceRetry) {
+              // This is not an admission to retry. Hand the caller back to the
+              // authoritative disposition without changing its owner, locks or
+              // active repair. A 409 here turns an obsolete retry request into
+              // another recovery attempt instead of settling it.
+              return {
+                issue: { ...lockedIssue, activeRecoveryAction },
+                recoveryAction: activeRecoveryAction,
+                replayed: true,
+                retry: {
+                  outcome: "no_op" as const,
+                  reason: "current_disposition" as const,
+                  nextAction: "No retry was scheduled. Continue from the returned task and recovery action. Do not repeat this retry request.",
+                },
+              };
+            }
             throw conflict(
               "This recovery notice no longer matches the task. Refresh the task before choosing its next step.",
               { code: "disposition_recovery_retry_stale" },
@@ -10478,6 +10494,7 @@ export function issueRoutes(
             ? { ...result.issue, activeRecoveryAction: await recoveryActionsSvc.getActiveForIssue(result.issue.companyId, result.issue.id) }
             : result.issue,
           recoveryAction: result.recoveryAction,
+          ...("retry" in result ? { retry: result.retry } : {}),
         };
       }
       for (const publication of postCommitActivityPublications)

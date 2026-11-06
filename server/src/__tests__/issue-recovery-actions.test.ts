@@ -2859,10 +2859,22 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       wakePolicy: { type: "bounded_owner_disposition_repair", retryAgentId: coderId, attempt: 1, maxAttempts: 2 },
     });
     const app = createApp({ type: "agent", agentId: coderId, companyId, runId });
-    // The guarded retry remains unavailable; there is no force-release escape.
-    const rejected = await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
-      .send({ actionId: action.id, outcome: "restored", sourceIssueStatus: "todo" }).expect(409);
-    expect(rejected.body.details?.code).toBe("disposition_recovery_retry_stale");
+    // A retry of this active repair is acknowledged without releasing it or
+    // manufacturing another wake. Its monitor remains the continuation path.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const acknowledged = await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+        .send({ actionId: action.id, outcome: "restored", sourceIssueStatus: "todo" }).expect(200);
+      expect(acknowledged.body).toMatchObject({
+        issue: { status: "in_progress", assigneeAgentId: coderId, checkoutRunId: runId, executionRunId: runId,
+          activeRecoveryAction: { id: action.id, status: "active" } },
+        retry: { outcome: "no_op", reason: "current_disposition" },
+      });
+    }
+    const [unchanged] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(unchanged).toMatchObject({ status: "active", outcome: null, attemptCount: action.attemptCount,
+      updatedAt: new Date(action.updatedAt) });
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
+    expect(wakes).toHaveLength(0);
     const nextCheckAt = new Date(Date.now() + 120_000).toISOString();
     const saved = await request(app).patch(`/api/issues/${sourceIssueId}`).send({
       executionPolicy: { monitor: { nextCheckAt, notes: "Continue the remaining managed-seat acceptance." } },

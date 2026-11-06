@@ -2734,19 +2734,82 @@ describe("agent issue mutation checkout ownership", () => {
         wakePolicy: { type: "board_escalation" },
       });
     }
-    it.each(["done", "cancelled", "backlog", "todo", "in_progress"])("rejects a stale retry of a %s task", async status => {
+    it.each(["done", "cancelled", "backlog", "todo", "in_progress", "in_review"])("acknowledges a stale retry of a %s task without reopening it", async status => {
       seedRetry(); mockIssueService.getById.mockResolvedValue(makeIssue({ status, assigneeAgentId: ownerAgentId }));
       const res = await request(await createApp(boardActor())).post(`/api/issues/${issueId}/recovery-actions/resolve`)
         .send({ actionId: recoveryActionId, outcome: "restored", sourceIssueStatus: "todo" });
-      expect(res.status, JSON.stringify(res.body)).toBe(409);
-      expect(res.body.details?.code).toBe("disposition_recovery_retry_stale");
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body).toMatchObject({
+        issue: { status, assigneeAgentId: ownerAgentId, activeRecoveryAction: { id: recoveryActionId } },
+        recoveryAction: { id: recoveryActionId, status: "active" },
+        retry: { outcome: "no_op", reason: "current_disposition", nextAction: expect.any(String) },
+      });
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockIssueRecoveryActionService.resolveActiveForIssue).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalled();
+    });
+
+    it("hands repeated retries back to the current active repair without writes or another wake", async () => {
+      seedRetry();
+      const currentIssue = makeIssue({ status: "in_progress", checkoutRunId: ownerRunId, executionRunId: ownerRunId });
+      // The task can advance between the initial read and the transaction lock.
+      mockIssueService.getById.mockResolvedValueOnce(makeIssue({ status: "blocked" })).mockResolvedValue(currentIssue);
+      const action = { id: recoveryActionId, status: "active", kind: "deliberate_wait_without_target",
+        ownerType: "agent", ownerAgentId, returnOwnerAgentId: ownerAgentId,
+        nextAction: "Record a durable continuation through the issue update API.",
+        wakePolicy: { type: "bounded_owner_disposition_repair" } };
+      mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue(action);
+      const app = await createApp(ownerActor());
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const res = await request(app).post(`/api/issues/${issueId}/recovery-actions/resolve`)
+          .send({ actionId: recoveryActionId, outcome: "restored", sourceIssueStatus: "todo" });
+        expect(res.status, JSON.stringify(res.body)).toBe(200);
+        expect(res.body).toMatchObject({
+          issue: { ...currentIssue, activeRecoveryAction: action }, recoveryAction: action,
+          retry: { outcome: "no_op", reason: "current_disposition", nextAction: expect.stringContaining("Do not repeat") },
+        });
+      }
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockIssueRecoveryActionService.resolveActiveForIssue).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+      expect(mockLogActivity).not.toHaveBeenCalled();
+    });
+
+    it.each(["owner", "policy", "returnOwner"])("acknowledges the changed %s without retrying the recorded owner", async changed => {
+      seedRetry();
+      if (changed === "owner") mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
+      if (changed === "policy") mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+        id: recoveryActionId, status: "active", kind: "deliberate_wait_without_target",
+        ownerType: "board", returnOwnerAgentId: ownerAgentId, wakePolicy: { type: "bounded_owner_disposition_repair" },
+      });
+      if (changed === "returnOwner") mockIssueRecoveryActionService.getActiveForIssue.mockResolvedValue({
+        id: recoveryActionId, status: "active", kind: "deliberate_wait_without_target",
+        ownerType: "board", returnOwnerAgentId: null, wakePolicy: { type: "board_escalation" },
+      });
+      const res = await request(await createApp(boardActor())).post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({ actionId: recoveryActionId, outcome: "restored", sourceIssueStatus: "todo" });
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(res.body.retry?.outcome).toBe("no_op");
       expect(mockIssueService.update).not.toHaveBeenCalled();
       expect(mockIssueRecoveryActionService.resolveActiveForIssue).not.toHaveBeenCalled();
       expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
     });
-    it.each(["owner", "budget", "approval", "pause", "run", "blocker", "pausedAgent", "terminatedAgent"])("keeps the %s gate authoritative for a board retry", async gate => {
+
+    it("does not acknowledge another owner's repair for an unauthorized agent", async () => {
       seedRetry();
-      if (gate === "owner") mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: peerAgentId }));
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "in_progress" }));
+      const res = await request(await createApp(peerActor())).post(`/api/issues/${issueId}/recovery-actions/resolve`)
+        .send({ actionId: recoveryActionId, outcome: "restored", sourceIssueStatus: "todo" });
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      expect(mockIssueRecoveryActionService.resolveActiveForIssue).not.toHaveBeenCalled();
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    });
+
+    it.each(["budget", "approval", "pause", "run", "blocker", "pausedAgent", "terminatedAgent"])("keeps the %s gate authoritative for a board retry", async gate => {
+      seedRetry();
       if (gate === "budget") mockBudgetService.getInvocationBlock.mockResolvedValue({ scope: "agent", reason: "hard_limit_reached" });
       if (gate === "approval") mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([{ status: "pending" }]);
       if (gate === "pause") mockIssueTreeControlService.getActivePauseHoldGate.mockResolvedValue({ holdId: "hold", mode: "pause" });
