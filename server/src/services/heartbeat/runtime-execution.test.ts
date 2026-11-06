@@ -159,6 +159,20 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expect(input.instructions.releaseInstructionCopy).not.toHaveBeenCalled();
   });
 
+  it("reaps neither a pre-dispatch OpenCode row with unverified evidence nor a successor retry", async () => {
+    const { heartbeatService } = await import("../heartbeat.js");
+    const { input, run } = await fixture();
+    await db.update(agents).set({ adapterType: "opencode_local", status: "paused" }).where(eq(agents.id, input.agent.id));
+    await db.update(heartbeatRuns).set({ controllerBootId: randomUUID(),
+      controllerLeaseExpiresAt: sql`clock_timestamp() - interval '1 second'`, executionStage: "preparing",
+      resultJson: { executionRecovery: { kind: "bootstrap", reason: "pre_submit",
+        providerWorkStarted: false, providerWorkEvidence: "unverified" } } }).where(eq(heartbeatRuns.id, run.id));
+    const reaped = await heartbeatService(db).reapOrphanedRuns();
+    expect(reaped.runIds).not.toContain(run.id);
+    expect(await read(run.id)).toMatchObject({ status: "running" });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run.id))).toHaveLength(0);
+  });
+
   it("registers the plain OpenCode CLI controller when its child spawns", async () => {
     const { input, adapter, run } = await fixture();
     adapter.type = "opencode_local";
@@ -475,6 +489,32 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expect(await executeHeartbeatRuntime(db, input)).toMatchObject({ dispatched: true, adapterResult: { resultJson: { executionRecovery: recovery } } });
     expect(await finalizations()).toHaveLength(0);
     expect(await read(run.id)).toMatchObject({ status: "running" });
+    expect(revokeHeartbeatRunGatewayTokens).not.toHaveBeenCalled();
+    expect(input.instructions.releaseInstructionCopy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["unowned_successor", true], ["submit_outcome_unknown", true], ["outcome_unknown", true],
+    ["reattach_message_missing", true], ["reattach_binding_invalid", true], ["unowned_turn_verified_idle", true],
+    ["interrupt_unknown", true], ["timeout_unverified", true], ["pre_submit", false],
+  ] as const)("retains host resources and the run for unverified NAR %s", async (reason, started) => {
+    const { isUnverifiedSharedOpenCode, persistUnverifiedSharedOpenCode } = await import("./opencode-unverified-hold.js");
+    const { input, adapter, run } = await fixture();
+    const boot = randomUUID();
+    const expires = new Date(Date.now() + 60_000);
+    await db.update(heartbeatRuns).set({ controllerBootId: boot, controllerLeaseExpiresAt: expires }).where(eq(heartbeatRuns.id, run.id));
+    input.run.controllerBootId = boot;
+    input.run.controllerLeaseExpiresAt = expires;
+    input.agent.adapterType = "opencode_local";
+    const recovery = { kind: "bootstrap", reason, providerWorkStarted: started, providerWorkEvidence: "unverified" };
+    adapter.execute.mockResolvedValueOnce({ exitCode: 75, signal: null, timedOut: false, resultJson: { executionRecovery: recovery } });
+    const result = await executeHeartbeatRuntime(db, input);
+    expect(result.dispatched).toBe(true);
+    if (!result.dispatched) throw new Error("expected dispatch");
+    expect(isUnverifiedSharedOpenCode({ run: input.run, adapterType: input.agent.adapterType, resultJson: result.adapterResult.resultJson })).toBe(true);
+    await persistUnverifiedSharedOpenCode(db, { run: input.run, resultJson: result.adapterResult.resultJson });
+    expect(await read(run.id)).toMatchObject({ status: "running", resultJson: { executionRecovery: recovery } });
+    expect(await finalizations()).toHaveLength(0);
     expect(revokeHeartbeatRunGatewayTokens).not.toHaveBeenCalled();
     expect(input.instructions.releaseInstructionCopy).not.toHaveBeenCalled();
   });

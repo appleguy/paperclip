@@ -220,10 +220,12 @@ describe("OpenCode adapter nativeRuntime nar", () => {
 
   it.each([1, 2])("holds live completion when a successor appears on outcome read %i", async (read) => {
     successorOnMessageRead = read;
-    const result = await execute(context("run-live-successor", { nativeRuntime: "nar" }) as never);
+    const onProviderStopped = vi.fn(async () => {});
+    const result = await execute({ ...context("run-live-successor", { nativeRuntime: "nar" }), onProviderStopped } as never);
     expect(result).toMatchObject({ exitCode: 75, resultJson: { executionRecovery: {
-      providerWorkStarted: true, reason: "unowned_successor",
+      providerWorkStarted: true, providerWorkEvidence: "unverified", reason: "unowned_successor",
     } } });
+    expect(onProviderStopped).not.toHaveBeenCalled();
     expect(result.summary ?? "").toBe("");
     expect(result.costUsd ?? null).toBeNull();
     expect(promptPosts).toBe(1);
@@ -234,10 +236,19 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     messagePageSize = 1;
     const result = await execute(context("run-live-older", { nativeRuntime: "nar" }) as never);
     expect(result).toMatchObject({ exitCode: 75, resultJson: { executionRecovery: {
-      providerWorkStarted: true, reason: "outcome_unknown",
+      providerWorkStarted: true, providerWorkEvidence: "unverified", reason: "outcome_unknown",
     } } });
     expect(promptPosts).toBe(1);
     expect(interruptPosts).toBe(0);
+  });
+
+  it("holds a timed-out owned turn unless provider termination is verified", async () => {
+    autoComplete = false;
+    const result = await runNarOpenCodeAttempt({ configPath: cfg, agentId: scope.agentId, taskId: scope.issueId, runId: "run-timeout", cwd: root,
+      model: "", prompt: "original", timeoutSec: 0.05, pollMs: 1, onLog: async () => {} });
+    expect(result.proc.timedOut).toBe(true);
+    expect(result.executionRecovery).toMatchObject({ reason: "timeout_unverified", providerWorkStarted: true,
+      providerWorkEvidence: "unverified" });
   });
 
   it("retains possible provider work if checkpointing a rejoined turn fails", async () => {

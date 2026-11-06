@@ -10,10 +10,10 @@ export function isUnverifiedSharedOpenCode(input: {
 }): boolean {
   const recovery = input.resultJson?.executionRecovery;
   if (input.run.runtimeMode !== "legacy" || input.adapterType !== "opencode_local" ||
-      !recovery || typeof recovery !== "object" || Array.isArray(recovery) ||
-      !["shared_session_unverified", "stop_before_dispatch_unverified"].some(reason => reason === (recovery as Record<string, unknown>).reason) ||
-      (recovery as Record<string, unknown>).providerWorkStarted !== true) return false;
-  return true;
+      !recovery || typeof recovery !== "object" || Array.isArray(recovery)) return false;
+  const evidence = recovery as Record<string, unknown>;
+  return evidence.kind === "bootstrap" && (evidence.providerWorkEvidence === "unverified" ||
+    (evidence.providerWorkStarted === true && ["shared_session_unverified", "stop_before_dispatch_unverified"].includes(String(evidence.reason))));
 }
 
 export async function persistUnverifiedSharedOpenCode(db: Db, input: {

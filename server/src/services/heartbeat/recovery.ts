@@ -2743,7 +2743,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         revokedState.executionStage === "preparing" &&
         !!run.controllerBootId &&
         run.controllerBootId !== legacyControllerBootId &&
-        (!openCodeLegacyRun || parseObject(latestResult.executionRecovery).providerWorkStarted !== true) &&
+        (!openCodeLegacyRun || (parseObject(latestResult.executionRecovery).providerWorkStarted !== true &&
+          parseObject(latestResult.executionRecovery).providerWorkEvidence !== "unverified")) &&
         !revokedState.processPid &&
         !revokedState.processGroupId;
       if (openCodeLegacyRun && !restartInterruptedBeforeDispatch) {

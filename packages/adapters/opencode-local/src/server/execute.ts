@@ -536,7 +536,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       return {
         exitCode: 75, signal: null, timedOut: false,
         errorMessage: "OpenCode NAR runtime unavailable for this run; no inference sent",
-        resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+        resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false,
+          reason: "nar_runtime_unavailable", providerWorkEvidence: "unverified" } },
       };
     }
     if (sharedConfigPath && !narMode) {
@@ -950,6 +951,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // A shared CLI exit alone does not establish that its provider turn ended.
     // Keep the stopped callback closed unless the shared attempt exits cleanly.
     let sharedProviderUnverified = sharedSession !== null;
+    let narProviderUnverified = false;
     try {
       const initial = await runAttempt(sharedSession?.resumed ? sharedSession.sessionId : sessionId);
       if (narMode) {
@@ -963,6 +965,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             executionRecovery: { kind: "interrupted", providerStopped: true, sessionPreserved: true, actionOutcomes: "settled", reason: termination.reason } } };
         }
         const recovery = (initial as { executionRecovery?: unknown }).executionRecovery;
+        if (recovery) sharedProviderUnverified = narProviderUnverified = true;
         return recovery ? { ...result, resultJson: { ...(result.resultJson ?? {}), executionRecovery: recovery } } : result;
       }
       const sharedFinish = await sharedSession?.finish(initial.proc);
@@ -992,6 +995,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
       return toResult(initial);
     } catch (error) {
+      if (narMode) {
+        sharedProviderUnverified = narProviderUnverified = true;
+        return { exitCode: 75, signal: null, timedOut: false,
+          errorMessage: "OpenCode NAR attempt failed with provider state unverified",
+          resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: true,
+            reason: "nar_attempt_exception", providerWorkEvidence: "unverified" } } };
+      }
       if (!sharedSession) throw error;
       sharedProviderUnverified = true;
       // The client can fail after submitting to the persistent server; retain
@@ -1003,12 +1013,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       try {
         if (!sharedProviderUnverified) await providerStop.collectBeforeRestore();
       } finally {
-        await Promise.all([
-          paperclipBridge?.stop(),
-          runHandle?.cleanup(),
-          restoreRemoteWorkspace?.(),
-          localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
-        ]);
+        if (!narProviderUnverified) {
+          await Promise.all([
+            paperclipBridge?.stop(),
+            runHandle?.cleanup(),
+            restoreRemoteWorkspace?.(),
+            localSkillsDir ? fs.rm(path.dirname(localSkillsDir), { recursive: true, force: true }).catch(() => undefined) : Promise.resolve(),
+          ]);
+        }
       }
     }
   } finally {

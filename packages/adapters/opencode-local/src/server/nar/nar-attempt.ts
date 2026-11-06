@@ -85,7 +85,8 @@ const held = (
   parsed: emptyParsed(sessionId, message),
   possibleWork: providerWorkStarted,
   capacityRefusal: false,
-  executionRecovery: { kind: "bootstrap", providerWorkStarted, reason, ...(providerWorkEvidence ? { providerWorkEvidence } : {}) },
+  // A local no-submit observation does not fence a previous controller.
+  executionRecovery: { kind: "bootstrap", providerWorkStarted, reason, providerWorkEvidence: providerWorkEvidence ?? "unverified" },
 });
 
 /** Provider turn is gone and verified from OpenCode: the session resumes, so replay is safe (SCO-679). */
@@ -538,10 +539,8 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
       return held("OpenCode NAR timed out observing another run's turn; held without interrupting it", true, conversationId, "unowned_turn_timeout", { timedOut: true });
     }
     await interruptOnce().catch(() => undefined);
-    return {
-      proc: { exitCode: null, signal: null, timedOut: true, stdout: "", stderr: "" }, rawStderr: "",
-      parsed: emptyParsed(conversationId, null), possibleWork: true, capacityRefusal: false,
-    };
+    return held("OpenCode NAR timed out; provider termination remains unverified", true, conversationId,
+      "timeout_unverified", { exitCode: null, timedOut: true });
   }
 
   // A retry observing a different run's message has no authority to treat
