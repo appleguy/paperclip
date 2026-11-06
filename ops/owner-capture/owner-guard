@@ -130,15 +130,30 @@ proc_key() { # agent process identity pid@start: stable across /clear and compac
 }
 alive() { case "$1" in ''|*@) return 1;; esac; [ "$(lstart "${1%%@*}")" = "${1#*@}" ]; }
 ledger_add() { # Identity is an occurrence, never prompt text.
+  if [ "${OWNER_GUARD_LEDGER_LOCKED:-}" != 1 ]; then
+    OWNER_GUARD_LEDGER_LOCKED=1 exec /opt/homebrew/bin/flock -x -w 30 "$STATE/ledger.lock" "$0" _ledger_add "$1"
+  fi
   mkdir -p "$OPEN"
   while IFS= read -r m; do
     sid=$(printf '%s' "$m" | jq -r .sid); [ -n "$sid" ] && [ "$sid" != null ] || continue
     event=$(printf '%s' "$m" | jq -r '.event // empty')
-    [ -n "$event" ] || event="receipt:$(uuidgen)" # no transport identity: preserve independent calls
+    [ -n "$event" ] || event="text:$(printf '%s' "$m" | jq -rj .text | shasum -a 256 | cut -c1-16)"
     f="$OPEN/$sid.jsonl"; h=$(printf '%s\n%s' "$sid" "$event" | shasum -a 256 | cut -c1-16)
     id="$(printf %.8s "$sid"):$h"
     if [ -r "$f" ]; then
-      jq -se --arg e "$event" 'any(.[]; .event==$e)' "$f" >/dev/null && continue
+      jq -se --arg e "$event" --arg id "$id" 'any(.[]; .event==$e or .id==$id)' "$f" >/dev/null && continue
+      # Match an identity-free hook receipt to one transcript occurrence once.
+      # The alias makes later scans idempotent, including after closure.
+      fallback=$(printf '%s' "$m" | jq -rj .text | shasum -a 256 | cut -c1-16)
+      if [ "${event#text:}" != "$event" ]; then
+        jq -se --arg t "$(printf '%s' "$m" | jq -r .text)" 'any(.[]; .text==$t)' "$f" >/dev/null && continue
+      else
+        old=$(jq -sr --arg e "text:$fallback" '[.[]|select(.event==$e)|.id][0] // empty' "$f")
+        if [ -n "$old" ] && ! jq -se --arg id "$old" 'any(.[]; .id==$id and .event_alias==true)' "$f" >/dev/null; then
+          jq -nc --arg id "$old" --arg event "$event" '{id:$id,event:$event,event_alias:true}' >> "$f"
+          continue
+        fi
+      fi
     fi
     printf '%s' "$m" | jq -c --arg id "$id" --arg event "$event" --arg cwd "$1" '{id:$id,event:$event,transcript,after_line,line,ts:(.ts|if type=="number" then (./1000|floor|todate) else sub("\\.[0-9]+Z$";"Z") end),sid,
       cwd:(if $cwd != "" then $cwd else (.cwd // "") end),proc:(.proc // ""),agent:(.agent // ""),src:(.src // ""),text:(.text|.[0:4000])}' >> "$f"
@@ -157,8 +172,7 @@ capture() { # UserPromptSubmit hook: record the owner prompt at receipt, before 
   m=$(printf '%s' "$in" | jq -c --arg auto "$AUTO" --arg ts "$(nowz)" --arg proc "$(proc_key)" --arg agent "${PAPERCLIP_AGENT_ID:-}" --arg src "${OWNER_GUARD_SRC:-}" "$OWNER_JQ"' (.prompt|owner) as $t
     | {ts:$ts,sid:.session_id,text:$t,event:((.event_id // .message_id // .turn_id // .prompt_id // .uuid // "")|if .=="" then null else "message:"+. end),cwd:(.cwd//""),proc:$proc,agent:$agent,src:(if $src != "" then $src elif ((.transcript_path//"")|test("rollout-")) then "codex" else "claude" end)}' 2>/dev/null) || exit 0
   [ -n "$m" ] || exit 0
-  # Without a native occurrence ID, neither frontier nor matching text proves
-  # whether this is redelivery or another genuine owner turn. Retain both.
+  # Without a source ID, text is the best available fallback.
   printf '%s\n' "$m" | ledger_add ""
 }
 ledger_records() { # Read each JSONL line independently; never rewrite damaged originals.
