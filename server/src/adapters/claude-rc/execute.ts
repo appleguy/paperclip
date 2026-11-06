@@ -140,9 +140,9 @@ export function isClaudeIdle(screen: string): boolean {
   if (input !== "" && !/^Try "[^"]*"$/.test(input)) return false;
   const after = tail.slice(i + 1);
   if (!after.some(l => /bypass permissions on/i.test(l))) return false;
-  // Only terminal rules/blank lines may occur between the editor and footer.
+  // Only terminal rules, blank lines and the model/effort status line may sit between the editor and footer.
   if (after.some(l => l.trim() && !/^[\s─━═│┃]+$/.test(l) &&
-    !/bypass permissions on|shift\+tab to cycle/i.test(l))) return false;
+    !/bypass permissions on|shift\+tab to cycle/i.test(l) && !/^\s*claude-[\w.-]+ · effort \w+\s*$/.test(l))) return false;
   // Spinner tokens are capitalized and end in an ellipsis; plain prose such as
   // "one pane per generating session" in the last answer must not read as busy.
   const text = tail.join("\n");

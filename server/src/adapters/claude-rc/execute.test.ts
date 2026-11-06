@@ -8,6 +8,8 @@ describe("claude_rc_local screen parsing", () => {
   it("treats the empty input box with the permission footer as idle", () => {
     expect(isClaudeIdle([rule, "❯ ", "─".repeat(40), footer].join("\n"))).toBe(true);
     expect(isClaudeIdle([rule, '❯ Try "how does <filepath> work?"', "─".repeat(40), footer].join("\n"))).toBe(true);
+    // Seats with a status line show model and effort between the editor and the footer.
+    expect(isClaudeIdle([rule, "❯ ", "─".repeat(40), "  claude-opus-5-5 · effort xhigh", "  ⏵⏵ bypass permissions on · 2 monitors"].join("\n"))).toBe(true);
   });
   it("stays idle when the last answer merely mentions a spinner word", () => {
     const answer = "  - Panes: one pane per generating session; thinking and working notes follow.";

@@ -57,7 +57,7 @@ beforeEach(async () => {
     if (args[0] === "display-message") return args.at(-1) === "#{pane_current_path}" ? cwd : "claude";
     return "";
   });
-  deps.gate.mockResolvedValue({ ok: true, reasons: [] });
+  deps.gate.mockResolvedValue({ ok: true, notes: [] });
   deps.deliver.mockResolvedValue({ status: "done" });
   ctx = {
     agent: { id: "agent", name: "Busy seat", companyId: "company" }, runId: "run-busy",
