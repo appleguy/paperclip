@@ -109,6 +109,44 @@ describe("stale resolved no-replay holds", () => {
     expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toEqual([]);
   });
 
+  it("retains a process-lost OpenCode hold when provider evidence was never recorded", async () => {
+    const { companyId, issueId, action } = await seed("opencode_local", "process_lost", false, {
+      conversationContinuation: "continue_conversation_v1",
+      earlySession: { sessionId: "original-session", sessionParams: { narBinding: { messageId: "original-message" } } },
+    });
+    await db.delete(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, action.evidence.runId as string));
+    await terminalizeLegacyExecution({ db, run, status: "failed", fromStatuses: ["failed"] });
+    const [first] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(first).toMatchObject({ status: "active", evidence: { runId: run.id } });
+    await settleUnrecoverableExecutions(db);
+    await terminalizeLegacyExecution({ db, run, status: "failed", fromStatuses: ["failed"] });
+    await settleUnrecoverableExecutions(db);
+    const after = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
+    expect(after).toHaveLength(1);
+    expect(after[0]).toMatchObject({ id: first.id, evidence: { runId: run.id } });
+    expect(after[0].outcome).not.toBe("cancelled");
+    expect(await getExecutionBlocker(db, companyId, issueId)).not.toBeNull();
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0].resultJson).toEqual(run.resultJson);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).toEqual([]);
+  });
+
+  it.each([
+    ["opencode_local", { kind: "bootstrap", providerWorkStarted: false }],
+    ["opencode_local", { kind: "bootstrap", providerWorkStarted: true, reason: "unowned_turn_verified_idle", providerSessionId: "session", providerMessageId: "message" }],
+    ["codex_local", undefined],
+  ])("allows an established safe conversation continuation for process-lost %s (%j)", async (adapter, recovery) => {
+    const { action } = await seed(adapter, "process_lost", false, {
+      conversationContinuation: "continue_conversation_v1",
+      ...(recovery ? { executionRecovery: recovery } : {}),
+    });
+    await db.update(issueRecoveryActions).set({ status: "active", outcome: null, resolvedAt: null }).where(eq(issueRecoveryActions.id, action.id));
+    await settleUnrecoverableExecutions(db);
+    const [after] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(after.outcome).toBe("cancelled");
+  });
+
   it.each([
     [{ providerSessionId: "session", providerMessageId: "message" }, "cancelled"],
     [{ providerSessionId: "session" }, "blocked"],

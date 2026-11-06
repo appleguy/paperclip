@@ -63,7 +63,7 @@ export async function runUsedConversationAdapter(db: Db, run: typeof heartbeatRu
 }
 
 /** An unverified OpenCode observation does not fence another controller.
- * Older holds predate providerWorkEvidence and can report started work instead. */
+ * Older holds can report started work, or lose their controller before recording evidence. */
 export function unverifiedOpenCodeRecoveryActionPredicate() {
   return and(eq(issueRecoveryActions.cause, "legacy_execution_requires_reconciliation"), sql`exists (
     select 1 from ${heartbeatRuns}
@@ -75,10 +75,22 @@ export function unverifiedOpenCodeRecoveryActionPredicate() {
       and (
         ${heartbeatRuns.resultJson}->'executionRecovery'->>'providerWorkEvidence' = 'unverified'
         or (
-          ${heartbeatRuns.resultJson}->'executionRecovery'->>'kind' = 'bootstrap'
-          and ${heartbeatRuns.resultJson}->'executionRecovery'->>'providerWorkStarted' = 'true'
+          (
+            (${heartbeatRuns.resultJson}->'executionRecovery'->>'kind' = 'bootstrap'
+              and ${heartbeatRuns.resultJson}->'executionRecovery'->>'providerWorkStarted' = 'true')
+            or (
+              ${heartbeatRuns.status} = 'failed' and ${heartbeatRuns.errorCode} = 'process_lost'
+              and ${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType' = 'opencode_local'
+              and not coalesce((
+                ${heartbeatRuns.resultJson}->'executionRecovery'->>'kind' = 'bootstrap'
+                and ${heartbeatRuns.resultJson}->'executionRecovery'->'providerWorkStarted' = 'false'::jsonb
+              ), false)
+            )
+          )
           and not coalesce((
-            coalesce(${heartbeatRuns.resultJson}->'executionRecovery'->>'reason', '') = 'unowned_turn_verified_idle'
+            ${heartbeatRuns.resultJson}->'executionRecovery'->>'kind' = 'bootstrap'
+            and ${heartbeatRuns.resultJson}->'executionRecovery'->'providerWorkStarted' = 'true'::jsonb
+            and coalesce(${heartbeatRuns.resultJson}->'executionRecovery'->>'reason', '') = 'unowned_turn_verified_idle'
             and jsonb_typeof(${heartbeatRuns.resultJson}->'executionRecovery'->'providerSessionId') = 'string'
             and length(${heartbeatRuns.resultJson}->'executionRecovery'->>'providerSessionId') > 0
             and jsonb_typeof(${heartbeatRuns.resultJson}->'executionRecovery'->'providerMessageId') = 'string'
