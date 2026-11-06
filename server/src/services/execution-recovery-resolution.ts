@@ -303,6 +303,7 @@ export async function markExecutionReconciliation(
 export async function deliverReconciledExecutions(
   db: Db,
   wake: ReturnType<typeof import("./heartbeat.js").heartbeatService>["wakeup"],
+  actionId?: string,
 ) {
   const pending = await db
     .select()
@@ -311,6 +312,7 @@ export async function deliverReconciledExecutions(
       and(
         eq(issueRecoveryActions.status, "resolved"),
         sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
+        actionId ? eq(issueRecoveryActions.id, actionId) : undefined,
       ),
     )
     .limit(25);
@@ -318,13 +320,17 @@ export async function deliverReconciledExecutions(
     try {
       const decision = action.evidence.executionReconciliation as
         ExecutionReconciliation | undefined;
-      if (!decision || !action.returnOwnerAgentId) continue;
+      const strandedRestore = action.kind === "stranded_assigned_issue"
+        ? action.evidence.strandedRestoreDelivery : undefined;
+      if ((!decision && !strandedRestore) || !action.returnOwnerAgentId) continue;
       const pendingDecision = and(
         eq(issueRecoveryActions.companyId, action.companyId),
         eq(issueRecoveryActions.id, action.id),
         eq(issueRecoveryActions.status, "resolved"),
         sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
-        sql`${issueRecoveryActions.evidence}->'executionReconciliation' = ${JSON.stringify(decision)}::jsonb`,
+        decision
+          ? sql`${issueRecoveryActions.evidence}->'executionReconciliation' = ${JSON.stringify(decision)}::jsonb`
+          : sql`${issueRecoveryActions.evidence}->'strandedRestoreDelivery' = ${JSON.stringify(strandedRestore)}::jsonb`,
       );
       const [task] = await db
         .select()
@@ -360,8 +366,7 @@ export async function deliverReconciledExecutions(
           issueId: task.id,
           taskId: task.id,
           recoveryActionId: action.id,
-          previousRunId: decision.runId,
-          retryOfRunId: decision.runId,
+          ...(decision ? { previousRunId: decision.runId, retryOfRunId: decision.runId } : {}),
           forceFreshSession: true,
           wakeReason: "issue_recovery_action_restored",
           source: "execution.reconciled",
@@ -369,7 +374,7 @@ export async function deliverReconciledExecutions(
       });
       if (run)
         await db.transaction(async (tx) => {
-          await tx
+          if (decision) await tx
             .update(heartbeatRuns)
             .set({ retryOfRunId: decision.runId })
             .where(

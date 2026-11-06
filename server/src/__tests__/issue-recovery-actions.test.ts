@@ -40,6 +40,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbeat.js";
 import { deliverReconciledExecutions, markExecutionReconciliation } from "../services/execution-recovery-resolution.js";
+import { legacyExecutionNeedsReconciliationWithEvidence } from "../services/legacy-execution-recovery.js";
 import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive } from "../services/workspace-operations.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
@@ -2020,7 +2021,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(list.body.actions).toHaveLength(1);
   });
 
-  it("lists a settled reconciliation hold that still blocks replay", async () => {
+  it("retains settled reconciliation evidence in recovery history", async () => {
     const { companyId, coderId, sourceIssueId } = await seedCompany();
     const runId = randomUUID();
     const [action] = await db.insert(issueRecoveryActions).values({
@@ -2891,6 +2892,96 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const logs = await db.select().from(activityLog).where(eq(activityLog.entityId, sourceIssueId));
     expect(logs.filter(entry => entry.action === "issue.recovery_action_resolved")).toHaveLength(1);
     expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]).toMatchObject({ status: "todo", assigneeAgentId: coderId });
+  });
+
+  async function seedStrandedLegacyHold(status = "failed", runPatch: Partial<typeof heartbeatRuns.$inferInsert> = {},
+    evidence: Record<string, unknown> = {}) {
+    const f = await seedCompany();
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.sourceIssueId));
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.coderId,
+      issueId: f.sourceIssueId, contextSnapshot: { issueId: f.sourceIssueId }, status, runtimeMode: "legacy",
+      errorCode: "adapter_failed", finishedAt: new Date(), ...runPatch }).returning();
+    const [hold] = await db.insert(issueRecoveryActions).values({ companyId: f.companyId,
+      sourceIssueId: f.sourceIssueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",
+      ownerType: "board", returnOwnerAgentId: f.coderId, cause: "legacy_execution_requires_reconciliation",
+      fingerprint: `legacy-execution:${run.id}`, nextAction: "Inspect the terminal source.",
+      evidence: { runId: run.id, automaticRecovery: { replay: "blocked" }, ...evidence } }).returning();
+    const action = await issueRecoveryActionService(db).upsertSourceScoped({ companyId: f.companyId,
+      sourceIssueId: f.sourceIssueId, kind: "stranded_assigned_issue", cause: "stranded_assigned_issue",
+      fingerprint: "stranded:restore", ownerType: "board", returnOwnerAgentId: f.coderId,
+      nextAction: "Restore the assigned task." });
+    const body = { actionId: action.id, outcome: "restored", sourceIssueStatus: "todo" };
+    return { ...f, run, hold, action, body };
+  }
+
+  it.each(["failed", "timed_out", "cancelled", "interrupted"])(
+    "restoring stranded work settles a %s legacy hold and durably wakes an unchanged todo assignee once", async status => {
+      const f = await seedStrandedLegacyHold(status);
+      expect(await legacyExecutionNeedsReconciliationWithEvidence(db, f.run)).toBe(true);
+      const wake = vi.fn<ReturnType<typeof heartbeatService>["wakeup"]>(async () => ({ id: randomUUID() }) as never);
+      const app = createApp(undefined, { recoveryActionEnqueueWakeup: wake });
+      await request(app).post(`/api/issues/${f.sourceIssueId}/recovery-actions/resolve`).send(f.body).expect(200);
+      const [hold] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.hold.id));
+      expect(hold.evidence).toMatchObject({ strandedRestoreReconciliation: {
+        runId: f.run.id, providerStopped: true, recoveryActionId: f.action.id }, continuationDelivery: "not_requested" });
+      expect(hold.evidence).not.toHaveProperty("automaticRecovery");
+      expect(hold.evidence).not.toHaveProperty("executionReconciliation");
+      expect(await legacyExecutionNeedsReconciliationWithEvidence(db, f.run)).toBe(false);
+      expect(wake).toHaveBeenCalledWith(f.coderId, expect.objectContaining({
+        idempotencyKey: `execution-reconciliation:${f.action.id}`,
+        payload: { issueId: f.sourceIssueId, recoveryActionId: f.action.id },
+        contextSnapshot: expect.objectContaining({ issueId: f.sourceIssueId, forceFreshSession: true }),
+      }));
+      expect(wake.mock.calls[0][1].contextSnapshot).not.toHaveProperty("previousRunId");
+      await request(app).post(`/api/issues/${f.sourceIssueId}/recovery-actions/resolve`).send(f.body).expect(200);
+      await deliverReconciledExecutions(db, wake);
+      expect(wake).toHaveBeenCalledOnce();
+      const [restored] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.action.id));
+      expect(restored.evidence.continuationDelivery).toBe("delivered");
+    },
+  );
+
+  it.each(["live", "live_process", "lease", "workspace", "system", "native", "reassigned"])(
+    "stranded restore preserves a legacy hold with %s authority or repair obligations", async kind => {
+      const f = await seedStrandedLegacyHold(kind === "live" ? "running" : "failed",
+        kind === "live_process" ? { processPid: process.pid }
+          : kind === "workspace" ? { resultJson: { workspaceRestoreFailure: "restore_unsafe_archive" } }
+          : kind === "system" ? { resultJson: { systemRecovery: { state: "pending" } } }
+          : kind === "native" ? { runtimeMode: "native" } : {});
+      if (kind === "reassigned") await db.update(issues).set({ assigneeAgentId: f.managerId }).where(eq(issues.id, f.sourceIssueId));
+      if (kind === "lease") await db.insert(environmentLeases).values({ companyId: f.companyId,
+        heartbeatRunId: f.run.id, issueId: f.sourceIssueId, provider: "local", leasePolicy: "ephemeral", status: "active" });
+      const wake = vi.fn(async () => null);
+      await request(createApp(undefined, { recoveryActionEnqueueWakeup: wake }))
+        .post(`/api/issues/${f.sourceIssueId}/recovery-actions/resolve`).send(f.body).expect(200);
+      const [hold] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.hold.id));
+      expect(hold).toEqual(f.hold);
+      if (kind === "reassigned") expect(wake).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps a stranded restore wake pending when immediate delivery fails", async () => {
+    const f = await seedStrandedLegacyHold();
+    const wake = vi.fn(async () => { throw new Error("dispatch unavailable"); });
+    await request(createApp(undefined, { recoveryActionEnqueueWakeup: wake }))
+      .post(`/api/issues/${f.sourceIssueId}/recovery-actions/resolve`).send(f.body).expect(200);
+    const [pending] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.action.id));
+    expect(pending.evidence.continuationDelivery).toBe("pending");
+    const retry = vi.fn(async () => ({ id: randomUUID() }) as never);
+    await deliverReconciledExecutions(db, retry);
+    expect(retry).toHaveBeenCalledOnce();
+  });
+
+  it("invalidates a pending stranded restore after reassignment instead of waking the former owner", async () => {
+    const f = await seedStrandedLegacyHold();
+    await request(createApp(undefined, { recoveryActionEnqueueWakeup: vi.fn(async () => null) }))
+      .post(`/api/issues/${f.sourceIssueId}/recovery-actions/resolve`).send(f.body).expect(200);
+    await db.update(issues).set({ assigneeAgentId: f.managerId }).where(eq(issues.id, f.sourceIssueId));
+    const wake = vi.fn(async () => null);
+    await deliverReconciledExecutions(db, wake);
+    expect(wake).not.toHaveBeenCalled();
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.action.id));
+    expect(action.evidence.continuationDelivery).toBe("invalidated");
   });
 
   it("hands restored work back to the recorded return owner and records the outcome", async () => {

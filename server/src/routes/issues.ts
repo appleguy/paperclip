@@ -54,7 +54,9 @@ import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from
 import {
   validateExecutionReconciliation,
   markExecutionReconciliation,
+  deliverReconciledExecutions,
 } from "../services/execution-recovery-resolution.js";
+import { settleStrandedLegacyExecutions } from "../services/stranded-execution-recovery.js";
 import {
   storedSteeringAcknowledgement,
   reconcileSteeredIdentity,
@@ -10492,7 +10494,14 @@ export function issueRoutes(
               ? "owner_completed"
               : outcome;
 
-        const recoveryAction = await recoveryActionsSvc.resolveActiveForIssue(
+        const strandedRestore = outcome === "restored" && activeRecoveryAction.kind === "stranded_assigned_issue"
+          && ["todo", "in_progress"].includes(issue.status) && !!issue.assigneeAgentId
+          && issue.assigneeAgentId === activeRecoveryAction.returnOwnerAgentId && req.actor.type === "board";
+        const settledLegacyActionIds = strandedRestore
+          ? await settleStrandedLegacyExecutions(tx as unknown as Db, { companyId: issue.companyId,
+            issueId: issue.id, recoveryActionId: activeRecoveryAction.id, actorId: actor.actorId }) : [];
+
+        let recoveryAction = await recoveryActionsSvc.resolveActiveForIssue(
           {
             companyId: existing.companyId,
             sourceIssueId: existing.id,
@@ -10504,8 +10513,15 @@ export function issueRoutes(
           tx,
         );
         if (!recoveryAction) throw notFound("Active recovery action not found");
+        if (strandedRestore && !chatRetry) {
+          const [updated] = await tx.update(issueRecoveryActions).set({ evidence: {
+            ...recoveryAction.evidence, continuationDelivery: "pending",
+            strandedRestoreDelivery: { settledLegacyActionIds, actorId: actor.actorId },
+          } }).where(eq(issueRecoveryActions.id, recoveryAction.id)).returning();
+          recoveryAction = issueRecoveryActionReadModel(updated!);
+        }
 
-        return { issue, recoveryAction, chatRetry };
+        return { issue, recoveryAction, chatRetry, strandedRestore };
       });
       if (result.replayed) {
         res.json({
@@ -10579,6 +10595,8 @@ export function issueRoutes(
             "chat recovery retry dispatch deferred to durable worker",
           );
         }
+      } else if ("strandedRestore" in result && result.strandedRestore) {
+        await deliverReconciledExecutions(db, enqueueRecoveryActionWakeup, result.recoveryAction.id);
       } else if (
         !executionReconciliation &&
         sourceIssueStatus === "todo" &&

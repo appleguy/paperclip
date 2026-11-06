@@ -126,11 +126,19 @@ export async function legacyExecutionNeedsReconciliationWithEvidence(db: Db, run
  * later sweep or backfill must not re-derive the same hold from the run row alone. */
 async function isOperatorReconciled(db: Db, run: Run): Promise<boolean> {
   if (hasRequiredWorkspaceRecovery(run.resultJson)) return false;
+  const issueId = run.nativeIssueId ?? run.issueId ?? run.contextSnapshot?.issueId;
+  if (typeof issueId !== "string") return false;
   const [row] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, run.companyId),
     eq(issueRecoveryActions.status, "resolved"),
-    sql`${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId' = ${run.id}`,
-    sql`${issueRecoveryActions.evidence}->'executionReconciliation'->>'providerStopped' = 'true'`,
+    eq(issueRecoveryActions.sourceIssueId, issueId),
+    or(and(
+      sql`${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId' = ${run.id}`,
+      sql`${issueRecoveryActions.evidence}->'executionReconciliation'->>'providerStopped' = 'true'`,
+    ), and(
+      sql`${issueRecoveryActions.evidence}->'strandedRestoreReconciliation'->>'runId' = ${run.id}`,
+      sql`${issueRecoveryActions.evidence}->'strandedRestoreReconciliation'->>'providerStopped' = 'true'`,
+    )),
   )).limit(1);
   return Boolean(row);
 }
