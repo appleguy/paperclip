@@ -10812,9 +10812,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const heartbeat = heartbeatService(db);
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
-    expect(result.assignmentDispatched).toBe(0);
+    expect(result.assignmentDispatched).toBe(1);
     expect(result.dispatchRequeued).toBe(0);
-    expect(result.continuationRequeued).toBe(1);
+    expect(result.continuationRequeued).toBe(0);
     expect(result.escalated).toBe(0);
     expect(result.issueIds).toEqual([issueId]);
 
@@ -10825,17 +10825,31 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(retryRun?.contextSnapshot).toMatchObject({
       issueId,
       taskId: issueId,
-      wakeReason: "issue_disposition_repair",
-      retryReason: "issue_disposition_repair",
-      source: "issue.deliberate_wait_disposition_repair",
-      retryOfRunId: runId,
+      wakeReason: "issue_assigned",
+      source: "issue.assigned_todo_liveness_dispatch",
     });
+    expect(retryRun?.contextSnapshot).not.toHaveProperty("retryOfRunId");
     expect(
       retryRun?.contextSnapshot as Record<string, unknown>,
     ).not.toHaveProperty("modelProfile");
     if (retryRun) {
       await waitForRunToSettle(heartbeat, retryRun.id);
     }
+  });
+
+  it("does not dispatch handed-back todo work while a durable monitor remains", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({ status: "todo", runStatus: "succeeded" });
+    await db.update(issues).set({ monitorNextCheckAt: new Date(Date.now() + 3_600_000) }).where(eq(issues.id, issueId));
+    await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId: issueId, kind: "stranded_assigned_issue", status: "resolved",
+      ownerType: "agent", ownerAgentId: agentId, previousOwnerAgentId: agentId, returnOwnerAgentId: agentId,
+      cause: "stranded_assigned_issue", fingerprint: `handed-back-wait:${issueId}`,
+      nextAction: "Wait for the external event", outcome: "handed_back", resolvedAt: new Date(),
+    });
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+    expect(result.assignmentDispatched).toBe(0);
+    expect(result.continuationRequeued).toBe(0);
+    expect(await selectRecoveryRunsByAgent(agentId)).toHaveLength(1);
   });
 
   it("does not let an active chat conversation suppress stranded execution-review participant recovery", async () => {

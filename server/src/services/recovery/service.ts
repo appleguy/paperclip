@@ -1755,7 +1755,7 @@ export function recoveryService(
     issue: RecoveryIssue,
     latestRun: LatestIssueRun,
   ) {
-    if (issue.status !== "todo" || latestRun?.status !== "succeeded")
+    if (issue.status !== "todo" || !issue.assigneeAgentId || latestRun?.status !== "succeeded")
       return false;
     const runBeganAt = latestRun.startedAt ?? latestRun.createdAt;
 
@@ -1768,6 +1768,7 @@ export function recoveryService(
           eq(issueRecoveryActions.sourceIssueId, issue.id),
           eq(issueRecoveryActions.status, "resolved"),
           eq(issueRecoveryActions.outcome, "handed_back"),
+          eq(issueRecoveryActions.returnOwnerAgentId, issue.assigneeAgentId),
           gte(issueRecoveryActions.resolvedAt, runBeganAt),
         ),
       )
@@ -4944,7 +4945,8 @@ export function recoveryService(
         } else recordSkip(issue, "session_goal_admission");
         continue;
       }
-      if (latestRun?.status === "succeeded" && issue.status !== "in_review") {
+      if (latestRun?.status === "succeeded" && issue.status !== "in_review" &&
+          !(await wasTodoHandedBackDuringOrAfterLatestRun(issue, latestRun))) {
         const [source] = await db.select({ runtimeMode: heartbeatRuns.runtimeMode }).from(heartbeatRuns).where(eq(heartbeatRuns.id, latestRun.id)).limit(1);
         if (source?.runtimeMode !== "native") {
           let gate = "legacy_continuation_admission";
@@ -5430,6 +5432,21 @@ export function recoveryService(
       }
 
       if (issue.status === "todo") {
+        if (latestRun?.status === "succeeded" &&
+            await wasTodoHandedBackDuringOrAfterLatestRun(issue, latestRun)) {
+          const handbackState = await collectDispositionRepairSourceState(db, { issue });
+          if (handbackState.hasDurableWaitingPath || handbackState.hasActiveExecutionPath ||
+              await hasQueuedIssueWake(issue.companyId, issue.id)) {
+            recordSkip(issue, "todo_restored_execution");
+            continue;
+          }
+          const queued = await enqueueInitialAssignedTodoDispatch(issue, agentId);
+          if (queued) {
+            result.assignmentDispatched += 1;
+            result.issueIds.push(issue.id);
+          } else recordSkip(issue, "todo_initial_admission");
+          continue;
+        }
         if (!latestRun) {
           // The onboarding first task is deliberately created without a wake:
           // nothing runs and no token is spent until the user types. It is not

@@ -30,9 +30,8 @@ export function isSuppressedLegacyDispositionRepair(run: { errorCode?: string | 
 }
 export const DISPOSITION_REPAIR_CONTINUATION_INSTRUCTION =
   "For unfinished work needing another turn, preserve the current assignee and active execution/checkout locks. " +
-  "Schedule a future executionPolicy.monitor.nextCheckAt with actionable monitor.notes through the issue update API, " +
-  "and verify monitorNextCheckAt is non-null before ending this run. Merge the monitor into the existing execution policy. " +
-  "This durable continuation lets source revalidation settle the recovery action. " +
+  "If work is actionable now, continue it in this run; do not create a monitor merely to represent queued work. " +
+  "For a real external wait, record the appropriate durable waiting target; use a monitor only for a specific future event. " +
   "Do not resolve restored/todo from your own active repair run: that retry is for a blocked Board-escalated action. " +
   "Never release or cancel a live run to hand work back.";
 export const LEGACY_DISPOSITION_REPAIR_INSTRUCTION =
