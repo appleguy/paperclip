@@ -384,6 +384,15 @@ export class OpenCodeHttpDriver implements ProviderDriver {
     return "working";
   }
 
+  async verifyStoppedMessage(conversationId: string, messageId: string): Promise<boolean> {
+    try {
+      if (await this.stateOutcome(conversationId, messageId) !== "hook_observed") return false;
+      return await this.inflightMessage(conversationId) === null;
+    } catch {
+      return false;
+    }
+  }
+
   // Do not interrupt an idle session or a different (possibly owner-driven) turn.
   // A repeated Stop after the provider goes idle is a no-op, not a second write.
   async interruptExpectedMessage(conversationId: string, messageId: string, op: Op, fence: Fence): Promise<"requested" | "uncertain" | "idle"> {
@@ -393,6 +402,7 @@ export class OpenCodeHttpDriver implements ProviderDriver {
       // An unreadable state is not authority to cancel an unverified turn.
       return "uncertain";
     }
+    // An outside client can start a turn here or later interrupt a fresh turn.
     return this.interrupt(conversationId, op, fence);
   }
 

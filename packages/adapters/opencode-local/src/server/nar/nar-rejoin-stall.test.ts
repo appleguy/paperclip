@@ -4,7 +4,7 @@ import path from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // SCO-756: a rejoined in-flight message that makes no progress must not hold the run open forever.
-const d = vi.hoisted(() => ({ inflight: "msg_old" as string | null, marks: [] as (string | null)[], interrupts: 0, settleAfter: Infinity, reads: 0, successorAfter: Infinity }));
+const d = vi.hoisted(() => ({ inflight: "msg_old" as string | null, marks: [] as (string | null)[], interrupts: 0, settleAfter: Infinity, reads: 0, successorAfter: Infinity, interruptResult: "requested" as "requested" | "uncertain", verified: false, checks: 0, pidAfterStop: 7 }));
 vi.mock("./opencode-http-driver.js", async (orig) => {
   const real = await orig<typeof import("./opencode-http-driver.js")>();
   class FakeDriver {
@@ -16,8 +16,9 @@ vi.mock("./opencode-http-driver.js", async (orig) => {
     async submit() { throw new Error("must not resend on rejoin"); }
     async readOutcomeMsg() { return ++d.reads >= d.settleAfter ? "hook_observed" : "working"; }
     async progressMark() { return d.marks.length > 1 ? d.marks.shift()! : d.marks[0] ?? null; }
-    async interruptExpectedMessage() { d.interrupts++; d.inflight = null; return "requested"; }
-    async probePid() { return 7; }
+    async interruptExpectedMessage() { d.interrupts++; d.inflight = null; return d.interruptResult; }
+    async verifyStoppedMessage() { d.checks++; return d.verified; }
+    async probePid() { return d.interrupts ? d.pidAfterStop : 7; }
   }
   return { ...real, OpenCodeHttpDriver: FakeDriver };
 });
@@ -41,7 +42,7 @@ async function run(extra: Record<string, unknown>, onLine?: (line: string) => vo
 }
 
 describe("NAR rejoin stall watchdog", () => {
-  beforeEach(() => { Object.assign(d, { inflight: messageIdFor(narOpIdFor("run-1")), marks: ["same"], interrupts: 0, settleAfter: Infinity, reads: 0, successorAfter: Infinity }); });
+  beforeEach(() => { Object.assign(d, { inflight: messageIdFor(narOpIdFor("run-1")), marks: ["same"], interrupts: 0, settleAfter: Infinity, reads: 0, successorAfter: Infinity, interruptResult: "requested", verified: false, checks: 0, pidAfterStop: 7 }); });
 
   it("does not call a different active message an idle session", async () => {
     d.successorAfter = 3;
@@ -81,6 +82,23 @@ describe("NAR rejoin stall watchdog", () => {
       expect(res.executionRecovery).toMatchObject({ providerWorkStarted: true, reason: "unowned_turn" });
     }
   });
+
+  it.each([true, false])("requires target proof after an uncertain interrupt (verified: %s)", async verified => {
+    d.interruptResult = "uncertain";
+    d.verified = verified;
+    d.pidAfterStop = 8;
+    const controller = new AbortController();
+    const { res } = await run({ signal: controller.signal, rejoinStallMs: 60_000 }, line => {
+      if (line.includes("nar_rejoin")) setTimeout(() => controller.abort({ code: "paperclip_explicit_run_stop" }), 0);
+    });
+    expect(d.interrupts).toBe(1);
+    expect(d.checks).toBeGreaterThan(0);
+    if (verified) expect(res.providerTermination).toMatchObject({ proof: "session_idle" });
+    else {
+      expect(res.providerTermination).toBeUndefined();
+      expect(res.executionRecovery).toMatchObject({ providerWorkStarted: true, reason: "interrupt_unknown" });
+    }
+  }, 25_000);
 
   it("leaves a rejoined message alone while it keeps progressing", async () => {
     d.marks = Array.from({ length: 100000 }, (_, i) => `m${i}`);

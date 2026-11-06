@@ -10,6 +10,8 @@ describe("OpenCode stop inbox cancellation", () => {
   let active: string | null;
   let deliveredDuringCancel: boolean;
   let cancellationFails: boolean;
+  let targetRecorded: boolean;
+  let idleAt: number | undefined;
   let calls: string[];
   let driver: OpenCodeHttpDriver;
   const op = { opId: "stop", kind: "interrupt" as const, payloadSha256: "" };
@@ -23,6 +25,8 @@ describe("OpenCode stop inbox cancellation", () => {
     active = null;
     deliveredDuringCancel = false;
     cancellationFails = false;
+    targetRecorded = true;
+    idleAt = 2;
     calls = [];
     const fetchImpl = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       const pathname = new URL(String(url)).pathname;
@@ -37,6 +41,9 @@ describe("OpenCode stop inbox cancellation", () => {
       }
       if (pathname === "/api/session/active") return Response.json({ data: active ? { ses_fixture: { type: "running" } } : {} });
       if (pathname.endsWith("/message")) return Response.json({ data: active ? [{ id: active, type: "user", time: { created: 1 } }] : [] });
+      if (pathname.endsWith("/message/msg_target")) return targetRecorded
+        ? Response.json({ data: { id: "msg_target", type: "user", time: { created: 1 } } }) : new Response(null, { status: 404 });
+      if (pathname === "/api/session/ses_fixture") return Response.json({ data: { time: { idle: idleAt }, outcome: "interrupted" } });
       if (pathname.endsWith("/interrupt")) return Response.json({ interrupted: true });
       return new Response(null, { status: 404 });
     }) as unknown as typeof fetch;
@@ -81,5 +88,20 @@ describe("OpenCode stop inbox cancellation", () => {
     active = "msg_successor";
     expect(await driver.interruptExpectedMessage("ses_fixture", "msg_target", op, fence)).toBe("idle");
     expect(calls.some((call) => call.endsWith("/interrupt"))).toBe(false);
+  });
+
+  it("requires an idle session and an observed target outcome to verify an uncertain stop", async () => {
+    expect(await driver.verifyStoppedMessage("ses_fixture", "msg_target")).toBe(true);
+    active = "msg_successor";
+    expect(await driver.verifyStoppedMessage("ses_fixture", "msg_target")).toBe(false);
+    active = null;
+    pending = ["msg_target"];
+    expect(await driver.verifyStoppedMessage("ses_fixture", "msg_target")).toBe(false);
+    pending = [];
+    idleAt = undefined;
+    expect(await driver.verifyStoppedMessage("ses_fixture", "msg_target")).toBe(false);
+    idleAt = 2;
+    targetRecorded = false;
+    expect(await driver.verifyStoppedMessage("ses_fixture", "msg_target")).toBe(false);
   });
 });

@@ -94,10 +94,11 @@ const interrupted = (
 
 /** A different active or queued message does not prove that this session is idle. */
 async function verifyTermination(
-  driver: OpenCodeHttpDriver, hostPid: number | null, conversationId: string,
+  driver: OpenCodeHttpDriver, hostPid: number | null, conversationId: string, uncertainMessageId?: string,
 ): Promise<"server_restarted" | "session_idle" | null> {
   const pid = await driver.probePid();
   if (pid === null) return null;
+  if (uncertainMessageId) return await driver.verifyStoppedMessage(conversationId, uncertainMessageId) ? "session_idle" : null;
   if (hostPid !== null && pid !== hostPid) return "server_restarted";
   try {
     return (await driver.inflightMessage(conversationId)) === null ? "session_idle" : null;
@@ -373,7 +374,7 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
         if (interruptResult !== "rejoin") {
           // Verify from OpenCode that the turn ended (session idle/absent, or the server restarted).
           for (let i = 0; i < 10; i++) {
-            const proof = await verifyTermination(driver, hostPid, conversationId);
+            const proof = await verifyTermination(driver, hostPid, conversationId, interruptResult === "uncertain" ? msgId : undefined);
             if (proof) return interrupted("stopped by explicit Stop", proof, conversationId);
             await sleep(1500);
           }
