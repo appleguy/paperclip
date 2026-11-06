@@ -552,6 +552,10 @@ export async function releaseDeployInterruptedReplayHolds(db: Db, now = new Date
       and not (${issueRecoveryActions.evidence} ? 'workspaceRestoreFailure')
       and not (${issueRecoveryActions.evidence} ? 'workspaceRestoreRecovery')
       and not (${issueRecoveryActions.evidence} ? 'systemRecovery')
+      -- Historical actions can omit workspace evidence retained on the run.
+      -- Provider interruption proof alone cannot discharge that obligation.
+      and coalesce(${heartbeatRuns.resultJson}->>'workspaceRestoreFailure', '') <> 'restore_unsafe_archive'
+      and coalesce(${heartbeatRuns.resultJson}->'workspaceRestoreRecovery'->>'schema', '') <> 'paperclip.workspace-restore-recovery.v1'
       and ((${heartbeatRuns.errorCode} = 'server_shutdown_interrupted'
         and ${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType' = 'claude_rc')
         or (${heartbeatRuns.resultJson}->'executionRecovery'->>'kind' = 'interrupted'

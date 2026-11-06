@@ -8,7 +8,7 @@ import {
 import type { ExecutionReconciliation } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
-import { markExecutionReconciliation, validateExecutionReconciliation } from "./execution-recovery-resolution.js";
+import { markExecutionReconciliation, releaseDeployInterruptedReplayHolds, validateExecutionReconciliation } from "./execution-recovery-resolution.js";
 import { remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "./workspace-restore-recovery-state.js";
 
@@ -168,6 +168,57 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     const [source] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, f.leaseId));
     expect(source).toMatchObject({ status: "released", leasePolicy: "retain_on_failure",
       metadata: { remoteExecutionTermination: { state: "stopped" } } });
+  });
+
+  it("keeps a source-only unsafe restore hold through the replay sweep until repair is recorded", async () => {
+    const f = await seed();
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+    await db.update(heartbeatRuns).set({ errorCode: "server_shutdown_interrupted",
+      runnerProfileJson: { adapterDispatch: { adapterType: "claude_rc" } },
+      resultJson: { ...run.resultJson, workspaceRestoreFailure: "restore_unsafe_archive" },
+    }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    await db.update(issueRecoveryActions).set({ evidence: { runId: f.sourceRunId, automaticRecovery: { replay: "blocked" } } })
+      .where(eq(issueRecoveryActions.id, f.actionId));
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ recoveryActionId: f.actionId, workspaceRepairRequired: true });
+    await releaseDeployInterruptedReplayHolds(db);
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ recoveryActionId: f.actionId, workspaceRepairRequired: true });
+    await expect(validateExecutionReconciliation({ db, ...f, decision: { ...f.decision, workspaceRepairEvidence: undefined } }))
+      .rejects.toThrow("workspaceRepairEvidence");
+    await validateExecutionReconciliation({ db, ...f });
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId));
+    await markExecutionReconciliation(db, action, f.decision, "board");
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId));
+    expect(recorded.evidence.executionReconciliation).toMatchObject({ runId: f.sourceRunId,
+      workspaceRepairEvidence: f.decision.workspaceRepairEvidence });
+  });
+
+  it("still releases a deploy-interrupted replay hold with no workspace evidence", async () => {
+    const f = await seed();
+    await db.update(heartbeatRuns).set({ errorCode: "server_shutdown_interrupted",
+      runnerProfileJson: { adapterDispatch: { adapterType: "claude_rc" } }, resultJson: null,
+    }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    await db.update(issueRecoveryActions).set({ evidence: { runId: f.sourceRunId, automaticRecovery: { replay: "blocked" } } })
+      .where(eq(issueRecoveryActions.id, f.actionId));
+    await releaseDeployInterruptedReplayHolds(db);
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId));
+    expect(action.evidence.automaticRecovery).toMatchObject({ replay: "allowed" });
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+  });
+
+  it.each(["unsafe_marker", "recovery_schema"])("retains source-only %s independently in the replay sweep", async evidence => {
+    const f = await seed();
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+    await db.update(heartbeatRuns).set({ errorCode: "server_shutdown_interrupted",
+      runnerProfileJson: { adapterDispatch: { adapterType: "claude_rc" } },
+      resultJson: evidence === "unsafe_marker" ? { workspaceRestoreFailure: "restore_unsafe_archive" }
+        : { workspaceRestoreRecovery: run.resultJson!.workspaceRestoreRecovery },
+    }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    await db.update(issueRecoveryActions).set({ evidence: { runId: f.sourceRunId, automaticRecovery: { replay: "blocked" } } })
+      .where(eq(issueRecoveryActions.id, f.actionId));
+    await releaseDeployInterruptedReplayHolds(db);
+    const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, f.actionId));
+    expect(action.evidence.automaticRecovery).toMatchObject({ replay: "blocked" });
   });
 
   it("preserves the host process check for local restore failures", async () => {
