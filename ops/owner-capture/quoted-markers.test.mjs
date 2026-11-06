@@ -27,6 +27,9 @@ const automated = [wake, task, 'Paperclip task context:\n- Issue: "SCO-977"\n', 
   'You are resuming an existing Paperclip session.'),
   'From: peer\nTo: platform\n' + owner[0],
   'Paperclip has materialized selected runtime skills for this ACPX Codex run.\n' + wake,
+  '{"schema":"owner-example","text":"Please explain this JSON"}',
+  '<shell>Owner asks about this literal tag</shell>',
+  'Respond with hello.',
 ];
 const prompts = [...owner, ...automated];
 function fixture(name) {
@@ -41,16 +44,16 @@ function fixture(name) {
   return { dir, run, rows };
 }
 
-test('capture retains quoted and mixed owner prompts, excludes automated envelopes', () => {
+test('capture retains ambiguous exact envelopes and quoted or mixed owner prompts', () => {
   const f = fixture('capture');
   prompts.forEach((prompt, i) => f.run(['capture'], JSON.stringify({
     session_id: 'receipt', message_id: String(i), cwd: f.dir, prompt,
   })));
-  assert.deepEqual(f.rows(f.run(['list'])).map(r => r.text).sort(), [...owner].sort());
+  assert.deepEqual(f.rows(f.run(['list'])).map(r => r.text).sort(), [...prompts].sort());
 });
 
 for (const harness of ['claude', 'codex', 'opencode-v1', 'opencode-v2']) {
-  test(`${harness} scan agrees with capture for quoted, mixed and automated prompts`, () => {
+  test(`${harness} scan retains ambiguous envelopes and agrees with capture`, () => {
     const f = fixture(harness);
     let transcript;
     if (harness.startsWith('opencode')) {
@@ -74,7 +77,7 @@ for (const harness of ['claude', 'codex', 'opencode-v1', 'opencode-v2']) {
       writeFileSync(transcript, records.map(r => JSON.stringify(r)).join('\n') + '\n');
     }
     const scanned = f.rows(f.run(['scan', transcript]));
-    assert.deepEqual(scanned.map(r => r.text), owner);
+    assert.deepEqual(scanned.map(r => r.text), prompts);
     assert.equal(f.rows(f.run(['scan', transcript, String(prompts.length + 2)])).length, 0);
   });
 }

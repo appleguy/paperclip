@@ -32,21 +32,14 @@ Run `node --test ops/owner-capture/event-identity.test.mjs`. All inputs and stat
 are synthetic and retained under NVM scratch. Text fixtures are archived rather
 than deleted, per `file-hygiene`; no production ledger is mutated by tests.
 
-Receipt capture and Claude, Codex and both OpenCode schema scans share the same
-Paperclip envelope classifier (SCO-977). A wake/resume envelope must start the
-message, carry its generated opening sentence, and contain reason/issue fields;
-a task-context envelope must start the message and contain its issue field.
-Owner prose mentioning markers, or preceding a quoted payload with an instruction,
-is retained. Existing transport exclusions (Codex exec, Claude metadata and
-OpenCode synthetic/compaction rows) still apply. Text structure is a fallback,
-not authentication: an exact envelope without origin metadata is ambiguous.
-Run `node --test ops/owner-capture/quoted-markers.test.mjs` for receipt/scan parity,
-mixed owner-plus-payload cases and automated-envelope exclusions.
-
-The older shared text-based wake and automated-message exclusions above remain
-in this source. They can suppress an owner-authored exact envelope without
-trusted origin metadata and therefore do not yet meet the no-shape-only
-classification requirement. They require reconciliation before installation.
+Capture and scans retain nonempty text even when it resembles a wake, peer mail,
+tool result, or health probe. Text shape is not authentication. Trusted Codex
+provenance, guardian/exec transport, Claude metadata, and OpenCode synthetic or
+identified NAR occurrences remain excluded. Unattributed injections can thus
+appear in the ledger and require independent verification and correction; this
+is preferable to silently dropping genuine steering. Run
+`node --test ops/owner-capture/quoted-markers.test.mjs` for parity and ambiguous
+envelope fixtures.
 
 Deployment belongs to the outside Platform Lead: recheck the actual source/live
 diff against the then-current live script and preserve any newer live protections

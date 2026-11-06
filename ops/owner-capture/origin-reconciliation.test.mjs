@@ -27,6 +27,24 @@ test('source provenance distinguishes peer and harness from owner steering', () 
   f.run(['_ledger_add', ''], scanned.map(JSON.stringify).join('\n') + '\n');
   assert.equal(f.run(['list']).trim().split('\n').length, 4);
 });
+test('guardian transport remains excluded', () => {
+  const f = fixture(); const tr = path.join(f.dir, 'rollout-guardian.jsonl');
+  writeFileSync(tr, JSON.stringify({type:'session_meta',payload:{id:'guardian',source:{subagent:{other:'guardian'}}}})+'\n'+JSON.stringify({type:'response_item',payload:{type:'message',role:'user',content:[{type:'input_text',text:'owner-like text'}]}})+'\n');
+  assert.equal(f.run(['scan',tr]), '');
+  f.run(['capture'], JSON.stringify({session_id:'guardian',transcript_path:tr,prompt:'owner-like text'}));
+  assert.equal(f.run(['list']), '');
+});
+test('OpenCode managed NAR identity excludes only the identified occurrence', () => {
+  const f = fixture(); const db = path.join(f.dir, 'oc.db');
+  const sql = `create table session_v2(id text,directory text,metadata text); create table session_message(id text,session_id text,type text,seq integer,time_created integer,data text); insert into session_v2 values('seat','/test','{"paperclip":{"agentId":"agent","issueId":"issue"}}'); insert into session_message values('msg_aaaaaaaaaaaaaaaaaaaaaaaaaa','seat','user',1,1700000000000,'{"text":"same text"}'); insert into session_message values('owner-id','seat','user',2,1700000000001,'{"text":"same text"}');`;
+  execFileSync('sqlite3',[db],{input:sql}); f.env.OPENCODE_DB=db; f.env.OWNER_GUARD_SRC='opencode';
+  const rows=f.run(['scan',`opencode:seat@${db}`]).trim().split('\n').map(JSON.parse);
+  assert.deepEqual(rows.map(x=>x.event),['message:owner-id']);
+  f.run(['capture'], JSON.stringify({session_id:'seat',message_id:'msg_aaaaaaaaaaaaaaaaaaaaaaaaaa',prompt:'same text'}));
+  assert.equal(f.run(['list']),'');
+  f.run(['capture'], JSON.stringify({session_id:'seat',prompt:'same text'}));
+  assert.equal(JSON.parse(f.run(['list']).trim()).text,'same text');
+});
 test('later dropped closure supersedes an earlier watch without rewriting history', () => {
   const f = fixture(); mkdirSync(path.join(f.dir, 'open'));
   const file = path.join(f.dir, 'open/seat.jsonl');
