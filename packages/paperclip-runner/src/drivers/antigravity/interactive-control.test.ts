@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { AntigravityInteractiveControl, emptyAgyEditor } from "./interactive-control.js";
+import { AntigravityInteractiveControl, emptyAgyEditor, isAgySeatIdle } from "./interactive-control.js";
 
 const scratch = "/Volumes/NVM/AI_Agent_Runtime/tmp";
 const screen = ["https://antigravity.google.com/r/seat-1", "────────────", ">", "────────────"].join("\n");
@@ -106,11 +106,12 @@ describe("Antigravity interactive seat", () => {
       return "";
     };
     try {
-      await writeFile(path.join(stateDir, "active.json"), JSON.stringify({ runId: "run-1" }));
+      await writeFile(path.join(stateDir, "active.json"), JSON.stringify({ runId: "run-1", conversationId: "conversation-1" }));
       const control = await AntigravityInteractiveControl.attach({ socket: "socket", session: "seat", stateDir, authorize: () => true, tmux });
-      await expect(control.interruptRun("other", { isIdle: async () => false })).rejects.toThrow(/ownership/);
+      await expect(control.interruptRun("other", {})).rejects.toThrow(/ownership/);
       expect(calls.filter(args => args[0] === "send-keys")).toEqual([]);
-      const result = await control.interruptRun("run-1", { isIdle: async () => clock >= 6000, now: () => clock,
+      const result = await control.interruptRun("run-1", { readStatus: async () => ({ agentState: clock >= 6000 ? "idle" : "working",
+        conversationId: "conversation-1", pendingInputCount: 0, toolConfirmationPending: false, observedAt: new Date(clock).toISOString() }), now: () => clock,
         wait: async ms => { clock += ms; }, timeoutMs: 10_000 });
       expect(result).toBe("idle");
       expect(calls.filter(args => args[0] === "send-keys")).toEqual([
@@ -126,11 +127,11 @@ describe("Antigravity interactive seat", () => {
     try {
       await writeFile(path.join(stateDir, "active.json"), JSON.stringify({ runId: "run-1" }));
       const control = await AntigravityInteractiveControl.attach({ socket: "socket", session: "seat", stateDir, authorize: () => true, tmux });
-      expect(await control.interruptRun("run-1", { isIdle: async () => false, now: () => clock,
+      expect(await control.interruptRun("run-1", { now: () => clock,
         wait: async ms => { clock += ms; }, timeoutMs: 1000 })).toBe("restart_required");
-      await expect(control.interruptRun("run-1", { isIdle: async () => {
+      await expect(control.interruptRun("run-1", { readStatus: async () => {
         await writeFile(path.join(stateDir, "active.json"), JSON.stringify({ runId: "run-2" }));
-        return false;
+        return null;
       }, now: () => clock, wait: async ms => { clock += ms; }, timeoutMs: 1000 })).rejects.toThrow(/ownership/);
     } finally { await rm(stateDir, { recursive: true, force: true }); }
   });
@@ -159,7 +160,7 @@ describe("Antigravity interactive seat", () => {
       await expect(control.restartRunSeat("run-1", { ...launch, conversationId: "--bad" })).rejects.toThrow(/Invalid/);
       await expect(control.restartRunSeat("run-1", launch)).rejects.toThrow(/interrupt timeout/);
       let clock = 0;
-      expect(await control.interruptRun("run-1", { isIdle: async () => false, now: () => clock,
+      expect(await control.interruptRun("run-1", { now: () => clock,
         wait: async ms => { clock += ms; }, timeoutMs: 1000 })).toBe("restart_required");
       await expect(control.restartRunSeat("run-1", { ...launch, conversationId: "other" })).rejects.toThrow(/conversation/);
       expect(calls.some(args => args[0] === "kill-session")).toBe(false);
@@ -174,5 +175,15 @@ describe("Antigravity interactive seat", () => {
     expect(emptyAgyEditor(screen)).toBe(true);
     expect(emptyAgyEditor(screen.replace(">", "> owner text"))).toBe(false);
     expect(emptyAgyEditor("Generating..." )).toBe(false);
+  });
+
+  it("requires fresh idle status for the checkpointed conversation", () => {
+    const idle = { agentState: "idle", conversationId: "c1", pendingInputCount: 0,
+      toolConfirmationPending: false, observedAt: new Date(20_000).toISOString() };
+    expect(isAgySeatIdle(idle, "c1", 19_000, 20_000)).toBe(true);
+    expect(isAgySeatIdle(idle, "c2", 19_000, 20_000)).toBe(false);
+    expect(isAgySeatIdle(idle, "c1", 20_001, 20_001)).toBe(false);
+    expect(isAgySeatIdle(idle, "c1", 19_000, 31_000)).toBe(false);
+    expect(isAgySeatIdle({ ...idle, pendingInputCount: 1 }, "c1", 19_000, 20_000)).toBe(false);
   });
 });

@@ -29,6 +29,14 @@ export function emptyAgyEditor(screen: string): boolean {
   return false;
 }
 
+export function isAgySeatIdle(snapshot: unknown, conversationId: unknown, after: number, now: number): boolean {
+  if (!snapshot || typeof snapshot !== "object" || typeof conversationId !== "string" || !conversationId) return false;
+  const status = snapshot as Record<string, unknown>;
+  const observed = typeof status.observedAt === "string" ? Date.parse(status.observedAt) : NaN;
+  return status.agentState === "idle" && status.conversationId === conversationId && status.pendingInputCount === 0 &&
+    status.toolConfirmationPending === false && Number.isFinite(observed) && observed >= after && observed <= now && now - observed <= 10_000;
+}
+
 /** An existing seat is usable only while its exact pane and process remain present.
  * The caller holds the seat lock and reconciles any prior dispatched turn. */
 export class AntigravityInteractiveControl {
@@ -78,7 +86,7 @@ export class AntigravityInteractiveControl {
 
   /** The caller holds the seat lock for the whole operation. */
   async interruptRun(runId: string, options: {
-    isIdle: (after: number) => Promise<boolean>; wait?: (ms: number) => Promise<void>;
+    readStatus?: () => Promise<unknown>; wait?: (ms: number) => Promise<void>;
     now?: () => number; timeoutMs?: number;
   }): Promise<"idle" | "restart_required"> {
     this.restartEligibleRun = undefined;
@@ -86,13 +94,21 @@ export class AntigravityInteractiveControl {
     const wait = options.wait ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
     const started = now();
     const deadline = started + (options.timeoutMs ?? 60_000);
+    const readStatus = options.readStatus ?? (async () => {
+      try { return JSON.parse(await fs.readFile(path.join(this.input.stateDir, "status-line.json"), "utf8")); } catch { return null; }
+    });
     const check = () => this.assertRunOwner(runId);
     await check();
     await this.input.tmux(["send-keys", "-t", this.input.paneId, "Escape"]);
     let sentControlC = false;
     while (now() < deadline) {
       await check();
-      if (await options.isIdle(started)) { await check(); return "idle"; }
+      const checkpoint = JSON.parse(await fs.readFile(path.join(this.input.stateDir, "active.json"), "utf8")) as { conversationId?: unknown };
+      const status = await readStatus();
+      const screen = await this.input.tmux(["capture-pane", "-t", this.input.paneId, "-p", "-J", "-S", "-150"]);
+      if (isAgySeatIdle(status, checkpoint.conversationId, started, now()) && emptyAgyEditor(screen)) {
+        await check(); return "idle";
+      }
       if (!sentControlC && now() - started >= 5000) {
         await check();
         await this.input.tmux(["send-keys", "-t", this.input.paneId, "C-c"]);
