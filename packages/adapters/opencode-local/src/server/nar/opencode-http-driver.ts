@@ -270,7 +270,7 @@ export class OpenCodeHttpDriver implements ProviderDriver {
   // Rejoin (spec: restart resumes, never replays): the user message the conversation is still working on, or
   // null when it is idle. A retry run after a Paperclip restart settles on this message instead of submitting
   // a second prompt into the same conversation.
-  async inflightMessage(conversationId: string): Promise<string | null> {
+  async inflightMessage(conversationId: string, options?: { cancelPendingMessageId: string }): Promise<string | null> {
     const sid = encodeURIComponent(conversationId);
     const inbox = await this.json("GET", `/api/session/${sid}/inbox`);
     if (inbox.status !== 200 || !Array.isArray(inbox.data?.data)) {
@@ -279,6 +279,14 @@ export class OpenCodeHttpDriver implements ProviderDriver {
     const pending = inbox.data.data;
     if (pending.some((item: unknown) => !item || typeof item !== "object" || typeof (item as { id?: unknown }).id !== "string")) {
       throw new OpenCodeHttpError("mismatch", "session.inbox contains an item without an id");
+    }
+    if (options && pending.some((item: any) => item.id === options.cancelPendingMessageId)) {
+      try {
+        const cancelled = await this.json("DELETE", `/api/session/${sid}/inbox/${encodeURIComponent(options.cancelPendingMessageId)}`);
+        if (cancelled.status === 204) return this.inflightMessage(conversationId);
+      } catch {
+        // Preserve the existing interrupt path if queued cancellation fails.
+      }
     }
     const last = pending[pending.length - 1];
     if (typeof last?.id === "string") return last.id;
@@ -357,7 +365,7 @@ export class OpenCodeHttpDriver implements ProviderDriver {
   // A repeated Stop after the provider goes idle is a no-op, not a second write.
   async interruptExpectedMessage(conversationId: string, messageId: string, op: Op, fence: Fence): Promise<"requested" | "uncertain" | "idle"> {
     try {
-      if (await this.inflightMessage(conversationId) !== messageId) return "idle";
+      if (await this.inflightMessage(conversationId, { cancelPendingMessageId: messageId }) !== messageId) return "idle";
     } catch {
       // An unreadable state is not authority to cancel an unverified turn.
       return "uncertain";
