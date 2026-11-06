@@ -41,6 +41,7 @@ import {
   asc,
   desc,
   eq,
+  exists,
   gt,
   getTableColumns,
   gte,
@@ -2199,6 +2200,7 @@ export function recoveryService(
         and(
           eq(issueRelations.type, "blocks"),
           eq(issueRelations.companyId, issues.companyId),
+          eq(companies.status, "active"),
           opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
           inArray(issues.status, ["todo", "blocked"]),
           isNull(issues.assigneeAgentId),
@@ -2223,6 +2225,11 @@ export function recoveryService(
       if (seen.has(candidate.id)) continue;
       seen.add(candidate.id);
 
+      if (await isAutomaticRecoverySuppressedByPauseHold(db, candidate.companyId, candidate.id, treeControlSvc)) {
+        skipped += 1;
+        continue;
+      }
+
       const creatorAgentId = candidate.createdByAgentId;
       if (!creatorAgentId) {
         skipped += 1;
@@ -2232,6 +2239,7 @@ export function recoveryService(
       if (
         !creatorAgent ||
         creatorAgent.companyId !== candidate.companyId ||
+        isAgentAwaitingSetup(creatorAgent) ||
         !(await isAgentInvokable(creatorAgent))
       ) {
         skipped += 1;
@@ -4546,6 +4554,9 @@ export function recoveryService(
         and(
           opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
           opts?.issueId ? eq(issues.id, opts.issueId) : undefined,
+          exists(db.select({ id: companies.id }).from(companies).where(and(
+            eq(companies.id, issues.companyId), eq(companies.status, "active"),
+          ))),
           isNull(issues.assigneeUserId),
           inArray(issues.status, ["todo", "in_progress", "in_review"]),
           or(
@@ -4622,6 +4633,10 @@ export function recoveryService(
     }
 
     for (const issue of candidates) {
+      if (await isAutomaticRecoverySuppressedByPauseHold(db, issue.companyId, issue.id, treeControlSvc)) {
+        recordSkip(issue, "pause_hold");
+        continue;
+      }
       if (issue.originKind === "chat_channel") {
         if (opts?.skipExternalConversationSettlement) {
 
@@ -4815,18 +4830,6 @@ export function recoveryService(
       );
       if (activeRecoveryAction?.ownerType === "board") {
         recordSkip(issue, "board_recovery_action");
-        continue;
-      }
-
-      if (
-        await isAutomaticRecoverySuppressedByPauseHold(
-          db,
-          issue.companyId,
-          issue.id,
-          treeControlSvc,
-        )
-      ) {
-        recordSkip(issue, "pause_hold");
         continue;
       }
 

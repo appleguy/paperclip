@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { activityLog, agents, agentTaskSessions, agentWakeupRequests, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issues } from "@paperclipai/db";
+import { activityLog, agents, agentTaskSessions, agentWakeupRequests, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issueComments, issueRelations, issueTreeHolds, issues } from "@paperclipai/db";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -36,6 +36,59 @@ describe.skipIf(!support.supported)("stranded assigned issue recovery", () => {
     const sweep = () => service.reconcileStrandedAssignedIssues({ companyId: company.id, skipRelatedRecovery: true });
     return { company, agent, issue, run, enqueueWakeup, scheduleRecoveryRetry, sweep };
   }
+
+  it.each(["company", "tree"])("leaves %s-held stranded work untouched until resumed", async scope => {
+    const f = await fixture();
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.agent.id));
+    let holdId: string | undefined;
+    if (scope === "company") {
+      await db.update(companies).set({ status: "paused" }).where(eq(companies.id, f.company.id));
+    } else {
+      const [hold] = await db.insert(issueTreeHolds).values({ companyId: f.company.id, rootIssueId: f.issue.id, mode: "pause" }).returning();
+      holdId = hold.id;
+    }
+    expect(await f.sweep()).toMatchObject({ escalated: 0, continuationRequeued: 0 });
+    expect((await db.select().from(issues).where(eq(issues.id, f.issue.id)))[0].status).toBe("in_progress");
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issue.id))).toHaveLength(0);
+    expect(f.enqueueWakeup).not.toHaveBeenCalled();
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.agent.id));
+    if (holdId) await db.update(issueTreeHolds).set({ status: "released" }).where(eq(issueTreeHolds.id, holdId));
+    else await db.update(companies).set({ status: "active" }).where(eq(companies.id, f.company.id));
+    expect(await f.sweep()).toMatchObject({ continuationRequeued: 1, escalated: 0 });
+  });
+
+  it.each(["company", "tree", "setup", "invalid_chain", "none"])("only assigns an eligible orphan blocker after %s clears", async gate => {
+    const f = await fixture();
+    const [parent] = await db.insert(issues).values({ companyId: f.company.id, title: "Parent", status: "todo", responsibleUserId: "stranded-owner" }).returning();
+    const [blocker] = await db.insert(issues).values({ companyId: f.company.id, parentId: parent.id, title: "Orphan blocker", status: "todo", createdByAgentId: f.agent.id, responsibleUserId: "stranded-owner" }).returning();
+    await db.insert(issueRelations).values({ companyId: f.company.id, issueId: blocker.id, relatedIssueId: f.issue.id, type: "blocks" });
+    let holdId: string | undefined;
+    if (gate === "company") await db.update(companies).set({ status: "paused" }).where(eq(companies.id, f.company.id));
+    if (gate === "tree") {
+      const [hold] = await db.insert(issueTreeHolds).values({ companyId: f.company.id, rootIssueId: parent.id, mode: "pause" }).returning();
+      holdId = hold.id;
+    }
+    if (gate === "setup") await db.update(agents).set({ lifecycleState: "preparing", lifecycleHolds: [] }).where(eq(agents.id, f.agent.id));
+    if (gate === "invalid_chain") {
+      const [manager] = await db.insert(agents).values({ companyId: f.company.id, name: "Former manager", role: "engineer", status: "terminated" }).returning();
+      await db.update(agents).set({ reportsTo: manager.id }).where(eq(agents.id, f.agent.id));
+    }
+    const service = recoveryService(db, { enqueueWakeup: f.enqueueWakeup });
+    const sweep = () => service.reconcileUnassignedBlockingIssues({ companyId: f.company.id });
+    expect((await sweep()).assigned).toBe(gate === "none" ? 1 : 0);
+    if (gate !== "none") {
+      expect((await db.select().from(issues).where(eq(issues.id, blocker.id)))[0].assigneeAgentId).toBeNull();
+      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, blocker.id))).toHaveLength(0);
+      expect(f.enqueueWakeup).not.toHaveBeenCalled();
+      if (gate === "company") await db.update(companies).set({ status: "active" }).where(eq(companies.id, f.company.id));
+      if (holdId) await db.update(issueTreeHolds).set({ status: "released" }).where(eq(issueTreeHolds.id, holdId));
+      if (gate === "setup") await db.update(agents).set({ lifecycleState: "ready", lifecycleHolds: [] }).where(eq(agents.id, f.agent.id));
+      if (gate === "invalid_chain") await db.update(agents).set({ reportsTo: null }).where(eq(agents.id, f.agent.id));
+      expect((await sweep()).assigned).toBe(1);
+    }
+    expect((await db.select().from(issues).where(eq(issues.id, blocker.id)))[0].assigneeAgentId).toBe(f.agent.id);
+    expect(f.enqueueWakeup).toHaveBeenCalledTimes(1);
+  });
 
   it.each(["failed", "cancelled", "timed_out", "interrupted"])("admits a successor when %s has no eligible infrastructure retry", async status => {
     const f = await fixture(status);
