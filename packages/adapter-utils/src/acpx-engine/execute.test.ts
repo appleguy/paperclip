@@ -915,6 +915,27 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(a.indexOf("The agent instructions earlier in this prompt")).toBeGreaterThan(a.indexOf("You are agent agent-1"));
     expect(a.indexOf("Skill root for this run:")).toBeGreaterThan(a.indexOf("Stable bootstrap."));
     expect(a.indexOf("Skill root for this run:")).toBeLessThan(a.indexOf("## Paperclip Wake Payload"));
+    // Before 3c5413e5d the exact same materialized skill block was prepended
+    // to each fresh prompt. Compare that former first section with the full
+    // current prompts; differing skill roots make the old prefix end there.
+    const skillBlock = (prompt: string) => {
+      const start = prompt.indexOf("Paperclip has materialized selected runtime skills for this ACPX Codex run.");
+      expect(start).toBeGreaterThanOrEqual(0);
+      const end = prompt.indexOf("\n\n", start);
+      expect(end).toBeGreaterThan(start);
+      return prompt.slice(start, end);
+    };
+    const prefixLength = (left: string, right: string) => {
+      let i = 0;
+      while (i < Math.min(left.length, right.length) && left[i] === right[i]) i++;
+      return i;
+    };
+    const oldA = skillBlock(a);
+    const oldB = skillBlock(b);
+    const before = prefixLength(oldA, oldB);
+    const after = prefixLength(a, b);
+    expect(before).toBeLessThan(Math.min(oldA.length, oldB.length));
+    expect(after).toBeGreaterThan(before);
     const resumed = await runExecutor({ ...config, instructionsFilePath: paths[0] }, {
       context, runtime: { sessionParams: first.result.sessionParams },
     });
