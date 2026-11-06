@@ -505,10 +505,12 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
       expect((await heartbeatService(db).reapOrphanedRuns()).runIds).not.toContain(run.id);
       expect(await read(run.id)).toMatchObject({ status: "running", resultJson: {} });
       expect((await read(run.id)).controllerBootId).not.toBe(successorBoot);
-      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, input.task.issueId!))).toEqual(
-        expect.arrayContaining([expect.objectContaining({ cause: "opencode_controller_lost_provider_unverified", evidence: expect.objectContaining({ runId: run.id }) })]),
-      );
+      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, input.task.issueId!))).toEqual([
+        expect.objectContaining({ cause: "opencode_controller_lost_provider_unverified", evidence: expect.objectContaining({ runId: run.id }) }),
+      ]);
       expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run.id))).toHaveLength(0);
+      expect(promptPosts).toBe(0);
+      expect(otherWrites).toBe(0);
     } finally {
       await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     }
