@@ -2230,16 +2230,16 @@ async function buildRuntime(input: {
   // acpx's persistent record. A different generation must own different caches.
   let tokenSessionGeneration = asString(input.ctx.runtime.sessionParams?.tokenSessionGeneration, "");
   if (input.ctx.evaluateSessionPrompt) {
-    const assembled = await buildPrompt(input.ctx, Boolean(input.ctx.runtime.sessionId || input.ctx.runtime.sessionParams), env);
+    const assembled = await buildPrompt(input.ctx, Boolean(input.ctx.runtime.sessionId || input.ctx.runtime.sessionParams), env, skillPromptInstructions);
     const gate = await preflightSessionPrompt(input.ctx, requestedModel,
-      joinPromptSections([skillPromptInstructions, assembled.prompt]),
+      assembled.prompt,
       input.ctx.runtime.sessionDisplayId ?? input.ctx.runtime.sessionId ?? null);
     if (gate.rotate) {
       applyPromptRotation(input.ctx, gate);
       tokenSessionGeneration = `rotation-${shortHash(runId)}`;
-      const fresh = await buildPrompt(input.ctx, false, env);
+      const fresh = await buildPrompt(input.ctx, false, env, skillPromptInstructions);
       await assertAssembledPrompt({ seat: agent.name, model: requestedModel,
-        prompt: joinPromptSections([skillPromptInstructions, fresh.prompt]),
+        prompt: fresh.prompt,
         share: config.tokenPreflightShare === undefined ? undefined : Number(config.tokenPreflightShare) });
       await input.ctx.onLog("stderr", `[paperclip] Starting fresh: ${gate.reason}\n`);
     }
@@ -3133,7 +3133,7 @@ function renderApiAccessNote(env: Record<string, string>): string {
   return lines.join("\n");
 }
 
-async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean, env: Record<string, string>): Promise<{
+async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean, env: Record<string, string>, skillPromptInstructions = ""): Promise<{
   prompt: string;
   promptMetrics: Record<string, number>;
   commandNotes: string[];
@@ -3155,17 +3155,18 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
     : configuredInstructionsPath;
   const instructionsDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
   let instructionsPrefix = "";
+  let instructionsPathNote = "";
   const commandNotes: string[] = [];
   if (instructionsFilePath) {
     try {
       const instructionsContents = await fs.readFile(instructionsFilePath, "utf8");
-      instructionsPrefix =
-        `${instructionsContents}\n\n` +
-        `The above agent instructions were loaded from ${instructionsFilePath}. ` +
-        `Resolve any relative file references from ${instructionsDir}.\n\n`;
+      instructionsPrefix = instructionsContents;
+      instructionsPathNote =
+        `The agent instructions earlier in this prompt were loaded from ${instructionsFilePath}. ` +
+        `Resolve any relative file references from ${instructionsDir}.`;
       commandNotes.push(
         `Loaded agent instructions from ${instructionsFilePath}`,
-        `Prepended instructions + path directive to the ACPX prompt (relative references from ${instructionsDir}).`,
+        `Added instructions and path directive to the ACPX prompt (relative references from ${instructionsDir}).`,
       );
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err);
@@ -3206,13 +3207,16 @@ async function buildPrompt(ctx: AdapterExecutionContext, resumedSession: boolean
   const prompt = joinPromptSections([
     promptInstructionsPrefix,
     renderedBootstrapPrompt,
+    hasCustomPromptTemplate ? "" : renderedPrompt,
+    shouldUseResumeDeltaPrompt ? "" : instructionsPathNote,
+    skillPromptInstructions,
     selectInitialCommunicationGuidance(context, { resumedSession }),
     wakePrompt,
     sessionHandoffNote,
     taskContextNote,
     paperclipEnvNote,
     apiAccessNote,
-    renderedPrompt,
+    hasCustomPromptTemplate ? renderedPrompt : "",
   ]);
 
   return {
@@ -5061,8 +5065,8 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // boundary. A failure here returns an error result with phase
         // `prepare_turn`.
         preparePhaseStart = now();
-        const { prompt, promptMetrics, commandNotes } = await buildPrompt(ctx, resumedSession, prepared.env);
-        runPrompt = joinPromptSections([prepared.skillPromptInstructions, prompt]);
+        const { prompt, promptMetrics, commandNotes } = await buildPrompt(ctx, resumedSession, prepared.env, prepared.skillPromptInstructions);
+        runPrompt = prompt;
         await assertAssembledPrompt({
           seat: ctx.agent.name,
           model: prepared.requestedModel,

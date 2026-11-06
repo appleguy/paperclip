@@ -885,6 +885,47 @@ describe("shared ACPX engine runtime behavior", () => {
     expect(resetPrompt).not.toContain("Execution contract:");
   });
 
+  it("keeps fresh ACPX instructions ahead of run-specific paths and preserves resume skill guidance", async () => {
+    const root = await makeTempRoot();
+    const skill = { ...await createSkill(path.join(root, "skills"), "paperclip"), key: "paperclipai/paperclip/paperclip" };
+    const paths = [path.join(root, "one", "AGENTS.md"), path.join(root, "two", "AGENTS.md")];
+    for (const file of paths) {
+      await fs.mkdir(path.dirname(file), { recursive: true });
+      await fs.writeFile(file, "Stable agent instructions.");
+    }
+    const config = {
+      agent: "codex", cwd: root, stateDir: path.join(root, "state"), mode: "persistent",
+      env: { CODEX_HOME: path.join(root, "codex-home") },
+      paperclipRuntimeSkills: [skill], paperclipSkillSync: { desiredSkills: [] },
+      bootstrapPromptTemplate: "Stable bootstrap.",
+    };
+    const context = createPromptContextFixture();
+    const first = await runExecutor({ ...config, instructionsFilePath: paths[0] }, { context });
+    const otherContext = { ...context, paperclipWake: { ...context.paperclipWake,
+      issue: { ...context.paperclipWake.issue, id: "issue-2", identifier: "PAP-2" },
+    } };
+    const second = await runExecutor({ ...config, instructionsFilePath: paths[1],
+      env: { CODEX_HOME: path.join(root, "other-codex-home") } }, { context: otherContext });
+    const a = String(first.turnInputs[0]?.text ?? "");
+    const b = String(second.turnInputs[0]?.text ?? "");
+    const stable = "Stable agent instructions.\n\nStable bootstrap.\n\nYou are agent agent-1";
+    expect(a.startsWith(stable)).toBe(true);
+    expect(b.startsWith(stable)).toBe(true);
+    expect(b).toContain("PAP-2");
+    expect(a.indexOf("The agent instructions earlier in this prompt")).toBeGreaterThan(a.indexOf("You are agent agent-1"));
+    expect(a.indexOf("Skill root for this run:")).toBeGreaterThan(a.indexOf("Stable bootstrap."));
+    expect(a.indexOf("Skill root for this run:")).toBeLessThan(a.indexOf("## Paperclip Wake Payload"));
+    const resumed = await runExecutor({ ...config, instructionsFilePath: paths[0] }, {
+      context, runtime: { sessionParams: first.result.sessionParams },
+    });
+    const resumePrompt = String(resumed.turnInputs[0]?.text ?? "");
+    expect(resumePrompt).not.toContain("Stable agent instructions.");
+    expect(resumePrompt).not.toContain("Stable bootstrap.");
+    expect(resumePrompt).not.toContain("agent instructions earlier in this prompt");
+    expect(resumePrompt).toContain("Skill root for this run:");
+    expect(resumePrompt).toContain(context.paperclipTaskMarkdownAssignmentCompact);
+  });
+
   it("includes Paperclip env and API access notes in the ACPX prompt without leaking the token", async () => {
     const { meta } = await runExecutor(
       { agent: "custom", agentCommand: "node ./fake-acp.js" },
