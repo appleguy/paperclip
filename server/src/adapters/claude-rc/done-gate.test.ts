@@ -111,6 +111,11 @@ describe("editedPaths", () => {
     const jsonl = [line("2026-11-05T01:00:00Z", "Edit", `${M}/old.ts`), line("2026-11-05T02:00:00Z", "Write", `${M}/new.ts`), line("2026-11-05T02:01:00Z", "Read", `${M}/r.ts`)].join("\n");
     expect(editedPaths(jsonl, Date.parse("2026-11-05T01:30:00Z"))).toEqual({ paths: [`${M}/new.ts`], unknown: [] });
   });
+  it("ignores tool blocks copied into api-request-blob records (SCO-1107)", () => {
+    const blob = JSON.stringify({ type: "api-request-blob", message: { content: [{ type: "tool_use", name: "Edit", input: { file_path: `${M}/copied.ts` } }] } });
+    const own = JSON.stringify({ type: "assistant", timestamp: "2026-11-05T02:00:00Z", message: { content: [{ type: "tool_use", name: "Write", input: { file_path: `${M}/mine.ts` } }] } });
+    expect(editedPaths([blob, own].join("\n"), Date.parse("2026-11-05T01:30:00Z"))).toEqual({ paths: [`${M}/mine.ts`], unknown: [] });
+  });
   it("preserves uncertainty about untimestamped tools instead of assuming replay", () => {
     const replay = JSON.stringify({ message: { content: [{ type: "tool_use", name: "Edit", input: { file_path: `${M}/replayed.ts` } }] } });
     expect(editedPaths(replay, Date.parse("2026-11-05T01:30:00Z")).unknown).toContain("tool record has no run timestamp");

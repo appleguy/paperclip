@@ -61,9 +61,12 @@ export function editedPaths(jsonl: string, sinceMs: number): MutationRecord {
   if (!jsonl.trim()) unknown.add("transcript was read successfully but is empty; no run-owned mutation evidence");
   for (const [index, line] of lines.entries()) {
     if (!line.trim()) continue;
-    let rec: { timestamp?: string; cwd?: string; message?: { content?: unknown } };
+    let rec: { type?: unknown; timestamp?: string; cwd?: string; message?: { content?: unknown } };
     try { rec = JSON.parse(line); } catch { unknown.add("transcript contains an unreadable record"); continue; }
     if (!rec || typeof rec !== "object") { unknown.add("transcript contains an invalid record"); continue; }
+    // SCO-1107: tool calls live in assistant and user records only. Claude Code also writes
+    // untimestamped copies (api-request-blob) that must not count as unattributable run tools.
+    if (typeof rec.type === "string" && rec.type !== "assistant" && rec.type !== "user") continue;
     const t = Date.parse(rec.timestamp ?? "");
     if (Number.isFinite(t) && t < sinceMs) continue;
     if (sinceMs > 0 && !Number.isFinite(t) && firstRunRecord >= 0 && index < firstRunRecord) continue;
