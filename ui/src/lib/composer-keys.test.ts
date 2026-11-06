@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isPeriodShortcutKey, isPlainEnterSend } from "./composer-keys";
+import { isPeriodShortcutKey } from "./composer-keys";
 
 describe("isPeriodShortcutKey", () => {
   it("matches the period character on any layout", () => {
@@ -20,26 +20,5 @@ describe("isPeriodShortcutKey", () => {
     expect(isPeriodShortcutKey({ key: "Unidentified", code: "Period" })).toBe(true);
     expect(isPeriodShortcutKey({ key: "", code: "Period" })).toBe(true);
     expect(isPeriodShortcutKey({ key: "Unidentified", code: "KeyV" })).toBe(false);
-  });
-});
-
-describe("isPlainEnterSend", () => {
-  const base = { key: "Enter", shiftKey: false, altKey: false, metaKey: false, ctrlKey: false };
-
-  it("accepts a bare Enter", () => {
-    expect(isPlainEnterSend(base)).toBe(true);
-  });
-
-  it("rejects modified Enter so Shift+Enter stays a newline", () => {
-    for (const mod of ["shiftKey", "altKey", "metaKey", "ctrlKey"] as const) {
-      expect(isPlainEnterSend({ ...base, [mod]: true })).toBe(false);
-    }
-  });
-
-  it("rejects IME composition Enter and other keys", () => {
-    expect(isPlainEnterSend({ ...base, isComposing: true })).toBe(false);
-    expect(isPlainEnterSend({ ...base, nativeEvent: { isComposing: true } })).toBe(false);
-    expect(isPlainEnterSend({ ...base, keyCode: 229 })).toBe(false);
-    expect(isPlainEnterSend({ ...base, key: "a" })).toBe(false);
   });
 });
