@@ -58,9 +58,10 @@ function parseOptionalJson(raw: string | undefined | null): unknown {
 async function callRuntimeConnectionTool(
   endpointEnv: "PAPERCLIP_RUNTIME_TOOLS_CONNECTIONS_SEARCH_URL" | "PAPERCLIP_RUNTIME_TOOLS_CONNECTION_REQUEST_URL",
   body: unknown,
+  env: NodeJS.ProcessEnv,
 ) {
-  const endpoint = process.env[endpointEnv]?.trim();
-  const token = process.env.PAPERCLIP_RUNTIME_TOOLS_TOKEN?.trim();
+  const endpoint = env[endpointEnv]?.trim();
+  const token = env.PAPERCLIP_RUNTIME_TOOLS_TOKEN?.trim();
   if (!endpoint || !token) {
     throw new Error("Connection intent tools are available only inside an active Paperclip heartbeat run");
   }
@@ -267,7 +268,7 @@ async function getIssueWorkspaceRuntime(client: PaperclipApiClient, issueId: str
   };
 }
 
-export function createToolDefinitions(client: PaperclipApiClient): ToolDefinition[] {
+export function createToolDefinitions(client: PaperclipApiClient, env: NodeJS.ProcessEnv = process.env): ToolDefinition[] {
   return [
     makeTool(
       "connections_search",
@@ -275,7 +276,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       connectionsSearchInputSchema,
       async (input) => callRuntimeConnectionTool(
         "PAPERCLIP_RUNTIME_TOOLS_CONNECTIONS_SEARCH_URL",
-        input,
+        input, env,
       ),
     ),
     makeTool(
@@ -284,7 +285,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       connectionRequestInputSchema,
       async (input) => callRuntimeConnectionTool(
         "PAPERCLIP_RUNTIME_TOOLS_CONNECTION_REQUEST_URL",
-        input,
+        input, env,
       ),
     ),
     makeTool(

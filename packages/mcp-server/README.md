@@ -17,6 +17,12 @@ The server reads its configuration from environment variables:
 
 Inside an active heartbeat, Paperclip also injects `PAPERCLIP_RUNTIME_TOOLS_*` variables. They enable the run-scoped `connections_search` and `connection_request` tools and expire with the run.
 
+Persistent Claude RC seats set `PAPERCLIP_RC_RUN_ENV` to their private slot's
+`run-env.sh`. Missing Paperclip environment values are read from that file for
+each tool call; the file is removed when the run ends. Explicit environment
+values take precedence. The seat's local MCP server requires the package to be
+built before the seat starts.
+
 ## Usage
 
 ```sh
