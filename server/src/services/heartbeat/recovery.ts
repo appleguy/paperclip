@@ -78,6 +78,7 @@ import {
   reconcileRetainedNativeSessionCleanup,
 } from "../native-runtime/index.js";
 import { findServerAdapter, runningProcesses } from "../../adapters/index.js";
+import { markCodexRunDetachedForRestart } from "../../adapters/codex-rc-reattach.js";
 import { parseObject } from "../../adapters/utils.js";
 import {
   isNativeRunnerOwnershipHeld,
@@ -575,7 +576,28 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       previousServerVersion: intent.previousServerVersion ?? serverVersion,
     };
 
-    const serverStdioRuns = activeRuns.filter(isServerStdioBoundHotRestartRun);
+    // SCO-1098: a codex_local turn lives in the Codex RC daemon. Once its thread is recorded,
+    // kill the server-owned codex-acp bridge without an interrupt and let the next server
+    // re-enter the run; the daemon keeps the turn running across the swap.
+    const detachableCodexRuns = activeRuns.filter(({ run, adapterType, adapterConfig }) =>
+      adapterType === "codex_local" && run.runtimeMode === "legacy" &&
+      supportsRestartReattach(adapterType, adapterConfig) &&
+      (!run.controllerBootId || run.controllerBootId === legacyControllerBootId) &&
+      typeof parseObject(parseObject(run.resultJson).earlySession).sessionId === "string" &&
+      typeof run.processPid === "number" && run.processPid > 0);
+    for (const { run } of detachableCodexRuns) {
+      markCodexRunDetachedForRestart(run.id);
+      try { process.kill(run.processPid!, "SIGKILL"); } catch { /* already gone; the daemon still owns the turn */ }
+      await appendRunEvent(run, {
+        eventType: "lifecycle",
+        stream: "system",
+        level: "info",
+        message: "Hot restart detached the Codex bridge without interrupting its turn; the next server rejoins it",
+        payload: { signal, processPid: run.processPid, threadId: parseObject(parseObject(run.resultJson).earlySession).sessionId },
+      });
+    }
+    const detachedCodexRunIds = new Set(detachableCodexRuns.map(({ run }) => run.id));
+    const serverStdioRuns = activeRuns.filter(entry => !detachedCodexRunIds.has(entry.run.id) && isServerStdioBoundHotRestartRun(entry));
     const activeServerStdioRunIds = serverStdioRuns.map(({ run }) => run.id);
     await writeHotRestartShutdownSnapshot({
       intent: intentWithVersion,

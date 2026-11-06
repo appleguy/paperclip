@@ -4082,6 +4082,35 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("detaches a Codex RC run with a recorded thread instead of draining it (SCO-1098)", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { agentId, runId } = await seedRunFixture({
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: null,
+      contextSnapshot: { executionEngine: "acp", processTopology: "server_stdio" },
+    });
+    await db.update(agents).set({ adapterConfig: { agentCommand: "/Volumes/NVM/Paperclip/ops/codex-remote-control/codex-acp-rc" } }).where(eq(agents.id, agentId));
+    await db.update(heartbeatRuns).set({ resultJson: { earlySession: { sessionId: "thread-1", sessionParams: {} } } }).where(eq(heartbeatRuns.id, runId));
+
+    await withTempPaperclipHome(async () => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: new Date("2026-08-04T00:05:00.000Z"),
+        preflightActiveRunIds: [runId],
+      });
+      const heartbeat = heartbeatService(db);
+      await expect(heartbeat.prepareHotRestartShutdown("SIGTERM", new Date("2026-08-04T00:06:00.000Z")))
+        .resolves.toMatchObject({ mode: "hot_restart", skipDrain: true, activeRunIds: [runId] });
+      await vi.waitFor(() => expect(child.exitCode !== null || child.signalCode !== null).toBe(true));
+      expect(child.signalCode).toBe("SIGKILL");
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(run?.status).toBe("running");
+    });
+  });
+
   it("snapshots and drains a server-stdio ACP run before embedded database shutdown", async () => {
     const child = spawnAliveProcess();
     childProcesses.add(child);

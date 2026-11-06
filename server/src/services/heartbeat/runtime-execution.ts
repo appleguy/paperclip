@@ -822,6 +822,12 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
         ...(agent.adapterType === "agy_local" ? {
           paperclipRestartReattach: typeof parseObject(parseObject(run.resultJson).restartReattach).count === "number",
         } : {}),
+        // SCO-1098: a re-entered codex_local run waits for the daemon turn its thread already holds.
+        ...(agent.adapterType === "codex_local" && typeof parseObject(parseObject(run.resultJson).restartReattach).count === "number" ? {
+          paperclipRestartReattach: true,
+          paperclipRestartReattachSession: parseObject(parseObject(run.resultJson).earlySession),
+          paperclipRestartReattachRunStartedAt: run.startedAt ? new Date(run.startedAt).toISOString() : null,
+        } : {}),
         ...(legacyQuestionResponse
           ? {
               [PAPERCLIP_WAKE_PAYLOAD_KEY]: {
