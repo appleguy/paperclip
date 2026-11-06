@@ -122,6 +122,7 @@ interface RunCompletionInput {
   output: RunCompletionOutput;
   session: RunCompletionSession;
   readFailureReportSecrets: () => string[];
+  onLegacyTerminalWrite?: () => void;
 }
 
 export interface CompleteHeartbeatRunInput extends RunCompletionInput {
@@ -159,6 +160,7 @@ export interface FailHeartbeatRunSetupInput {
   providerDispatchStarted: boolean;
   identityRedactor: Pick<ReturnType<typeof createAgentIdentityRedactor>, "redact">;
   readFailureReportSecrets: () => string[];
+  onLegacyTerminalWrite?: () => void;
 }
 
 // A log-only census (pathology slice-a) can tell a finished run from a killed one only by an
@@ -724,6 +726,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     ));
     let persistedRun: typeof heartbeatRuns.$inferSelect | null =
       persistedRunWrite.run;
+    if (persistedRunWrite.updated && run.runtimeMode === "legacy" && agent.adapterType === "opencode_local") {
+      input.onLegacyTerminalWrite?.();
+    }
     if (!persistedRunWrite.updated) {
       // A successor may have claimed or completed the same run after this
       // controller returned. Do not enrich or account its result here.
@@ -1245,6 +1250,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     }, { error: err, phase: "execute", secretValues: readFailureReportSecrets() },
     run.runtimeMode === "legacy" && agent.adapterType === "opencode_local"
       ? { expectedLegacyControllerBootId: run.controllerBootId } : undefined));
+    if (failedRunWrite.updated && run.runtimeMode === "legacy" && agent.adapterType === "opencode_local") {
+      input.onLegacyTerminalWrite?.();
+    }
     if (
       !failedRunWrite.updated &&
       !(
@@ -1534,6 +1542,10 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         parseObject(parseObject(run.runnerProfileJson).adapterDispatch).adapterType === "opencode_local")
         ? { expectedLegacyControllerBootId: run.controllerBootId } : {}),
     }).catch(() => ({ run: null, updated: false as const }));
+    if (setupFailureWrite.updated && run.runtimeMode === "legacy" && (setupFailureAgent?.adapterType === "opencode_local" ||
+      parseObject(parseObject(run.runnerProfileJson).adapterDispatch).adapterType === "opencode_local")) {
+      input.onLegacyTerminalWrite?.();
+    }
     if (!setupFailureWrite.updated) {
       logger.info(
         {

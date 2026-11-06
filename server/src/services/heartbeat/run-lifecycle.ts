@@ -1213,6 +1213,11 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
       .where(eq(heartbeatRuns.id, runId))
       .then((rows) => rows[0] ?? null);
     const previousStatus = previous?.run ?? null;
+    // A legacy executor must never follow a changed row into the native write
+    // branch, which has different ownership authority.
+    if (options && "expectedLegacyControllerBootId" in options && previousStatus?.runtimeMode !== "legacy") {
+      return { updated: false, run: previousStatus };
+    }
     if (status === "failed" && patch?.errorCode === "process_lost" && previousStatus?.runtimeMode === "native" && readNativeStartupCleanup(previousStatus)) {
       return { updated: false, run: previousStatus };
     }

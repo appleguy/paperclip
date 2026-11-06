@@ -189,6 +189,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     const f = await fixture({ controllerBootId: state === "missing" ? null : boot,
       controllerLeaseExpiresAt: new Date(Date.now() + 60_000) });
     f.input.agent = { ...f.agent, adapterType: "opencode_local" };
+    f.input.onLegacyTerminalWrite = vi.fn();
     if (state === "replaced") await db.update(heartbeatRuns).set({ controllerBootId: randomUUID() }).where(eq(heartbeatRuns.id, f.run.id));
     if (state === "expired") await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: new Date(Date.now() - 1000) }).where(eq(heartbeatRuns.id, f.run.id));
     await f.completion.completeRun(f.input);
@@ -196,13 +197,16 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(f.deps.releaseIssueExecutionAndPromote).not.toHaveBeenCalled();
     expect(f.deps.finalizeAgentStatus).not.toHaveBeenCalled();
     expect(f.deps.scheduleBoundedRetryForRun).not.toHaveBeenCalled();
+    expect(f.input.onLegacyTerminalWrite).not.toHaveBeenCalled();
   });
 
   it("allows OpenCode completion while its exact controller lease is live", async () => {
     const f = await fixture({ controllerBootId: randomUUID(), controllerLeaseExpiresAt: new Date(Date.now() + 60_000) });
     f.input.agent = { ...f.agent, adapterType: "opencode_local" };
+    f.input.onLegacyTerminalWrite = vi.fn();
     await f.completion.completeRun(f.input);
     expect((await read(f.run.id)).status).toBe("succeeded");
+    expect(f.input.onLegacyTerminalWrite).toHaveBeenCalledOnce();
   });
 
   it("fences OpenCode completion when takeover occurs immediately before the terminal write", async () => {
@@ -217,6 +221,16 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     await f.completion.completeRun(f.input);
     expect(await read(f.run.id)).toMatchObject({ status: "running", controllerBootId: successor });
     expect(f.deps.releaseIssueExecutionAndPromote).not.toHaveBeenCalled();
+  });
+
+  it("does not let a legacy OpenCode completion write a run moved to native ownership", async () => {
+    const f = await fixture({ controllerBootId: randomUUID(), controllerLeaseExpiresAt: new Date(Date.now() + 60_000) });
+    f.input.agent = { ...f.agent, adapterType: "opencode_local" };
+    f.input.onLegacyTerminalWrite = vi.fn();
+    await db.update(heartbeatRuns).set({ runtimeMode: "native" }).where(eq(heartbeatRuns.id, f.run.id));
+    await f.completion.completeRun(f.input);
+    expect(await read(f.run.id)).toMatchObject({ status: "running", runtimeMode: "native" });
+    expect(f.input.onLegacyTerminalWrite).not.toHaveBeenCalled();
   });
 
   it("does not terminalize a late OpenCode adapter failure after a successor claims the run", async () => {

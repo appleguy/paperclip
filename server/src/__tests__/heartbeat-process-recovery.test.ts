@@ -9204,6 +9204,45 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     },
   );
 
+  it.each([false, true])("gates OpenCode teardown on the executing controller's terminal write (takeover: %s)", async takeover => {
+    let releaseAdapter!: () => void;
+    const gate = new Promise<void>(resolve => { releaseAdapter = resolve; });
+    let started = false;
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      started = true;
+      await gate;
+      return { exitCode: 0, signal: null, timedOut: false, summary: "synthetic completion", provider: "test", model: "test" };
+    });
+    const f = await seedRunFixture({ adapterType: "opencode_local", runtimeMode: "legacy", agentStatus: "idle", runStatus: "queued", includeIssue: false });
+    const originalFactory = environmentOrchestrator.environmentRunOrchestrator;
+    const release = vi.fn(async () => ({ released: [], errors: [] }));
+    const factory = vi.spyOn(environmentOrchestrator, "environmentRunOrchestrator").mockImplementation((...args) => ({
+      ...originalFactory(...args), releaseForRun: release,
+    }));
+    const heartbeat = heartbeatService(db);
+    try {
+      await heartbeat.resumeQueuedRuns();
+      await waitForValue(async () => started ? true : null);
+      const successor = randomUUID();
+      if (takeover) await db.update(heartbeatRuns).set({ controllerBootId: successor,
+        controllerLeaseExpiresAt: new Date(Date.now() + 60_000) }).where(eq(heartbeatRuns.id, f.runId));
+      releaseAdapter();
+      await heartbeat.drainActiveRunExecutions();
+      const run = await heartbeat.getRun(f.runId);
+      if (takeover) {
+        expect(run).toMatchObject({ status: "running", controllerBootId: successor });
+        expect(release).not.toHaveBeenCalled();
+      } else {
+        expect(run?.status).toBe("succeeded");
+        expect(release).toHaveBeenCalled();
+      }
+    } finally {
+      releaseAdapter();
+      await heartbeat.drainActiveRunExecutions();
+      factory.mockRestore();
+    }
+  });
+
   it("honors a recorded OpenCode Stop when adapter registration follows it", async () => {
     let releaseRegistration!: () => void;
     const registrationGate = new Promise<void>(resolve => { releaseRegistration = resolve; });

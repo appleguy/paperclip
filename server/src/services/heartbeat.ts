@@ -1900,6 +1900,9 @@ export function heartbeatService(
       }
       run = claimed;
     }
+    let legacyOpenCode = run.runtimeMode === "legacy" && claimedAdapterType(run) === "opencode_local";
+    let legacyOpenCodeTerminalWriteOwned = false;
+    const onLegacyOpenCodeTerminalWrite = () => { legacyOpenCodeTerminalWriteOwned = true; };
 
     const releaseInstructionCopy = createHeartbeatInstructionCopyRelease(run, instructionCopies, appendRunEvent);
 
@@ -2077,6 +2080,7 @@ export function heartbeatService(
         return;
       }
       let agent = loadedAgent;
+      legacyOpenCode ||= run.runtimeMode === "legacy" && agent.adapterType === "opencode_local";
 
       // The claimed adapter identity is immutable recovery evidence. Do not
       // execute a newly selected adapter under a previous adapter's claim.
@@ -3601,6 +3605,7 @@ export function heartbeatService(
           configFreshnessResultMetadata, runLedgerScope, currentUserRedactionOptions,
           providerTraceCapture: providerTraceCapture !== null,
           onProviderTraceFinalized: () => { providerTraceFinalized = true; },
+          onLegacyTerminalWrite: onLegacyOpenCodeTerminalWrite,
           issueContext, onLog,
         }));
       } catch (err) {
@@ -3745,6 +3750,7 @@ export function heartbeatService(
           readFailureReportSecrets,
           runId, err, identityRedactor, requiredWorkspaceRestoreEvidence, legacyAdapterEntered,
           goalCheckpointSession, previousSessionDisplayId, taskSession,
+          onLegacyTerminalWrite: onLegacyOpenCodeTerminalWrite,
         });
       }
     } catch (outerErr) {
@@ -3794,9 +3800,23 @@ export function heartbeatService(
           run, runId, outerErr, signal: executionControl.controller.signal,
           providerDispatchStarted: legacyAdapterEntered || nativeDispatchStarted,
           identityRedactor, readFailureReportSecrets,
+          onLegacyTerminalWrite: onLegacyOpenCodeTerminalWrite,
         });
       }
     } finally {
+      const nativeExecutionEstablished = !legacyAdapterEntered &&
+        (nativeDispatchStarted || nativeOwnershipHeld || nativeSessionResumeScheduled || nativeWorkspaceFinalizeScheduled);
+      if (legacyOpenCode && !legacyOpenCodeTerminalWriteOwned && !nativeExecutionEstablished) {
+        // A read of the row cannot authorize cleanup: another controller can
+        // take over before an external release starts. Only our successful
+        // terminal CAS grants this executor permission to clean shared state.
+        logger.warn({ runId: run.id }, "holding OpenCode teardown without an owned terminal write");
+        controllerLease.stop();
+        activeRunExecutions.delete(run.id);
+        failedProcessRunCancellations.delete(run.id);
+        executionControl.finish();
+        if (adapterExecutionControls.get(run.id) === executionControl) adapterExecutionControls.delete(run.id);
+      } else {
       let caseHandoffCleanupSettled = false;
       await instructionWorkingCopy?.nativeInstructionReservation?.release().catch(error => logger.warn({ runId: run.id, err: error }, "Managed warm session preparation cleanup failed"));
       if (managedAiRuntime) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
@@ -4085,6 +4105,7 @@ export function heartbeatService(
             logger.warn({ err, runId: run.id }, "failed to wake next assigned issue after execution cleanup");
           });
         }
+      }
       }
     }
   }
