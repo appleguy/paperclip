@@ -10,7 +10,7 @@ import { parseProviderQuotaClockReset } from "../provider-quota-reset.js";
 const PROVIDER_LIMIT_CATEGORIES = ["rate_limit", "quota_exhausted"];
 /** Run errors that record an exhausted allowance without a typed provider failure. */
 const PROVIDER_LIMIT_ERROR_CODES = ["native_provider_usage_limit", "provider_quota"];
-/** Limit evidence older than this is ignored, and no limit holds a retry longer. */
+/** Bounds the search for recent limit evidence. */
 const NATIVE_PROVIDER_LIMIT_WINDOW_MS = 24 * 60 * 60_000;
 const LIMIT_EVIDENCE_ROWS = 20;
 
@@ -88,7 +88,7 @@ export async function agentProviderLimitCooldown(db: Db, input: {
   }
   if (!latest || latest.resetAt <= now) return null;
   return {
-    resetAt: new Date(Math.min(latest.resetAt, now + NATIVE_PROVIDER_LIMIT_WINDOW_MS)),
+    resetAt: new Date(latest.resetAt),
     resetReported: latest.resetReported,
     category: latest.category,
     sourceRunId: latest.sourceRunId,

@@ -688,20 +688,20 @@ describe("native provider startup retry", () => {
       .toMatchObject({ resetAt: expected, resetReported: true });
   });
 
-  it("holds a startup retry for at most one day before trying again", async () => {
+  it("honors a provider-reported reset more than one day away", async () => {
     const seeded = await seedRun(await createAgent());
-    const failedAt = await failStartup(seeded, sessionOpenFailure({
+    const resetAt = new Date(Date.now() + 3 * 24 * 60 * 60_000);
+    await failStartup(seeded, sessionOpenFailure({
       providerFailure: limitFailure({
         phase: "startup",
         category: "quota_exhausted",
-        retryAt: new Date(Date.now() + 3 * 24 * 60 * 60_000).toISOString(),
+        retryAt: resetAt.toISOString(),
         retryability: "requires_action",
       }),
     }));
     const state = await read(seeded);
     const cooldownAt = Date.parse(String(state.coordinator.failureDetail?.providerCooldownAt));
-    expect(cooldownAt).toBeGreaterThanOrEqual(failedAt.getTime() + 24 * 60 * 60_000);
-    expect(cooldownAt).toBeLessThanOrEqual(Date.now() + 24 * 60 * 60_000);
+    expect(cooldownAt).toBe(resetAt.getTime());
     expect(state.coordinator.nextAttemptAt!.getTime()).toBeGreaterThanOrEqual(backoffWindow(new Date(cooldownAt), 1)[0]);
   });
 
