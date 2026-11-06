@@ -45,6 +45,41 @@ function probeResult(overrides: Record<string, unknown>) {
 describe("OpenCode local skill injection", () => {
   let configHome: string;
 
+  it.each([false, true])("bounds the assembled default launch/wake prompt (resumed=%s)", async (resumed) => {
+    const commandPath = path.join(configHome, "fake-opencode-budget");
+    await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const instructionsFilePath = new URL("../../../../../server/src/onboarding-assets/default/AGENTS.md", import.meta.url).pathname;
+    const skill = await fs.readFile(new URL("../../../../../skills/paperclip/SKILL.md", import.meta.url), "utf8");
+    runProcessMock.mockReset();
+    runProcessMock.mockResolvedValue(probeResult({ stdout: JSON.stringify({
+      type: "text", sessionID: "budget-session", part: { text: "Result" },
+    }) }));
+    let prompt = "";
+    const result = await execute({
+      runId: "budget-run",
+      agent: { id: "agent-1", companyId: "company-1", name: "Coder", adapterType: "opencode_local", adapterConfig: {} },
+      runtime: {
+        sessionId: resumed ? "budget-session" : null,
+        sessionParams: resumed ? { sessionId: "budget-session", cwd: configHome } : null,
+        sessionDisplayId: null, taskKey: null,
+      },
+      config: { command: commandPath, cwd: configHome, instructionsFilePath,
+        model: "openai/fixture", env: { OPENCODE_ALLOW_ALL_MODELS: "1" } },
+      context: createPromptContextFixture(),
+      onLog: async () => {},
+      onMeta: async (meta) => { if (typeof meta.prompt === "string") prompt = meta.prompt; },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(prompt).toContain(resumed ? "Paperclip Resume Delta" : "Paperclip Wake Payload");
+    expect(prompt).toContain("comment-second");
+    const promptBytes = Buffer.byteLength(prompt);
+    const skillBytes = Buffer.byteLength(skill);
+    expect(promptBytes).toBeLessThanOrEqual(5000);
+    expect(skillBytes).toBeLessThanOrEqual(9000);
+    expect(promptBytes + skillBytes).toBeLessThanOrEqual(14000);
+    console.info(`opencode ${resumed ? "resume" : "launch"}: prompt=${promptBytes}, skill=${skillBytes} bytes`);
+  });
+
   beforeEach(async () => {
     configHome = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-test-config-"));
     vi.stubEnv("XDG_CONFIG_HOME", configHome);

@@ -100,8 +100,9 @@ material ambiguity or missing authority remains. Unrelated messages are not
 approval. Record conversational confirmation with the current card's
 `resolve-from-comment` route; do not treat revisions as acceptance.
 
-Use `connection_request` for connection/tool access and `propose_secret` for
-credential proposals. Never solicit or publish raw secrets in task prose. Granted
+Use `connection_request` for connection/tool access and
+`POST /api/agents/me/secret-proposals` for API credential proposals (native runs
+use their advertised scoped tools). Never solicit or publish raw secrets in task prose. Granted
 secrets use the advertised scoped tools or API and must remain out of logs.
 MCP approval-required calls use the supplied approval flow; wait for its actual
 resolution. Formal board approvals use `/api/companies/{companyId}/approvals`.

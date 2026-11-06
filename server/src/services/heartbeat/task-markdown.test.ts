@@ -39,6 +39,7 @@ describe("heartbeat task markdown rendering", () => {
     expect(markdown).toContain("If the outcome and success criteria are clear enough to act, proceed without a setup checklist or ritual questions");
     expect(markdown).toContain("When a missing decision materially changes the outcome");
     expect(markdown).toContain("Implement the accepted plan on this issue");
+    expect(markdown).toContain("create sub-issues only when it truly cannot fit one run");
     expect(markdown).toContain("Write a 300-word launch post for customers using the supplied brief.");
   });
 

@@ -79,6 +79,44 @@ import { execute } from "./execute.js";
 describe("codex remote execution", () => {
   const cleanupDirs: string[] = [];
 
+  it.each([false, true])("bounds the assembled default launch/wake prompt (resumed=%s)", async (resumed) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "codex-guidance-budget-"));
+    cleanupDirs.push(root);
+    const instructionsFilePath = new URL("../../../../../server/src/onboarding-assets/default/AGENTS.md", import.meta.url).pathname;
+    const skill = await readFile(new URL("../../../../../skills/paperclip/SKILL.md", import.meta.url), "utf8");
+    runChildProcess.mockResolvedValueOnce({
+      exitCode: 0, signal: null, timedOut: false, stderr: "", pid: 123,
+      startedAt: new Date().toISOString(),
+      stdout: JSON.stringify({ type: "thread.started", thread_id: "budget-session" }),
+    });
+    let prompt = "";
+    const result = await execute({
+      runId: "budget-run",
+      agent: { id: "agent-1", companyId: "company-1", name: "Coder", adapterType: "codex_local", adapterConfig: {} },
+      runtime: {
+        sessionId: resumed ? "budget-session" : null,
+        sessionParams: resumed ? { sessionId: "budget-session", cwd: root } : null,
+        sessionDisplayId: null, taskKey: null,
+      },
+      config: { engine: "cli", command: "codex", cwd: root, instructionsFilePath,
+        env: { OPENAI_API_KEY: "fixture-key", CODEX_HOME: root } },
+      context: { ...createPromptContextFixture(), paperclipWorkspace: { cwd: root, source: "project_primary" } },
+      onLog: async () => {},
+      onMeta: async (meta) => { if (typeof meta.prompt === "string") prompt = meta.prompt; },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(prompt).toContain(resumed ? "Paperclip Resume Delta" : "Paperclip Wake Payload");
+    expect(prompt).toContain("comment-second");
+    // Skill text is discovered separately by the harness; budget it as well so
+    // moving ceremony out of stdin cannot evade this starting-context check.
+    const promptBytes = Buffer.byteLength(prompt);
+    const skillBytes = Buffer.byteLength(skill);
+    expect(promptBytes).toBeLessThanOrEqual(5000);
+    expect(skillBytes).toBeLessThanOrEqual(9000);
+    expect(promptBytes + skillBytes).toBeLessThanOrEqual(14000);
+    console.info(`codex ${resumed ? "resume" : "launch"}: prompt=${promptBytes}, skill=${skillBytes} bytes`);
+  });
+
   afterEach(async () => {
     vi.clearAllMocks();
     while (cleanupDirs.length > 0) {
