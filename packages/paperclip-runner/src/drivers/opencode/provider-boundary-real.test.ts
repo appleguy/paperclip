@@ -8,6 +8,7 @@ import { dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { expect, it } from "vitest";
 import { OpenCodeProviderBoundary } from "./provider-boundary.js";
+import { OpenCodeSharedNativeBackend } from "./shared-native-backend.ts";
 import { startOpenCodeProviderProxy } from "./opencode-server-driver.ts";
 
 it.each(["v1", "v2"])("holds a real qualified OpenCode %s streaming tool turn through an inference restart", async version => {
@@ -70,14 +71,25 @@ it.each(["v1", "v2"])("holds a real qualified OpenCode %s streaming tool turn th
     };
     const created = await (await api(version === "v1" ? "/session" : "/api/session", { method: "POST", body: JSON.stringify(version === "v1" ? { title: "freeze fixture" } : { id: "ses_freeze_fixture", model: { providerID: "paperclip", id: "qualification" }, location: { directory: workspace } }) })).json() as any;
     const session = version === "v1" ? created : created.data;
-    const freeze = boundary.freeze({ timeoutMs: 30_000, signal: new AbortController().signal });
-    await api(version === "v1" ? `/session/${session.id}/prompt_async` : `/api/session/${session.id}/prompt`, { method: "POST", body: JSON.stringify(version === "v1" ? { providerID: "openrouter", modelID: "qualification", parts: [{ type: "text", text: "Read fixture.txt." }] } : { id: "msg_freeze_fixture", text: "Read fixture.txt." }) });
+    const identity = { runId: "fixture_run", sessionId: session.id, companyId: "fixture_company", issueId: "fixture_issue", agentId: "fixture_agent" };
+    const managed = await new OpenCodeSharedNativeBackend({
+      identity, runnerInstanceId: "fixture_runner", providerSessionId: session.id,
+      verify: async () => {}, readReceipt: async () => null,
+      dispatch: async prompt => { await api(version === "v1" ? `/session/${session.id}/prompt_async` : `/api/session/${session.id}/prompt`, { method: "POST", body: JSON.stringify(version === "v1" ? { providerID: "openrouter", modelID: "qualification", parts: [{ type: "text", text: prompt.text }] } : { id: prompt.id, text: prompt.text }) }); },
+      startObservation: async () => {}, waitForReceipt: async () => { throw new Error("unused"); },
+      stop: async () => {}, close: async () => {},
+      freezeProvider: options => boundary.freeze(options),
+      resumeProvider: async checkpoint => boundary.resume(checkpoint),
+    }).openSession({ identity, signal: new AbortController().signal });
+    const turn = managed.startTurn({ message: { role: "user", text: "Read fixture.txt." } });
+    const freeze = managed.freezeProvider!({ timeoutMs: 30_000, signal: new AbortController().signal });
+    await turn;
     const checkpoint = await freeze;
     const before = requests.length;
     expect(before).toBeGreaterThan(0);
     await new Promise<void>(done => engine!.close(() => done()));
     engine = await startEngine(port);
-    boundary.resume(checkpoint);
+    await managed.resumeProvider!(checkpoint);
     let messages: any[] = [];
     for (let i = 0; i < 150; i++) {
       const result = await (await api(version === "v1" ? `/session/${session.id}/message` : `/api/session/${session.id}/message`)).json() as any;

@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 
-/** Opt-in for a private, single-session provider proxy. Memory only: loss of
- * the proxy or the held HTTP request invalidates the checkpoint. */
+/** Opt-in for a private, single-session provider proxy. Memory only: proxy- or
+ * runner-process restart loses the held request and invalidates the checkpoint.
+ * This only gates inference-server restart while the owner processes stay alive. */
 export class OpenCodeProviderBoundary {
   #active = 0;
   #closed = false;
