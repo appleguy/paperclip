@@ -25,6 +25,7 @@ import { environmentService } from "./environments.js";
 import { instanceSettingsService } from "./instance-settings.js";
 import { pluginEnvironmentRequiresAgent, pluginForAgentEnvironment } from "./plugin-environment-driver.js";
 import { isProviderApiSetupDraft } from "./native-runtime/provider-api-placement.js";
+import { retryPending, settingsReconciler } from "../adapters/claude-rc/pending-settings.js";
 
 export { scheduleAgentLifecycle, processAgentLifecycle } from "../modules/agent-lifecycle/index.js";
 export type { LifecycleDriver, LifecycleAgent } from "../modules/agent-lifecycle/index.js";
@@ -87,7 +88,21 @@ export function createAgentLifecycleEffects(_hooks: BudgetServiceHooks = {}): li
 }
 
 export function createAgentLifecycle(db: Db, hooks: BudgetServiceHooks = {}) {
-  return lifecycle.createAgentLifecycle(db, createAgentLifecycleEffects(hooks));
+  const service = lifecycle.createAgentLifecycle(db, createAgentLifecycleEffects(hooks));
+  const attempt = (id: string) => void retryPending(() => settingsReconciler(db).attemptAgent(id))
+    .catch(err => logger.warn({ err, agentId: id }, "Claude RC settings reconciliation deferred"));
+  return { ...service,
+    async updateConfiguration(...args: Parameters<typeof service.updateConfiguration>) {
+      const result = await service.updateConfiguration(...args);
+      if (result && args[1].adapterConfig !== undefined) attempt(args[0]);
+      return result;
+    },
+    async updateAndTransition(...args: Parameters<typeof service.updateAndTransition>) {
+      const result = await service.updateAndTransition(...args);
+      if (result && args[2].adapterConfig !== undefined) attempt(args[0]);
+      return result;
+    },
+  };
 }
 
 function trackedDriver(driver: lifecycle.LifecycleDriver): lifecycle.LifecycleDriver {

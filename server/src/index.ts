@@ -118,6 +118,7 @@ import {
 } from "@paperclipai/db";
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
+import { configureClaudeRcSettings } from "./adapters/claude-rc/index.js";
 import { drainHttpRequestWork } from "./middleware/idle-admission.js";
 import { initializeCloudRuntimeConfig } from "./services/cloud-runtime-config.js";
 import { loadCloudBootstrapConfig, loadConfig, type Config } from "./config.js";
@@ -1085,6 +1086,10 @@ async function startServerWithDatabaseTeardown(
       process.kill(process.pid, "SIGTERM");
     },
   });
+
+  void trackIdleWork(configureClaudeRcSettings(db).catch(err => {
+    logger.warn({ err }, "startup Claude RC settings reconciliation deferred");
+  }));
 
   try {
     const result = await workspaceOperationService(db as any)

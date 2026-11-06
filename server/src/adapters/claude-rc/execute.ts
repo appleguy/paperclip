@@ -35,6 +35,7 @@ const CLAUDE = "/opt/homebrew/bin/claude";
 const MODELS = new Set(["claude-sonnet-5-5", "claude-haiku-5-5", "claude-opus-5-5"]);
 const EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 const ID = /^[a-zA-Z0-9_-]{1,55}$/;
+export const isValidSeatSettings = (model: string, effort: string) => MODELS.has(model) && EFFORTS.has(effort);
 /** SCO-965: one tmux seat per concurrent run. Slot 0 is the agent's configured seat, unchanged. */
 export type RcSlot = { index: number; session: string; stateDir: string };
 export const RC_MAX_SLOTS = 4;
@@ -583,7 +584,9 @@ async function derivedRcName(ctx: AdapterExecutionContext): Promise<string> {
   return name;
 }
 
-export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+export async function execute(ctx: AdapterExecutionContext, settings?: {
+  inspect: (dir: string) => Promise<import("./pending-settings.js").PendingSnapshot>;
+}): Promise<AdapterExecutionResult> {
   const cfg = ctx.config;
   const baseSession = asString(cfg.tmuxSession, "claude");
   let session = baseSession;
@@ -704,7 +707,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
       await ctx.onLog("stdout", `[claude-rc] Adopting run ${adopted.runId} for issue ${issueId}; no re-dispatch; receipt ${receiptPath}\n`);
     } else {
-      await applySeatSettings(socket, session, stateDir, model, effort, message => ctx.onLog("stderr", message));
+      const applied = await applySeatSettings(socket, session, stateDir, model, effort, message => ctx.onLog("stderr", message));
+      if (applied && settings) {
+        try {
+          const { clearDispatchApplied } = await import("./pending-settings.js");
+          await clearDispatchApplied(() => settings.inspect(stateDir), { model, effort });
+        } catch (error) {
+          await ctx.onLog("stderr", `[claude-rc] Pending settings cleanup deferred: ${String(error)}\n`);
+        }
+      }
       const keepPath = path.join(stateDir, "keep-conversation.json");
       const keepEnabled = cfg.keepConversation === true;
       const projectId = asString(ctx.context.projectId, "");
@@ -950,5 +961,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   } finally {
     if (runEnvPath) await fs.rm(runEnvPath, { force: true });
     if (unlock) await unlock();
+    if (unlock && settings) {
+      const dir = stateDir;
+      void (async () => {
+        const { attemptPending, retryPending } = await import("./pending-settings.js");
+        await retryPending(() => attemptPending(dir, () => settings.inspect(dir)));
+      })().catch(error => ctx.onLog("stderr", `[claude-rc] Settings reconciliation deferred: ${String(error)}\n`).catch(() => {}));
+    }
   }
 }

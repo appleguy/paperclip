@@ -19,6 +19,7 @@ import { secretService, assertClaudeOAuthBindingInvariant } from "./secrets.js";
 import { agentCredentialService } from "./agent-credentials.js";
 import { clearPrimaryAgent } from "./primary-agent.js";
 import { budgetServiceInTransaction } from "./budgets.js";
+import { recordSettingsChange } from "../adapters/claude-rc/pending-settings.js";
 
 export async function prepareAgentConfiguration(db: Db, existing: AgentConfigurationRecord, data: AgentConfigurationPatch, options?: UpdateAgentOptions): Promise<AgentConfigurationPatch> {
   await notifyAttentionRetentionWork(db, { companyId: existing.companyId });
@@ -103,6 +104,7 @@ export async function prepareAgentConfiguration(db: Db, existing: AgentConfigura
 }
 
 export async function completeAgentConfiguration(txDb: Db, existing: AgentConfigurationRecord, updated: AgentConfigurationRecord, normalizedPatch: AgentConfigurationPatch, options: UpdateAgentOptions | undefined, publications: ActivityPublication[]) {
+  await recordSettingsChange(existing, updated);
   const id = updated.id;
   const shouldRecordRevision = Boolean(options?.recordRevision) && hasConfigPatchFields(normalizedPatch);
   const beforeConfig = shouldRecordRevision

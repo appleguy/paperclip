@@ -4,12 +4,22 @@ import { promisify } from "node:util";
 import { execute as builtinExecute } from "./execute.js";
 import { hotImport } from "../../hot/hot-modules.js";
 import type { AdapterExecutionContext } from "../types.js";
+import type { Db } from "@paperclipai/db";
+import { settingsReconciler } from "./pending-settings.js";
 const run = promisify(execFile);
+
+let reconciler: ReturnType<typeof settingsReconciler> | undefined;
+export function configureClaudeRcSettings(db: Db) {
+  reconciler = settingsReconciler(db);
+  return reconciler.boot();
+}
 
 // SCO-818: hot-deployable. New calls use the hot payload copy when one is active.
 export const HOT_REL = "adapters/claude-rc/execute.js";
 const execute = async (ctx: AdapterExecutionContext) =>
-  (await hotImport(HOT_REL, async () => ({ execute: builtinExecute }))).execute(ctx);
+  (await hotImport(HOT_REL, async () => ({ execute: builtinExecute }))).execute(ctx, reconciler && {
+    inspect: (dir: string) => reconciler!.inspect(ctx.agent.id, dir),
+  });
 
 export const claudeRcAdapter: ServerAdapterModule = {
   type: "claude_rc_local",
