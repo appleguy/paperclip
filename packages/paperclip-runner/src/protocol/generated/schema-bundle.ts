@@ -4659,6 +4659,20 @@ export const usageSchema = {
     "runDelta": {
       "$ref": "#/$defs/measurement"
     },
+    "last": {
+      "type": "object",
+      "required": [
+        "totalTokens"
+      ],
+      "properties": {
+        "totalTokens": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2147483647
+        }
+      },
+      "additionalProperties": false
+    },
     "context": {
       "description": "Live context-window occupancy for the provider session after this usage, when the provider reports it.",
       "type": "object",

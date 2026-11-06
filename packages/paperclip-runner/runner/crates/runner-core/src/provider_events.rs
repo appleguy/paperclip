@@ -832,6 +832,19 @@ fn measurement(value: &Value) -> Value {
     })
 }
 
+fn codex_last_total(value: &Value) -> Option<u64> {
+    value
+        .get("totalTokens")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            value
+                .get("inputTokens")
+                .and_then(Value::as_u64)?
+                .checked_add(value.get("outputTokens").and_then(Value::as_u64)?)
+        })
+        .filter(|value| *value <= 2_147_483_647)
+}
+
 /// Context-window occupancy from a Codex `thread/tokenUsage/updated` payload.
 /// Codex sizes the live context by the most recent request's total tokens.
 pub(crate) fn codex_context_usage(params: &Value) -> Option<Value> {
@@ -1152,6 +1165,11 @@ pub fn normalize_codex_notification_in(
             if let Some(context) = codex_context_usage(params) {
                 if let Some(event) = events.last_mut() {
                     event.payload["context"] = context;
+                }
+            }
+            if let Some(total) = run_delta.and_then(codex_last_total) {
+                if let Some(event) = events.last_mut() {
+                    event.payload["last"] = json!({"totalTokens": total});
                 }
             }
         }
@@ -2440,6 +2458,20 @@ mod tests {
             events[0].payload["context"],
             json!({"usedTokens": 120, "windowTokens": 10000})
         );
+        let without_window = normalize_codex_notification(
+            "thread/tokenUsage/updated",
+            &json!({"tokenUsage":{"total":{"inputTokens":1000,"outputTokens":60},"last":{"inputTokens":100,"outputTokens":20}}}),
+        );
+        assert_eq!(
+            without_window[0].payload["last"],
+            json!({"totalTokens":120})
+        );
+        assert!(without_window[0].payload.get("context").is_none());
+        let malformed = normalize_codex_notification(
+            "thread/tokenUsage/updated",
+            &json!({"tokenUsage":{"last":{"inputTokens":-5,"outputTokens":20}}}),
+        );
+        assert!(malformed[0].payload.get("last").is_none());
     }
 
     #[test]
