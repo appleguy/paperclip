@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
-/** The only recoverable failure is a verified pre-inference hold. Never
+/** No inference is sent by this attempt when session safety is unverified. Never
  * manufacture a new session when the old provider might still be executing. */
 export class OpenCodeSharedSessionWait extends Error {
   constructor() {
@@ -104,6 +104,9 @@ export async function prepareSharedOpenCodeSession(input: Input) {
   if (selected && !sessionIdPattern.test(selected)) throw new OpenCodeSharedSessionWait();
   const states = await active();
   if (running(states).some(sid => sid !== selected)) throw new OpenCodeSharedSessionWait();
+  // Idle is only a snapshot; it does not prove that an interrupted predecessor
+  // has finished or that its delayed submission cannot still reach the server.
+  if (old && old.exited !== "clean") throw new OpenCodeSharedSessionWait();
 
   let sessionId = selected;
   const resumed = sessionId !== null;
@@ -117,26 +120,11 @@ export async function prepareSharedOpenCodeSession(input: Input) {
     if (typeof id !== "string" || !sessionIdPattern.test(id)) throw new OpenCodeSharedSessionWait();
     sessionId = id;
   }
-  // If Paperclip died but the persistent OpenCode server kept generating,
-  // interrupt ONLY the exact session backed by this agent/task binding.
+  // A task/session binding is not a message-level interrupt fence. A newer
+  // turn (including one from an outside client) can occupy this same session.
   const ownedSessionId = sessionId!;
-  const interruptOwned = async () => {
-    const statesNow = await active();
-    if (!running(statesNow).includes(ownedSessionId)) return;
-    const result = await call("POST", "/session/" + ownedSessionId + "/interrupt", {});
-    if (!result || typeof result !== "object" ||
-        (result as Record<string, unknown>).interrupted !== true) throw new OpenCodeSharedSessionWait();
-    for (let attempt = 0; attempt < 5; attempt++) {
-      if (!running(await active()).includes(ownedSessionId)) return;
-      await new Promise(resolve => setTimeout(resolve, 100 * (attempt + 1)));
-    }
-    throw new OpenCodeSharedSessionWait();
-  };
-  // A legacy session ID without our durable owner record is not sufficient
-  // authority to interrupt a running provider operation.
   if (resumed && running(states).includes(ownedSessionId)) {
-    if (!old) throw new OpenCodeSharedSessionWait();
-    await interruptOwned();
+    throw new OpenCodeSharedSessionWait();
   }
 
   const binding: Binding = { version: 1, agentId: input.agentId, taskId: input.taskId,
@@ -154,31 +142,22 @@ export async function prepareSharedOpenCodeSession(input: Input) {
   // Only a predecessor that did not record a clean exit is a crash/restart
   // recovery. Ordinary follow-up wakes resume the same session normally.
   const recovered = old !== null && old.exited !== "clean";
-  let stopPromise: Promise<void> | null = null;
-  const pause = () => {
-    stopPromise ??= interruptOwned();
-    return stopPromise;
-  };
-  const onAbort = () => { void pause().catch(() => undefined); };
-  input.signal?.addEventListener("abort", onAbort, { once: true });
-  if (input.signal?.aborted) onAbort();
-
   return {
     sessionId: sessionId!,
     resumed,
     recovered,
     /** Preserve the binding until issue archival, including after exit 0. */
     async finish(outcome: { exitCode: number | null; signal: string | null; timedOut: boolean }) {
-      input.signal?.removeEventListener("abort", onAbort);
-      if (outcome.signal || outcome.timedOut || input.signal?.aborted) {
-        await pause();
-        return;
+      if (outcome.exitCode !== 0 || outcome.signal || outcome.timedOut || input.signal?.aborted) {
+        // Local CLI exit does not prove a shared provider turn stopped.
+        return { providerWorkUnverified: true };
       }
       if (outcome.exitCode === 0) await persist({ ...binding, exited: "clean" });
       // A clean client exit is not proof the Paperclip run result was committed.
       // Preserve the exact provider session binding for a successor after a
       // crash between CLI completion and durable run settlement. Retire it only
       // as part of an authoritative task/session archival operation.
+      return { providerWorkUnverified: false };
     },
   };
 }

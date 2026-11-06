@@ -560,7 +560,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         return {
           exitCode: 75, signal: null, timedOut: false,
           errorMessage: "OpenCode shared server has unresolved active sessions; no inference sent",
-          resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+          resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: true, reason: "shared_session_unverified" } },
         };
       }
     }
@@ -962,7 +962,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         const recovery = (initial as { executionRecovery?: unknown }).executionRecovery;
         return recovery ? { ...result, resultJson: { ...(result.resultJson ?? {}), executionRecovery: recovery } } : result;
       }
-      await sharedSession?.finish(initial.proc);
+      const sharedFinish = await sharedSession?.finish(initial.proc);
+      if (sharedFinish?.providerWorkUnverified) {
+        const result = toResult(initial);
+        return { ...result, resultJson: { ...(result.resultJson ?? {}),
+          executionRecovery: { kind: "bootstrap", providerWorkStarted: true, reason: "shared_session_unverified" } } };
+      }
       const initialFailed =
         !initial.proc.timedOut && ((initial.proc.exitCode ?? 0) !== 0 || Boolean(initial.parsed.errorMessage));
       if (

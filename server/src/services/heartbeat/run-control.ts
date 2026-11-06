@@ -1365,7 +1365,10 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     // A shared OpenCode session can continue after its Paperclip controller is
     // lost. An absent in-process handle is not a provider termination receipt.
     // Persist the request, but retain the run and its resources for recovery.
-    if (run.runtimeMode === "legacy" && run.status === "running" && !control && !running &&
+    const openCodeBinding = parseObject(parseObject(parseObject(run.resultJson?.earlySession).sessionParams).narBinding);
+    const ownedNarBinding = openCodeBinding.schema === "paperclip.opencode-binding.v1" &&
+      openCodeBinding.runId === run.id && openCodeBinding.agentId === run.agentId;
+    if (run.runtimeMode === "legacy" && run.status === "running" && (!control || !ownedNarBinding) &&
         (agent?.adapterType === "opencode_local" || parseObject(run.runnerProfileJson?.adapterDispatch).adapterType === "opencode_local")) {
       let held: { id: string } | undefined;
       try {
@@ -1381,7 +1384,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         stopOwnership?.release();
       }
       if (!held) return getRun(run.id);
-      throw conflict("Stop is recorded, but the OpenCode controller is unavailable and provider termination is unverified.",
+      throw conflict("Stop is recorded, but exact OpenCode turn ownership or provider termination is unverified.",
         { code: "adapter_stop_pending", runId: run.id });
     }
     // Capture the existing adapter owner before waiting on the run lock. Then

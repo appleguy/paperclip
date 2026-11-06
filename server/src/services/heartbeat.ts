@@ -331,6 +331,7 @@ import {
 import { agentInstructionWorkingCopyService } from "./agent-instruction-working-copies.js";
 
 import fs from "node:fs/promises";
+import { isUnverifiedSharedOpenCode, persistUnverifiedSharedOpenCode } from "./heartbeat/opencode-unverified-hold.js";
 import path from "node:path";
 import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
@@ -1902,6 +1903,7 @@ export function heartbeatService(
     }
     let legacyOpenCode = run.runtimeMode === "legacy" && claimedAdapterType(run) === "opencode_local";
     let legacyOpenCodeTerminalWriteOwned = false;
+    let legacyOpenCodeProviderUnverified = false;
     const onLegacyOpenCodeTerminalWrite = () => { legacyOpenCodeTerminalWriteOwned = true; };
 
     const releaseInstructionCopy = createHeartbeatInstructionCopyRelease(run, instructionCopies, appendRunEvent);
@@ -3558,6 +3560,14 @@ export function heartbeatService(
         }));
         if (!execution.dispatched) return;
         const { adapterResult } = execution;
+        if (isUnverifiedSharedOpenCode({ run, adapterType: agent.adapterType, resultJson: adapterResult.resultJson })) {
+          legacyOpenCodeProviderUnverified = true;
+          await persistUnverifiedSharedOpenCode(db, { run, resultJson: adapterResult.resultJson }).catch(err => {
+            logger.error({ err, runId: run.id }, "failed to persist unverified shared OpenCode hold");
+          });
+          logger.warn({ runId: run.id }, "holding shared OpenCode run without provider termination proof");
+          return;
+        }
         // Reconcile the referenced-project set against the real remote staging outcome. A referenced
         // project can pass authorization and clone locally at run prep, then fail to stage into the
         // sandbox during execution. The run-prep observability above counts such a project as synced,
@@ -3808,7 +3818,7 @@ export function heartbeatService(
     } finally {
       const nativeExecutionEstablished = !legacyAdapterEntered &&
         (nativeDispatchStarted || nativeOwnershipHeld || nativeSessionResumeScheduled || nativeWorkspaceFinalizeScheduled);
-      if (legacyOpenCode && !legacyOpenCodeTerminalWriteOwned && !nativeExecutionEstablished && run.controllerBootId) {
+      if (legacyOpenCode && !legacyOpenCodeProviderUnverified && !legacyOpenCodeTerminalWriteOwned && !nativeExecutionEstablished && run.controllerBootId) {
         // Another path (cancel, watchdog, done gate) may have terminalized the run with no
         // takeover. Both boot-id writers require status running, so a terminal row that still
         // carries this executor's boot id was never claimed by a successor; its cleanup is ours.
@@ -3818,7 +3828,7 @@ export function heartbeatService(
         if (settledRow && settledRow.status !== "running" && settledRow.status !== "queued" &&
           settledRow.controllerBootId === run.controllerBootId) legacyOpenCodeTerminalWriteOwned = true;
       }
-      if (legacyOpenCode && !legacyOpenCodeTerminalWriteOwned && !nativeExecutionEstablished) {
+      if (legacyOpenCode && (legacyOpenCodeProviderUnverified || !legacyOpenCodeTerminalWriteOwned) && !nativeExecutionEstablished) {
         // A read of the row cannot authorize cleanup: another controller can
         // take over before an external release starts. Only our successful
         // terminal CAS grants this executor permission to clean shared state.

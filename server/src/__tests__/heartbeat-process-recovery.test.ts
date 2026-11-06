@@ -3400,6 +3400,23 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(retries).toHaveLength(1);
   });
 
+  it("holds an OpenCode pre-dispatch row when earlier shared provider work is unverified", async () => {
+    const { runId, agentId, companyId, issueId } = await seedRunFixture({
+      adapterType: "opencode_local", runtimeMode: "legacy", agentStatus: "paused",
+    });
+    await db.update(heartbeatRuns).set({ controllerBootId: randomUUID(),
+      controllerLeaseExpiresAt: sql`clock_timestamp() - interval '1 second'`, executionStage: "preparing",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: true, reason: "shared_session_unverified" } } })
+      .where(eq(heartbeatRuns.id, runId));
+    expect((await heartbeatService(db).reapOrphanedRuns()).runIds).not.toContain(runId);
+    expect(await heartbeatService(db).getRun(runId)).toMatchObject({ status: "running" });
+    expect(await selectRecoveryActionForIssue(companyId, issueId)).toMatchObject({
+      ownerType: "board", returnOwnerAgentId: agentId, cause: "opencode_controller_lost_provider_unverified",
+    });
+    const retries = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.retryOfRunId, runId)));
+    expect(retries).toHaveLength(0);
+  });
+
   it("surfaces an orphaned OpenCode Stop even while a persisted child is alive", async () => {
     const { runId, agentId, companyId, issueId } = await seedRunFixture({
       adapterType: "opencode_local", runtimeMode: "legacy", agentStatus: "paused", processPid: process.pid,

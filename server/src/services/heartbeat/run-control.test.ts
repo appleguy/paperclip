@@ -158,6 +158,27 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
     expect(deps.startNextQueuedRunForAgent).not.toHaveBeenCalled();
   });
 
+  it.each(["missing", "unbound"] as const)("holds OpenCode Stop with a live child and %s controller", async ownership => {
+    const { company, agent } = await fixture();
+    await db.update(agents).set({ adapterType: "opencode_local" }).where(eq(agents.id, agent.id));
+    const run = await liveRun(company.id, agent.id);
+    const execution = createAdapterExecutionControl();
+    if (ownership === "unbound") adapterExecutionControls.set(run.id, execution);
+    const deps = callbacks(db);
+    try {
+      await expect(createHeartbeatRunControl(db, deps).cancelRunInternal(run.id, "Operator Stop"))
+        .rejects.toMatchObject({ status: 409 });
+      expect(await deps.getRun(run.id)).toMatchObject({ status: "running", resultJson: { executionCancellation: { state: "requested" } } });
+      expect(execution.controller.signal.aborted).toBe(false);
+      expect(terminateLocalService).not.toHaveBeenCalled();
+      expect(deps.setRunStatusFromLive).not.toHaveBeenCalled();
+      expect(deps.envOrchestrator.releaseForRun).not.toHaveBeenCalled();
+      expect(deps.startNextQueuedRunForAgent).not.toHaveBeenCalled();
+    } finally {
+      adapterExecutionControls.delete(run.id);
+    }
+  });
+
   it.each(["queued", "running", "cancelled", "succeeded"] as const)("does not supersede a retry that becomes %s between lookup and the cancellation fence", async status => {
     const { company, agent } = await fixture();
     const [run] = await db.insert(heartbeatRuns).values({

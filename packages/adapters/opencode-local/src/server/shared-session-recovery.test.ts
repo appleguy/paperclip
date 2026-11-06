@@ -75,7 +75,7 @@ describe("persistent OpenCode server restart re-pair", () => {
       requestedSessionId: null, ...changes };
   }
 
-  it("durably binds before dispatch, then re-pairs after a simulated controller crash without POSTing a second session", async () => {
+  it("holds a still-active bound session after controller loss without interrupting a successor", async () => {
     const original = await prepareSharedOpenCodeSession(input("run-before-crash"));
     expect(original.sessionId).toBe(previousId);
     expect(original.resumed).toBe(false);
@@ -87,17 +87,14 @@ describe("persistent OpenCode server restart re-pair", () => {
     // generating. No finish() is called: the new process sees ONLY durable state.
     state.sessions.add(previousId);
     state.active.add(previousId);
-    const successor = await prepareSharedOpenCodeSession(input("run-after-crash"));
-    expect(successor.sessionId).toBe(previousId);
-    expect(successor.resumed).toBe(true);
-    expect(successor.recovered).toBe(true);
+    await expect(prepareSharedOpenCodeSession(input("run-after-crash"))).rejects.toBeInstanceOf(OpenCodeSharedSessionWait);
+    expect(state.interrupted).toEqual([]);
+    expect(state.active.has(previousId)).toBe(true);
+    expect(JSON.parse(await fs.readFile(journal, "utf8"))).toMatchObject({ runId: "run-before-crash" });
+    state.active.delete(previousId);
+    await expect(prepareSharedOpenCodeSession(input("run-after-crash"))).rejects.toBeInstanceOf(OpenCodeSharedSessionWait);
     expect(state.created).toBe(1);
-    expect(state.interrupted).toEqual([previousId]);
-    expect(state.active.has(previousId)).toBe(false);
-    await successor.finish({ exitCode: 0, signal: null, timedOut: false });
-    expect(JSON.parse(await fs.readFile(journal, "utf8"))).toMatchObject({
-      sessionId: previousId, runId: "run-after-crash", exited: "clean",
-    });
+    expect(state.interrupted).toEqual([]);
   });
 
   it("treats a follow-up after a clean exit as a normal resume, not a restart recovery", async () => {
@@ -112,19 +109,20 @@ describe("persistent OpenCode server restart re-pair", () => {
     const journal = path.join(root, "paperclip-opencode-session-recovery", "agent-test-issue-test.json");
     expect(JSON.parse(await fs.readFile(journal, "utf8")).exited).toBeUndefined();
     await followUp.finish({ exitCode: 1, signal: null, timedOut: false });
-    const afterFailure = await prepareSharedOpenCodeSession(input("run-after-failure"));
-    expect(afterFailure.recovered).toBe(true);
+    await expect(prepareSharedOpenCodeSession(input("run-after-failure"))).rejects.toBeInstanceOf(OpenCodeSharedSessionWait);
   });
 
-  it("pauses the exact bound session when shutdown aborts, and retains the binding", async () => {
+  it("holds unverified provider work on shutdown without interrupting the session", async () => {
     const controller = new AbortController();
     const current = await prepareSharedOpenCodeSession(input("run-before-shutdown", { signal: controller.signal }));
     state.active.add(current.sessionId);
     controller.abort();
-    await current.finish({ exitCode: null, signal: "SIGTERM", timedOut: false });
-    expect(state.interrupted).toEqual([current.sessionId]);
-    const next = await prepareSharedOpenCodeSession(input("run-after-shutdown"));
-    expect(next.sessionId).toBe(current.sessionId);
+    expect(await current.finish({ exitCode: null, signal: "SIGTERM", timedOut: false })).toEqual({ providerWorkUnverified: true });
+    expect(state.interrupted).toEqual([]);
+    expect(state.active.has(current.sessionId)).toBe(true);
+    await expect(prepareSharedOpenCodeSession(input("run-after-shutdown"))).rejects.toBeInstanceOf(OpenCodeSharedSessionWait);
+    state.active.delete(current.sessionId);
+    await expect(prepareSharedOpenCodeSession(input("run-after-shutdown"))).rejects.toBeInstanceOf(OpenCodeSharedSessionWait);
     expect(state.created).toBe(1);
   });
 
@@ -156,7 +154,7 @@ describe("persistent OpenCode server restart re-pair", () => {
     expect(state.created).toBe(1);
   });
 
-  it("holds when the provider refuses to confirm interruption", async () => {
+  it("holds an active bound session without attempting an interrupt", async () => {
     await prepareSharedOpenCodeSession(input("original"));
     state.active.add(previousId);
     state.refuseInterrupt = true;

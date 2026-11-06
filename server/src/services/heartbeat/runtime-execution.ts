@@ -8,6 +8,7 @@ import { describeFailedAttachment } from "../native-runtime/remote-warm-session-
 import { usesNativeUsageDelivery } from "../native-runtime/native-usage-accounting.js";
 import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
 import { saveOpenCodeGoalCheckpoint } from "./opencode-shared-checkpoint.js";
+import { isUnverifiedSharedOpenCode } from "./opencode-unverified-hold.js";
 import { randomUUID } from "node:crypto";
 import { nativeSha256 } from "../native-runtime/canonical.js";
 import { readRemoteWorkspaceAuthority, saveRemoteWorkspace } from "../remote-workspaces.js";
@@ -313,6 +314,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
   }
   let adapterFinalizeOutcome: "succeeded" | "failed" | null = null;
   let preserveRunGatewayTokens = false;
+  let preserveUnverifiedSharedResources = false;
   let pluginWorkspaceFinalization: Record<string, unknown> | null = null;
   const inspectFinalizeWorkspaceBranch = async () => {
     const workspaceRecord = persistedExecutionWorkspace?.id
@@ -1009,6 +1011,13 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       adapterResult = await guardedDispatch.resultPromise;
     }
     adapterResult = identityRedactor.redact(adapterResult);
+    if (isUnverifiedSharedOpenCode({ run, adapterType: agent.adapterType, resultJson: adapterResult.resultJson })) {
+      // The local client returned without establishing that the shared provider
+      // stopped. Keep workspace/instruction state and gateway access available.
+      preserveRunGatewayTokens = true;
+      preserveUnverifiedSharedResources = true;
+      return { dispatched: true, adapterResult };
+    }
     if (run.runtimeMode === "legacy" && hasWorkspaceRestoreFailure(adapterResult.resultJson)
         && executionTarget?.kind === "remote" && executionTarget.transport === "sandbox") {
       const requiredWorkspaceRestoreEvidence = {
@@ -1322,8 +1331,10 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
         "failed to revoke heartbeat-run MCP gateway tokens",
       );
     }
-    await nativeInstructionReservation?.release();
-    await withAdapterExecutionPhase(executionPhaseContext, "instruction_cleanup", releaseInstructionCopy);
+    if (!preserveUnverifiedSharedResources) {
+      await nativeInstructionReservation?.release();
+      await withAdapterExecutionPhase(executionPhaseContext, "instruction_cleanup", releaseInstructionCopy);
+    }
   }
   return { dispatched: true, adapterResult };
 }

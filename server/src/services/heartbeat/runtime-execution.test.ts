@@ -364,6 +364,18 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expectCleanup(input);
   });
 
+  it("retains shared OpenCode workspace and credentials while provider work is unverified", async () => {
+    const { input, adapter, run } = await fixture();
+    input.agent.adapterType = "opencode_local";
+    const recovery = { kind: "bootstrap", reason: "shared_session_unverified", providerWorkStarted: true };
+    adapter.execute.mockResolvedValueOnce({ exitCode: 75, signal: null, timedOut: false, resultJson: { executionRecovery: recovery } });
+    expect(await executeHeartbeatRuntime(db, input)).toMatchObject({ dispatched: true, adapterResult: { resultJson: { executionRecovery: recovery } } });
+    expect(await finalizations()).toHaveLength(0);
+    expect(await read(run.id)).toMatchObject({ status: "running" });
+    expect(revokeHeartbeatRunGatewayTokens).not.toHaveBeenCalled();
+    expect(input.instructions.releaseInstructionCopy).not.toHaveBeenCalled();
+  });
+
   it("preserves Stop metadata and marks no-work accounting without manufacturing a receipt", async () => {
     const { input, adapter, run } = await fixture();
     await db.update(heartbeatRuns).set({ status: "cancelled", resultJson: { stoppedByUser: true } }).where(eq(heartbeatRuns.id, run.id));

@@ -85,7 +85,7 @@ describe("OpenCode adapter reconnects to persistent server after SIGTERM", () =>
     onLog: async () => {},
   });
 
-  it("interrupts server-side work on SIGTERM and resumes the same session without replaying the process", async () => {
+  it("holds server-side work on SIGTERM and does not replay while the session is active", async () => {
     const completed = JSON.stringify({ type: "tool_use", sessionID: sid,
       part: { state: { status: "completed", output: "already written" } } });
     runProcess.mockImplementationOnce(async () => {
@@ -97,22 +97,24 @@ describe("OpenCode adapter reconnects to persistent server after SIGTERM", () =>
       stderr: "", pid: 13, startedAt: "" } as never);
 
     const initial = await execute(context("first-run"));
-    expect(initial).toMatchObject({ signal: "SIGTERM", sessionId: sid });
-    expect(interrupted).toEqual([sid]);
-    expect(active.size).toBe(0);
-    const resumed = await execute(context("successor-run"));
-    expect(resumed).toMatchObject({ exitCode: 0, sessionId: sid });
+    expect(initial).toMatchObject({ signal: "SIGTERM", sessionId: sid,
+      resultJson: { executionRecovery: { providerWorkStarted: true, reason: "shared_session_unverified" } } });
+    expect(interrupted).toEqual([]);
+    expect(active.has(sid)).toBe(true);
+    const held = await execute(context("successor-run"));
+    expect(held).toMatchObject({ exitCode: 75, resultJson: { executionRecovery: { providerWorkStarted: true } } });
+    expect(runProcess).toHaveBeenCalledTimes(1);
+    active.delete(sid);
+    const idleHeld = await execute(context("successor-run"));
+    expect(idleHeld).toMatchObject({ exitCode: 75 });
     expect(created).toBe(1);
-    expect(runProcess).toHaveBeenCalledTimes(2);
+    expect(runProcess).toHaveBeenCalledTimes(1);
     for (const call of runProcess.mock.calls) {
       const args = call[3];
       expect(args).toContain("--session");
       expect(args[args.indexOf("--session") + 1]).toBe(sid);
       expect(args).not.toContain("--fork");
     }
-    const resumedPrompt = runProcess.mock.calls[1]![4].stdin as string;
-    expect(resumedPrompt).toContain("Do not repeat any completed tool actions");
-    expect(resumedPrompt).not.toContain("bootstrap-only");
   });
 
   it("refuses a fresh prompt when a different persistent session is still running", async () => {
