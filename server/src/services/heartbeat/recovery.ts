@@ -37,6 +37,7 @@ import {
 import { remoteTerminationReceipt } from "../remote-execution-termination.js";
 import { readEnvironmentStopFailure, type PluginEnvironmentStopFailure } from "@paperclipai/plugin-sdk";
 import { runUsedConversationAdapter } from "../conversation-continuation.js";
+import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { legacyExecutionNeedsReconciliationWithEvidence, terminalizeLegacyExecution } from "../legacy-execution-recovery.js";
 import { reconcileRetainedWorkspaces } from "../workspace-recovery.js";
 import { randomUUID } from "node:crypto";
@@ -2673,6 +2674,41 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       const revokedState = await revokeExpiredLegacyControllerWithState(db, run);
       if (!revokedState) continue;
       const latestResult = parseObject((await getRun(run.id))?.resultJson ?? run.resultJson);
+      const openCodeLegacyRun = run.runtimeMode === "legacy" &&
+        (adapterType === "opencode_local" || parseObject(run.runnerProfileJson?.adapterDispatch).adapterType === "opencode_local");
+      if (openCodeLegacyRun &&
+          parseObject(latestResult.executionCancellation).state === "requested") {
+        // Controller loss does not prove that a shared provider turn ended.
+        // Make the retained Stop visible to an operator, without displacing an
+        // existing recovery action or releasing the run's execution resources.
+        const issueId = run.issueId ?? readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+        if (issueId) {
+          await db.transaction(async tx => {
+            const [task] = await tx.select().from(issues).where(and(
+              eq(issues.id, issueId), eq(issues.companyId, run.companyId),
+            )).for("update");
+            if (!task) return;
+            const [held] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+              eq(heartbeatRuns.status, "running"), eq(heartbeatRuns.runtimeMode, "legacy"),
+              sql`${heartbeatRuns.resultJson}->'executionCancellation'->>'state' = 'requested'`,
+            )).for("update");
+            if (!held) return;
+            await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
+              companyId: run.companyId, sourceIssueId: issueId,
+              kind: "active_run_watchdog", ownerType: "board",
+              returnOwnerAgentId: task.assigneeAgentId ?? run.agentId,
+              cause: "opencode_stop_provider_unverified",
+              fingerprint: `opencode-stop:${run.id}`,
+              evidence: { runId: run.id, agentId: run.agentId, providerTermination: "unverified" },
+              nextAction: "Inspect the original OpenCode provider turn and establish whether it ended; preserve the run and its resources until termination and ownership are verified.",
+              wakePolicy: null, createOnly: true,
+            });
+          });
+        }
+        scope.onDeferredDeadline?.(Date.now() + 60_000);
+        continue;
+      }
       // A legacy controller persists "dispatching" in the same lease renewal
       // that admits the adapter. An expired lease from another boot that is
       // still "preparing" proves a restart stopped setup before provider work.
@@ -2734,7 +2770,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           })(),
         },
         undefined,
-        adapterType === "opencode_local" && run.runtimeMode === "legacy"
+        openCodeLegacyRun
           ? sql`coalesce(${heartbeatRuns.resultJson}->'executionCancellation'->>'state', '') <> 'requested'`
           : undefined,
       );

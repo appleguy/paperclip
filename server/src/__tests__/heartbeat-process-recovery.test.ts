@@ -3349,13 +3349,37 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   });
 
   it("retains an OpenCode run with a pending Stop when its controller is lost", async () => {
-    const { runId, agentId } = await seedRunFixture({ adapterType: "opencode_local", runtimeMode: "legacy", agentStatus: "paused" });
+    const { runId, agentId, companyId, issueId } = await seedRunFixture({ adapterType: "opencode_local", runtimeMode: "legacy", agentStatus: "paused" });
     await db.update(heartbeatRuns).set({ resultJson: { executionCancellation: { state: "requested" } } })
       .where(eq(heartbeatRuns.id, runId));
     const result = await heartbeatService(db).reapOrphanedRuns();
     expect(result.runIds).not.toContain(runId);
     expect(await heartbeatService(db).getRun(runId)).toMatchObject({ status: "running", resultJson: { executionCancellation: { state: "requested" } } });
     expect(await selectRecoveryRunsByAgent(agentId)).toHaveLength(1);
+    expect(await selectRecoveryActionForIssue(companyId, issueId)).toMatchObject({
+      kind: "active_run_watchdog", ownerType: "board", returnOwnerAgentId: agentId,
+      cause: "opencode_stop_provider_unverified", evidence: { runId, providerTermination: "unverified" },
+    });
+    await heartbeatService(db).reapOrphanedRuns();
+    expect(await selectRecoveryActionsForIssue(issueId)).toHaveLength(1);
+  });
+
+  it("does not replace an existing recovery owner when surfacing a lost OpenCode Stop", async () => {
+    const { companyId, issueId, runId, agentId } = await seedRunFixture({ adapterType: "codex_local", runtimeMode: "legacy" });
+    await db.update(heartbeatRuns).set({
+      runnerProfileJson: { adapterDispatch: { adapterType: "opencode_local" } },
+      resultJson: { executionCancellation: { state: "requested" } },
+    }).where(eq(heartbeatRuns.id, runId));
+    const [original] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId: issueId, kind: "active_run_watchdog", status: "active",
+      ownerType: "agent", ownerAgentId: agentId, cause: "existing_hold",
+      fingerprint: `existing:${runId}`, evidence: {}, nextAction: "Existing recovery work",
+    }).returning();
+    await heartbeatService(db).reapOrphanedRuns();
+    expect(await selectRecoveryActionsForIssue(issueId)).toMatchObject([{
+      id: original!.id, ownerType: "agent", ownerAgentId: agentId, cause: "existing_hold",
+    }]);
+    expect(await heartbeatService(db).getRun(runId)).toMatchObject({ status: "running" });
   });
 
   it("schedules one conversation continuation after losing the provider", async () => {
