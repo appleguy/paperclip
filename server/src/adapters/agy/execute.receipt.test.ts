@@ -28,17 +28,32 @@ describe("agy busy dispatch and receipt completion", () => {
   let dir: string;
   let submitted: string[];
   let capture: string;
+  let abortOnEnter: AbortController | undefined;
+  let enterAbortReason: unknown;
   let api: Mock<(url: string, init: RequestInit) => Promise<Response>>;
   beforeEach(async () => {
     dir = await fs.mkdtemp(path.join(ROOT, "agy-receipt-test-"));
     submitted = [];
     capture = screen();
+    abortOnEnter = undefined;
+    enterAbortReason = undefined;
     transport.exec.mockImplementation((_command, args, _options, callback) => {
       void (async () => {
         if (args.includes("load-buffer")) submitted.push(await fs.readFile(args.at(-1), "utf8"));
         // Any native input is queued; after Enter the owner starts another draft.
-        if (args.includes("send-keys")) capture = screen("> owner typing while the receipt arrives");
-        const stdout = args.includes("capture-pane") ? capture : args.includes("display-message") ? "agy\n" : "";
+        if (args.includes("send-keys")) {
+          if (args.at(-1) === "Enter") {
+            capture = screen("> owner typing while the receipt arrives");
+            abortOnEnter?.abort(enterAbortReason);
+          } else if (args.at(-1) === "Escape") {
+            capture = screen();
+            await fs.writeFile(path.join(dir, "status-line.json"), JSON.stringify({
+              agentState: "idle", conversationId: conversation, pendingInputCount: 0,
+              toolConfirmationPending: false, observedAt: new Date().toISOString(),
+            }));
+          }
+        }
+        const stdout = args.includes("capture-pane") ? capture : args.includes("display-message") ? "%42 123 agy\n" : "";
         callback(null, { stdout, stderr: "" });
       })().catch(callback);
     });
@@ -98,6 +113,36 @@ describe("agy busy dispatch and receipt completion", () => {
     expect(submitted).toEqual([]);
     expect(api).not.toHaveBeenCalled();
     await expect(fs.stat(path.join(dir, "active.json"))).rejects.toThrow();
+  });
+
+  it("explicit Stop interrupts only its checkpointed seat and archives the idle run", async () => {
+    const controller = new AbortController();
+    // Abort at the provider-write boundary, after the Runner persisted ownership.
+    abortOnEnter = controller;
+    enterAbortReason = Object.assign(new Error("Stop"), { code: "paperclip_explicit_run_stop" });
+    const sibling = path.join(dir, "s1");
+    await fs.mkdir(sibling, { mode: 0o700 });
+    const siblingCheckpoint = JSON.stringify({ runId: OLD, issueId: "sibling" });
+    await fs.writeFile(path.join(sibling, "active.json"), siblingCheckpoint);
+    const result = await execute({ ...context(dir), signal: controller.signal });
+    expect(result.exitCode).toBe(1);
+    expect(submitted).toHaveLength(1);
+    const signals = transport.exec.mock.calls.map(call => call[1] as string[]).filter(args => args.includes("send-keys"));
+    expect(signals.map(args => args.at(-1))).toEqual(["Enter", "Escape"]);
+    expect(signals.every(args => args[args.indexOf("-t") + 1] === "%42")).toBe(true);
+    expect(await fs.readFile(path.join(sibling, "active.json"), "utf8")).toBe(siblingCheckpoint);
+    await expect(fs.stat(path.join(dir, "active.json"))).rejects.toThrow();
+    expect(api).not.toHaveBeenCalled();
+  });
+
+  it("shutdown detaches without interrupting or removing the live checkpoint", async () => {
+    const controller = new AbortController();
+    abortOnEnter = controller;
+    const result = await execute({ ...context(dir), signal: controller.signal });
+    expect(result.exitCode).toBe(1);
+    expect(JSON.parse(await fs.readFile(path.join(dir, "active.json"), "utf8"))).toMatchObject({ runId: RUN, paneId: "%42", panePid: "123" });
+    const signals = transport.exec.mock.calls.map(call => call[1] as string[]).filter(args => args.includes("send-keys"));
+    expect(signals.map(args => args.at(-1))).toEqual(["Enter"]);
   });
 
   it("reports review-wait and reuses the receipt without another PATCH or provider dispatch", async () => {
@@ -190,7 +235,7 @@ describe("agy busy dispatch and receipt completion", () => {
       runId: OLD, issueId: "probe", receiptPath: receiptFilePath(dir, OLD), rcUrl: URL,
       conversationId: conversation, startedAt: "2000-01-01T00:00:00Z",
     };
-    await fs.writeFile(path.join(dir, "active.json"), JSON.stringify(active));
+    await fs.writeFile(path.join(dir, "active.json"), JSON.stringify(active), { mode: 0o600 });
     await fs.writeFile(active.receiptPath, JSON.stringify(receipt(OLD)));
     capture = screen("> owner draft");
     const result = await execute(context(dir));
@@ -202,7 +247,7 @@ describe("agy busy dispatch and receipt completion", () => {
   it("reattaches the exact run checkpoint without submitting another prompt", async () => {
     await fs.writeFile(path.join(dir, "active.json"), JSON.stringify({
       runId: RUN, issueId: "probe", receiptPath: receiptFilePath(dir, RUN), rcUrl: URL, conversationId: conversation,
-    }));
+    }), { mode: 0o600 });
     await fs.writeFile(receiptFilePath(dir, RUN), JSON.stringify(receipt()));
     const ctx = context(dir);
     ctx.context.paperclipRestartReattach = true;
@@ -230,7 +275,7 @@ describe("agy busy dispatch and receipt completion", () => {
     certifyTerminalCheckpoint("previous");
     await fs.writeFile(path.join(dir, "active.json"), JSON.stringify({
       runId: OLD, issueId: "previous", receiptPath: receiptFilePath(dir, OLD), rcUrl: URL,
-    }));
+    }), { mode: 0o600 });
     await fs.writeFile(receiptFilePath(dir, OLD), JSON.stringify(receipt(OLD, "previous")));
     await fs.writeFile(receiptFilePath(dir, RUN), JSON.stringify(receipt()));
     expect((await execute(context(dir))).exitCode).toBe(0);

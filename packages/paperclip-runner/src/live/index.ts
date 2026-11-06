@@ -14,3 +14,5 @@ export { probeKimiModels, KimiMetadataProbeError, type KimiVerifiedModelMetadata
 export { probeKimiMetadata, validateKimiMetadata, kimiMetadataProbeDigest, kimiMetadataProbeNodeDigest, type KimiMetadataResult } from "../drivers/acpx/kimi-metadata-probe.js";
 
 export { bundledRemoteProviderPackManifestPath, bundledRemoteRunnerBinary } from "./bundled-remote-provider-pack.js";
+export { AntigravityInteractiveControl } from "../drivers/antigravity/interactive-control.js";
+export { AntigravityInteractiveRun } from "../drivers/antigravity/interactive-run.js";

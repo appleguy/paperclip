@@ -13,6 +13,7 @@ import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { readableRuntimePath } from "@paperclipai/adapter-utils/readable-runtime-paths";
+import { AntigravityInteractiveControl, AntigravityInteractiveRun } from "@paperclipai/paperclip-runner/live";
 import { parseHeartbeatPolicy } from "../../services/heartbeat/timer-policy.js";
 import { AGY_HOST_ADMISSION, claimAgyHostAdmission, isAgyAdmissionIdle, isAgyHostLimitedModel } from "./admission.js";
 import { assertAssembledPrompt, preflightSessionPrompt, applyPromptRotation } from "@paperclipai/adapter-utils/token-preflight";
@@ -170,7 +171,7 @@ export function parseReceipt(raw: string, runId: string, issueId: string): Recei
   }
   return r as Receipt;
 }
-export type ActiveDispatch = { runId: string; issueId: string; receiptPath: string; rcUrl: string; conversationId?: string | null };
+export type ActiveDispatch = { runId: string; issueId: string; receiptPath: string; rcUrl: string; conversationId?: string | null; paneId?: string; panePid?: string };
 
 export function receiptFilePath(stateDir: string, runId: string): string {
   return path.join(stateDir, `receipt-${runId.replaceAll("-", "").slice(0, 12)}.json`);
@@ -254,42 +255,6 @@ function agentTmpDir(socket: string, session: string): string { return path.join
 function assertWorkableCwd(cwd: string): void {
   if (cwd === "/" || cwd.startsWith("/private/var/folders") || cwd.startsWith("/var/folders"))
     throw new Error(`agy cwd ${cwd} is root or system temp; use a canonical NVM path (SCO-534)`);
-}
-
-async function ensureSession(
-  socket: string, session: string, cwd: string, stateDir: string, rejoinOnly: boolean, model: string,
-): Promise<string> {
-  let exists = true;
-  try { await tmux(socket, ["has-session", ...target(session)]); } catch { exists = false; }
-  if (!exists) {
-    // An already-emitted op cannot be rejoined through a newly launched TUI.
-    if (rejoinOnly) throw new Error("agy active op lost its original TUI; operator reconciliation required, never replay");
-    await fs.mkdir(cwd, { recursive: true });
-    await fs.mkdir(agentTmpDir(socket, session), { recursive: true });
-    // tmux exec mode: no interpolated shell source or arbitrary model selection.
-    await tmux(socket, ["new-session", "-d", "-s", session, "-c", cwd,
-      "-e", `TMPDIR=${agentTmpDir(socket, session)}`,
-      AGY, "--remote-control", "--dangerously-skip-permissions", "--model", model]);
-  }
-  const processName = (await tmux(socket, ["display-message", "-p", ...target(session), "#{pane_current_command}"])).trim();
-  if (processName !== "agy") throw new Error(`tmux pane is ${processName}, not agy; refusing to commandeer it`);
-  let screen = await pane(socket, session);
-  // A freshly launched seat prints its RC URL and empty editor only after start-up.
-  for (const until = Date.now() + 45_000; !exists && Date.now() < until
-      && !/Do you trust the contents/.test(screen) && !(parseRemoteUrl(screen) && isEmptyInputBox(screen));) {
-    await sleep(1000);
-    screen = await pane(socket, session);
-  }
-  if (/Do you trust the contents/.test(screen))
-    throw new Error("agy workspace trust prompt: approve this dedicated workspace in the terminal, then retry");
-  if (!rejoinOnly) {
-    const readiness = inputGuard(screen);
-    if (!readiness.allowed) throw new Error(`agy input guard refused: ${readiness.reason}`);
-  }
-  const url = parseRemoteUrl(screen);
-  if (url) await fs.writeFile(path.join(stateDir, "remote-control-url.txt"), url + "\n", { mode: 0o600 });
-  const previous = await fs.readFile(path.join(stateDir, "remote-control-url.txt"), "utf8").catch(() => "");
-  return url ?? (exists ? previous.trim() : "");
 }
 
 /** One non-blocking attempt at a seat's dispatch mutex; null while another live adapter run holds it. */
@@ -443,7 +408,7 @@ export async function claimSlot(
       const state = await checkpointRunState(ctx, raw);
       if (state === "live" || state === "unknown") { await unlock(); continue; }
       if (raw && state === "terminal") {
-        await settleForeignCheckpoint(ctx, raw, issueId, slot.stateDir, path.join(slot.stateDir, "active.json"));
+        await settleForeignCheckpoint(ctx, raw, issueId, slot.stateDir);
         raw = await activeOf(slot);
       }
       adoptableActive(raw, issueId, slot.stateDir);
@@ -532,7 +497,7 @@ export async function deliver(ctx: AdapterExecutionContext, receipt: Receipt, ti
  * The caller holds the state mutex, so no live adapter run owns this checkpoint.
  */
 async function settleForeignCheckpoint(
-  ctx: AdapterExecutionContext, raw: string, issueId: string, stateDir: string, activePath: string,
+  ctx: AdapterExecutionContext, raw: string, issueId: string, stateDir: string,
 ): Promise<void> {
   let a: Partial<ActiveDispatch>;
   try { a = JSON.parse(raw) as Partial<ActiveDispatch>; } catch { return; }
@@ -549,7 +514,7 @@ async function settleForeignCheckpoint(
     await ctx.onLog("stderr", `[agy] Could not settle receipt of run ${a.runId} onto issue ${a.issueId} (${e instanceof Error ? e.message : e}); receipt kept at ${a.receiptPath}\n`);
     return;
   }
-  await fs.rename(activePath, path.join(stateDir, `active.stale-${a.runId}-${Date.now()}.json`));
+  await AntigravityInteractiveRun.archiveSettled({ stateDir, runId: a.runId, issueId: a.issueId });
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
@@ -570,6 +535,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let releaseHost: (() => Promise<void>) | undefined;
   let hostMayRelease = true;
   let dispatched = false;
+  let nativeRun: AntigravityInteractiveRun | undefined;
+  let control: AntigravityInteractiveControl | undefined;
+  let ownedRunId = ctx.runId;
   const failure = (reason: string, timedOut = false): AdapterExecutionResult => ({
     exitCode: 1, signal: null, timedOut, model, provider: "google", biller: "google",
     billingType: "subscription", costStatus: "unpriced", errorMessage: reason,
@@ -598,10 +566,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         { runId: adopted?.runId ?? ctx.runId, issueId, stateDir }, Boolean(adopted));
       if (adopted) hostMayRelease = false;
     }
-    const rcUrl = await ensureSession(socket, session, cwd, stateDir, Boolean(adopted), model);
+    ownedRunId = adopted?.runId ?? ctx.runId;
+    ctx.signal?.throwIfAborted();
+    control = await AntigravityInteractiveControl.open({ socket, session, cwd, stateDir,
+      tmpDir: agentTmpDir(socket, session), executable: AGY, model, rejoinOnly: Boolean(adopted),
+      expectedRemoteControlUrl: adopted?.rcUrl,
+      ...(adopted?.paneId && adopted.panePid ? { expectedSeat: { paneId: adopted.paneId, panePid: adopted.panePid } } : {}),
+      authorize: operationId => operationId === ownedRunId && !ctx.signal?.aborted,
+      tmux: args => tmux(socket, args),
+    });
+    const rcUrl = control.remoteControlUrl;
+    nativeRun = await AntigravityInteractiveRun.open({ control, stateDir, runId: ownedRunId, issueId });
+    await fs.writeFile(path.join(stateDir, "remote-control-url.txt"), rcUrl + "\n", { mode: 0o600 });
     if (!rcUrl) throw new Error("agy RC URL unavailable: use /remote-control in its TUI, then retry");
-    // Owner 2026-11-03: auto re-pin, logged. The URL rotates on every agy restart; ensureSession only reads it from the
-    // adapter-owned private tmux socket/session, so a new URL there is the same owned instance. The pin lives in
+    // Owner 2026-11-03: auto re-pin, logged. Runner observes the URL on the
+    // owned pane/process. The pin lives in
     // stateDir (cfg.expectedRemoteControlUrl is only the initial seed). An in-flight adopted dispatch stays strict below.
     const pinPath = path.join(stateDir, "rc-url.json");
     const pinned = await fs.readFile(pinPath, "utf8").then((t) => asString(JSON.parse(t)?.url, "")).catch(() => "")
@@ -687,14 +666,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const preflight = await inputReadiness(socket, session);
     if (!preflight.allowed) throw new Error(`agy input guard refused before dispatch: ${preflight.reason}`);
     hostMayRelease = false;
-    await fs.writeFile(activePath, JSON.stringify({
+    const checkpoint = {
       runId: ctx.runId, issueId, receiptPath, rcUrl, tmuxSocket: socket, tmuxSession: session,
-      conversationId, startedAt: new Date().toISOString(),
-    }, null, 2), { flag: "wx", mode: 0o600 });
+      conversationId, startedAt: new Date().toISOString(), ...control.seatIdentity,
+    };
     ctx.onDispatch?.();
     dispatched = true;
     await ctx.onLog("stdout", `[agy] Dispatching issue ${issueId} in shared RC ${rcUrl}; receipt ${receiptPath}\n`);
-    await send(socket, session, prompt, stateDir);
+    await nativeRun.dispatch(checkpoint, prompt);
     }
     const deadline = Date.now() + timeoutMs;
     let receipt: Receipt | null = null;
@@ -736,7 +715,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const disposition = await deliver(ctx, receipt, undefined, undefined, stateDir);
     const issueClosed = disposition.status === "done";
     await ctx.onLog("stdout", `[agy] ${issueClosed ? "Done" : "Awaiting review"} ${issueId}: ${receipt.summary}; conversation=${conversationId ?? "unknown"}\n`);
-    if (issueClosed) await fs.rm(activePath);
+    if (issueClosed) await nativeRun.complete();
     return {
       exitCode: 0, signal: null, timedOut: false, provider: "google", biller: "google", model,
       billingType: "subscription", costStatus: "unpriced", summary: receipt.summary,
@@ -746,6 +725,22 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         issueClosed, issueStatus: disposition.status, reviewPending: !issueClosed },
     };
   } catch (e) {
+    // Stop is distinct from shutdown/lease loss: restart detaches the controller
+    // while its exact checkpoint and live provider remain available for adoption.
+    if (nativeRun && control && ctx.signal?.aborted
+        && (ctx.signal.reason as { code?: unknown } | undefined)?.code === "paperclip_explicit_run_stop") {
+      try {
+        const stopped = await nativeRun.stop();
+        if (stopped === "restart_required") {
+          await control.terminateRunSeat(ownedRunId);
+          await AntigravityInteractiveRun.archiveSettled({ stateDir, runId: ownedRunId, issueId });
+        }
+        hostMayRelease = true;
+        await ctx.onLog("stdout", `[agy] Stopped owned seat ${socket}/${session}; sibling seats unchanged\n`);
+      } catch (stopError) {
+        await ctx.onLog("stderr", `[agy] Stop unconfirmed; checkpoint retained: ${stopError instanceof Error ? stopError.message : String(stopError)}\n`);
+      }
+    }
     const error = e instanceof Error ? e.message : String(e);
     await ctx.onLog("stderr", `[agy] ${error}\n`);
     return failure(error);

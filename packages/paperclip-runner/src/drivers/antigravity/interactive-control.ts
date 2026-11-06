@@ -46,6 +46,10 @@ export class AntigravityInteractiveControl {
     tmux: Tmux; authorize: (operationId: string) => boolean;
   }, readonly remoteControlUrl: string) {}
 
+  get seatIdentity(): Readonly<{ paneId: string; panePid: string }> {
+    return { paneId: this.input.paneId, panePid: this.input.panePid };
+  }
+
   private async assertRunOwner(runId: string): Promise<void> {
     const active = JSON.parse(await fs.readFile(path.join(this.input.stateDir, "active.json"), "utf8")) as { runId?: unknown };
     if (!runId || active.runId !== runId) throw new Error("Antigravity stop checkpoint ownership changed");
@@ -55,7 +59,7 @@ export class AntigravityInteractiveControl {
 
   static async open(input: {
     socket: string; session: string; stateDir: string; cwd: string; tmpDir: string; executable: string; model: string;
-    rejoinOnly: boolean; requireNew?: boolean; expectedRemoteControlUrl?: string; conversationId?: string; authorize: (operationId: string) => boolean; tmux?: Tmux;
+    rejoinOnly: boolean; requireNew?: boolean; expectedRemoteControlUrl?: string; expectedSeat?: { paneId: string; panePid: string }; conversationId?: string; authorize: (operationId: string) => boolean; tmux?: Tmux;
     wait?: (ms: number) => Promise<void>; startupTimeoutMs?: number;
   }): Promise<AntigravityInteractiveControl> {
     validateLaunch(input);
@@ -140,8 +144,22 @@ export class AntigravityInteractiveControl {
       stateDir: this.input.stateDir, authorize: this.input.authorize, tmux: this.input.tmux, rejoinOnly: false, requireNew: true });
   }
 
+  /** Explicit Stop escalation: remove only this exact seat after interruption
+   * failed. No replacement provider is launched and sibling seats stay live. */
+  async terminateRunSeat(runId: string): Promise<void> {
+    await this.assertRunOwner(runId);
+    if (this.restartEligibleRun !== runId) throw new Error("Antigravity seat termination requires an interrupt timeout");
+    this.restartEligibleRun = undefined;
+    await this.input.tmux(["kill-session", "-t", `=${this.input.session}:`]);
+    let present = true;
+    try { await this.input.tmux(["has-session", "-t", `=${this.input.session}:`]); }
+    catch { present = false; }
+    if (present) throw new Error("Antigravity stopped seat still present");
+  }
+
   static async attach(input: {
     socket: string; session: string; stateDir: string; expectedRemoteControlUrl?: string;
+    expectedSeat?: { paneId: string; panePid: string };
     authorize: (operationId: string) => boolean; tmux?: Tmux;
   }): Promise<AntigravityInteractiveControl> {
     if (!idPattern.test(input.socket) || !idPattern.test(input.session) || !path.isAbsolute(input.stateDir))
@@ -152,13 +170,36 @@ export class AntigravityInteractiveControl {
     const identity = (await tmux(["display-message", "-p", ...target, "#{pane_id} #{pane_pid} #{pane_current_command}"])).trim();
     const match = /^(%\d+) (\d+) agy$/.exec(identity);
     if (!match) throw new Error("Antigravity seat identity unavailable");
-    const screen = await tmux(["capture-pane", ...target, "-p", "-J", "-S", "-150"]);
-    const remoteControlUrl = screen.match(remotePattern)?.[0];
-    if (!remoteControlUrl || (input.expectedRemoteControlUrl && input.expectedRemoteControlUrl !== remoteControlUrl))
-      throw new Error("Antigravity Remote Control identity unavailable or changed");
+    if (input.expectedSeat && (match[1] !== input.expectedSeat.paneId || match[2] !== input.expectedSeat.panePid))
+      throw new Error("Antigravity seat identity changed");
     const state = await fs.lstat(input.stateDir);
     if (!state.isDirectory() || state.isSymbolicLink() || (process.platform !== "win32" && ((state.mode & 0o077) !== 0 || state.uid !== process.getuid?.())))
       throw new Error("Antigravity seat state must be private and owned");
+    const screen = await tmux(["capture-pane", ...target, "-p", "-J", "-S", "-150"]);
+    if (/Do you trust the contents/.test(screen)) throw new Error("Antigravity workspace trust prompt requires reconciliation");
+    // A busy seat can scroll its RC banner out of view. Only the exact persisted
+    // pane/process binding permits using its checkpointed URL during adoption.
+    let remoteControlUrl = screen.match(remotePattern)?.[0] ?? (input.expectedSeat ? input.expectedRemoteControlUrl : undefined);
+    const bindingPath = path.join(input.stateDir, "seat-binding.json");
+    if (!remoteControlUrl) {
+      const binding = await fs.readFile(bindingPath, "utf8").then(text => JSON.parse(text) as Record<string, unknown>).catch(() => null);
+      if (binding?.paneId === match[1] && binding.panePid === match[2] && binding.socket === input.socket && binding.session === input.session
+          && typeof binding.remoteControlUrl === "string" && binding.remoteControlUrl.match(remotePattern)?.[0] === binding.remoteControlUrl)
+        remoteControlUrl = binding.remoteControlUrl;
+    }
+    if (!remoteControlUrl) {
+      // Bounded migration of a pre-Runner seat: observe its own banner in pane
+      // history, never issue /remote-control or change the owner's editor.
+      const history = await tmux(["capture-pane", ...target, "-p", "-J", "-S", "-5000"]);
+      remoteControlUrl = [...history.matchAll(new RegExp(remotePattern.source, "g"))].at(-1)?.[0];
+    }
+    if (!remoteControlUrl || (input.expectedRemoteControlUrl && input.expectedRemoteControlUrl !== remoteControlUrl))
+      throw new Error("Antigravity Remote Control identity unavailable or changed");
+    const bindingTmp = path.join(input.stateDir, `seat-binding-${randomUUID()}.tmp`);
+    try {
+      await fs.writeFile(bindingTmp, JSON.stringify({ socket: input.socket, session: input.session, paneId: match[1], panePid: match[2], remoteControlUrl }), { flag: "wx", mode: 0o600 });
+      await fs.rename(bindingTmp, bindingPath);
+    } finally { await fs.rm(bindingTmp, { force: true }); }
     return new AntigravityInteractiveControl({ ...input, tmux, paneId: match[1]!, panePid: match[2]! }, remoteControlUrl);
   }
 
@@ -193,6 +234,8 @@ export class AntigravityInteractiveControl {
       await this.input.tmux(["load-buffer", "-b", buffer, file]);
       await this.input.tmux(["paste-buffer", "-p", "-r", "-d", "-b", buffer, ...target]);
       await new Promise(resolve => setTimeout(resolve, Math.min(3000, Math.max(350, 500 + Math.ceil(message.length / 1500) * 300))));
+      if (!this.input.authorize(operationId)) throw new Error("Antigravity interactive admission revoked");
+      await this.assertRunOwner(runId);
       await this.input.tmux(["send-keys", ...target, "Enter"]);
     } finally {
       await this.input.tmux(["delete-buffer", "-b", buffer]).catch(() => {});

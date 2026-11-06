@@ -77,7 +77,7 @@ describe("Antigravity interactive seat", () => {
       content = screen;
       authorize.mockReturnValue(false);
       await expect(control.submit("three", "work", "run-1")).rejects.toThrow(/denied/);
-      expect(await readdir(stateDir)).toEqual(["active.json"]);
+      expect((await readdir(stateDir)).sort()).toEqual(["active.json", "seat-binding.json"]);
     } finally { await rm(stateDir, { recursive: true, force: true }); }
   });
 
@@ -178,6 +178,47 @@ describe("Antigravity interactive seat", () => {
     expect(emptyAgyEditor(screen)).toBe(true);
     expect(emptyAgyEditor(screen.replace(">", "> owner text"))).toBe(false);
     expect(emptyAgyEditor("Generating..." )).toBe(false);
+  });
+
+  it("reattaches after the banner scrolls away only with the persisted exact pane", async () => {
+    const stateDir = await mkdtemp(path.join(scratch, "agy-interactive-"));
+    let content = screen;
+    let identity = "%42 123 agy";
+    const tmux = async (args: string[]) => args[0] === "display-message" ? identity : args[0] === "capture-pane" ? content : "";
+    try {
+      const control = await AntigravityInteractiveControl.attach({ socket: "socket", session: "seat", stateDir, authorize: () => true, tmux });
+      content = "Working...";
+      expect((await AntigravityInteractiveControl.attach({ socket: "socket", session: "seat", stateDir, authorize: () => true, tmux })).remoteControlUrl).toBe(control.remoteControlUrl);
+      identity = "%42 456 agy";
+      await expect(AntigravityInteractiveControl.attach({ socket: "socket", session: "seat", stateDir,
+        expectedSeat: control.seatIdentity, expectedRemoteControlUrl: control.remoteControlUrl, authorize: () => true, tmux })).rejects.toThrow(/identity changed/);
+      await expect(AntigravityInteractiveControl.attach({ socket: "socket", session: "seat", stateDir, authorize: () => true, tmux })).rejects.toThrow(/identity unavailable/);
+    } finally { await rm(stateDir, { recursive: true, force: true }); }
+  });
+
+  it("escalates Stop only to the bound session after interruption times out", async () => {
+    const stateDir = await mkdtemp(path.join(scratch, "agy-interactive-"));
+    const calls: string[][] = [];
+    let exists = true;
+    const tmux = async (args: string[]) => {
+      calls.push(args);
+      if (args[0] === "display-message") return "%42 123 agy";
+      if (args[0] === "capture-pane") return screen;
+      if (args[0] === "kill-session") exists = false;
+      if (args[0] === "has-session" && !exists) throw new Error("missing");
+      return "";
+    };
+    try {
+      await writeFile(path.join(stateDir, "active.json"), JSON.stringify({ runId: "run-1" }));
+      const control = await AntigravityInteractiveControl.attach({ socket: "socket", session: "seat", stateDir, authorize: () => true, tmux });
+      await expect(control.terminateRunSeat("run-1")).rejects.toThrow(/interrupt timeout/);
+      let clock = 0;
+      expect(await control.interruptRun("run-1", { now: () => clock, wait: async ms => { clock += ms; }, timeoutMs: 1000 })).toBe("restart_required");
+      await expect(control.terminateRunSeat("other")).rejects.toThrow(/ownership/);
+      await control.terminateRunSeat("run-1");
+      expect(calls.filter(args => args[0] === "kill-session")).toEqual([["kill-session", "-t", "=seat:"]]);
+      expect(calls.some(args => args[0] === "new-session")).toBe(false);
+    } finally { await rm(stateDir, { recursive: true, force: true }); }
   });
 
   it("requires fresh idle status for the checkpointed conversation", () => {

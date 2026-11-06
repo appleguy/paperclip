@@ -42,13 +42,14 @@ export const agyAdapter: ServerAdapterModule = {
   // run checkpoint and never submits a replacement prompt.
   supportsRestartReattach: true,
   instructionsPathKey: "instructionsFilePath",
-  agentConfigurationDoc: `# agy_local: one shared Antigravity Remote Control session
+  agentConfigurationDoc: `# agy_local: Runner-owned Antigravity Remote Control seats
 
 Requires macOS, agy 1.4.12 and tmux. Runs ONLY gemini-3.8-flash-{low,medium,high}, gemini-4-argon-{low,medium,high},
 claude-opus-5-5-{medium,high} and claude-sonnet-5-5-{medium,high} (Claude draws the Antigravity 3p pool).
-One persistent interactive TUI with a stable https://antigravity.google.com/r/... instance.
-Paperclip turns are serialized. Each issue is isolated with /new, while the
-owner sees/steers that same live process from the single RC instance.
+Each seat has one persistent interactive TUI and its own Remote Control URL.
+Runner owns its dispatch checkpoint and exact pane/process binding. Turns on a
+seat are serialized; the owner sees and steers that same live process. Ordinary
+wakes preserve the conversation; context rotation requires verified idle state.
 
 Config:
 - cwd: fixed, trusted work directory; all turns share it
@@ -61,8 +62,8 @@ Config:
 - statusLine setup: merge statusline.settings.template.json as documented in
   statusline-install.md next to this adapter. The adapter never edits
   ~/.gemini/antigravity-cli/settings.json itself.
-- input safety: statusLine agent_state must be idle AND the captured TUI input
-  must be empty; a stale idle signal qualifies only after >=5 minutes.
+- input safety: the captured TUI input must be empty. StatusLine idle evidence
+  is required for context rotation and confirmed interruption.
   Every submission uses tmux bracketed paste (-p -r) and a named buffer.
 - heartbeat.maxConcurrentRuns (1-50; Gemini models only, Claude stays 1): concurrent seats (SCO-991). Seat 1 is the
   configured session/stateDir/cwd; seat k>1 is tmux session <tmuxSession>-s<k-1> on the same socket, stateDir
@@ -70,6 +71,10 @@ Config:
   statusLine pair). Each seat has its own RC URL and lock.
 - expectedRemoteControlUrl: optional stable /r/ instance URL guard (seat 1)
 - timeoutSec (30-3600, default 600)
+
+Explicit Stop interrupts only the checkpointed pane, escalating only that seat
+if interruption times out. Shutdown leaves live seats and checkpoints intact;
+restart adopts the exact run without submitting another prompt.
 
 The agent writes a validated JSON completion receipt; the adapter, never the
 model, uses its run-scoped token to PUT /documents/report then PATCH issue done.
