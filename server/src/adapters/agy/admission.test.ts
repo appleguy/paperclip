@@ -1,7 +1,7 @@
 import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { claimAgyHostAdmission, isAgyAdmissionIdle, isAgyHostLimitedModel } from "./admission.js";
+import { claimAgyHostAdmission, isAgyAdmissionIdle, isAgyHeadlessHostLimitedModel, isAgyHostLimitedModel } from "./admission.js";
 
 const scratch = "/Volumes/NVM/AI_Agent_Runtime/tmp";
 const first = { runId: "run-a", issueId: "issue-a", stateDir: "/seat-a" };
@@ -62,5 +62,10 @@ describe("agy Claude/GPT host admission", () => {
     expect(isAgyHostLimitedModel("claude-opus-5-5-high")).toBe(true);
     expect(isAgyHostLimitedModel("gpt-6-high")).toBe(true);
     expect(isAgyHostLimitedModel("gemini-4-argon-high")).toBe(false);
+    expect(isAgyHeadlessHostLimitedModel("gemini-4-argon-high")).toBe(false);
+    expect(isAgyHeadlessHostLimitedModel("claude-opus-5-5-high")).toBe(true);
+    expect(isAgyHeadlessHostLimitedModel("gpt-6-high")).toBe(true);
+    expect(isAgyHeadlessHostLimitedModel(undefined)).toBe(true);
+    expect(isAgyHeadlessHostLimitedModel("anthropic/claude-opus")).toBe(true);
   });
 });
