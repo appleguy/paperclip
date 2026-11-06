@@ -46,6 +46,7 @@ import { buildNativeCompletionContract } from "../native-runtime/completion-cont
 import { readPendingNativeRunStop } from "../native-runtime/native-cancellation-request.js";
 import { reserveRunBudget } from "../budget-reservations.js";
 import { hasAcknowledgedNativeReassignmentStopIntent } from "../acknowledged-native-stop.js";
+import { legacyExecutionNeedsReconciliation } from "../legacy-execution-recovery.js";
 
 vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
 
@@ -493,7 +494,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(f.deps.finalizeAgentStatus).toHaveBeenCalledWith(f.agent.id, expected, expect.any(String), expect.objectContaining({ keepIdleOnFailure: result.errorCode === "provider_quota" }));
   });
 
-  it("settles a pre-dispatch refusal as a wait without blocking its task or spending failure attempts", async () => {
+  it.each(["target_busy", "provider_quota"] as const)("settles a proven pre-dispatch %s refusal as a wait without spending failure attempts", async errorFamily => {
     const f = await fixture({ scheduledRetryReason: "transient_failure", scheduledRetryAttempt: 2 });
     const [issue] = await db.insert(issues).values({ companyId: f.run.companyId,
       title: "Busy seat task", status: "in_progress", assigneeAgentId: f.agent.id,
@@ -502,18 +503,82 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
       contextSnapshot: { issueId: issue.id } }).where(eq(heartbeatRuns.id, f.run.id)).returning();
     f.input.run = run;
     f.input.issueId = issue.id;
+    const retryNotBefore = new Date(Date.now() + 3_600_000).toISOString();
     f.input.adapterResult = { exitCode: 1, signal: null, timedOut: false,
-      errorFamily: "target_busy", errorMessage: "Claude TUI not idle; leave the owner's live work intact",
+      errorFamily, errorMessage: "Provider refused before dispatch", retryNotBefore,
       executionRecovery: { kind: "bootstrap", providerWorkStarted: false } };
     await f.completion.completeRun(f.input);
-    expect(await read(run.id)).toMatchObject({ status: "cancelled", errorCode: "target_busy",
-      resultJson: { errorFamily: "target_busy", executionRecovery: { providerWorkStarted: false } } });
+    const saved = await read(run.id);
+    expect(saved).toMatchObject({ status: "cancelled", errorCode: "target_busy",
+      resultJson: { errorFamily, retryNotBefore, executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } });
+    expect(legacyExecutionNeedsReconciliation(saved)).toBe(false);
     expect(f.deps.scheduleBoundedRetryForRun).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({ id: run.id }), f.agent,
       { retryReason: "target_busy", wakeReason: "target_busy_retry" },
     );
     expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0].status).toBe("in_progress");
     expect(f.deps.issuesSvc.addComment).not.toHaveBeenCalled();
+  });
+
+  it.each(["tool work", "no usage", "interruption", "conversation"] as const)("preserves action uncertainty after a quota reset with %s", async evidence => {
+    const f = await fixture({ runnerProfileJson: { adapterDispatch: { adapterType: "claude_local" } } });
+    const [issue] = await db.insert(issues).values({ companyId: f.run.companyId,
+      title: "Quota-interrupted task", status: "in_progress", assigneeAgentId: f.agent.id,
+      executionRunId: f.run.id }).returning();
+    const [run] = await db.update(heartbeatRuns).set({ scopeKind: "issue", issueId: issue.id,
+      contextSnapshot: { issueId: issue.id } }).where(eq(heartbeatRuns.id, f.run.id)).returning();
+    f.input.run = run;
+    f.input.issueId = issue.id;
+    const retryNotBefore = new Date(Date.now() + 3_600_000).toISOString();
+    const recovery = evidence === "interruption"
+      ? { kind: "interrupted" as const, providerStopped: true as const, sessionPreserved: true as const, actionOutcomes: "settled" as const }
+      : undefined;
+    const resultJson = evidence === "no usage" ? {} : {
+      toolActionsCompleted: 1,
+      ...(evidence === "conversation" ? { conversationContinuation: "continue_conversation_v1" } : {}),
+    };
+    Object.assign(f.input.adapterResult, {
+      exitCode: 1, errorCode: "provider_quota", errorFamily: "provider_quota",
+      errorMessage: "Quota exhausted after a tool action", retryNotBefore,
+      executionRecovery: recovery, resultJson,
+      ...(evidence === "no usage" ? { usage: undefined, costUsd: undefined } : {}),
+    });
+    await f.completion.completeRun(f.input);
+    const saved = await read(f.run.id);
+    expect(saved).toMatchObject({ status: "failed", errorCode: "provider_quota",
+      sessionIdAfter: "provider-session", resultJson: { ...resultJson, errorFamily: "provider_quota", retryNotBefore } });
+    expect(saved.resultJson?.executionRecovery).toEqual(recovery);
+    expect(saved.resultJson?.cancellation).toBeUndefined();
+    if (evidence !== "no usage") expect(saved.usageJson).toMatchObject({ inputTokens: 20, outputTokens: 8 });
+    expect(legacyExecutionNeedsReconciliation(saved)).toBe(evidence !== "conversation");
+    const holds = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issue.id));
+    if (evidence === "conversation") expect(holds).toHaveLength(0);
+    else {
+      expect(holds).toHaveLength(1);
+      expect(holds[0]).toMatchObject({ cause: "legacy_execution_requires_reconciliation", evidence: { runId: run.id } });
+      expect((await db.select().from(issues).where(eq(issues.id, issue.id)))[0].executionRunId).toBeNull();
+    }
+    // The ordinary bounded scheduler owns reconciliation/continuation policy;
+    // this must never select the unlimited target-busy admission lane.
+    expect(f.deps.scheduleBoundedRetryForRun).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ id: f.run.id, status: "failed" }), f.agent,
+    );
+    expect(f.deps.recovery.reconcileLegacyContinuation).toHaveBeenCalledExactlyOnceWith(f.run.id);
+  });
+
+  it.each(["unproven busy", "local admission"] as const)("requires pre-dispatch evidence for %s", async evidence => {
+    const localAdmission = evidence === "local admission";
+    const f = await fixture({ runnerProfileJson: { adapterDispatch: { adapterType: localAdmission ? "opencode_local" : "claude_local" } } });
+    f.input.adapterResult = { exitCode: localAdmission ? 75 : 1, signal: null, timedOut: false,
+      errorFamily: localAdmission ? undefined : "target_busy",
+      errorMessage: localAdmission ? "WRX80 admission declined (BUSY:GPU); no inference sent" : "Target busy" };
+    await f.completion.completeRun(f.input);
+    const saved = await read(f.run.id);
+    expect(saved.status).toBe(localAdmission ? "cancelled" : "failed");
+    expect(saved.resultJson?.executionRecovery).toEqual(localAdmission ? { kind: "bootstrap", providerWorkStarted: false } : undefined);
+    expect(legacyExecutionNeedsReconciliation(saved)).toBe(!localAdmission);
+    expect(f.deps.scheduleBoundedRetryForRun.mock.calls[0]?.[2]).toEqual(localAdmission
+      ? { retryReason: "target_busy", wakeReason: "target_busy_retry" } : undefined);
   });
 
   it.each(["completeRun", "failRun"] as const)("waits for an owned Stop before %s can write a competing outcome", async operation => {

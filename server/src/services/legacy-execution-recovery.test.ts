@@ -35,6 +35,20 @@ it("permits subscription waits only with explicit evidence that provider work ne
   } })).toBe(true);
 });
 
+it("keeps mid-turn quota failures held and exempts only proven pre-dispatch waits", () => {
+  const resultJson = { errorFamily: "provider_quota", retryNotBefore: new Date(Date.now() + 3_600_000).toISOString(), toolActionsCompleted: 1 };
+  const run = { runtimeMode: "legacy", status: "failed", errorCode: "provider_quota", resultJson };
+  expect(legacyExecutionNeedsReconciliation(run)).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...run, resultJson: {
+    ...resultJson, conversationContinuation: "continue_conversation_v1",
+  } })).toBe(false);
+  const waiting = { ...run, status: "cancelled", errorCode: "target_busy", scheduledRetryAttempt: 12 };
+  expect(legacyExecutionNeedsReconciliation(waiting)).toBe(true);
+  expect(legacyExecutionNeedsReconciliation({ ...waiting, resultJson: {
+    errorFamily: "provider_quota", executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+  } })).toBe(false);
+});
+
 it("allows a confirmed interrupted checkpoint without treating ordinary cancellation as replay permission", () => {
   expect(legacyExecutionNeedsReconciliation(stopped)).toBe(false);
   expect(legacyExecutionNeedsReconciliation({ ...stopped, resultJson: {} })).toBe(true);

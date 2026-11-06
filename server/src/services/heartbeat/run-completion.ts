@@ -422,16 +422,20 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       failedProcessRunCancellations.get(run.id);
     await processCancellation?.settled;
     let outcome: RunSessionOutcome;
-    // A busy seat/engine or a quota-limited provider refused before any work began:
-    // that is a wait (cancelled + scheduled_retry), not a failed run.
+    // Availability and reset timing do not prove that no earlier actions ran.
+    // Only a verified pre-dispatch refusal may use the target-busy wait lane.
     const quotaResetAt = adapterResult.errorFamily === "provider_quota" && adapterResult.retryNotBefore
       ? new Date(adapterResult.retryNotBefore).getTime() : NaN;
-    const targetBusy = adapterResult.errorFamily === "target_busy" ||
-      quotaResetAt > Date.now() ||
-      isLocalOpenCodeAdmissionDecline({
-        errorCode: "adapter_failed", exitCode: adapterResult.exitCode,
-        error: adapterResult.errorMessage, runnerProfileJson: run.runnerProfileJson,
-      });
+    const localAdmissionDeclined = isLocalOpenCodeAdmissionDecline({
+      errorCode: "adapter_failed", exitCode: adapterResult.exitCode,
+      error: adapterResult.errorMessage, runnerProfileJson: run.runnerProfileJson,
+    });
+    const executionRecovery = adapterResult.executionRecovery ??
+      // The exact wrapper-owned admission decline proves no inference was sent.
+      (localAdmissionDeclined ? { kind: "bootstrap" as const, providerWorkStarted: false as const } : undefined);
+    const targetBusy = executionRecovery?.kind === "bootstrap" &&
+      executionRecovery.providerWorkStarted === false &&
+      (adapterResult.errorFamily === "target_busy" || quotaResetAt > Date.now() || localAdmissionDeclined);
     const latestRun = await getRun(run.id);
     if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
       outcome = latestRun.status;
@@ -658,13 +662,12 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
               ? { earlySession: parseObject(latestRun?.resultJson).earlySession }
               : {}),
             ...parseObject(adapterResult.resultJson),
-            ...(adapterResult.executionRecovery
-              ? { executionRecovery: adapterResult.executionRecovery }
+            ...(executionRecovery
+              ? { executionRecovery }
               : {}),
             ...(outcome === "cancelled" ? controllerLeaseLossResultJson(signal) : {}),
             ...(targetBusy && outcome === "cancelled"
               ? {
-                  executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
                   cancellation: {
                     source: "control_plane", expected: true, initiator: { type: "system" },
                     reason: "Waiting for the target seat or engine", recordedAt: new Date().toISOString(),
