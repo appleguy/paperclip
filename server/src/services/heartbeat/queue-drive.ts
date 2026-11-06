@@ -92,6 +92,7 @@ export function createHeartbeatQueueDrive(db: Db, deps: QueueDriveDependencies) 
       // Per-issue history prevents alternating failing issues from resetting each other's bound.
       // A successful explicit/event-driven attempt resets the streak; other issues do not.
       const recent = await db.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode,
+        processLossRetryCount: heartbeatRuns.processLossRetryCount,
         resultJson: sql<Record<string, unknown>>`jsonb_build_object('cancelledByActorType', ${heartbeatRuns.resultJson}->'cancelledByActorType')` }).from(heartbeatRuns).where(and(
         eq(heartbeatRuns.companyId, source.companyId), eq(heartbeatRuns.agentId, source.agentId),
         inArray(heartbeatRuns.status, COMPLETED_STATUSES),
@@ -102,6 +103,8 @@ export function createHeartbeatQueueDrive(db: Db, deps: QueueDriveDependencies) 
       // These outcomes require a fresh request, not an automatic assignment wake.
       if (latest?.errorCode === CHAT_CONTROL_RECOVERY_STOP_CODE ||
           latest?.errorCode === CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE) continue;
+      // Do not bypass the process-loss recovery lane's exhausted retry budget.
+      if (latest?.errorCode === "process_lost" && (latest.processLossRetryCount ?? 0) >= 1) continue;
       if (latest?.status === "cancelled" && (latest.errorCode === "operator_interrupted" ||
           latest.resultJson?.cancelledByActorType !== "system")) continue;
       if (recent.length === 2 && recent.every(row => FAILURE_STATUSES.has(row.status))) continue;

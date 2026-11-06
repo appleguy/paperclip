@@ -4534,7 +4534,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
-  it("drains only server-stdio runs and preserves detached CLI adoption in a mixed restart", async () => {
+  it("drains only server-stdio runs and leaves detached legacy CLI ownership unclaimed", async () => {
     const acpChild = spawnAliveProcess();
     const cliChild = spawnAliveProcess();
     childProcesses.add(acpChild);
@@ -4604,10 +4604,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       );
       expect(reconciliation).toMatchObject({
         mode: "reported",
-        adoptedRunIds: [cli.runId],
+        adoptedRunIds: [],
         finalizedWhileDownRunIds: [acp.runId],
         lostRunIds: [],
-        skippedRunIds: [],
+        skippedRunIds: [cli.runId],
       });
 
       const originalRuns = await db
@@ -4628,9 +4628,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(report).toMatchObject({
         drainRequired: true,
         drainReason: "active_acp_run",
-        adoptedRunIds: [cli.runId],
+        adoptedRunIds: [],
         finalizedWhileDownRunIds: [acp.runId],
         lostRunIds: [],
+        skippedRunIds: [cli.runId],
       });
     });
   });
@@ -5326,7 +5327,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
     expect(await db.select().from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, issueId))).toEqual([settled]);
-    expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ runId });
+    // Resolved legacy bookkeeping preserves the no-replay record without
+    // blocking fresh work; a new unresolved source is held below.
+    expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
 
     const [newSource] = await db.insert(heartbeatRuns).values({
       companyId, agentId, status: "failed", contextSnapshot: { issueId },
@@ -5342,11 +5345,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       fingerprint: `legacy-execution:${newSource!.id}`,
       evidence: { runId: newSource!.id },
     });
+    expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ runId: newSource!.id });
   });
 
-  it("does not reset an exhausted incident budget on server restart", async () => {
+  it("does not reset an exhausted process-loss incident budget on server restart", async () => {
     const { agentId, runId, issueId } = await seedRunFixture({
       agentStatus: "running",
+      processPid: 999_999_999,
+      processLossRetryCount: 1,
     });
     await db
       .update(heartbeatRuns)
@@ -5357,7 +5363,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         },
       })
       .where(eq(heartbeatRuns.id, runId));
-    await heartbeatService(db).drainRunningRunsForShutdown("SIGTERM");
+    await heartbeatService(db).reapOrphanedRuns();
     const reconciled = await heartbeatService(db).reconcileStrandedAssignedIssues();
     // The budget stays spent across the restart: no successor run is
     // queued, by the process-loss retry or by the sweeper.
@@ -6707,7 +6713,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const workspaceId = randomUUID();
     const heartbeat = heartbeatService(db);
     const previousSettings = await instanceSettingsService(db).getExperimental();
+    const previousDiscovery = process.env.GIT_DISCOVERY_ACROSS_FILESYSTEM;
     try {
+      // The test scratch directory can live on a separate volume. Allow Git to
+      // reach its ordinary not-a-repository result across that boundary.
+      process.env.GIT_DISCOVERY_ACROSS_FILESYSTEM = "1";
       await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
       await db.insert(projects).values({ id: projectId, companyId, name: "Local documents", status: "in_progress" });
       await db.insert(projectWorkspaces).values({
@@ -6744,6 +6754,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(comments.some((comment) => comment.body.includes("workspace failed validation"))).toBe(true);
       expect(mockCaptureRunFailure.mock.calls.filter(([event]) => event.runId === runId)).toEqual([]);
     } finally {
+      if (previousDiscovery === undefined) delete process.env.GIT_DISCOVERY_ACROSS_FILESYSTEM;
+      else process.env.GIT_DISCOVERY_ACROSS_FILESYSTEM = previousDiscovery;
       await heartbeat.waitForRunExecutionDrain(runId);
       await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: previousSettings.enableIsolatedWorkspaces });
       await fs.rm(cwd, { recursive: true, force: true });
@@ -8879,14 +8891,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       const [otherComment] = await db.insert(issueComments).values({
         companyId, issueId, authorUserId: "other-user", body: "Other actor's input",
       }).returning();
-      await db.insert(agentWakeupRequests).values({
+      const [otherWake] = await db.insert(agentWakeupRequests).values({
         companyId, agentId, source: "automation", reason: "issue_commented",
         status: "deferred_issue_execution", requestedAt: new Date(0),
         requestedByActorType: "user", requestedByActorId: "other-user",
         payload: { issueId, commentId: otherComment!.id, _paperclipWakeContext: {
           issueId, wakeReason: "issue_commented", wakeCommentIds: [otherComment!.id],
         } },
-      });
+      }).returning();
       await heartbeat.cancelRun(runId, "Interrupt queued messages", {
         suppressImmediateRecovery: true, errorCode: "operator_interrupted",
         resultJson: {
@@ -8900,13 +8912,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       const runs = await selectRecoveryRunsByAgent(agentId);
       const successors = runs.filter((run) => run.id !== runId)
         .sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime());
-      expect(successors).toHaveLength(state === "pending" ? 2 : 0);
+      expect(successors).toHaveLength(state === "pending" ? 1 : 0);
       if (state === "pending") {
         expect(successors[0]!.contextSnapshot?.wakeCommentIds).toEqual(commentIds);
-        // Only the requested turn's normal completion can drain the other queue.
-        expect(successors[1]!.contextSnapshot?.wakeCommentIds).toEqual([otherComment!.id]);
+        // The requested turn closes the issue, so the other actor's queued
+        // input cannot start another provider turn against the closed task.
+        expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, otherWake!.id)))[0]?.runId).toBeNull();
         await heartbeat.cancelRun(runId, "Duplicate interrupt");
-        expect(await selectRecoveryRunsByAgent(agentId)).toHaveLength(3);
+        expect(await selectRecoveryRunsByAgent(agentId)).toHaveLength(2);
       }
     },
   );
@@ -8919,6 +8932,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       payload: { issueId, commentId: pending!.id, _paperclipWakeContext: { issueId, wakeReason: "issue_commented", wakeCommentIds: [pending!.id] } },
     }).returning();
     await heartbeat.cancelRun(runId, "Operator Stop", { resultJson: {
+      cancelledByActorType: "user", cancelledByUserId: "responsible-user",
       executionCancellation: { state: "acknowledged" },
       executionRecovery: { kind: "interrupted", providerStopped: true, sessionPreserved: true, actionOutcomes: "settled" },
     } });
