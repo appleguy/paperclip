@@ -519,6 +519,29 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expect(input.instructions.releaseInstructionCopy).not.toHaveBeenCalled();
   });
 
+  it("retains shared OpenCode resources when adapter setup throws before returning a marker", async () => {
+    const { input, adapter } = await fixture();
+    input.agent.adapterType = adapter.type = "opencode_local";
+    input.config.runtimeConfig.sharedServerRecoveryConfigPath = "/shared/config.json";
+    input.config.runtimeConfig.nativeRuntime = "nar";
+    adapter.execute.mockRejectedValueOnce(new Error("adapter setup failed"));
+    expect(await executeHeartbeatRuntime(db, input)).toMatchObject({ dispatched: true, adapterResult: {
+      resultJson: { executionRecovery: { reason: "shared_adapter_exception", providerWorkStarted: true,
+        providerWorkEvidence: "unverified" } } } });
+    expect(revokeHeartbeatRunGatewayTokens).not.toHaveBeenCalled();
+    expect(input.instructions.releaseInstructionCopy).not.toHaveBeenCalled();
+    expect(await finalizations()).toHaveLength(0);
+  });
+
+  it("preserves ordinary plain OpenCode adapter setup failure handling", async () => {
+    const { input, adapter } = await fixture();
+    input.agent.adapterType = adapter.type = "opencode_local";
+    adapter.execute.mockRejectedValueOnce(new Error("adapter setup failed"));
+    await expect(executeHeartbeatRuntime(db, input)).rejects.toThrow("adapter setup failed");
+    expect(revokeHeartbeatRunGatewayTokens).toHaveBeenCalledOnce();
+    expect(input.instructions.releaseInstructionCopy).toHaveBeenCalledOnce();
+  });
+
   it("preserves Stop metadata and marks no-work accounting without manufacturing a receipt", async () => {
     const { input, adapter, run } = await fixture();
     await db.update(heartbeatRuns).set({ status: "cancelled", resultJson: { stoppedByUser: true } }).where(eq(heartbeatRuns.id, run.id));

@@ -1027,7 +1027,20 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
                 });
               },
               authToken: authToken ?? undefined,
-            }));
+            })).catch((error: unknown) => {
+              // Adapter setup can fail before it constructs a recovery result.
+              // A shared OpenCode session can still have work from a prior
+              // controller, so the exception is not no-provider-work proof.
+              if (adapter.type === "opencode_local" && executionControl.getOpenCodeExecutionMode?.() === "shared") {
+                return {
+                  exitCode: 75, signal: null, timedOut: false,
+                  errorMessage: "Shared OpenCode adapter failed with provider work unverified",
+                  resultJson: { executionRecovery: { kind: "bootstrap", reason: "shared_adapter_exception",
+                    providerWorkStarted: true, providerWorkEvidence: "unverified" } },
+                };
+              }
+              throw error;
+            });
           },
         );
       if (!guardedDispatch.dispatched) return { dispatched: false };
