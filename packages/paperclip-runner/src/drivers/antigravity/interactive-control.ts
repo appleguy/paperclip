@@ -32,6 +32,7 @@ export function emptyAgyEditor(screen: string): boolean {
 /** An existing seat is usable only while its exact pane and process remain present.
  * The caller holds the seat lock and reconciles any prior dispatched turn. */
 export class AntigravityInteractiveControl {
+  private restartEligibleRun?: string;
   private constructor(private readonly input: {
     socket: string; session: string; stateDir: string; paneId: string; panePid: string;
     tmux: Tmux; authorize: (operationId: string) => boolean;
@@ -80,6 +81,7 @@ export class AntigravityInteractiveControl {
     isIdle: (after: number) => Promise<boolean>; wait?: (ms: number) => Promise<void>;
     now?: () => number; timeoutMs?: number;
   }): Promise<"idle" | "restart_required"> {
+    this.restartEligibleRun = undefined;
     const now = options.now ?? Date.now;
     const wait = options.wait ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
     const started = now();
@@ -99,6 +101,7 @@ export class AntigravityInteractiveControl {
       await wait(Math.min(500, Math.max(0, deadline - now())));
     }
     await check();
+    this.restartEligibleRun = runId;
     return "restart_required";
   }
 
@@ -109,9 +112,11 @@ export class AntigravityInteractiveControl {
   }): Promise<AntigravityInteractiveControl> {
     validateLaunch({ ...input, socket: this.input.socket, session: this.input.session, stateDir: this.input.stateDir });
     await this.assertRunOwner(runId);
+    if (this.restartEligibleRun !== runId) throw new Error("Antigravity seat restart requires an interrupt timeout");
     const checkpoint = JSON.parse(await fs.readFile(path.join(this.input.stateDir, "active.json"), "utf8")) as { conversationId?: unknown };
     if ((input.conversationId ?? null) !== (checkpoint.conversationId ?? null))
       throw new Error("Antigravity restart conversation does not match checkpoint");
+    this.restartEligibleRun = undefined;
     await this.input.tmux(["kill-session", "-t", `=${this.input.session}:`]);
     const active = JSON.parse(await fs.readFile(path.join(this.input.stateDir, "active.json"), "utf8")) as { runId?: unknown };
     if (active.runId !== runId) throw new Error("Antigravity stop checkpoint ownership changed");

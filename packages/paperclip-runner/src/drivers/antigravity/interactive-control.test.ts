@@ -157,6 +157,10 @@ describe("Antigravity interactive seat", () => {
       const control = await AntigravityInteractiveControl.attach({ socket: "socket", session: "seat", stateDir, authorize: () => true, tmux });
       await expect(control.restartRunSeat("run-2", launch)).rejects.toThrow(/ownership/);
       await expect(control.restartRunSeat("run-1", { ...launch, conversationId: "--bad" })).rejects.toThrow(/Invalid/);
+      await expect(control.restartRunSeat("run-1", launch)).rejects.toThrow(/interrupt timeout/);
+      let clock = 0;
+      expect(await control.interruptRun("run-1", { isIdle: async () => false, now: () => clock,
+        wait: async ms => { clock += ms; }, timeoutMs: 1000 })).toBe("restart_required");
       await expect(control.restartRunSeat("run-1", { ...launch, conversationId: "other" })).rejects.toThrow(/conversation/);
       expect(calls.some(args => args[0] === "kill-session")).toBe(false);
       const relaunched = await control.restartRunSeat("run-1", launch);
