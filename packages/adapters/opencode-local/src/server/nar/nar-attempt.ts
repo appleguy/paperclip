@@ -48,6 +48,8 @@ export interface NarAttemptInput {
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   /** Persist the exact provider binding before submitting or observing a turn. */
   onBound?: (binding: { sessionId: string; messageId: string; kind: "submit" | "rejoin"; hostPid: number | null; providerOrigin: string }) => Promise<void>;
+  /** Require a host-provided binding checkpoint before provider contact. */
+  requireBindingCheckpoint?: boolean;
   pollMs?: number;
   /** Liveness probe cadence, idle-session grace, and unreachable-server give-up (SCO-679). */
   probeMs?: number;
@@ -251,6 +253,9 @@ async function chooseSessionId(
 
 export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<NarAttempt> {
   const { onLog, signal } = input;
+  if (input.requireBindingCheckpoint && !input.onBound)
+    return held("OpenCode binding checkpoint unavailable; provider work remains unverified", true,
+      null, "binding_checkpoint_unavailable");
   if (input.reattachOnly && input.invalidReattachBinding)
     return held("OpenCode reattach binding is invalid; held without replay", true, null, "reattach_binding_invalid");
   // This controller has not submitted, but another controller may still have

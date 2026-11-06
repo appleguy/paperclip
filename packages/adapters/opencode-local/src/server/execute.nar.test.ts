@@ -32,6 +32,7 @@ describe("OpenCode adapter nativeRuntime nar", () => {
   let active: Set<string>;
   let promptPosts: number;
   let interruptPosts: number;
+  let providerRequests: number;
   let autoComplete: boolean;
   let promptStatus: number | undefined;
   let messagePageSize: number | undefined;
@@ -49,6 +50,7 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     active = new Set();
     promptPosts = 0;
     interruptPosts = 0;
+    providerRequests = 0;
     autoComplete = true;
     promptStatus = undefined;
     messagePageSize = undefined;
@@ -61,6 +63,7 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     runProcess.mockReset();
     const expected = "Basic " + Buffer.from("opencode:local-secret").toString("base64");
     server = createServer((req, res) => {
+      providerRequests++;
       const reply = (status: number, body: unknown) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(body)); };
       let raw = "";
       req.on("data", (c) => { raw += c; });
@@ -168,6 +171,7 @@ describe("OpenCode adapter nativeRuntime nar", () => {
       promptTemplate: "Full assignment", env: { OPENCODE_ALLOW_ALL_MODELS: "1" }, ...extra },
     context: { taskId, paperclipTaskMarkdown: "Finish SCO-337" },
     onLog: async () => {},
+    onSession: async () => {},
   });
   const userMsgs = () => [...sessions.values()].flatMap((s) => s.msgs.filter((m) => m.type === "user"));
   const scope = { agentId: "agent-one", issueId: "issue-one" };
@@ -216,6 +220,21 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     } as never);
     expect(promptPosts).toBe(0);
     expect(result.resultJson?.executionRecovery).toMatchObject({ providerWorkStarted: false });
+  });
+
+  it.each([false, true])("holds without provider contact when the binding checkpoint is missing (reattach: %s)", async (reattach) => {
+    const base = context("run-no-checkpoint", { nativeRuntime: "nar" });
+    const onProviderStopped = vi.fn(async () => {});
+    const result = await execute({ ...base, onSession: undefined, onProviderStopped,
+      context: { ...base.context, paperclipRestartReattach: reattach },
+    } as never);
+    expect(result.resultJson?.executionRecovery).toMatchObject({
+      reason: "binding_checkpoint_unavailable", providerWorkStarted: true, providerWorkEvidence: "unverified",
+    });
+    expect(sessions.size).toBe(0);
+    expect(providerRequests).toBe(0);
+    expect(promptPosts).toBe(0);
+    expect(onProviderStopped).not.toHaveBeenCalled();
   });
 
   it.each([1, 2])("holds live completion when a successor appears on outcome read %i", async (read) => {

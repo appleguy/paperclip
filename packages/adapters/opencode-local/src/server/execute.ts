@@ -780,6 +780,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           requireResumeSession: context.paperclipForeignTurnContinuation === true,
           expectedResumeSessionId: context.paperclipForeignTurnContinuation === true ? asString(context.paperclipForeignTurnSessionId, "") : undefined,
           model: model && variant ? `${model}#${variant}` : model, prompt, timeoutSec, signal: ctx.signal, onLog, preflight,
+          requireBindingCheckpoint: true,
           onBound: ctx.onSession ? async binding => {
             await ctx.onSession!({ sessionId: binding.sessionId, sessionParams: {
               sessionId: binding.sessionId, cwd: effectiveExecutionCwd,
