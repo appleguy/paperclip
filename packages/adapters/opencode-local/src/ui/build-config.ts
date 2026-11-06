@@ -12,7 +12,8 @@ export function buildOpenCodeLocalConfig(v: CreateConfigValues): Record<string, 
   if (v.cwd) ac.cwd = v.cwd;
   if (v.instructionsFilePath) ac.instructionsFilePath = v.instructionsFilePath;
   if (v.model) ac.model = v.model;
-  if (v.thinkingEffort) ac.variant = v.thinkingEffort;
+  const variant = v.thinkingEffort || (/deepseek|dsv4/i.test(v.model ?? "") ? "high" : "");
+  if (variant) ac.variant = variant;
   ac.dangerouslySkipPermissions = v.dangerouslySkipPermissions;
   const nativeSelected = v.runner === "paperclip"
     || ((v.runner === undefined || v.runner === "auto") && v.resolvedRunner === "paperclip");
