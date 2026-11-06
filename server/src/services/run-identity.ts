@@ -559,7 +559,8 @@ export async function captureRunIdentity<Scope extends RunIdentityReadScope | un
       .for("no key update");
     if (!run || run.status !== "running")
       throw forbidden(
-        "Credential acquisition requires this agent's active run",
+        "An active run for this agent is unavailable. Do not retry with this run; start a new authorized run.",
+        { code: "agent_run_inactive" },
       );
     const [pending] = await tx
       .select()

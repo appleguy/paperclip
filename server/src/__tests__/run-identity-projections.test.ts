@@ -81,7 +81,9 @@ const scopes = ["identity", "task_authorization", "token_broker"] as const;
       const f = await seedIdentityProjection(db);
       if (fault === "finished") await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, f.runId));
       await expect(captureRunIdentity(db, { ...f, ...(fault === "company" ? { companyId: randomUUID() } :
-        fault === "agent" ? { agentId: randomUUID() } : fault === "run" ? { runId: randomUUID() } : {}) }, { readScope })).rejects.toThrow("active run");
+        fault === "agent" ? { agentId: randomUUID() } : fault === "run" ? { runId: randomUUID() } : {}) }, { readScope })).rejects.toMatchObject({
+        status: 403, details: { code: "agent_run_inactive" }, message: expect.stringContaining("Do not retry with this run"),
+      });
     },
   );
 
