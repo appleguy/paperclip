@@ -219,6 +219,25 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run.id))).toHaveLength(0);
   });
 
+  it.each([ { messageId: "message-original" }, null ])(
+    "holds a preparing OpenCode orphan with a persisted NAR binding and no restart marker (%s)", async binding => {
+      const { heartbeatService } = await import("../heartbeat.js");
+      const { persistUnverifiedSharedOpenCode } = await import("./opencode-unverified-hold.js");
+      const { input, run } = await fixture();
+      await db.update(agents).set({ adapterType: "opencode_local", status: "paused" }).where(eq(agents.id, input.agent.id));
+      const earlySession = { sessionId: "session-original", sessionParams: { narBinding: binding } };
+      const [expired] = await db.update(heartbeatRuns).set({ controllerBootId: randomUUID(),
+        controllerLeaseExpiresAt: sql`clock_timestamp() - interval '1 second'`,
+        executionStage: "preparing", resultJson: { earlySession } }).where(eq(heartbeatRuns.id, run.id)).returning();
+      expect(await persistUnverifiedSharedOpenCode(db, { run: expired, resultJson: { executionRecovery: {
+        kind: "bootstrap", reason: "outcome_unknown", providerWorkEvidence: "unverified",
+      } } })).toBe(false);
+      expect((await heartbeatService(db).reapOrphanedRuns()).runIds).not.toContain(run.id);
+      expect(await read(run.id)).toMatchObject({ status: "running", resultJson: { earlySession } });
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run.id))).toHaveLength(0);
+    },
+  );
+
   it("re-enters the original OpenCode message through host execution and preserves resources on untagged shutdown", async () => {
     const { input, adapter, run } = await fixture();
     const boot = randomUUID();
