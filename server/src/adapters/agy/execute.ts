@@ -9,6 +9,8 @@ import os from "node:os";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { DatabaseSync } from "node:sqlite";
+import { randomUUID } from "node:crypto";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { readableRuntimePath } from "@paperclipai/adapter-utils/readable-runtime-paths";
 import { parseHeartbeatPolicy } from "../../services/heartbeat/timer-policy.js";
@@ -291,27 +293,80 @@ async function ensureSession(
 }
 
 /** One non-blocking attempt at a seat's dispatch mutex; null while another live adapter run holds it. */
-export async function tryAcquire(stateDir: string, reclaimed = false): Promise<(() => Promise<void>) | null> {
+export async function tryAcquire(stateDir: string): Promise<(() => Promise<void>) | null> {
   const dir = path.join(stateDir, "dispatch.lock");
+  const pending = path.join(stateDir, "dispatch.pending");
+  const databasePath = path.join(stateDir, "dispatch-mutex.sqlite");
+  const stat = await fs.lstat(databasePath).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (stat && (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1))
+    throw new Error("Seat mutex database must be a plain, unshared file");
+
+  // As with workspace restore locks, SQLite owns all descriptors for this
+  // permanent inode. Never unlink it or open/close a raw descriptor: POSIX
+  // locks could otherwise be lost or split across different inodes.
+  const database = new DatabaseSync(databasePath, { allowExtension: false });
+  let locked = false;
+  let claimed = false;
   try {
-    await fs.mkdir(dir);
-    await fs.writeFile(path.join(dir, "pid"), String(process.pid), { mode: 0o600 });
-    return async () => { await fs.rm(dir, { recursive: true, force: true }); };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    const pidText = await fs.readFile(path.join(dir, "pid"), "utf8").catch(() => "");
-    const pid = Number(pidText);
-    if (pid > 1 && Number.isInteger(pid)) {
-      try { process.kill(pid, 0); } catch (e) {
-        if ((e as NodeJS.ErrnoException).code === "ESRCH") {
-          // No replay; only stale mutex reclaimed. active.json remains.
-          await fs.rename(dir, path.join(stateDir, `stale-lock-${Date.now()}`)).catch(() => {});
-          // SCO-1053: a holder that died (the server a deploy replaced) must not make this claim busy.
-          if (!reclaimed) return tryAcquire(stateDir, true);
-        }
-      }
+    database.exec("PRAGMA busy_timeout=0;");
+    try {
+      database.exec("BEGIN IMMEDIATE;");
+      locked = true;
+    } catch (error) {
+      const code = (error as { errcode?: number }).errcode;
+      if (typeof code === "number" && (code & 0xff) === 5) return null; // SQLITE_BUSY
+      throw error;
     }
-    return null;
+    await fs.chmod(databasePath, 0o600);
+
+    // Respect pre-upgrade owners. Only a definitely dead legacy PID permits
+    // reclaim; missing/invalid metadata stays busy. All upgraded contenders
+    // hold the SQLite lock before reading, reclaiming or removing this path.
+    const existing = await fs.lstat(dir).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (existing) {
+      const pidText = await fs.readFile(path.join(dir, "pid"), "utf8").catch(() => "");
+      const pid = Number(pidText);
+      if (!Number.isSafeInteger(pid) || pid <= 1) return null;
+      try {
+        process.kill(pid, 0);
+        return null;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") return null;
+      }
+      // Preserve stale metadata and active.json; no provider work is replayed.
+      await fs.rename(dir, path.join(stateDir, `stale-lock-${Date.now()}-${randomUUID().slice(0, 8)}`));
+    }
+
+    // Publish a complete legacy-compatible diagnostic directory atomically.
+    // Death before PID publication leaves only pending scratch; the next
+    // SQLite owner can discard that scratch safely, even if it has no PID.
+    await fs.rm(pending, { recursive: true, force: true });
+    await fs.mkdir(pending, { mode: 0o700 });
+    await fs.writeFile(path.join(pending, "pid"), String(process.pid), { mode: 0o600 });
+    await fs.rename(pending, dir);
+    claimed = true;
+    let released = false;
+    return async () => {
+      if (released) return;
+      released = true;
+      try {
+        // Keep process ownership until removal completes. Repeated unlocks
+        // must never touch a successor's directory or close its connection.
+        await fs.rm(dir, { recursive: true, force: true });
+      } finally { database.close(); }
+    };
+  } finally {
+    if (!claimed) {
+      try {
+        if (locked) await fs.rm(pending, { recursive: true, force: true });
+      } finally { database.close(); }
+    }
   }
 }
 
