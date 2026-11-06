@@ -123,7 +123,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-async function readServer(configPath: string): Promise<{ url: string; passwordFile: string }> {
+export async function readNarServer(configPath: string): Promise<{ url: string; passwordFile: string }> {
   if (!path.isAbsolute(configPath)) throw new Error("shared server config path must be absolute");
   const cfg = JSON.parse(await fs.readFile(configPath, "utf8")) as Record<string, unknown>;
   const url = cfg.url;
@@ -245,7 +245,7 @@ export async function runNarOpenCodeAttempt(input: NarAttemptInput): Promise<Nar
   const f = input.fetchImpl ?? fetch;
   let server: { url: string; passwordFile: string };
   try {
-    server = await readServer(input.configPath);
+    server = await readNarServer(input.configPath);
   } catch {
     await onLog("stderr", "[paperclip] NAR OpenCode server config unavailable; no inference sent.\n");
     return held("OpenCode NAR server config unavailable; no new inference sent", Boolean(input.reattachOnly), null, "config");

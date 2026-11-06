@@ -77,3 +77,4 @@ export {
   resetOpenCodeModelsCacheForTests,
 } from "./models.js";
 export { parseOpenCodeJsonl, isOpenCodeUnknownSessionError } from "./parse.js";
+export { inspectBoundOpenCodeTurn } from "./nar/inspect-bound-turn.js";

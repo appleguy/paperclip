@@ -148,6 +148,13 @@ export class OpenCodeHttpDriver implements ProviderDriver {
     }
   }
 
+  /** A read-only identity check: unlike bindConversation it never retitles or creates a session. */
+  async sessionMatches(conversationId: string, cwd: string): Promise<boolean> {
+    const response = await this.json("GET", `/api/session/${encodeURIComponent(conversationId)}`);
+    return response.status === 200 && response.data?.data?.id === conversationId &&
+      response.data?.data?.location?.directory === cwd;
+  }
+
   /** Highest generation of this agent+issue pair that exists on the server, or -1 when none does. */
   async latestGeneration(s: Pick<ConvScope, "agentId" | "issueId">): Promise<number> {
     let latest = -1;
