@@ -654,6 +654,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
             ...(adapterResult.nativeFinalization || outcome === "cancelled"
               ? parseObject(latestRun?.resultJson)
               : {}),
+            ...(outcome !== "succeeded" && parseObject(latestRun?.resultJson).earlySession
+              ? { earlySession: parseObject(latestRun?.resultJson).earlySession }
+              : {}),
             ...parseObject(adapterResult.resultJson),
             ...(adapterResult.executionRecovery
               ? { executionRecovery: adapterResult.executionRecovery }
@@ -692,7 +695,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       usageJson: { ...usageJson, ledgerScope },
       resultJson: persistedResultJson,
       sessionIdAfter:
-        nextSessionState.displayId ?? nextSessionState.legacySessionId,
+        (outcome !== "succeeded" ? latestRun?.sessionIdAfter : null) ?? nextSessionState.displayId ?? nextSessionState.legacySessionId,
       stdoutExcerpt: output.stdoutExcerpt,
       stderrExcerpt: output.stderrExcerpt,
       logBytes: logSummary?.bytes,
@@ -1188,11 +1191,11 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     });
 
     const stoppedDuringFailure = signal.aborted;
-    const stopSnapshot = stoppedDuringFailure ? await getRun(run.id) : null;
+    const stopSnapshot = await getRun(run.id);
     const failureOutcome = stoppedDuringFailure ? "cancelled" : "failed";
     const failedRunWrite = await measureRunPhase("completion.terminal_write", () => setRunStatusIfRunning(run.id, failureOutcome, {
       error: message,
-      errorCode: stopSnapshot?.errorCode ?? failureErrorCode,
+      errorCode: (stoppedDuringFailure ? stopSnapshot?.errorCode : null) ?? failureErrorCode,
       finishedAt: new Date(),
       resultJson: mergeRunStopMetadataForAgent(agent, failureOutcome, {
         errorCode: failureErrorCode,

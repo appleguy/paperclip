@@ -634,6 +634,18 @@ describePostgres("heartbeat recovery module ownership", () => {
     },
   );
 
+  it("keeps a session checkpoint written after the shutdown scan", async () => {
+    const run = await seedRun();
+    const deps = callbacks(db);
+    const earlySession = { sessionId: "thread-1", sessionParams: { sessionId: "thread-1", cwd: "/workspace" } };
+    deps.getRun.mockResolvedValue({ ...run, resultJson: { earlySession } });
+    await createHeartbeatRecovery(db, deps).drainRunningRunsForShutdown("SIGTERM", new Date(), [run.id]);
+    expect(deps.setRunStatusIfRunning).toHaveBeenCalledWith(run.id, "interrupted", expect.objectContaining({
+      resultJson: expect.objectContaining({ earlySession }),
+    }));
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+  });
+
   it.each(["restored", "restore_failed"])("keeps the sandbox available until adapter workspace settlement: %s", async outcome => {
     const run = await seedRun();
     const deps = callbacks(db);

@@ -197,6 +197,7 @@ async function runExecutor(
     startupTraceContext?: AdapterExecutionContext["startupTraceContext"];
     expectedExitCode?: number;
     evaluateSessionPrompt?: AdapterExecutionContext["evaluateSessionPrompt"];
+    onSession?: AdapterExecutionContext["onSession"];
   } = {},
 ) {
   // Skill reconciliation must never inspect or modify the developer's real
@@ -246,6 +247,10 @@ async function runExecutor(
       runtimeMcp: options.runtimeMcp,
       startupTraceContext: options.startupTraceContext,
       evaluateSessionPrompt: options.evaluateSessionPrompt,
+      onSession: options.onSession ? async (session: Parameters<NonNullable<AdapterExecutionContext["onSession"]>>[0]) => {
+        expect(turnInputs).toHaveLength(0);
+        await options.onSession!(session);
+      } : undefined,
       onLog: async (stream: "stdout" | "stderr", text: string) => {
         logs.push({ stream, text });
       },
@@ -414,6 +419,18 @@ const ALLOWED_TURN_SPAN_ATTRIBUTE_KEYS = new Set<string>([
 ]);
 
 describe("shared ACPX engine runtime behavior", () => {
+  it("reports the resumable provider session before starting the turn", async () => {
+    const root = await makeTempRoot();
+    const onSession = vi.fn(async (_session: Parameters<NonNullable<AdapterExecutionContext["onSession"]>>[0]) => {});
+    const result = await runExecutor({ agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state"), cwd: root }, { onSession });
+    expect(onSession).toHaveBeenCalledOnce();
+    expect(onSession).toHaveBeenCalledWith(expect.objectContaining({ sessionId: result.result.sessionId, sessionParams: result.result.sessionParams }));
+    const earlySession = onSession.mock.calls[0]![0];
+    const resumed = await runExecutor({ agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state"), cwd: root }, {
+      runtime: { sessionParams: sessionCodec.deserialize(earlySession.sessionParams) },
+    });
+    expect(resumed.sessionInputs[0]?.resumeSessionId).toBe(earlySession.sessionId);
+  });
   it("rotates before opening a persistent record and resumes the new generation", async () => {
     const root = await makeTempRoot();
     const config = { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir: path.join(root, "state"), cwd: root, model: "gpt-6.1-terra" };

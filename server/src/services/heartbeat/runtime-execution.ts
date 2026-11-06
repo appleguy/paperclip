@@ -17,6 +17,7 @@ import { inspectPluginWorkspaceForFinalization } from "../native-runtime/native-
 import { AsyncLocalStorage } from "node:async_hooks";
 import { measureRunPhase } from "../execution-preparation-timing.js";
 import { parseNativeSessionGoalControl } from "./scheduling.js";
+import { getAdapterSessionCodec } from "./run-state.js";
 import { isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
 import {
   PAPERCLIP_WAKE_PAYLOAD_KEY,
@@ -54,7 +55,7 @@ import { withAdapterExecutionPhase } from "@paperclipai/adapter-utils/execution-
 import { remoteExecutionHasStopped } from "../remote-execution-termination.js";
 import { registerAdapterExecutionControl } from "../adapter-execution-control.js";
 import { resolveManagedOpenAiBilling } from "@paperclipai/adapter-utils";
-import { and, desc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, ne, sql } from "drizzle-orm";
 import { heartbeatRuns, nativeRunFinalizations, workspaceOperations } from "@paperclipai/db";
 import { conflict } from "../../errors.js";
 import { getStartupTraceContext } from "../../instrumentation.js";
@@ -917,6 +918,18 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               onLog,
               onMeta: onAdapterMeta,
               onEvent: onAdapterEvent,
+              onSession: async (session) => {
+                const sessionParams = getAdapterSessionCodec(agent.adapterType).serialize(session.sessionParams ?? null);
+                const [updated] = await db.update(heartbeatRuns).set({
+                  sessionIdAfter: session.sessionDisplayId ?? session.sessionId,
+                  resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({ earlySession: { sessionId: session.sessionId, sessionParams } })}::jsonb`,
+                  updatedAt: new Date(),
+                }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.agentId, run.agentId), eq(heartbeatRuns.status, "running"),
+                  run.controllerBootId ? eq(heartbeatRuns.controllerBootId, run.controllerBootId) : isNull(heartbeatRuns.controllerBootId),
+                  run.controllerBootId ? gt(heartbeatRuns.controllerLeaseExpiresAt, sql`clock_timestamp()`) : undefined,
+                )).returning({ id: heartbeatRuns.id });
+                if (!updated) throw new Error("Session checkpoint lost run ownership");
+              },
               onUsage: usageRecorder ? async receipt => { await usageRecorder.capture(receipt); } : undefined,
               onExecutionPhase: executionControl.phases.enter,
               startupTraceContext: getStartupTraceContext(),

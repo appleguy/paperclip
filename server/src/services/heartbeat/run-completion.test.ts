@@ -680,6 +680,17 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(f.deps.finalizeAgentStatus).toHaveBeenCalledOnce();
   });
 
+  it.each(["result", "throw"] as const)("retains the early session after an adapter %s failure", async mode => {
+    const f = await fixture();
+    const earlySession = { sessionId: "thread-1", sessionParams: { sessionId: "thread-1" } };
+    await db.update(heartbeatRuns).set({ sessionIdAfter: "thread-1", resultJson: { earlySession } }).where(eq(heartbeatRuns.id, f.run.id));
+    if (mode === "result") {
+      f.input.adapterResult.exitCode = 1;
+      await f.completion.completeRun(f.input);
+    } else await f.completion.failRun(f.failure(new Error("adapter failed")));
+    expect(await read(f.run.id)).toMatchObject({ status: "failed", sessionIdAfter: "thread-1", resultJson: { earlySession } });
+  });
+
   it.each(["execution", "setup"] as const)("retains a provider startup cause at the outer %s settlement boundary", async phase => {
     const f = await fixture();
     const providerFailure = { schema: "paperclip.provider-failure.v1", provider: "anthropic", phase: "startup",

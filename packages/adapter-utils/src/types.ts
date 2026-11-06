@@ -280,6 +280,8 @@ export interface AdapterExecutionContext {
   runtimeTools?: AdapterRuntimeToolAccess;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
+  /** Persist a provider session before its turn starts. */
+  onSession?: (session: { sessionId: string; sessionDisplayId?: string | null; sessionParams?: Record<string, unknown> | null }) => Promise<void>;
   onEvent?: (event: AdapterRuntimeEvent) => Promise<void>;
   onUsage?: (receipt: AdapterUsageCheckpoint) => Promise<void>;
   onRuntimeProgress?: RuntimeStatusSink;

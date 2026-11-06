@@ -69,7 +69,7 @@ import {
   type LocalProcessSandboxOptions,
 } from "@paperclipai/adapter-utils/local-process-sandbox";
 import {
-  parseCodexJsonl, createCodexJsonlParser,
+  parseCodexJsonl, createCodexJsonlParser, createCodexThreadIdParser,
   classifyCodexAuthRefreshFailure,
   extractCodexRetryNotBefore,
   isCodexHarnessCrash,
@@ -1413,6 +1413,8 @@ async function executeCodex(ctx: AdapterExecutionContext): Promise<AdapterExecut
       };
 
       const consumeAccounting = createCodexJsonlParser();
+      const consumeThreadId = createCodexThreadIdParser();
+      let checkpointedSessionId: string | null = null;
       const accountingLog = createUsageCheckpointLog(onLog, ctx.onUsage, stdout => {
         const parsed = consumeAccounting(stdout);
         return { usage: parsed.usageReported ? parsed.usage : undefined, costStatus: parsed.usageComplete ? undefined : "unpriced", usageBasis: "per_run", provider: "openai", biller, billingType, model, pricingContext, costUsd: null, complete: parsed.usageComplete };
@@ -1430,6 +1432,11 @@ async function executeCodex(ctx: AdapterExecutionContext): Promise<AdapterExecut
           onLog: async (stream, chunk) => {
             monitor?.noteOutputChunk(stream, chunk);
             if (stream === "stdout") {
+              const threadId = consumeThreadId(chunk);
+              if (threadId && threadId !== checkpointedSessionId) {
+                await ctx.onSession?.({ sessionId: threadId, sessionParams: { sessionId: threadId, cwd } });
+                checkpointedSessionId = threadId;
+              }
               await accountingLog(stream, chunk);
               return;
             }

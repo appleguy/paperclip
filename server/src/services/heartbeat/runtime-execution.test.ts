@@ -125,6 +125,20 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     };
     return { input, adapter, run };
   }
+  it("persists a provider session while the legacy adapter is still running and fences late callbacks", async () => {
+    const { input, adapter, run } = await fixture();
+    adapter.execute.mockImplementationOnce(async ctx => {
+      await ctx.onSession!({ sessionId: "backend", sessionDisplayId: "thread", sessionParams: { sessionId: "backend", cwd: home } });
+      const [saved] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+      expect(saved).toMatchObject({ status: "running", sessionIdAfter: "thread", resultJson: { earlySession: { sessionId: "backend" } } });
+      await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, run.id));
+      await expect(ctx.onSession!({ sessionId: "late" })).rejects.toThrow("Session checkpoint lost run ownership");
+      const [stopped] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+      expect(stopped.sessionIdAfter).toBe("thread");
+      return { exitCode: 0, signal: null, timedOut: false };
+    });
+    await executeHeartbeatRuntime(db, input);
+  });
   it.each(["current", "expired", "replaced-owner", "generation", "attempt", "boot", "pid", "process-start", "stopped", "unknown-code", "permission", "io", "diagnostic-sink-failed", "diagnostic-lock-busy"] as const)(
     "preserves post-result diagnostics without changing recovery authority (%s)", async scenario => {
       const { input } = await fixture(true);

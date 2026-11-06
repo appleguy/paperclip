@@ -33,6 +33,26 @@ export function parseCodexJsonl(stdout: string) {
   return createCodexJsonlParser()(stdout);
 }
 
+export function createCodexThreadIdParser() {
+  let remainder = "";
+  let discarding = false;
+  return (chunk: string): string | null => {
+    let found: string | null = null;
+    for (const part of chunk.split(/(?<=\n)/)) {
+      if (!discarding) remainder += part;
+      if (remainder.length > 65536) { remainder = ""; discarding = true; }
+      if (!part.endsWith("\n")) continue;
+      if (!discarding) {
+        const event = parseJson(remainder.trim());
+        if (event && event.type === "thread.started") found = asString(event.thread_id, "").trim() || found;
+      }
+      remainder = "";
+      discarding = false;
+    }
+    return found;
+  };
+}
+
 /** Consume complete JSONL records once, retaining protocol accounting state. */
 export function createCodexJsonlParser() {
   let sessionId: string | null = null;

@@ -7,9 +7,17 @@ import {
   isCodexTransientUpstreamError,
   isCodexUnknownSessionError,
   parseCodexJsonl,
+  createCodexThreadIdParser,
 } from "./parse.js";
 
 describe("parseCodexJsonl", () => {
+  it("detects a split thread-start event and recovers after an oversized line", () => {
+    const consume = createCodexThreadIdParser();
+    expect(consume('{"type":"thread.star')).toBeNull();
+    expect(consume('ted","thread_id":"thread-1"}\n')).toBe("thread-1");
+    expect(consume("x".repeat(70_000))).toBeNull();
+    expect(consume('\n{"type":"thread.started","thread_id":"thread-2"}\n')).toBe("thread-2");
+  });
   it.each(["turn.failed", "error", "turn.completed"])("does not invent zero usage for %s without counters", (type) => {
     expect(parseCodexJsonl(JSON.stringify({ type }))).toMatchObject({
       sawProtocolTerminalEvent: true, usageReported: false, usageComplete: false,

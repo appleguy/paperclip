@@ -4887,6 +4887,12 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           );
         }
         sessionHandle = handle;
+        const sessionId = handle.backendSessionId ?? handle.runtimeSessionName;
+        if (sessionId) await ctx.onSession?.({
+          sessionId,
+          sessionDisplayId: handle.agentSessionId ?? sessionId,
+          sessionParams: buildSessionParams({ prepared, handle }),
+        });
         startupFailed = false;
         await emitPhase("ensure_session", ensureSessionPhaseStart, "ok");
       } catch (err) {

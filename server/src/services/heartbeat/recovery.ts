@@ -1362,12 +1362,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         if (!control && runningProcesses.get(run.id) === running) runningProcesses.delete(run.id);
       }
 
-      const persistedCancellationResult =
-        run.runtimeMode === "native"
-          ? await getRun(run.id).then((current) =>
-              parseObject(current?.resultJson),
-            )
-          : parseObject(run.resultJson);
+      const persistedCancellationResult = parseObject((await getRun(run.id))?.resultJson ?? run.resultJson);
 
       const interruptedStatus = await setRunStatusIfRunning(
         run.id,
@@ -2644,6 +2639,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         (!monitorNextCheckAt || monitorNextCheckAt.getTime() <= now.getTime());
       const revokedState = await revokeExpiredLegacyControllerWithState(db, run);
       if (!revokedState) continue;
+      const latestResult = parseObject((await getRun(run.id))?.resultJson ?? run.resultJson);
       // A legacy controller persists "dispatching" in the same lease renewal
       // that admits the adapter. An expired lease from another boot that is
       // still "preparing" proves a restart stopped setup before provider work.
@@ -2689,7 +2685,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
               {
                 conversationContinuationEligible,
                 resultJson: {
-                  ...parseObject(run.resultJson),
+                  ...latestResult,
                   processLossDiagnostic,
                   ...(restartInterruptedBeforeDispatch
                     ? { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } }
