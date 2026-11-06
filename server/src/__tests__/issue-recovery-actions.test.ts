@@ -3300,7 +3300,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
-  it("folds stale recovery during read projection after the source issue reaches done", async () => {
+  it.each(["detail", "full list", "compact list", "rows list"])("does not revalidate stale recovery on %s reads", async (view) => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     const recoveryActionSvc = issueRecoveryActionService(db);
     const action = await recoveryActionSvc.upsertSourceScoped({
@@ -3318,36 +3318,28 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await db.update(issues).set({ status: "done" }).where(eq(issues.id, sourceIssueId));
     const app = createApp();
 
-    const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
-
-    expect(detail.body).toMatchObject({
+    const [before] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    const activityBefore = await db.select().from(activityLog).where(eq(activityLog.entityId, sourceIssueId));
+    const url = view === "detail" ? `/api/issues/${sourceIssueId}`
+      : `/api/companies/${companyId}/issues${view === "full list" ? "" : `?view=${view === "compact list" ? "compact" : "rows"}`}`;
+    const response = await request(app).get(url).expect(200);
+    const projected = view === "detail" ? response.body : response.body.find((issue: { id: string }) => issue.id === sourceIssueId);
+    expect(projected).toMatchObject({
       id: sourceIssueId,
       status: "done",
-      activeRecoveryAction: null,
+      activeRecoveryAction: { id: action.id, status: "active" },
     });
     const [actionRow] = await db
       .select()
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.id, action.id));
-    expect(actionRow).toMatchObject({
-      status: "cancelled",
-      outcome: "cancelled",
-      resolutionNote: "Recovery action became stale because the source issue reached done.",
-    });
-    expect(actionRow?.resolvedAt).toBeTruthy();
+    expect(actionRow).toEqual(before);
 
     const activityRows = await db
       .select()
       .from(activityLog)
       .where(eq(activityLog.entityId, sourceIssueId));
-    expect(activityRows.find((row) => row.action === "issue.recovery_action_resolved")?.details).toMatchObject({
-      source: "source_revalidation",
-      trigger: "read_projection",
-      recoveryActionId: action.id,
-    });
-    expect(activityRows.find((row) => row.action === "issue.recovery_action_resolved")).toMatchObject({
-      actorType: "system", actorId: "recovery", agentId: null,
-    });
+    expect(activityRows).toEqual(activityBefore);
   });
 
   it.each(["done", "cancelled"])("keeps one workspace owner hold across reads and sweeps of a %s task", async (status) => {
@@ -3385,8 +3377,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
 
     // Only clearing the exact physical owner receipt makes this hold stale.
     await db.update(heartbeatRuns).set({ runnerProfileJson: {} }).where(eq(heartbeatRuns.id, runId));
-    const cleared = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
-    expect(cleared.body.activeRecoveryAction).toBeNull();
+    const cleared = await request(app).get(`/api/issues/${sourceIssueId}/recovery-actions`).expect(200);
+    expect(cleared.body.active).toBeNull();
     const rows = await db.select().from(activityLog).where(eq(activityLog.entityId, sourceIssueId));
     expect(rows).toEqual([expect.objectContaining({ actorType: "system", actorId: "recovery", action: "issue.recovery_action_resolved" })]);
     expect(await issueService(db).list(companyId, { touchedByUserId: userId })).toEqual([]);

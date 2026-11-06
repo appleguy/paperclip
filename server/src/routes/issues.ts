@@ -8491,22 +8491,6 @@ export function issueRoutes(
         listSuccessfulRunHandoffStates(db, companyId, issueIds),
         recoveryActionsSvc.listActiveForIssues(companyId, issueIds),
       ]);
-      const actor = getActorInfo(req);
-      await Promise.all(
-        result.map(async (issue) => {
-          const activeRecoveryAction =
-            recoveryActionByIssue.get(issue.id) ?? null;
-          if (!activeRecoveryAction) return;
-          const revalidated = await revalidateActiveSourceRecoveryForRead({
-            issue,
-            trigger: "read_projection",
-            actor,
-            activeRecoveryAction,
-          });
-          if (revalidated) recoveryActionByIssue.set(issue.id, revalidated);
-          else recoveryActionByIssue.delete(issue.id);
-        }),
-      );
       const compactResult = result.map((issue) =>
         ({ ...toCompactIssue({
           ...issue,
@@ -8526,22 +8510,6 @@ export function issueRoutes(
       listSuccessfulRunHandoffStates(db, companyId, issueIds),
       recoveryActionsSvc.listActiveForIssues(companyId, issueIds),
     ]);
-    const actor = getActorInfo(req);
-    await Promise.all(
-      result.map(async (issue) => {
-        const activeRecoveryAction =
-          recoveryActionByIssue.get(issue.id) ?? null;
-        if (!activeRecoveryAction) return;
-        const revalidated = await revalidateActiveSourceRecoveryForRead({
-          issue,
-          trigger: "read_projection",
-          actor,
-          activeRecoveryAction,
-        });
-        if (revalidated) recoveryActionByIssue.set(issue.id, revalidated);
-        else recoveryActionByIssue.delete(issue.id);
-      }),
-    );
     return {
       kind: "full",
       body: result.map((issue) => ({
@@ -9643,14 +9611,8 @@ export function issueRoutes(
       timing.time("work_products", () => workProductsSvc.listForIssue(issue.id)),
       timing.time("created_from", () => resolveVisibleIssueCreationSource(req, issue)),
     ]);
-    const [recoveryActionsByRelationIssue, revalidatedActiveRecoveryAction, mentionedProjects] = await Promise.all([
+    const [recoveryActionsByRelationIssue, mentionedProjects] = await Promise.all([
       timing.time("relation_recovery", () => relationRecoveryActionMap(recoveryActionsSvc, issue.companyId, relations)),
-      timing.time("revalidate_recovery", () => revalidateActiveSourceRecoveryForRead({
-        issue,
-        trigger: "read_projection",
-        actor: getActorInfo(req),
-        activeRecoveryAction,
-      })),
       timing.time("mentioned_projects", () => mentionedProjectIds.length > 0
         ? projectsSvc.listByIds(issue.companyId, mentionedProjectIds)
         : Promise.resolve([])),
@@ -9665,7 +9627,6 @@ export function issueRoutes(
       Promise.all(mentionedProjects.map((mentionedProject) => canActorReadProject(req, mentionedProject))),
     ]);
     const visibleMentionedProjects = mentionedProjects.filter((_, index) => mentionedProjectVisibility[index]);
-    // Recovery revalidation may change the blocker; read it afterwards.
     const executionBlocker = await timing.time("execution_blocker", () => getExecutionBlocker(db, issue.companyId, issue.id));
     res.setHeader("Server-Timing", timing.header());
     res.json({
@@ -9679,7 +9640,7 @@ export function issueRoutes(
       executionBlocker,
       interruption: await taskInterruptionPresentation(db, issue),
       scheduledRetry,
-      activeRecoveryAction: revalidatedActiveRecoveryAction,
+      activeRecoveryAction,
       blockedBy: visibleRelations.blockedBy,
       blocks: visibleRelations.blocks,
       relatedWork: visibleReferenceSummary,
