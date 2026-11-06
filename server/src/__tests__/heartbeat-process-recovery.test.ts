@@ -13536,9 +13536,33 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     },
   );
 
-  it("allows fresh Board work after a stop and then drives the remaining assigned issue", async () => {
-    const { companyId, agentId, issueId, runId } = await seedRunFixture({ agentStatus: "idle", runStatus: "cancelled", runtimeMode: "legacy" });
-    await db.update(heartbeatRuns).set({ finishedAt: new Date(Date.now() - 10_000), resultJson: { cancelledByActorType: "user" } }).where(eq(heartbeatRuns.id, runId));
+  it("honors a chat close published at the queue-drive dispatch boundary", async () => {
+    const source = await seedCommittedChatControlStop();
+    await db.insert(agentWakeupRequests).values({ companyId: source.companyId, agentId: source.agentId,
+      source: "on_demand", triggerDetail: "manual", reason: "issue_commented", payload: { issueId: source.issueId },
+      status: "coalesced", runId: source.runId, requestedByActorType: "user", requestedByActorId: "responsible-user",
+      requestedAt: new Date(0) });
+    await db.update(chatPublications).set({ state: "pending" }).where(eq(chatPublications.id, source.publicationId));
+    let published = false;
+    const heartbeat = heartbeatService(db, { beforeChatControlRecoveryCheck: async ({ stage }) => {
+      if (stage !== "dispatch" || published) return;
+      published = true;
+      await db.update(chatPublications).set({ state: "published" }).where(eq(chatPublications.id, source.publicationId));
+    } });
+    const run = await heartbeat.wakeup(source.agentId, { source: "assignment", triggerDetail: "system", reason: "issue_queue_drive",
+      requestedByActorType: "system", requestedByActorId: "heartbeat_queue_drive", payload: { issueId: source.issueId },
+      contextSnapshot: { issueId: source.issueId, source: "heartbeat.queue_drive" } });
+    expect(run).not.toBeNull();
+    await heartbeat.drainActiveRunExecutions();
+    expect(published).toBe(true);
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+  });
+
+  it.each(["operator stop", "chat close"])("allows fresh Board work after a %s and then drives the remaining assigned issue", async (stopKind) => {
+    const { companyId, agentId, issueId, runId } = stopKind === "chat close"
+      ? await seedCommittedChatControlStop()
+      : await seedRunFixture({ agentStatus: "idle", runStatus: "cancelled", runtimeMode: "legacy" });
+    if (stopKind === "operator stop") await db.update(heartbeatRuns).set({ finishedAt: new Date(Date.now() - 10_000), resultJson: { cancelledByActorType: "user" } }).where(eq(heartbeatRuns.id, runId));
     await db.update(issues).set({ executionRunId: null, checkoutRunId: null }).where(eq(issues.id, issueId));
     let calls = 0;
     mockAdapterExecute.mockImplementation(async () => {

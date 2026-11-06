@@ -664,7 +664,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         const proof = admission === "invalid" || admissionLost
           ? { kind: "unresolved" as const }
           : queueDrive
-          ? (await hasQueueDriveRecoveryHold(tx as unknown as Db, { companyId: run.companyId, agentId: run.agentId, issueId }))
+          ? (await hasQueueDriveRecoveryHold(tx as unknown as Db, { companyId: run.companyId, agentId: run.agentId, issueId }, true))
             ? { kind: "queue_hold" as const } : { kind: "clear" as const }
           : await readChatControlRecoveryStop(
                 tx as unknown as Db,

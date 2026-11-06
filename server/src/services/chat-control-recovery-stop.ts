@@ -176,6 +176,7 @@ export async function readChatControlRecoveryStop(
   db: Db,
   scope: ChatControlRecoveryScope,
   lockConversation = false,
+  ignoreCoalescedBoardCause = false,
 ): Promise<ChatControlRecoveryStop> {
   if (!Object.values(scope).every(id)) return { kind: "unresolved" };
   let runId = scope.sourceRunId;
@@ -238,7 +239,7 @@ export async function readChatControlRecoveryStop(
         ),
       )
       .limit(1);
-    if (freshBoardCause) return { kind: "clear" };
+    if (freshBoardCause && !ignoreCoalescedBoardCause) return { kind: "clear" };
     const [action] = run.wakeupRequestId
       ? await db
           .select()
