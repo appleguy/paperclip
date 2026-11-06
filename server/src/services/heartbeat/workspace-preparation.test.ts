@@ -1658,7 +1658,7 @@ describe.skipIf(!support.supported && !externalDatabaseUrl)("heartbeat workspace
     expect(first.executionWorkspace.source).toBe("task_session");
     expect(first.persistedExecutionWorkspace).toMatchObject({ mode: "shared_workspace", strategyType: "project_primary",
       sourceIssueId: issue.id, projectId: null, projectWorkspaceId: null, repoUrl: null, metadata: { source: "task_session" } });
-    await mkdir(join(first.executionWorkspace.cwd, ".git", "info"), { recursive: true });
+    await execFile("git", ["init", "--initial-branch=main", first.executionWorkspace.cwd]);
     await writeFile(join(first.executionWorkspace.cwd, ".git", "info", "exclude"), "/.paperclip-repositories/\n");
     await writeFile(join(first.executionWorkspace.cwd, "original-context.txt"), "Preserve the original task bytes\n");
     await db.update(issues).set({ executionRunId: input.run.id }).where(eq(issues.id, issue.id));
