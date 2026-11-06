@@ -25,6 +25,7 @@ import { instanceSettingsService } from "../services/instance-settings.js";
 import { createHash, randomUUID } from "node:crypto";
 import { recordLegacyWorkspaceRestoreFailure, terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
 import { issueService } from "../services/issues.js";
+import { getIssueContinuationSummaryDocument } from "../services/issue-continuation-summary.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
 import { adapterExecutionControls, createAdapterExecutionControl } from "../services/adapter-execution-control.js";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
@@ -3505,6 +3506,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const [action] = await selectRecoveryActionsForIssue(issueId);
     expect(action).toBeUndefined();
     expect(retryRun).toMatchObject({ status: "scheduled_retry", scheduledRetryAttempt: 1 });
+    // The next wake must not inherit an older run's handoff (SCO-302 was told to fix a two-day-old failure).
+    expect((await getIssueContinuationSummaryDocument(db, issueId))?.body).toContain(runId);
     await heartbeat.reapOrphanedRuns();
     expect(
       await selectRecoveryRunsByAgent(agentId),

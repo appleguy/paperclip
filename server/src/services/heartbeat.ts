@@ -1070,6 +1070,7 @@ export function heartbeatService(
     registerNativeWorkspaceFinalizationWork,
     registerNativeEnvironmentSettlementWork,
   } = createHeartbeatRecovery(db, {
+    refreshContinuationSummaryForRun: (run, agent) => refreshContinuationSummaryForRun(run, agent),
     pluginWorkerManager: options.pluginWorkerManager,
     enterShutdown: () => { shutdownInProgress = true; },
     scheduleBoundedRetryForRun,

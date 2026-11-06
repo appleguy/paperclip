@@ -166,6 +166,8 @@ export interface HeartbeatRecoveryDependencies extends Pick<HeartbeatRetryDepend
     },
   ) => Record<string, unknown> | null;
   classifyAndPersistRunLiveness: (run: HeartbeatRun, resultJson?: Record<string, unknown> | null) => Promise<HeartbeatRun | null>;
+  /** Keeps the issue handoff current when a run is lost instead of completing normally. */
+  refreshContinuationSummaryForRun?: (run: HeartbeatRun, agent: NonNullable<Awaited<ReturnType<HeartbeatRecoveryDependencies["getAgent"]>>>) => Promise<unknown>;
   releaseEnvironmentLeasesForRun: (input: {
     runId: string;
     companyId: string;
@@ -428,6 +430,7 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     activeRunExecutions,
     setRunStatus,
     getAgent,
+    refreshContinuationSummaryForRun,
     scheduleInteractionContinuationInfrastructureRetryIfEligible,
     startNextQueuedRunForAgent,
   } = dependencies;
@@ -2822,6 +2825,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
 
       let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
       const retryAgent = await getAgent(run.agentId);
+      // A lost run skips normal completion; without this the next wake inherits an older run's handoff.
+      if (retryAgent) await refreshContinuationSummaryForRun?.(finalizedRun, retryAgent);
       if (shouldRetry) {
         if (retryAgent) {
           retriedRun = await enqueueProcessLossRetry(
