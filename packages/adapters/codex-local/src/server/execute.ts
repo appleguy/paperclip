@@ -1318,16 +1318,18 @@ async function executeCodex(ctx: AdapterExecutionContext): Promise<AdapterExecut
         ? ""
         : stripConnectionGuidanceWithoutIntent(renderTemplate(promptTemplate, templateData), context);
       const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+      // Keep the reusable agent prompt ahead of issue detail and per-run data so
+      // the provider prompt-cache prefix stays stable across issues of one agent.
       const prompt = joinPromptSections([
         promptInstructionsPrefix,
         renderedBootstrapPrompt,
         shouldUseResumeDeltaPrompt ? "" : instructionsPathNote,
+        renderedPrompt,
         selectInitialCommunicationGuidance(context, { resumedSession: Boolean(resumeSessionId) }),
+        taskContextNote,
+        sessionHandoffNote,
         wakePrompt,
         codexFallbackHandoffNote,
-        sessionHandoffNote,
-        taskContextNote,
-        renderedPrompt,
       ]);
       const promptMetrics = {
         promptChars: prompt.length,
