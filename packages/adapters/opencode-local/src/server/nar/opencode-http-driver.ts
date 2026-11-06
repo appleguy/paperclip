@@ -447,9 +447,9 @@ export class OpenCodeHttpDriver implements ProviderDriver {
     }
   }
 
-  // The provider does not enforce controller ownership on an inbox DELETE or
-  // an interrupt. Even the exact queued message can now belong to a successor
-  // controller. Hold until Stop authority can be fenced atomically.
+  // Run control fences the run before delivering an intentional Stop. The v2
+  // interrupt is session-wide, so only send it for the exact bound active
+  // message. A restart only detaches the observer and never calls this method.
   async interruptExpectedMessage(conversationId: string, messageId: string, _op: Op, _fence: Fence): Promise<"requested" | "uncertain" | "idle"> {
     try {
       const inbox = await this.json("GET", `/api/session/${encodeURIComponent(conversationId)}/inbox`);
@@ -457,11 +457,12 @@ export class OpenCodeHttpDriver implements ProviderDriver {
           inbox.data.data.some((item: unknown) => !item || typeof item !== "object" || typeof (item as { id?: unknown }).id !== "string")) return "uncertain";
       if (inbox.data.data.some((item: { id: string }) => item.id === messageId)) return "uncertain";
       if (await this.inflightMessage(conversationId) !== messageId) return "idle";
+      const response = await this.json("POST", `/api/session/${encodeURIComponent(conversationId)}/interrupt`);
+      return response.status === 200 && response.data?.interrupted === true ? "requested" : "uncertain";
     } catch {
       // An unreadable state is not authority to cancel an unverified turn.
       return "uncertain";
     }
-    return "uncertain";
   }
 
   async interrupt(_conversationId: string, _op: Op, _f: Fence): Promise<"requested" | "uncertain"> {

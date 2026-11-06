@@ -17,6 +17,7 @@ describe("OpenCode stop inbox cancellation", () => {
   let idleAt: number | undefined;
   let calls: string[];
   let driver: OpenCodeHttpDriver;
+  let interruptResponse: () => Response;
   const op = { opId: "stop", kind: "interrupt" as const, payloadSha256: "" };
   const fence = { runId: "run", leaseGeneration: 1, hostEpoch: 1 };
 
@@ -34,6 +35,7 @@ describe("OpenCode stop inbox cancellation", () => {
     historyReads = 0;
     idleAt = 2;
     calls = [];
+    interruptResponse = () => Response.json({ interrupted: true });
     const fetchImpl = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
       const pathname = new URL(String(url)).pathname;
       calls.push(`${init?.method} ${pathname}`);
@@ -56,7 +58,7 @@ describe("OpenCode stop inbox cancellation", () => {
       if (pathname.endsWith("/message/msg_target")) return targetRecorded
         ? Response.json({ data: { id: "msg_target", type: "user", time: { created: 1 } } }) : new Response(null, { status: 404 });
       if (pathname === "/api/session/ses_fixture") return Response.json({ data: { time: { idle: idleAt }, outcome: "interrupted" } });
-      if (pathname.endsWith("/interrupt")) return Response.json({ interrupted: true });
+      if (pathname.endsWith("/interrupt")) return interruptResponse();
       return new Response(null, { status: 404 });
     }) as unknown as typeof fetch;
     driver = new OpenCodeHttpDriver({ url: "http://127.0.0.1:4096", passwordFile, fetchImpl });
@@ -90,11 +92,21 @@ describe("OpenCode stop inbox cancellation", () => {
     expect(calls.some((call) => call.endsWith("/interrupt"))).toBe(false);
   });
 
-  it("holds a matching active turn when conditional interrupt is unavailable", async () => {
+  it("interrupts the exact bound active turn through the v2 route", async () => {
     active = "msg_target";
-    expect(await driver.interruptExpectedMessage("ses_fixture", "msg_target", op, fence)).toBe("uncertain");
+    expect(await driver.interruptExpectedMessage("ses_fixture", "msg_target", op, fence)).toBe("requested");
     expect(calls.some((call) => call.startsWith("DELETE "))).toBe(false);
-    expect(calls.some((call) => call.endsWith("/interrupt"))).toBe(false);
+    expect(calls.filter((call) => call.startsWith("POST "))).toEqual(["POST /api/session/ses_fixture/interrupt"]);
+  });
+
+  it.each(["http", "receipt", "transport"])("keeps %s interrupt failures unacknowledged", async failure => {
+    active = "msg_target";
+    interruptResponse = () => {
+      if (failure === "transport") throw new TypeError("connection lost");
+      return failure === "http" ? new Response(null, { status: 405 }) : Response.json({ interrupted: false });
+    };
+    expect(await driver.interruptExpectedMessage("ses_fixture", "msg_target", op, fence)).toBe("uncertain");
+    expect(calls.filter((call) => call.startsWith("POST "))).toEqual(["POST /api/session/ses_fixture/interrupt"]);
   });
 
   it("does not interrupt a different active turn", async () => {
