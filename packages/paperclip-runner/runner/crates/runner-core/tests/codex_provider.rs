@@ -93,6 +93,16 @@ fn dormant_source_fixture_with_switches(
 ) -> (DurableRunnerConfig, Value) {
     let mut switches_with_defaults = vec!["--record-process-start", "--durable-turn-ids"];
     switches_with_defaults.extend_from_slice(switches);
+    dormant_source_fixture_with_provider(
+        directory,
+        provider_config(directory, &switches_with_defaults),
+    )
+}
+
+fn dormant_source_fixture_with_provider(
+    directory: &Path,
+    provider: CodexProviderConfig,
+) -> (DurableRunnerConfig, Value) {
     let config = durable_config(directory);
     let mut executor = CodexCommandExecutor::with_runner_config(directory, &config);
     executor
@@ -100,7 +110,7 @@ fn dormant_source_fixture_with_switches(
             "prepare-source",
             1,
             "run.prepare",
-            json!({"provider":provider_config(directory, &switches_with_defaults)}),
+            json!({"provider":provider}),
         ))
         .unwrap();
     executor
@@ -121,6 +131,75 @@ fn dormant_source_fixture_with_switches(
         serde_json::from_slice(&fs::read(directory.join("codex-provider-state.json")).unwrap())
             .unwrap();
     (config, provider)
+}
+
+#[test]
+#[cfg(unix)]
+fn recovery_attaches_after_pruning_the_recorded_provider_install() {
+    for current_available in [true, false] {
+        let directory = temporary_directory("pruned-install-recovery");
+        let old_install = directory.join("cli/installs/git/abc123");
+        let current_install = directory.join("cli/installs/git/def456");
+        fs::create_dir_all(&old_install).unwrap();
+        fs::create_dir_all(&current_install).unwrap();
+        let executable = "fake-codex-app-server";
+        fs::copy(
+            env!("CARGO_BIN_EXE_fake-codex-app-server"),
+            old_install.join(executable),
+        )
+        .unwrap();
+        if current_available {
+            fs::copy(
+                env!("CARGO_BIN_EXE_fake-codex-app-server"),
+                current_install.join(executable),
+            )
+            .unwrap();
+        }
+        std::os::unix::fs::symlink(&current_install, directory.join("cli/current")).unwrap();
+        let mut provider = provider_config(
+            &directory,
+            &["--record-process-start", "--durable-turn-ids"],
+        );
+        provider.command = old_install.join(executable);
+        let (config, original) = dormant_source_fixture_with_provider(&directory, provider.clone());
+        fs::remove_dir_all(&old_install).unwrap();
+        let runner = DurableStateStore::new(&directory)
+            .unwrap()
+            .load_or_create(&config)
+            .unwrap()
+            .0;
+        let mut recovered = NativeProviderCommandExecutor::with_runner_config(&directory, &config);
+        recovered.observe_recovery_state(&runner).unwrap();
+        let result = recovered.execute(&command(
+            "attach-pruned",
+            4,
+            "run.attach",
+            json!({"provider":provider}),
+        ));
+        if current_available {
+            result.expect("attach must restore the original thread using the current executable");
+            assert_eq!(call_count(&directory, "process-start"), 2);
+            assert_eq!(call_count(&directory, "turn/start"), 1);
+            let restored: Value = serde_json::from_slice(
+                &fs::read(directory.join("codex-provider-state.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(restored["config"]["command"], original["config"]["command"]);
+            assert_eq!(restored["threadId"], original["threadId"]);
+            recovered.shutdown().unwrap();
+        } else {
+            let error = result.expect_err("missing current equivalent must fail closed");
+            assert!(
+                error
+                    .to_string()
+                    .contains("cli/current equivalent is unavailable"),
+                "{error}"
+            );
+            assert_eq!(call_count(&directory, "process-start"), 1);
+        }
+        drop(recovered);
+        fs::remove_dir_all(directory).unwrap();
+    }
 }
 
 #[test]

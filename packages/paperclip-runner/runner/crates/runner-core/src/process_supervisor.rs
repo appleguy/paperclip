@@ -30,6 +30,44 @@ const PROCESS_OUTPUT_QUEUE_CAPACITY: usize = 256;
 const VERIFIED_RUNTIME_EXECUTABLE_ENV: &str = "PAPERCLIP_VERIFIED_RUNTIME_EXECUTABLE";
 const VERIFIED_COMMONJS_ARTIFACT_LOADER: &str = r#"const fs=require("node:fs");const Module=require("node:module");const filename=process.argv[1];const source=fs.readFileSync(filename,"utf8").replace(/^#![^\r\n]*(?:\r?\n|$)/,"");const artifact=new Module(filename);artifact.filename=filename;artifact.paths=[];artifact._compile(source,filename);"#;
 
+// Resolve only missing, standalone install paths at the unverified provider
+// spawn boundary. Keep durable profiles/journal fingerprints and enrolled,
+// digest-verified launches unchanged. An extant install retains its exact code.
+fn retained_install_path(path: &Path) -> Result<PathBuf, LocalRunnerError> {
+    let Some(value) = path.to_str().filter(|_| path.is_absolute()) else {
+        return Ok(path.to_owned());
+    };
+    let Some((root, installed)) = value.split_once("/cli/installs/git/") else {
+        return Ok(path.to_owned());
+    };
+    let Some((revision, relative)) = installed.split_once('/') else {
+        return Ok(path.to_owned());
+    };
+    if revision.is_empty()
+        || !revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || relative.is_empty()
+        || Path::new(relative)
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Ok(path.to_owned());
+    }
+    match fs::metadata(path) {
+        Ok(_) => return Ok(path.to_owned()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(LocalRunnerError::invalid(error.to_string())),
+    }
+    let current = PathBuf::from(format!("{root}/cli/current"));
+    fs::canonicalize(&current)
+        .and_then(|current| fs::canonicalize(current.join(relative)))
+        .map_err(|error| {
+            LocalRunnerError::invalid(format!(
+                "retained provider launch path {} is missing and its cli/current equivalent is unavailable: {error}",
+                path.display()
+            ))
+        })
+}
+
 pub(crate) fn is_node_interpreter(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -963,9 +1001,17 @@ impl SupervisedProcess {
         additional_environment_keys: &[&str],
         cwd: &Path,
     ) -> Result<Self, LocalRunnerError> {
+        let program = retained_install_path(program)?;
+        let args = args
+            .iter()
+            .map(|arg| {
+                retained_install_path(Path::new(arg))
+                    .map(|path| path.to_string_lossy().into_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Self::spawn_command(
-            program,
-            args,
+            &program,
+            &args,
             shutdown_grace,
             max_line_bytes,
             additional_environment_keys,
@@ -1387,6 +1433,56 @@ fn exit_fact(status: ExitStatus) -> ProcessExitFact {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn retained_install_paths_preserve_existing_and_unrelated_paths() {
+        let root = std::env::temp_dir().join(format!("retained-install-{}", uuid::Uuid::new_v4()));
+        let old = root.join("cli/installs/git/abc123/bin/provider");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::write(&old, "original").unwrap();
+        assert_eq!(retained_install_path(&old).unwrap(), old);
+        for path in [
+            root.join("unrelated/missing"),
+            root.join("cli/installs/git/not-a-sha/bin/provider"),
+            root.join("cli/installs/git/abc123/../provider"),
+            PathBuf::from("provider"),
+        ] {
+            assert_eq!(retained_install_path(&path).unwrap(), path);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retained_install_script_spawns_from_current_realpath() {
+        let root = std::env::temp_dir().join(format!("retained-script-{}", uuid::Uuid::new_v4()));
+        let current = root.join("cli/installs/git/def456");
+        fs::create_dir_all(current.join("bin")).unwrap();
+        std::os::unix::fs::symlink(&current, root.join("cli/current")).unwrap();
+        let script = current.join("bin/provider.sh");
+        fs::write(&script, "printf '%s\\n' \"$0\"\n").unwrap();
+        let old_script = root.join("cli/installs/git/abc123/bin/provider.sh");
+        let mut process = SupervisedProcess::spawn_in_directory_with_environment_keys(
+            Path::new("/bin/sh"),
+            &[old_script.to_string_lossy().into_owned()],
+            Duration::from_secs(1),
+            4096,
+            &[],
+            &root,
+        )
+        .unwrap();
+        assert_eq!(
+            process.receive_stdout_line(Duration::from_secs(5)).unwrap(),
+            Some(
+                fs::canonicalize(script)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            )
+        );
+        process.terminate_group().unwrap();
+        assert!(retained_install_path(&root.join("cli/installs/git/abc123/bin/absent")).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     #[cfg(unix)]

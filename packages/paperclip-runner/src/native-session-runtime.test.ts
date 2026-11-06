@@ -9362,7 +9362,10 @@ describe("executeNativeSession recovery", () => {
 });
 
 
-it("fails preconfigured recovery without replacing a missing provider session", async () => {
+it.each([
+  "provider history is missing",
+  "retained provider launch path is missing and its cli/current equivalent is unavailable",
+])("fails preconfigured recovery without replacing a missing provider session: %s", async (reason) => {
   const checkpoint: PersistedNativeSession = {
     backendKind: "mock", sessionId: "driver-preconfigured", identity,
     providerSessionId: "provider-missing", providerRecoveryPolicy: "allow_replacement_after_resume_failure",
@@ -9375,7 +9378,7 @@ it("fails preconfigured recovery without replacing a missing provider session", 
       runtimeContextCapabilities: { instructions: "native", skills: "native", mcp: "native" },
       capabilities: { resume: true, typedEvents: true, steering: false, interruption: true } }),
     openSession, openReplacementSession,
-    recoverSession: async () => ({ recovered: false, reason: "provider history is missing" }),
+    recoverSession: async () => ({ recovered: false, reason }),
   };
   const port: ControlPlanePort = {
     openRun: vi.fn(), appendEvent: vi.fn(), completeRun: vi.fn(),
@@ -9384,7 +9387,7 @@ it("fails preconfigured recovery without replacing a missing provider session", 
   await expect(executeNativeSession({
     input: { ...preparedInput(), schema: "paperclip.native-execution-input.v7", homeMode: "preconfigured" },
     backend, controlPlane: port, runnerInstanceId: "runner-preconfigured", persistedSession: checkpoint,
-  })).rejects.toThrow("native_session_recovery_failed: provider history is missing");
+  })).rejects.toThrow(`native_session_recovery_failed: ${reason}`);
   expect(openSession).not.toHaveBeenCalled();
   expect(openReplacementSession).not.toHaveBeenCalled();
 });
