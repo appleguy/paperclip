@@ -809,7 +809,7 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     f.deps.setRunStatusIfRunning.mockRejectedValueOnce(writeError);
     await expect(f.completion.completeRun(f.input)).rejects.toBe(writeError);
     expect(f.input.onProviderTraceFinalized).toHaveBeenCalledOnce();
-    expect(f.deps.setRunStatusIfRunning).toHaveBeenCalledWith(f.run.id, "succeeded", expect.objectContaining({ stdoutExcerpt: "last provider output", logBytes: 99 }), expect.any(Object));
+    expect(f.deps.setRunStatusIfRunning).toHaveBeenCalledWith(f.run.id, "succeeded", expect.objectContaining({ stdoutExcerpt: "last provider output", logBytes: 99 }), expect.any(Object), undefined);
   });
 
   it("keeps a failed trace finalization eligible for the executor's cleanup retry", async () => {
