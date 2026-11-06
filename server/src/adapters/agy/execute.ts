@@ -13,7 +13,7 @@ import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import type { AdapterExecutionContext, AdapterExecutionResult } from "@paperclipai/adapter-utils";
 import { readableRuntimePath } from "@paperclipai/adapter-utils/readable-runtime-paths";
-import { AntigravityInteractiveControl, AntigravityInteractiveRun } from "@paperclipai/paperclip-runner/live";
+import { AntigravityInteractiveControl, AntigravityInteractiveRun } from "../../vendor/paperclip-runner/live/index.js";
 import { parseHeartbeatPolicy } from "../../services/heartbeat/timer-policy.js";
 import { AGY_HOST_ADMISSION, claimAgyHostAdmission, isAgyAdmissionIdle, isAgyHostLimitedModel } from "./admission.js";
 import { assertAssembledPrompt, preflightSessionPrompt, applyPromptRotation } from "@paperclipai/adapter-utils/token-preflight";

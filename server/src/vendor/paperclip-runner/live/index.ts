@@ -6,6 +6,11 @@ const sourceUrl = new URL(
 );
 const runner = (await import(sourceUrl.href)) as RunnerLiveModule;
 
+export const AntigravityInteractiveControl = runner.AntigravityInteractiveControl;
+export type AntigravityInteractiveControl = import("@paperclipai/paperclip-runner/live").AntigravityInteractiveControl;
+export const AntigravityInteractiveRun = runner.AntigravityInteractiveRun;
+export type AntigravityInteractiveRun = import("@paperclipai/paperclip-runner/live").AntigravityInteractiveRun;
+
 export const probeCopilotMetadata = runner.probeCopilotMetadata;
 export const validateCopilotMetadata = runner.validateCopilotMetadata;
 export const probeAcpxClaudeInstallation = runner.probeAcpxClaudeInstallation;
