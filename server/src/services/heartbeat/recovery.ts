@@ -2411,6 +2411,37 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
 
   }
 
+  async function surfaceHeldOpenCodeStop(run: HeartbeatRun, requireExpiredController = false) {
+    const issueId = run.issueId ?? readNonEmptyString(parseObject(run.contextSnapshot).issueId);
+    if (!issueId) return;
+    await db.transaction(async tx => {
+      const [task] = await tx.select().from(issues).where(and(
+        eq(issues.id, issueId), eq(issues.companyId, run.companyId),
+      )).for("update");
+      if (!task) return;
+      const [held] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
+        eq(heartbeatRuns.status, "running"), eq(heartbeatRuns.runtimeMode, "legacy"),
+        sql`${heartbeatRuns.resultJson}->'executionCancellation'->>'state' = 'requested'`,
+        ...(requireExpiredController ? [
+          run.controllerBootId ? eq(heartbeatRuns.controllerBootId, run.controllerBootId) : isNull(heartbeatRuns.controllerBootId),
+          or(isNull(heartbeatRuns.controllerLeaseExpiresAt), lte(heartbeatRuns.controllerLeaseExpiresAt, sql`clock_timestamp()`)),
+        ] : []),
+      )).for("update");
+      if (!held) return;
+      await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
+        companyId: run.companyId, sourceIssueId: issueId,
+        kind: "active_run_watchdog", ownerType: "board",
+        returnOwnerAgentId: task.assigneeAgentId ?? run.agentId,
+        cause: "opencode_stop_provider_unverified",
+        fingerprint: `opencode-stop:${run.id}`,
+        evidence: { runId: run.id, agentId: run.agentId, providerTermination: "unverified" },
+        nextAction: "Inspect the original OpenCode provider turn and establish whether it ended; preserve the run and its resources until termination and ownership are verified.",
+        wakePolicy: null, createOnly: true,
+      });
+    });
+  }
+
   async function recoverActiveExecutions(scope: RecoveryScope = {}, options: {
     staleThresholdMs?: number; resumedRunIds?: Set<string>;
   } = {}) {
@@ -2628,6 +2659,18 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         checksPersistedChildLiveness &&
         run.processGroupId &&
         isProcessGroupAlive(run.processGroupId);
+      // A retained Stop needs an owner even when an orphaned child is still
+      // alive. Liveness is not authority to signal it or proof of provider
+      // termination. Check the controller lease under the run lock; do not
+      // revoke it or signal a child that may still be doing useful work.
+      const openCodeLegacyRun = run.runtimeMode === "legacy" &&
+        (adapterType === "opencode_local" || parseObject(run.runnerProfileJson?.adapterDispatch).adapterType === "opencode_local");
+      if ((processPidAlive || processGroupAlive) && openCodeLegacyRun &&
+          parseObject(parseObject((await getRun(run.id))?.resultJson).executionCancellation).state === "requested") {
+        await surfaceHeldOpenCodeStop(run, true);
+        scope.onDeferredDeadline?.(Date.now() + 60_000);
+        continue;
+      }
       if (
         (processPidAlive || processGroupAlive) &&
         readHotRestartAdoptionMetadata(parseObject(run.resultJson))
@@ -2674,38 +2717,12 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       const revokedState = await revokeExpiredLegacyControllerWithState(db, run);
       if (!revokedState) continue;
       const latestResult = parseObject((await getRun(run.id))?.resultJson ?? run.resultJson);
-      const openCodeLegacyRun = run.runtimeMode === "legacy" &&
-        (adapterType === "opencode_local" || parseObject(run.runnerProfileJson?.adapterDispatch).adapterType === "opencode_local");
       if (openCodeLegacyRun &&
           parseObject(latestResult.executionCancellation).state === "requested") {
         // Controller loss does not prove that a shared provider turn ended.
         // Make the retained Stop visible to an operator, without displacing an
         // existing recovery action or releasing the run's execution resources.
-        const issueId = run.issueId ?? readNonEmptyString(parseObject(run.contextSnapshot).issueId);
-        if (issueId) {
-          await db.transaction(async tx => {
-            const [task] = await tx.select().from(issues).where(and(
-              eq(issues.id, issueId), eq(issues.companyId, run.companyId),
-            )).for("update");
-            if (!task) return;
-            const [held] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
-              eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId),
-              eq(heartbeatRuns.status, "running"), eq(heartbeatRuns.runtimeMode, "legacy"),
-              sql`${heartbeatRuns.resultJson}->'executionCancellation'->>'state' = 'requested'`,
-            )).for("update");
-            if (!held) return;
-            await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
-              companyId: run.companyId, sourceIssueId: issueId,
-              kind: "active_run_watchdog", ownerType: "board",
-              returnOwnerAgentId: task.assigneeAgentId ?? run.agentId,
-              cause: "opencode_stop_provider_unverified",
-              fingerprint: `opencode-stop:${run.id}`,
-              evidence: { runId: run.id, agentId: run.agentId, providerTermination: "unverified" },
-              nextAction: "Inspect the original OpenCode provider turn and establish whether it ended; preserve the run and its resources until termination and ownership are verified.",
-              wakePolicy: null, createOnly: true,
-            });
-          });
-        }
+        await surfaceHeldOpenCodeStop(run);
         scope.onDeferredDeadline?.(Date.now() + 60_000);
         continue;
       }
