@@ -197,10 +197,12 @@ describe("OpenCode adapter nativeRuntime nar", () => {
       "Stable launch instructions.",
       "Stable bootstrap instructions.",
       "Stable communication guidance.",
-      "Stable assignment context.",
       "Stable agent template.",
     ].join("\n\n");
     expect(prompt.startsWith(stablePrefix)).toBe(true);
+    expect(prompt.indexOf("Stable assignment context.")).toBeGreaterThan(
+      prompt.indexOf("Stable agent template."),
+    );
     const bridgeNoteOffset = prompt.indexOf("Paperclip access: use the paperclip-run MCP tools");
     expect(bridgeNoteOffset).toBeGreaterThan(Buffer.byteLength(stablePrefix, "utf8"));
     expect(prompt.slice(bridgeNoteOffset)).toContain("valid for this run only.");

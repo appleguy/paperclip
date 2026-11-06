@@ -90,13 +90,18 @@ describe("OpenCode local skill injection", () => {
     expect(prompt).not.toContain("Create child issues");
   });
 
-  it("keeps stable prompt sections ahead of changing wake and handoff data", async () => {
+  it("keeps reusable prompt sections ahead of changing task, wake and handoff data", async () => {
     const commandPath = path.join(configHome, "fake-opencode-prefix-audit");
     await fs.writeFile(commandPath, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
     const instructionsFilePath = path.join(configHome, "AGENTS.md");
     await fs.writeFile(instructionsFilePath, "Stable launch instructions.", "utf8");
     const prompts: string[] = [];
-    const promptFor = async (runId: string, handoff: string, changedWakeBody?: string) => {
+    const promptFor = async (
+      runId: string,
+      handoff: string,
+      taskAssignment = "Stable assignment context.",
+      changedWakeBody?: string,
+    ) => {
       runProcessMock.mockReset().mockResolvedValue(probeResult({ stdout: JSON.stringify({
         type: "text", sessionID: "prefix-audit-session", part: { text: "ok" },
       }) }));
@@ -118,7 +123,7 @@ describe("OpenCode local skill injection", () => {
           ...fixture,
           paperclipTaskCommunicationGuidance: "Stable communication guidance.",
           paperclipFreshSessionHandoffMarkdown: `Prior handoff ${handoff}.`,
-          paperclipTaskMarkdownAssignment: "Stable assignment context.",
+          paperclipTaskMarkdownAssignment: taskAssignment,
           paperclipWake: fixture.paperclipWake,
         },
         onLog: async () => {},
@@ -127,25 +132,39 @@ describe("OpenCode local skill injection", () => {
     };
     await promptFor("prefix-run-step-1", "A");
     await promptFor("prefix-run-step-2", "A");
-    await promptFor("prefix-run-wake-2", "B", "Changed wake body for the second wake.");
+    await promptFor(
+      "prefix-run-wake-2",
+      "B",
+      "Changed task context for the second wake.",
+      "Changed wake body for the second wake.",
+    );
     expect(prompts).toHaveLength(3);
 
     const stablePrefix = [
       "Stable launch instructions.",
       "Stable bootstrap instructions.",
       "Stable communication guidance.",
-      "Stable assignment context.",
       "Stable agent template.",
     ].join("\n\n");
     expect(prompts.every((prompt) => prompt.startsWith(stablePrefix))).toBe(true);
+    expect(prompts[2]!.indexOf("Changed task context for the second wake.")).toBeGreaterThan(
+      prompts[2]!.indexOf("Stable agent template."),
+    );
 
+    const legacyPromptForTaskContext = (taskAssignment: string) => [
+      "Stable launch instructions.",
+      "Stable bootstrap instructions.",
+      "Stable communication guidance.",
+      taskAssignment,
+      "Stable agent template.",
+    ].join("\n\n");
     const legacyFirstDifference = firstDifferingByte(
-      "Stable communication guidance.\n\nPrior handoff A.",
-      "Stable communication guidance.\n\nPrior handoff B.",
+      legacyPromptForTaskContext("Stable assignment context."),
+      legacyPromptForTaskContext("Changed task context for the second wake."),
     );
     const firstDifference = firstDifferingByte(prompts[1]!, prompts[2]!);
-    expect(legacyFirstDifference).toBe(46);
-    expect(firstDifference).toBeGreaterThan(Buffer.byteLength(stablePrefix, "utf8"));
+    expect(legacyFirstDifference).toBe(93);
+    expect(firstDifference).toBe(117);
     expect(firstDifference).toBeGreaterThan(legacyFirstDifference);
     expect(prompts[0]).toContain("The above agent instructions were loaded from");
     expect(prompts[2]).toContain("Changed wake body for the second wake.");

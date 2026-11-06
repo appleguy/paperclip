@@ -654,13 +654,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         (sharedSession.recovered || isPaperclipRecoveryWakePayload(context.paperclipWake))
         ? "Controller restart recovery: inspect the existing session history. Do not repeat any completed tool actions; continue only unfinished work."
         : "";
-      // Managed session goals stay in taskContextNote; stable sections precede per-run and wake data.
+      // Keep the reusable agent prompt ahead of task-specific and per-run data.
       const basePrompt = joinPromptSections([
         renderedInstructions,
         renderedBootstrapPrompt,
         communicationGuidance,
-        taskContextNote,
         renderedPrompt,
+        taskContextNote,
         recoveryNote,
         sessionHandoffNote,
         freshSessionHandoff,
