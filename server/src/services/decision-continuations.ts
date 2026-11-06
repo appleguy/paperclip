@@ -1,5 +1,5 @@
 import { and, asc, eq, gt, sql } from "drizzle-orm";
-import { databaseWorkScopeKey, decisions, type Db } from "@paperclipai/db";
+import { agents, databaseWorkScopeKey, decisions, type Db } from "@paperclipai/db";
 
 export type DecisionContinuationWake = (input: {
   companyId: string; agentId: string; issueId: string; decisionId: string;
@@ -11,6 +11,12 @@ const ready = sql`${decisions.continuationPolicy} = 'wake_origin_agent'
   AND ${decisions.metadata} ->> 'continuationPending' = 'true'
   AND (${decisions.status} IN ('expired', 'cancelled') OR
     (${decisions.status} = 'decided' AND ${decisions.executionStatus} IN ('succeeded', 'partial', 'failed')))`;
+// A pause is an admission hold, not a failed delivery. Keep the durable
+// continuation pending and periodically recheck it so resume needs no new
+// notification. The wake path still enforces authority if state changes here.
+const notPaused = sql`NOT EXISTS (SELECT 1 FROM ${agents}
+  WHERE ${agents.id} = ${decisions.originAgentId}
+    AND ${agents.companyId} = ${decisions.companyId} AND ${agents.status} = 'paused')`;
 
 export function decisionContinuationService(db: Db, wake: DecisionContinuationWake) {
   const scope = databaseWorkScopeKey(db);
@@ -45,7 +51,7 @@ export function decisionContinuationService(db: Db, wake: DecisionContinuationWa
       if (signal?.aborted) return { retry: true };
       const limit = Math.min(100, maxRows - attempted);
       const rows = await db.select({ id: decisions.id }).from(decisions)
-        .where(and(ready, recoveryCursor ? gt(decisions.id, recoveryCursor) : undefined))
+        .where(and(ready, notPaused, recoveryCursor ? gt(decisions.id, recoveryCursor) : undefined))
         .orderBy(asc(decisions.id)).limit(limit);
       for (const row of rows) {
         if (signal?.aborted) return { retry: true };

@@ -549,6 +549,22 @@ describePg("decisionService", () => {
     expect(await db.select().from(issueComments).where(eq(issueComments.issueId, targetIssueId))).toHaveLength(1);
   });
 
+  it("keeps a paused agent's continuation pending without repeated wake attempts, then delivers after resume", async () => {
+    const row = await createCommentDecision();
+    await db.update(decisions).set({ status: "cancelled", metadata: { continuationPending: true } }).where(eq(decisions.id, row.id));
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+    const wake = vi.fn(async () => {});
+    const recovery = decisionContinuationService(db, wake);
+    expect(await recovery.sweep()).toEqual({ retry: true });
+    expect(await recovery.sweep()).toEqual({ retry: true });
+    expect(wake).not.toHaveBeenCalled();
+    expect((await service().get(row.id))?.metadata.continuationPending).toBe(true);
+    await db.update(agents).set({ status: "active" }).where(eq(agents.id, agentId));
+    expect(await recovery.sweep()).toEqual({ retry: false });
+    expect(wake).toHaveBeenCalledTimes(1);
+    expect((await service().get(row.id))?.metadata.continuationPending).toBe(false);
+  });
+
   it("delivers the continuation when the origin agent cancels a decision", async () => {
     const created = await createCommentDecision();
 
