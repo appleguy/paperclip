@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, mkdir, open } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
+import { cleanDisplayName, modelEffortName, stripModelEffortWords } from "./model-effort-name.js";
 import { agents, issues, type Db } from "@paperclipai/db";
 import { and, eq } from "drizzle-orm";
 import type { ClaudeInteractiveNativePort, NativeExecutionInputV13, PrpEvent, PrpStructuredRunResult } from "../../vendor/paperclip-runner/index.js";
@@ -67,9 +68,11 @@ export async function startClaudeNativeSession(db: Db, input: StartClaudeNativeS
   const [agent] = await db.select({ name: agents.name }).from(agents).where(and(eq(agents.companyId, b.companyId), eq(agents.id, b.agentId))).limit(1);
   const [issue] = await db.select({ identifier: issues.identifier }).from(issues).where(and(eq(issues.companyId, b.companyId), eq(issues.id, b.issueId))).limit(1);
   if (!agent || !issue) throw new Error("claude_session_name_scope_unavailable");
-  const namePart = (value: string) => value.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 75);
+  const tag = modelEffortName("claude", execution.provider.model, execution.provider.effort);
+  const namePart = (value: string) => cleanDisplayName(value).slice(0, 75);
   // The enrolled seat's display identity survives successive task runs.
-  const remoteControlName = [agent.name, b.agentId.slice(0, 8)].map(namePart).join(" · ");
+  const seat = stripModelEffortWords(namePart(agent.name), "claude", execution.provider.model, execution.provider.effort) || "Agent";
+  const remoteControlName = `${tag ? `${tag} ` : ""}${seat.slice(0, 75 - (tag ? tag.length + 1 : 0))} · ${b.agentId.slice(0, 8)}`;
 
   const identity = Object.freeze({ runId: b.runId, sessionId: nativeSessionId, companyId: b.companyId, issueId: b.issueId, agentId: b.agentId });
   const admit = createClaudeNativeAdmission(db, {

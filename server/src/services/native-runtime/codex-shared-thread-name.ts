@@ -1,3 +1,5 @@
+import { modelEffortName, stripModelEffortWords } from "./model-effort-name.js";
+
 /** Build a short display name without copying URLs or credential-like values into Codex. */
 export function buildCodexSharedThreadName(input: {
   agentName: string;
@@ -5,6 +7,8 @@ export function buildCodexSharedThreadName(input: {
   issue?: { identifier: string; title: string } | null;
   wakeReason?: string | null;
   taskSummary?: string | null;
+  model?: string | null;
+  effort?: string | null;
 }): string {
   const clean = (value: string) => value
     .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
@@ -14,17 +18,19 @@ export function buildCodexSharedThreadName(input: {
     .replace(/\s+/g, " ").trim();
   const limit = (value: string, max: number) => Array.from(value).slice(0, Math.max(0, max)).join("").trimEnd();
   const originalAgent = clean(input.agentName) || "Agent";
-  const agent = clean(originalAgent.replace(/\([^)]*\)/g, " ")
-    .replace(/\b(?:codex|worker|low|medium|high|xhigh|max)\b/gi, " ")) || originalAgent;
-  const suffix = ` · ${limit(agent, 76)}`;
-  const available = 80 - Array.from(suffix).length;
+  const tag = modelEffortName("codex", input.model, input.effort);
+  const prefix = tag ? `${tag} ` : "";
+  const agent = clean(stripModelEffortWords(originalAgent.replace(/\([^)]*\)/g, " "), "codex", input.model, input.effort)
+    .replace(/\b(?:codex|worker|low|medium|high|xhigh|max)\b/gi, " ")) || (tag ? "Agent" : originalAgent);
+  const suffix = ` · ${limit(agent, 76 - Array.from(prefix).length)}`;
+  const available = 80 - Array.from(suffix).length - Array.from(prefix).length;
   const title = (value: string) => clean(value).replace(/^(?:owner ask)\s*:\s*/i, "").trim();
   if (!input.issue) {
     const summary = title(input.taskSummary || "") || clean(input.wakeReason || "").replace(/[_-]+/g, " ") || `run ${clean(input.runId).slice(0, 6)}`;
-    return limit(summary, available) + suffix;
+    return prefix + limit(summary, available) + suffix;
   }
   const identifier = limit(clean(input.issue.identifier) || "Issue", available);
   const issueTitle = title(input.issue.title);
   const rest = limit(issueTitle, available - Array.from(identifier).length - 1);
-  return identifier + (rest ? ` ${rest}` : "") + suffix;
+  return prefix + identifier + (rest ? ` ${rest}` : "") + suffix;
 }

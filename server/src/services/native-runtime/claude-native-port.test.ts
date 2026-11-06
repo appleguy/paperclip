@@ -73,6 +73,7 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(h.launch).toHaveBeenCalledTimes(1);
     expect(h.launched[0]).toMatchObject({ sessionId: f.nativeSessionId, model: "sonnet", effort: "high", autoCompactTokens: 200000, profile: "enrolled" });
     const requestedName = h.launched[0]!.remoteControlName;
+    expect(requestedName).toMatch(/^S@H /);
     expect(requestedName).toContain("Agent");
     expect(requestedName).toContain(f.agentId.slice(0, 8));
     expect(requestedName).not.toContain(f.runId.slice(0, 8));

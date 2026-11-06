@@ -2,6 +2,12 @@ import { describe, expect, it } from "vitest";
 import { buildCodexSharedThreadName } from "./codex-shared-thread-name.js";
 
 describe("buildCodexSharedThreadName", () => {
+  it("uses actual run settings and removes duplicated family from the seat", () => {
+    expect(buildCodexSharedThreadName({ agentName: "Codex Sol Worker 1", runId: "123456", model: "gpt-6.1-sol", effort: "high", issue: { identifier: "SCO-123", title: "Fix" } })).toBe("S@H SCO-123 Fix · 1");
+    expect(buildCodexSharedThreadName({ agentName: "Terra Worker", runId: "123456", model: "unknown", effort: "max" })).toBe("Mx run 123456 · Terra");
+    expect(buildCodexSharedThreadName({ agentName: "Terra Worker", runId: "123456", model: "gpt-6.1-terra", effort: "unknown" })).toBe("T run 123456 · Agent");
+    expect(Array.from(buildCodexSharedThreadName({ agentName: "A".repeat(100), runId: "123456", model: "gpt-6.1-sol", effort: "high" })).length).toBeLessThanOrEqual(80);
+  });
   it("puts the issue and title before a compact seat", () => {
     expect(buildCodexSharedThreadName({ agentName: "Codex Sol High", runId: "12345678", issue: { identifier: "SCO-793", title: "Owner ask: make the quota page primary" } }))
       .toBe("SCO-793 make the quota page primary · Sol");

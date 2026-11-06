@@ -11,6 +11,11 @@ const agents = [
 ];
 
 describe("claude_rc Remote Control name", () => {
+  it("prefixes actual model and effort without duplicating the family", () => {
+    expect(deriveRcName("Sonnet Worker High", 2, 1, "claude-sonnet-5-5", "high")).toBe("S@H 2 Worker s1");
+    expect(deriveRcName("Opus Worker", 1, 0, "unknown", "max")).toBe("Mx 1 Opus Worker");
+    expect(deriveRcName("Opus Worker", 1, 0, "claude-opus-5-5", null)).toBe("O 1 Worker");
+  });
   it("counts reportsTo hops below Board", () => {
     expect(reportsToDepth("b", agents)).toBe(0);
     expect(reportsToDepth("p", agents)).toBe(1);

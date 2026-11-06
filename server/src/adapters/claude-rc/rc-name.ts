@@ -4,7 +4,9 @@
  * "<hops below Board> <Paperclip agent name>", sanitized and capped.
  * A bad name is repaired, never a reason to fail a wake.
  */
-const DISALLOWED = /[^A-Za-z0-9 ._-]+/g;
+import { cleanDisplayName, modelEffortName, stripModelEffortWords } from "../../services/native-runtime/model-effort-name.js";
+
+const DISALLOWED = /[^A-Za-z0-9 ._@-]+/g;
 export const RC_NAME_MAX = 60;
 export const RC_NAME_FALLBACK = "Paperclip Claude";
 
@@ -36,7 +38,9 @@ export function slotRcName(name: string, slot: number): string {
   return `${name.slice(0, RC_NAME_MAX - suffix.length).trim()}${suffix}`;
 }
 
-export function deriveRcName(agentName: string, depth: number, slot = 0): string {
+export function deriveRcName(agentName: string, depth: number, slot = 0, model?: string | null, effort?: string | null): string {
   const d = Number.isFinite(depth) && depth >= 0 ? Math.floor(depth) : 0;
-  return slotRcName(sanitizeRcName(`${d} ${agentName}`), slot);
+  const tag = modelEffortName("claude", model, effort);
+  const agent = stripModelEffortWords(cleanDisplayName(agentName), "claude", model, effort) || "Agent";
+  return slotRcName(sanitizeRcName(`${tag ? `${tag} ` : ""}${d} ${agent}`), slot);
 }
