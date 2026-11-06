@@ -4586,10 +4586,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
-  it("continues reattaching an agy run after five restarts", async () => {
-    const { runId } = await seedRunFixture({
-      adapterType: "agy_local", agentStatus: "running", processPid: null, processGroupId: null,
+  // SCO-1124: OpenCode NAR re-entry binds only the run's own message, so it is fenced like agy.
+  it.each([["agy_local", {}], ["opencode_local", { nativeRuntime: "nar" }]] as const)("continues reattaching a %s run after five restarts", async (adapterType, adapterConfig) => {
+    const { runId, agentId } = await seedRunFixture({
+      adapterType, agentStatus: "running", processPid: null, processGroupId: null,
     });
+    await db.update(agents).set({ adapterConfig }).where(eq(agents.id, agentId));
     await db.update(heartbeatRuns)
       .set({ controllerBootId: "00000000-0000-4000-8000-00000000b007", resultJson: { restartReattach: { count: 5 } } })
       .where(eq(heartbeatRuns.id, runId));

@@ -301,6 +301,10 @@ function isTrackedLocalChildProcessAdapter(adapterType: string) {
 // Bounds re-entry of one run across consecutive hot restarts.
 const MAX_RESTART_REATTACHES = 5;
 
+// Adapters whose restart re-entry is fenced to the original turn, so the
+// reattach count cap does not apply (opencode_local reattaches only under NAR).
+const FENCED_REATTACH_ADAPTERS = new Set(["agy_local", "codex_local", "opencode_local"]);
+
 function supportsRestartReattach(adapterType: string, adapterConfig: unknown) {
   const capability = findServerAdapter(adapterType)?.supportsRestartReattach;
   return typeof capability === "function"
@@ -849,9 +853,11 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
         const count = typeof prior.count === "number" ? prior.count : 0;
         // agy restart re-entry is fenced to the original run's checkpoint and
         // fails closed if it is missing or foreign; codex_local re-entry only
-        // watches the run's own daemon turn. A long turn can span more than
-        // five deployments; exhausting an arbitrary count would orphan it.
-        if (count >= MAX_RESTART_REATTACHES && adapterType !== "agy_local" && adapterType !== "codex_local") {
+        // watches the run's own daemon turn; opencode_local NAR re-entry binds
+        // only this run's own message and holds without replay (SCO-1124).
+        // A long turn can span more than five deployments; exhausting an
+        // arbitrary count would orphan it.
+        if (count >= MAX_RESTART_REATTACHES && !FENCED_REATTACH_ADAPTERS.has(adapterType)) {
           classify(candidate, "skipped", "restart_reattach_budget_exhausted", patch);
           continue;
         }
