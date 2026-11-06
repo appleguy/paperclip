@@ -584,6 +584,19 @@ describe("OpenCode adapter nativeRuntime nar", () => {
     expect(await driver.progressMessages(sid, "target")).toEqual([{ id: "own", content: [{ type: "text", text: "own work" }] }]);
   });
 
+  it.each([100, undefined])("uses message order to exclude successor progress with timestamp %s", async (successorTime) => {
+    messagePageSize = 2;
+    const sid = sessionIdFor(scope);
+    sessions.set(sid, { info: { id: sid, location: { directory: root }, time: { created: 1 } }, msgs: [
+      { id: "target", type: "user", time: { created: 100 } },
+      { id: "own", type: "assistant", time: { created: 100 }, content: [{ type: "text", text: "own work" }] },
+      { id: "successor", type: "user", time: { created: successorTime } },
+      { id: "other", type: "assistant", time: { created: 100 }, content: [{ type: "text", text: "other work" }] },
+    ] });
+    const driver = new OpenCodeHttpDriver({ url, passwordFile: path.join(root, "pw") });
+    expect(await driver.progressMessages(sid, "target")).toEqual([{ id: "own", content: [{ type: "text", text: "own work" }] }]);
+  });
+
   it("finds and holds a foreign in-flight turn whose prompt is older than one page", async () => {
     // A turn that has run for hours: hundreds of assistant messages sit after the single user prompt, so the
     // newest page holds no user message. A retry run used to fail with "active session has no user message".

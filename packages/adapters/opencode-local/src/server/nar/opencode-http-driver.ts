@@ -341,25 +341,33 @@ export class OpenCodeHttpDriver implements ProviderDriver {
     const sid = encodeURIComponent(conversationId);
     const target = await this.json("GET", `/api/session/${sid}/message/${encodeURIComponent(messageId)}`);
     const created = target.data?.data?.time?.created;
-    if (target.status !== 200 || target.data?.data?.id !== messageId || typeof created !== "number") return [];
+    if (target.status !== 200 || target.data?.data?.id !== messageId || target.data.data.type !== "user" ||
+        typeof created !== "number" || !Number.isFinite(created)) return [];
     const messages: any[] = [];
     let cursor: string | null = null;
     let foundTarget = false;
     for (let page = 0; page < INFLIGHT_MESSAGE_MAX_PAGES; page++) {
       const list = await this.json("GET", `/api/session/${sid}/message?limit=200${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
       if (list.status !== 200 || !Array.isArray(list.data?.data)) return [];
+      if (list.data.data.some((m: any) => !m || typeof m !== "object" || typeof m.id !== "string" || typeof m.type !== "string")) return [];
       messages.push(...list.data.data);
-      if (messages.some((m: any) => m?.id === messageId && m.type === "user")) { foundTarget = true; break; }
+      if (messages.some((m: any) => m.id === messageId)) { foundTarget = true; break; }
       const nextCursor = list.data?.cursor?.next;
       if (typeof nextCursor !== "string" || !nextCursor || nextCursor === cursor) break;
       cursor = nextCursor;
     }
     if (!foundTarget) return [];
-    const next = messages.filter((m: any) => m?.type === "user" && m.id !== messageId && m.time?.created > created)
-      .reduce((min: number, m: any) => Math.min(min, m.time.created), Infinity);
-    return messages.filter((m: any) => m?.type === "assistant" && typeof m.id === "string" &&
-      typeof m.time?.created === "number" && m.time.created >= created && m.time.created < next && Array.isArray(m.content))
-      .sort((a: any, b: any) => a.time.created - b.time.created)
+    // Pages are newest first. Find the user message immediately after our
+    // target in that order; timestamps can tie or be absent, so they cannot
+    // safely separate a successor's output from this turn's progress.
+    const targetIndex = messages.findIndex((m: any) => m.id === messageId);
+    if (messages[targetIndex]?.type !== "user") return [];
+    let start = 0;
+    for (let i = targetIndex - 1; i >= 0; i--) {
+      if (messages[i].type === "user") { start = i + 1; break; }
+    }
+    return messages.slice(start, targetIndex).filter((m: any) => m.type === "assistant" && Array.isArray(m.content))
+      .reverse()
       .map((m: any) => ({ id: m.id, content: m.content }));
   }
 
