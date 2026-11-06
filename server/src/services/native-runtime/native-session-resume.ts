@@ -364,7 +364,9 @@ async function selectNativeSessionResumeBarrier(db: Db, input: NativeSessionResu
       contextSnapshot: sql<{
         paperclipWake: unknown;
         paperclipIssue: unknown;
+        projectId: unknown;
       }>`jsonb_build_object(
+        'projectId', ${heartbeatRuns.contextSnapshot}->'projectId',
         'paperclipWake', ${heartbeatRuns.contextSnapshot}->'paperclipWake',
         'paperclipIssue', case when jsonb_typeof(${heartbeatRuns.contextSnapshot}->'paperclipIssue') = 'object'
           then (select coalesce(jsonb_object_agg(brief.key, brief.value), '{}'::jsonb)

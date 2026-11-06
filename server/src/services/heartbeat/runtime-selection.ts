@@ -90,6 +90,10 @@ type Agent = typeof agents.$inferSelect;
 type IssueContext = Awaited<ReturnType<ReturnType<typeof createHeartbeatRunPreparation>["getIssueExecutionContext"]>> | null;
 type IssueRef = Parameters<typeof ensureNativeCompletionContract>[0]["issue"] & Parameters<typeof buildNativeExecutionInput>[0]["issue"];
 
+export function nativeWakeProjectMatches(current: string | null, saved: unknown): boolean {
+  return typeof current === "string" && current.length > 0 && saved === current;
+}
+
 export interface NativeLifecycleTelemetry {
   provider: string;
   harness: string;
@@ -503,7 +507,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
     // normalized session. Find the newest exact-session authority instead.
     // Rows that already acquired provider authority are progress barriers,
     // even when they do not contain a usable checkpoint.
-    const previousNativeRun =
+    const candidateNativeRun =
       requestedNativeSessionId &&
       isUnusedNativeSessionBootstrap(
         run,
@@ -518,6 +522,15 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
             beforeCreatedAt: run.createdAt,
           }))
         : null;
+    // A task can move between projects without changing its issue id. The
+    // source snapshot must independently prove the project for a new wake;
+    // a missing project is not evidence of cross-project continuity. Do not
+    // reinterpret an already admitted run during recovery.
+    const currentProjectId = issueContext?.projectId ?? null;
+    const sourceProjectId = candidateNativeRun?.contextSnapshot?.projectId;
+    const previousNativeRun = persistedNativeExecutionInput ||
+      nativeWakeProjectMatches(currentProjectId, sourceProjectId)
+      ? candidateNativeRun : null;
     nativeRunnerInstanceId =
       previousNativeRun?.runnerInstanceId &&
       previousNativeRun.nativeSessionId ===
@@ -878,6 +891,22 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
       });
       nativeExecution = nativeExecutionWithCheckpoint.execution;
       nativeResumeCheckpoint = nativeExecutionWithCheckpoint.checkpoint;
+      await onAdapterEvent({
+        eventType: "session.mapping.selected",
+        stream: "system",
+        message: nativeResumeCheckpoint ? "Selected a validated session checkpoint" : "Selected a fresh session",
+        payload: {
+          runtime: agent.adapterType,
+          agentId: agent.id,
+          issueId: issueRef.id,
+          projectId: currentProjectId,
+          selection: nativeResumeCheckpoint ? "resume_checkpoint" : "fresh",
+          reason: nativeResumeCheckpoint ? "checkpoint_validated"
+            : !candidateNativeRun ? "no_candidate"
+              : !nativeWakeProjectMatches(currentProjectId, sourceProjectId) ? "project_unverified_or_changed"
+                : "checkpoint_incompatible",
+        },
+      });
       if (
         nativeSessionId !==
         nativeExecutionWithCheckpoint.normalizedSessionId

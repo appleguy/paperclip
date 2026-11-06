@@ -4,7 +4,7 @@ import { execFile as execFileCallback } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { activityLog, agents, authUsers, companyMemberships, principalPermissionGrants, environments, environmentLeases, companies, completionContracts, createDb, applyPendingMigrations, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, executionWorkspaces, heartbeatRuns, issues, nativeRunFinalizations, workspaceOperations, type Db } from "@paperclipai/db";
+import { activityLog, agents, authUsers, companyMemberships, principalPermissionGrants, environments, environmentLeases, companies, completionContracts, createDb, applyPendingMigrations, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, executionWorkspaces, heartbeatRuns, issues, nativeRunFinalizations, projects, workspaceOperations, type Db } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -16,7 +16,7 @@ import { prepareNativeWorkspaceSync } from "../native-runtime/native-workspace-s
 import { resolveHeartbeatNativeRuntimeMode } from "../native-runtime/runtime-mode.js";
 import { claimNativeRestartRecoveries } from "../native-runtime/native-restart-recovery.js";
 import { buildNativeModelEnvelope, canonicalNativeRuntimeContextDigest } from "../../vendor/paperclip-runner/index.js";
-import { prepareAndSelectHeartbeatRuntime, selectHeartbeatRuntime, type HeartbeatRuntimeSelectionInput } from "./runtime-selection.js";
+import { nativeWakeProjectMatches, prepareAndSelectHeartbeatRuntime, selectHeartbeatRuntime, type HeartbeatRuntimeSelectionInput } from "./runtime-selection.js";
 import { reserveRunBudget } from "../budget-reservations.js";
 import { legacyControllerClaim } from "../legacy-controller-lease.js";
 import { agentInstructionWorkingCopyService } from "../agent-instruction-working-copies.js";
@@ -36,6 +36,15 @@ vi.mock("../native-runtime/native-workspace-sync.js", async (original) => ({
 
 const externalDatabaseUrl = resolveExternalTestDatabaseUrl("PAPERCLIP_RUNTIME_SELECTION_TEST_DATABASE_URL");
 const support = externalDatabaseUrl ? { supported: true } : await getEmbeddedPostgresTestSupport();
+describe("native wake project binding", () => {
+  it("requires independently recorded matching project identity", () => {
+    expect(nativeWakeProjectMatches("project-a", "project-a")).toBe(true);
+    expect(nativeWakeProjectMatches("project-a", "project-b")).toBe(false);
+    expect(nativeWakeProjectMatches("project-a", null)).toBe(false);
+    expect(nativeWakeProjectMatches(null, null)).toBe(false);
+    expect(nativeWakeProjectMatches("", "")).toBe(false);
+  });
+});
 describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: Db;
@@ -168,9 +177,13 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     if (changed) expect(await readFile(join(canonical, "memory.txt"), "utf8")).toBe("Synthetic changed memory.\n");
   }, 45_000);
 
-  it.each(["matching", "different-session", "absent"])("persists the migrated logical cwd only for the receipt's exact session: %s", async receipt => {
+  it.each(["matching", "different-session", "absent", "different-project", "missing-project"])("selects the migrated session only with project evidence: %s", async receipt => {
     const sameSession = receipt === "matching";
+    const sameProject = receipt !== "different-project" && receipt !== "missing-project";
     const { input, run, agent, issue } = await fixture();
+    const [project] = await db.insert(projects).values({ companyId: agent.companyId, name: "Migration project" }).returning();
+    await db.update(issues).set({ projectId: project!.id }).where(eq(issues.id, issue.id));
+    input.task.issueContext = { ...issue, projectId: project!.id } as NonNullable<typeof input.task.issueContext>;
     const sessionId = randomUUID(), operationId = randomUUID();
     const logicalCwd = "/paperclip/legacy/task-workspace";
     const marker = { schema: "paperclip.native-workspace-migration.v1", operationId };
@@ -196,7 +209,7 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     if (!prior.selected || !prior.nativeExecution) throw new Error("Expected prior native selection");
     const priorInput = { ...prior.nativeExecution, session: { ...prior.nativeExecution.session, normalizedSessionId: sessionId } };
     const priorProfile = (await read(run.id)).runnerProfileJson;
-    await db.update(heartbeatRuns).set({ status: "succeeded", nativeSessionId: sessionId,
+    await db.update(heartbeatRuns).set({ status: "succeeded", nativeSessionId: sessionId, contextSnapshot: receipt === "missing-project" ? {} : { projectId: receipt === "different-project" ? randomUUID() : project!.id },
       runnerProfileJson: { ...priorProfile, nativeExecutionInput: priorInput, sessionCheckpoint: {
         backendKind: "runner", driverKind: "codex_app_server", sessionId: "retained-provider-thread",
         providerSessionId: "retained-provider-thread", identity: { ...priorInput.binding, sessionId },
@@ -210,8 +223,16 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     input.workspace.executionWorkspace.cwd = workspace!.cwd!;
     const selected = await selectHeartbeatRuntime(db, input);
     if (!selected.selected || !selected.nativeExecution) throw new Error("Expected migrated native selection");
-    expect(selected.nativeExecution.session.normalizedSessionId).toBe(sessionId);
-    expect(selected.nativeExecution.workspace.cwd).toBe(sameSession ? logicalCwd : workspace!.cwd);
+    if (sameProject) {
+      expect(selected.nativeExecution.session.normalizedSessionId).toBe(sessionId);
+      expect(selected.nativeExecution.workspace.cwd).toBe(sameSession ? logicalCwd : workspace!.cwd);
+    } else {
+      expect(selected.nativeExecution.session.normalizedSessionId).not.toBe(sessionId);
+      expect(input.onAdapterEvent).toHaveBeenCalledWith(expect.objectContaining({
+        eventType: "session.mapping.selected",
+        payload: expect.objectContaining({ selection: "fresh", reason: "project_unverified_or_changed", issueId: issue.id, projectId: project!.id }),
+      }));
+    }
     expect((await read(nextRun!.id)).runnerProfileJson?.nativeExecutionInput).toEqual(selected.nativeExecution);
     expect((await read(nextRun!.id)).nativeSessionId).toBe(selected.nativeExecution.session.normalizedSessionId);
   });

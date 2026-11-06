@@ -13,7 +13,7 @@ const supported = Boolean(externalUrl) || (await getEmbeddedPostgresTestSupport(
 (supported ? describe : describe.skip)("native session resume SQL projection", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: Db;
-  const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), normalizedSessionId = randomUUID();
+  const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), normalizedSessionId = randomUUID(), projectId = randomUUID();
   const currentRunId = randomUUID();
   const at = (second: number) => new Date(Date.UTC(2026, 8, 8, 0, 0, second));
   const input = { companyId, agentId, issueId, normalizedSessionId, currentRunId, beforeCreatedAt: at(30) };
@@ -29,7 +29,7 @@ const supported = Boolean(externalUrl) || (await getEmbeddedPostgresTestSupport(
   const select = () => findNativeSessionResumeRun(db, input);
   const source = () => run(0, { runnerInstanceId: randomUUID(), processPid: 17, processGroupId: 19, processStartedAt: at(0),
     errorCode: "native_session_interrupted",
-    runnerProfileJson: profile, contextSnapshot: { paperclipWake, paperclipIssue: { ...paperclipIssue, unrelated: "Omit" }, prompt: "Omit" } });
+    runnerProfileJson: profile, contextSnapshot: { projectId, paperclipWake, paperclipIssue: { ...paperclipIssue, unrelated: "Omit" }, prompt: "Omit" } });
   const writeProfile = (id: string, value: unknown) => db.execute(sql`update ${heartbeatRuns}
     set runner_profile_json = ${JSON.stringify(value)}::jsonb where ${heartbeatRuns.id} = ${id}`);
 
@@ -61,7 +61,7 @@ const supported = Boolean(externalUrl) || (await getEmbeddedPostgresTestSupport(
     await db.insert(heartbeatRuns).values([saved, run(1), run(2)]);
     const result = await select();
     expect(result).toEqual({ ...saved, runnerProfileJson: { nativeExecutionInput, sessionCheckpoint: checkpoint, nativeToolContractFingerprint: "fingerprint", nativeControllerRecovery: null },
-      contextSnapshot: { paperclipWake, paperclipIssue } });
+      contextSnapshot: { projectId, paperclipWake, paperclipIssue } });
     const stored = await db.select({ profile: heartbeatRuns.runnerProfileJson, context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(eq(heartbeatRuns.id, saved.id));
     expect(stored[0].profile).toEqual(profile);
     expect(stored[0].context).toEqual(saved.contextSnapshot);
