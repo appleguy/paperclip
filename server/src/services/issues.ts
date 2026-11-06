@@ -11496,6 +11496,27 @@ export function issueService(db: Db) {
               receiptExisting.updatedAt.toISOString() !== expected.updatedAt ||
               receiptExisting.blockedTransitionAt?.toISOString() !== expected.blockedTransitionAt ||
               receiptExisting.checkoutRunId || receiptExisting.executionRunId) throw stale();
+          // The issue FOR UPDATE lock also conflicts with the foreign-key key
+          // share lock taken by new interaction, approval-link and recovery
+          // rows. Lock existing rows too: their statuses can change without
+          // touching the issue or its version. Read every status, including
+          // settled rows that a concurrent writer might reactivate.
+          const interactionGates = await tx.select({ status: issueThreadInteractions.status })
+            .from(issueThreadInteractions)
+            .where(and(eq(issueThreadInteractions.companyId, receiptExisting.companyId), eq(issueThreadInteractions.issueId, id)))
+            .for("update");
+          const approvalGates = await tx.select({ status: approvals.status })
+            .from(approvals)
+            .innerJoin(issueApprovals, eq(issueApprovals.approvalId, approvals.id))
+            .where(and(eq(issueApprovals.companyId, receiptExisting.companyId), eq(issueApprovals.issueId, id)))
+            .for("update", { of: approvals });
+          const recoveryGates = await tx.select({ status: issueRecoveryActions.status })
+            .from(issueRecoveryActions)
+            .where(and(eq(issueRecoveryActions.companyId, receiptExisting.companyId), eq(issueRecoveryActions.sourceIssueId, id)))
+            .for("update");
+          if (interactionGates.some((gate: { status: string }) => gate.status === "pending") ||
+              approvalGates.some((gate: { status: string }) => ["pending", "revision_requested"].includes(gate.status)) ||
+              recoveryGates.some((gate: { status: string }) => ["active", "escalated"].includes(gate.status))) throw stale();
           const readiness = (await listIssueDependencyReadinessMap(tx, receiptExisting.companyId, [id], true)).get(id);
           if (!readiness || !readiness.isDependencyReady ||
               !isDeepStrictEqual([...readiness.blockerIssueIds].sort(), [...expected.blockedByIssueIds].sort())) throw stale();
