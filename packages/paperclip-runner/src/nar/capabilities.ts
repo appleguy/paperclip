@@ -35,7 +35,7 @@ export const CAPABILITIES: Record<Provider, Capabilities> = {
     ownerPhone: { path: "Herdr/Moshi pane (generic)", proof: "OPEN" },
     permission: { route: "provider_policy", proof: "OPEN" },
     resume: { byId: true, proof: "SHIPPED-UNPROVEN" },
-    interrupt: { scoped: true, proof: "SHIPPED-UNPROVEN" },
+    interrupt: { scoped: false, proof: "OPEN" },
     needsPane: false,
     observeCoverage: "complete",
   },

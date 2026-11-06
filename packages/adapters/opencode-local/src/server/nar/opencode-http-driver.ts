@@ -20,7 +20,9 @@ export const OPENCODE_CAPABILITIES: Capabilities = {
   ownerPhone: { path: "Herdr/Moshi pane (generic)", proof: "OPEN" },
   permission: { route: "provider_policy", proof: "OPEN" },
   resume: { byId: true, proof: "SHIPPED-UNPROVEN" },
-  interrupt: { scoped: true, proof: "SHIPPED-UNPROVEN" },
+  // The HTTP interrupt targets the whole session; checking the active message
+  // first does not atomically fence a successor.
+  interrupt: { scoped: false, proof: "OPEN" },
   needsPane: false,
   observeCoverage: "complete",
 };
