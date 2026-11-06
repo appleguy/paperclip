@@ -28,6 +28,11 @@ describe("native zero facts", () => {
     const resumed = buildNativeExecutionInput({ ...args, zero: true, wakePayload, interactionResponses, resumedSession: true, previousTurn: { runId: args.runId, task: args.issue } as BuildNativeExecutionInput["previousTurn"] });
     expect(resumed.continuationPrompt).toBe(fresh.task.prompt);
   });
+  it("omits initial guidance and handoff in zero mode while retaining the default", () => {
+    const options = { ...args, initialCommunicationGuidance: "Communication guidance", freshSessionHandoff: "Handoff" };
+    expect(buildNativeExecutionInput({ ...options, zero: true })).not.toHaveProperty("initialCommunicationGuidance");
+    expect(buildNativeExecutionInput(options).initialCommunicationGuidance).toBe("Communication guidance\n\nHandoff");
+  });
   it("retains the default prompt", () => {
     const normal = buildNativeExecutionInput(args);
     expect(normal).toEqual(buildNativeExecutionInput({ ...args, zero: false }));

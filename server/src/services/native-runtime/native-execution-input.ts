@@ -298,7 +298,7 @@ export function buildNativeExecutionInput(input: BuildNativeExecutionInput): Nat
       : input.claudeEffort !== undefined ? "paperclip.native-execution-input.v9"
       : input.homeMode === "preconfigured" ? "paperclip.native-execution-input.v7" : "paperclip.native-execution-input.v5",
     ...(input.grokEffort !== undefined || input.grokDisableWebSearch !== undefined || input.claudeEffort !== undefined || input.homeMode === "preconfigured" ? { homeMode: input.homeMode ?? "isolated" } : {}),
-    ...((input.initialCommunicationGuidance || input.freshSessionHandoff) ? {
+    ...(!input.zero && (input.initialCommunicationGuidance || input.freshSessionHandoff) ? {
       initialCommunicationGuidance: [input.initialCommunicationGuidance, input.freshSessionHandoff].filter(Boolean).join("\n\n"),
     } : {}),
     ...(input.resumedSession && input.previousTurn && !input.conversationMode ? {
