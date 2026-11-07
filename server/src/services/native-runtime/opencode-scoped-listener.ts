@@ -9,7 +9,7 @@ export async function startOpenCodeScopedListener(input: {
   workspaceDirectory?: string;
   attestEvent?: () => Promise<void>;
   read: (path: string, signal: AbortSignal) => Promise<Response>;
-  dispatch: (operation: { id: string; text: string; delivery?: "steer" | "queue"; resume?: boolean }) => Promise<unknown>;
+  dispatch: (operation: { id: string; text: string; delivery?: "steer" | "queue"; resume?: boolean; agent?: string }) => Promise<unknown>;
 }) {
   const readerToken = randomBytes(32).toString("hex"), ownerToken = randomBytes(32).toString("hex");
   const handle = createOpenCodeScopedProxy({ ...input, readerToken, ownerToken });

@@ -124,10 +124,10 @@ export async function startOpenCodeSharedHost(input: { executable: string; dataR
       return Object.freeze({ sessionId, generation, version: "2.2.5" as const });
   }
   let creationAttempted = false;
-  async function dispatchForRun(db: Db, binding: OpenCodeSharedBinding, prompt: { id: string; text: string; delivery?: "steer" | "queue"; resume?: boolean }) {
+  async function dispatchForRun(db: Db, binding: OpenCodeSharedBinding, prompt: { id: string; text: string; delivery?: "steer" | "queue"; resume?: boolean; agent?: string }) {
     if (binding.generation !== generation || binding.version !== "2.2.5") throw new Error("opencode_host_binding_mismatch");
     await verifySession(binding.providerSessionId, binding);
-    const fetch = createOpenCodeBoundFetch({ pid, port, isAlive: () => alive, allowPromptForSession: binding.providerSessionId });
+    const fetch = createOpenCodeBoundFetch({ pid, port, isAlive: () => alive, allowPromptForSession: binding.providerSessionId, allowAgentPinForSession: binding.providerSessionId });
     const managed = createOpenCodeManagedMutation(db, { binding, fetch, admission: { baseUrl: origin, authorization,
       async attest(identity) { if (identity.sessionId !== binding.providerSessionId || identity.generation !== generation) throw new Error("opencode_host_binding_mismatch"); await verifyHost(); },
     } });

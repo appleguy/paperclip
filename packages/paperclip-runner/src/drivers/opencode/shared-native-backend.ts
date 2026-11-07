@@ -10,7 +10,7 @@ export interface OpenCodeSharedNativePort {
   providerSessionId: string;
   verify(): Promise<void>;
   readReceipt(): Promise<{ result: PrpStructuredRunResult; operationId: string; recordedAt: string } | null>;
-  dispatch(input: { id: string; text: string }): Promise<void>;
+  dispatch(input: { id: string; text: string; agent?: string }): Promise<void>;
   startObservation(): Promise<void>;
   waitForReceipt(signal: AbortSignal): Promise<{ result: PrpStructuredRunResult; operationId: string; recordedAt: string }>;
   freezeProvider?(input: { timeoutMs: number; signal: AbortSignal }): Promise<{ id: string; requestSha256: string }>;

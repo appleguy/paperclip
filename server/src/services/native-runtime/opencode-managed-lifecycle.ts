@@ -7,7 +7,7 @@ import { loadOpenCodeSuccessorBinding } from "./opencode-managed-admission.js";
 import type { NativeExecutionInputV12 } from "../../vendor/paperclip-runner/index.js";
 
 type OwnedHost = Awaited<ReturnType<typeof startOpenCodeSharedHost>>;
-type Prompt = { id: string; text: string; delivery?: "steer" | "queue"; resume?: boolean };
+type Prompt = { id: string; text: string; delivery?: "steer" | "queue"; resume?: boolean; agent?: string };
 
 /** Controller-only lifecycle. The exact native session must have been verified
  * by this owned host, and the run must already hold its finalization lease. */

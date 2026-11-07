@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 import { OpenCodeV2Shared, type V2Authority, type V2Binding, type V2Cursor } from "./opencode-v2-shared.js";
 
@@ -30,12 +31,49 @@ function sse(items: unknown[]) {
   return new Response(new ReadableStream({ start(c) { for (let i = 0; i < bytes.length; i += 4096) c.enqueue(bytes.subarray(i, i + 4096)); c.close(); } }), { headers: { "content-type": "text/event-stream" } });
 }
 function controller(authority: V2Authority, fetcher: typeof fetch) { return new OpenCodeV2Shared({ baseUrl: "http://localhost:4096/", binding, authority, headers: { authorization: "Bearer test" }, fetch: fetcher }); }
+const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
+type WorldOptions = {
+  sessionAgent?: string | null;
+  messages?: Array<Record<string, unknown>>;
+  agents?: Array<Record<string, unknown>>;
+  messageData?: unknown;
+  agentData?: unknown;
+  pinApplies?: boolean;
+  pinStatus?: number;
+};
+/** Stateful session fixture: the pin POST mutates session.agent unless pinApplies is false. */
+function world(options: WorldOptions = {}) {
+  const session: Record<string, unknown> = { id: "ses_one", agent: options.sessionAgent === undefined ? null : options.sessionAgent };
+  const requests: Array<{ method: string; target: string; body: string }> = [];
+  const fetcher = vi.fn(async (url: unknown, init?: RequestInit) => {
+    const parsed = new URL(String(url));
+    const target = parsed.pathname + parsed.search;
+    const body = String(init?.body ?? "");
+    const method = String(init?.method ?? "GET");
+    requests.push({ method, target, body });
+    if (method === "GET" && target === "/api/session/ses_one") return Response.json({ data: session });
+    if (method === "GET" && target === "/api/session/ses_one/message?type=assistant&limit=20&order=desc") return Response.json({ cursor: null, data: options.messageData === undefined ? options.messages ?? [] : options.messageData });
+    if (method === "GET" && target === "/api/agent") return Response.json({ data: options.agentData === undefined ? options.agents ?? [] : options.agentData });
+    if (method === "POST" && target === "/api/session/ses_one/agent") {
+      if (options.pinStatus && options.pinStatus !== 204) return new Response("pin failed", { status: options.pinStatus });
+      if (options.pinApplies !== false) session.agent = (JSON.parse(body) as { agent: string }).agent;
+      return new Response(null, { status: 204 });
+    }
+    if (init?.method === "POST" && target === "/api/session/ses_one/prompt") {
+      const sent = JSON.parse(body) as { id: string };
+      return Response.json({ data: { id: sent.id, sessionID: "ses_one", type: "user" } });
+    }
+    throw new Error(`unexpected request ${init?.method} ${target}`);
+  }) as unknown as typeof fetch;
+  return { session, requests, fetcher };
+}
+const primaries = [{ id: "build", mode: "primary" }, { id: "plan", mode: "primary" }, { id: "general", mode: "subagent" }];
 
 describe("OpenCode 2.2.5 shared transport", () => {
   it("retries an unknown prompt acknowledgement with the identical durable message id, rejecting changed content", async () => {
     const f = fixture(); let calls = 0;
-    const fetcher = vi.fn(async (_url: unknown, init?: RequestInit) => {
-      if (init?.method !== "POST") return Response.json({ data: { id: "ses_one" } });
+    const fetcher = vi.fn(async (url: unknown, init?: RequestInit) => {
+      if (init?.method !== "POST") return String(url).includes("/message?") ? Response.json({ data: [] }) : Response.json({ data: { id: "ses_one" } });
       calls++; if (calls === 1) throw new Error("lost response");
       expect(JSON.parse(String(init?.body))).toEqual({ id: "msg_one", text: "hello" });
       return Response.json({ data: { id: "msg_one", sessionID: "ses_one", type: "user" } });
@@ -65,7 +103,7 @@ describe("OpenCode 2.2.5 shared transport", () => {
     await expect(unauthorized.verifySession()).rejects.toThrow("HTTP 401");
     const wrong = controller(f.authority, vi.fn(async () => Response.json({ data: { id: "ses_other" } })) as unknown as typeof fetch);
     await expect(wrong.verifySession()).rejects.toThrow("identity mismatch");
-    const badReceipt = controller(f.authority, vi.fn(async (_url: unknown, init?: RequestInit) => init?.method === "POST" ? Response.json({ data: { id: "msg_foreign", sessionID: "ses_one", type: "user" } }) : Response.json({ data: { id: "ses_one" } })) as unknown as typeof fetch);
+    const badReceipt = controller(f.authority, vi.fn(async (url: unknown, init?: RequestInit) => init?.method === "POST" ? Response.json({ data: { id: "msg_foreign", sessionID: "ses_one", type: "user" } }) : String(url).includes("/message?") ? Response.json({ data: [] }) : Response.json({ data: { id: "ses_one" } })) as unknown as typeof fetch);
     await expect(badReceipt.prompt({ id: "msg_one", text: "x" })).rejects.toThrow("receipt identity mismatch");
   });
   it("requires authorization and snapshots headers, binding, and request options", async () => {
@@ -100,5 +138,111 @@ describe("OpenCode 2.2.5 shared transport", () => {
     const f = fixture(); const c = controller(f.authority, vi.fn(async () => sse([event(1)])) as unknown as typeof fetch);
     await expect(c.follow()).rejects.toThrow("before synchronization");
     expect(f.events).toHaveLength(1);
+  });
+  it("resolves a null-agent session from its newest assistant and pins before the prompt", async () => {
+    const f = fixture();
+    const w = world({ agents: primaries, messages: [{ type: "user", agent: "" }, { type: "assistant", agent: "plan" }] });
+    const c = controller(f.authority, w.fetcher);
+    await c.prompt({ id: "msg_implicit", text: "steer me" });
+    expect(w.requests.map((r) => `${r.method} ${r.target}`)).toEqual([
+      "GET /api/session/ses_one",
+      "GET /api/session/ses_one/message?type=assistant&limit=20&order=desc",
+      "GET /api/agent",
+      "POST /api/session/ses_one/agent",
+      "GET /api/session/ses_one",
+      "POST /api/session/ses_one/prompt",
+    ]);
+    expect(JSON.parse(w.requests[3].body)).toEqual({ agent: "plan" });
+    expect(JSON.parse(w.requests[5].body)).toEqual({ id: "msg_implicit", text: "steer me" });
+    expect(w.session.agent).toBe("plan");
+    expect(f.operations.get("msg_implicit")).toBe(sha256(JSON.stringify({ id: "msg_implicit", text: "steer me" })));
+  });
+  it("prefers an explicit agent, folds it into the digest, and conflicts on drift", async () => {
+    const f = fixture();
+    const w = world({ sessionAgent: "build", agents: primaries });
+    const c = controller(f.authority, w.fetcher);
+    await c.prompt({ id: "msg_explicit", text: "hi", agent: "build" });
+    expect(w.requests.map((r) => `${r.method} ${r.target}`)).toEqual([
+      "GET /api/session/ses_one",
+      "GET /api/agent",
+      "POST /api/session/ses_one/agent",
+      "GET /api/session/ses_one",
+      "POST /api/session/ses_one/prompt",
+    ]);
+    expect(f.operations.get("msg_explicit")).toBe(sha256(JSON.stringify({ id: "msg_explicit", text: "hi" }) + "\u0000agent\u0000build"));
+    await expect(c.prompt({ id: "msg_explicit", text: "hi", agent: "plan" })).rejects.toThrow("operation conflict");
+    expect(w.requests.filter((r) => r.target === "/api/session/ses_one/prompt")).toHaveLength(1);
+  });
+  it("sends a fresh no-agent first turn without resolving or pinning", async () => {
+    const f = fixture();
+    const w = world({ agents: primaries, messages: [] });
+    const c = controller(f.authority, w.fetcher);
+    await c.prompt({ id: "msg_fresh", text: "first" });
+    expect(w.requests.map((r) => `${r.method} ${r.target}`)).toEqual([
+      "GET /api/session/ses_one",
+      "GET /api/session/ses_one/message?type=assistant&limit=20&order=desc",
+      "POST /api/session/ses_one/prompt",
+    ]);
+    expect(f.operations.get("msg_fresh")).toBe(sha256(JSON.stringify({ id: "msg_fresh", text: "first" })));
+  });
+  it("resolves the session's stored agent without reading messages", async () => {
+    const f = fixture();
+    const w = world({ sessionAgent: "build", agents: primaries, messages: [{ type: "assistant", agent: "plan" }] });
+    const c = controller(f.authority, w.fetcher);
+    await c.prompt({ id: "msg_record", text: "go" });
+    expect(w.requests.map((r) => `${r.method} ${r.target}`)).toEqual([
+      "GET /api/session/ses_one",
+      "GET /api/agent",
+      "POST /api/session/ses_one/agent",
+      "GET /api/session/ses_one",
+      "POST /api/session/ses_one/prompt",
+    ]);
+    expect(JSON.parse(w.requests[2].body)).toEqual({ agent: "build" });
+  });
+  it("skips agentless newer entries and pins the older assistant's agent", async () => {
+    const f = fixture();
+    const w = world({ agents: primaries, messages: [{ type: "assistant", agent: "" }, { type: "user", agent: "" }, { type: "assistant", agent: "plan" }] });
+    const c = controller(f.authority, w.fetcher);
+    await c.prompt({ id: "msg_skip", text: "go" });
+    expect(w.requests.map((r) => `${r.method} ${r.target}`)).toEqual([
+      "GET /api/session/ses_one",
+      "GET /api/session/ses_one/message?type=assistant&limit=20&order=desc",
+      "GET /api/agent",
+      "POST /api/session/ses_one/agent",
+      "GET /api/session/ses_one",
+      "POST /api/session/ses_one/prompt",
+    ]);
+    expect(JSON.parse(w.requests[3].body)).toEqual({ agent: "plan" });
+  });
+  it("fails closed when the pin response is an error or the read-back does not confirm", async () => {
+    const f1 = fixture();
+    const w1 = world({ agents: primaries, messages: [{ type: "assistant", agent: "plan" }], pinStatus: 500 });
+    await expect(controller(f1.authority, w1.fetcher).prompt({ id: "msg_pin500", text: "go" })).rejects.toThrow("HTTP 500");
+    expect(w1.requests.filter((r) => r.target === "/api/session/ses_one/prompt")).toHaveLength(0);
+    const f2 = fixture();
+    const w2 = world({ agents: primaries, messages: [{ type: "assistant", agent: "plan" }], pinApplies: false });
+    await expect(controller(f2.authority, w2.fetcher).prompt({ id: "msg_pinstale", text: "go" })).rejects.toThrow("pin not confirmed");
+    expect(w2.requests.filter((r) => r.target === "/api/session/ses_one/prompt")).toHaveLength(0);
+    expect(w2.session.agent).toBeNull();
+  });
+  it("refuses a resolved subagent or unknown explicit agent without any POST", async () => {
+    const f1 = fixture();
+    const w1 = world({ agents: primaries, messages: [{ type: "assistant", agent: "general" }] });
+    await expect(controller(f1.authority, w1.fetcher).prompt({ id: "msg_sub", text: "go" })).rejects.toThrow("not a primary agent");
+    expect(w1.requests.filter((r) => r.method === "POST")).toHaveLength(0);
+    const f2 = fixture();
+    const w2 = world({ agents: primaries });
+    await expect(controller(f2.authority, w2.fetcher).prompt({ id: "msg_ghost", text: "go", agent: "ghost" })).rejects.toThrow("not a primary agent");
+    expect(w2.requests.filter((r) => r.method === "POST")).toHaveLength(0);
+  });
+  it("fails closed on malformed message or agent list responses without any POST", async () => {
+    const f1 = fixture();
+    const w1 = world({ messageData: {} });
+    await expect(controller(f1.authority, w1.fetcher).prompt({ id: "msg_badlist", text: "go" })).rejects.toThrow("Invalid OpenCode message response");
+    expect(w1.requests.filter((r) => r.method === "POST")).toHaveLength(0);
+    const f2 = fixture();
+    const w2 = world({ agentData: {} });
+    await expect(controller(f2.authority, w2.fetcher).prompt({ id: "msg_badagents", text: "go", agent: "build" })).rejects.toThrow("Invalid OpenCode agent response");
+    expect(w2.requests.filter((r) => r.method === "POST")).toHaveLength(0);
   });
 });

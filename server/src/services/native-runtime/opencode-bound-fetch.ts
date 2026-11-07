@@ -8,7 +8,21 @@ const execute = promisify(execFile);
 
 /** Connect first, then ask the kernel which process owns the exact server-side
  * socket, before sending credentials on that same connection. Darwin only. */
-export function createOpenCodeBoundFetch(input: { pid: number; port: number; isAlive: () => boolean; allowEmptySessionCreate?: boolean; allowExactSessionCreateBody?: string; allowPromptForSession?: string; allowInterruptForSession?: string; allowExactMcpReplace?: { body: string; directory: string } }): typeof fetch {
+function isAgentPinBody(value: unknown): value is string {
+  if (typeof value !== "string" || Buffer.byteLength(value) > 1024) return false;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return false;
+    const keys = Object.keys(parsed as Record<string, unknown>);
+    if (keys.length !== 1 || keys[0] !== "agent") return false;
+    const agent = (parsed as Record<string, unknown>).agent;
+    return typeof agent === "string" && agent.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+export function createOpenCodeBoundFetch(input: { pid: number; port: number; isAlive: () => boolean; allowEmptySessionCreate?: boolean; allowExactSessionCreateBody?: string; allowPromptForSession?: string; allowInterruptForSession?: string; allowExactMcpReplace?: { body: string; directory: string }; allowAgentPinForSession?: string }): typeof fetch {
   if (process.platform !== "darwin" || !Number.isSafeInteger(input.pid) || input.pid <= 0 || !Number.isSafeInteger(input.port) || input.port < 1 || input.port > 65535) throw new Error("opencode_socket_attestation_unsupported");
   return (async (resource: string | URL | Request, init?: RequestInit) => {
     const url = new URL(resource instanceof Request ? resource.url : resource.toString());
@@ -17,7 +31,8 @@ export function createOpenCodeBoundFetch(input: { pid: number; port: number; isA
     const allowedPrompt = Boolean(input.allowPromptForSession && method === "POST" && url.pathname === `/api/session/${encodeURIComponent(input.allowPromptForSession)}/prompt` && !url.search && typeof init?.body === "string" && Buffer.byteLength(init.body) <= 262_500);
     const allowedInterrupt = Boolean(input.allowInterruptForSession && method === "POST" && url.pathname === `/api/session/${encodeURIComponent(input.allowInterruptForSession)}/interrupt` && !url.search && init?.body === undefined);
     const allowedMcp = Boolean(input.allowExactMcpReplace && method === "PUT" && url.pathname === "/api/experimental/mcp/paperclip" && url.search === `?directory=${encodeURIComponent(input.allowExactMcpReplace.directory)}` && init?.body === input.allowExactMcpReplace.body && Buffer.byteLength(input.allowExactMcpReplace.body) <= 4096);
-    if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || Number(url.port) !== input.port || url.username || url.password || (!allowedCreate && !allowedPrompt && !allowedMcp && !allowedInterrupt && (method !== "GET" || init?.body))) throw new Error("opencode_socket_target_invalid");
+    const allowedAgentPin = Boolean(input.allowAgentPinForSession && method === "POST" && url.pathname === `/api/session/${encodeURIComponent(input.allowAgentPinForSession)}/agent` && !url.search && isAgentPinBody(init?.body));
+    if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || Number(url.port) !== input.port || url.username || url.password || (!allowedCreate && !allowedPrompt && !allowedMcp && !allowedInterrupt && !allowedAgentPin && (method !== "GET" || init?.body))) throw new Error("opencode_socket_target_invalid");
     if (!input.isAlive() || init?.signal?.aborted) throw new Error("opencode_daemon_unavailable");
     const socket = connect({ host: "127.0.0.1", port: input.port });
     // Bound connection, attestation and response headers; the durable stream
@@ -65,7 +80,7 @@ export function createOpenCodeBoundFetch(input: { pid: number; port: number; isA
         // was just attested. Node may otherwise choose a different socket.
         req.once("socket", actual => {
           if (actual !== socket) { req.destroy(new Error("opencode_socket_attestation_failed")); return; }
-          req.end(allowedCreate || allowedPrompt || allowedMcp ? init!.body as string : undefined);
+          req.end(allowedCreate || allowedPrompt || allowedMcp || allowedAgentPin ? init!.body as string : undefined);
         });
       });
     } catch (error) { socket.destroy(); throw error; }

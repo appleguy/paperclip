@@ -75,17 +75,46 @@ export class OpenCodeV2Shared {
     if (!response.ok) throw new Error(`OpenCode v2 HTTP ${response.status}`);
     return response;
   }
-  async verifySession(): Promise<void> {
+  async verifySession(): Promise<void> { await this.#sessionRecord(); }
+  async #sessionRecord(): Promise<Record<string, unknown>> {
     const response = await this.#request(`/api/session/${encodeURIComponent(this.#binding.sessionId)}`);
-    if (obj(obj(await boundedJson(response)).data).id !== this.#binding.sessionId) throw new Error("OpenCode session identity mismatch");
+    const data = obj(obj(await boundedJson(response)).data);
+    if (data.id !== this.#binding.sessionId) throw new Error("OpenCode session identity mismatch");
+    return data;
   }
-  async prompt(input: { id: string; text: string; delivery?: "steer" | "queue"; resume?: boolean }): Promise<void> {
-    if (!id(input.id, "msg_") || typeof input.text !== "string" || (input.delivery !== undefined && input.delivery !== "steer" && input.delivery !== "queue") || (input.resume !== undefined && typeof input.resume !== "boolean")) throw new Error("Invalid OpenCode prompt identity");
+  async #primaryAgentIds(): Promise<Set<string>> {
+    const response = await this.#request(`/api/agent`);
+    const data = obj(await boundedJson(response)).data;
+    if (!Array.isArray(data)) throw new Error("Invalid OpenCode agent response");
+    const primaries = new Set<string>();
+    for (const entry of data.map(obj)) if (entry.mode === "primary" && typeof entry.id === "string") primaries.add(entry.id);
+    return primaries;
+  }
+  async #resolvePromptAgent(explicit: string | undefined, record: Record<string, unknown>): Promise<string | null> {
+    if (explicit !== undefined) return explicit;
+    if (typeof record.agent === "string" && record.agent.length > 0) return record.agent;
+    const response = await this.#request(`/api/session/${encodeURIComponent(this.#binding.sessionId)}/message?type=assistant&limit=20&order=desc`);
+    const data = obj(await boundedJson(response)).data;
+    if (!Array.isArray(data)) throw new Error("Invalid OpenCode message response");
+    for (const entry of data.map(obj)) if (typeof entry.agent === "string" && entry.agent.length > 0) return entry.agent;
+    return null;
+  }
+  async #pinSessionAgent(agent: string): Promise<void> {
+    await this.#request(`/api/session/${encodeURIComponent(this.#binding.sessionId)}/agent`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ agent }) });
+    if ((await this.#sessionRecord()).agent !== agent) throw new Error("OpenCode agent pin not confirmed");
+  }
+  async prompt(input: { id: string; text: string; delivery?: "steer" | "queue"; resume?: boolean; agent?: string }): Promise<void> {
+    if (!id(input.id, "msg_") || typeof input.text !== "string" || (input.delivery !== undefined && input.delivery !== "steer" && input.delivery !== "queue") || (input.resume !== undefined && typeof input.resume !== "boolean") || (input.agent !== undefined && (typeof input.agent !== "string" || input.agent.length === 0))) throw new Error("Invalid OpenCode prompt identity");
     if (Buffer.byteLength(input.text, "utf8") > MAX_PROMPT_BYTES) throw new Error("OpenCode prompt too large");
     const body = JSON.stringify({ id: input.id, text: input.text, ...(input.delivery === undefined ? {} : { delivery: input.delivery }), ...(input.resume === undefined ? {} : { resume: input.resume }) });
-    const digest = createHash("sha256").update(body).digest("hex");
+    const digest = createHash("sha256").update(input.agent === undefined ? body : body + "\u0000agent\u0000" + input.agent).digest("hex");
     await this.#authority.withMutation(this.#binding, { id: input.id, digest }, async () => {
-      await this.verifySession();
+      const record = await this.#sessionRecord();
+      const agent = await this.#resolvePromptAgent(input.agent, record);
+      if (agent !== null) {
+        if (!(await this.#primaryAgentIds()).has(agent)) throw new Error("OpenCode agent is not a primary agent");
+        await this.#pinSessionAgent(agent);
+      }
       const response = await this.#request(`/api/session/${encodeURIComponent(this.#binding.sessionId)}/prompt`, { method: "POST", headers: { "content-type": "application/json" }, body });
       const item = obj(obj(await boundedJson(response)).data);
       if (item.id !== input.id || item.sessionID !== this.#binding.sessionId || item.type !== "user") throw new Error("OpenCode prompt receipt identity mismatch");

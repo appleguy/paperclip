@@ -108,5 +108,5 @@ export function createOpenCodeManagedMutation(db: Db, input: {
     async loadCursor() { throw new Error("opencode_mutation_cursor_unavailable"); },
     async commitLog() { throw new Error("opencode_mutation_observation_unavailable"); },
   } });
-  return Object.freeze({ async dispatch(input: { id: string; text: string; delivery?: "steer" | "queue"; resume?: boolean }) { await client.prompt(input); return { delivery: "acknowledged" as const, taskCompletion: "unproven" as const }; } });
+  return Object.freeze({ async dispatch(input: { id: string; text: string; delivery?: "steer" | "queue"; resume?: boolean; agent?: string }) { await client.prompt(input); return { delivery: "acknowledged" as const, taskCompletion: "unproven" as const }; } });
 }

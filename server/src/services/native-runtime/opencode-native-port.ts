@@ -26,7 +26,7 @@ export function createOpenCodeNativePort(db: Db, binding: OpenCodeSharedBinding,
     port: Object.freeze({ identity, runnerInstanceId: binding.runnerInstanceId, providerSessionId: binding.providerSessionId,
       async verify() { await readOpenCodeHost(db, binding); await host.verifySession(binding.providerSessionId, binding); },
       readReceipt,
-      async dispatch(prompt: { id: string; text: string }) { await host.dispatchForRun(db, binding, prompt); },
+      async dispatch(prompt: { id: string; text: string; agent?: string }) { await host.dispatchForRun(db, binding, prompt); },
       async freezeProvider(input: { timeoutMs: number; signal: AbortSignal }) { return host.freezeProvider(db, binding, input); },
       async resumeProvider(checkpoint: { id: string; requestSha256: string }, signal?: AbortSignal) { await host.resumeProvider(db, binding, checkpoint, signal); },
       stop() {

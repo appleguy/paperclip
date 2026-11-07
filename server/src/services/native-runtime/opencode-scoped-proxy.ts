@@ -12,7 +12,7 @@ export function createOpenCodeScopedProxy(input: {
   workspaceDirectory?: string;
   attestEvent?: () => Promise<void>;
   read: (path: string, signal: AbortSignal) => Promise<Response>;
-  dispatch: (operation: { id: string; text: string; delivery?: "steer" | "queue"; resume?: boolean }) => Promise<unknown>;
+  dispatch: (operation: { id: string; text: string; delivery?: "steer" | "queue"; resume?: boolean; agent?: string }) => Promise<unknown>;
 }) {
   if (!/^ses_[A-Za-z0-9_-]+$/.test(input.sessionId) || input.readerToken.length < 32 || input.ownerToken.length < 32 || input.readerToken === input.ownerToken) throw new Error("invalid_opencode_proxy_binding");
   if (input.workspaceDirectory !== undefined && (!isAbsolute(input.workspaceDirectory) || resolve(input.workspaceDirectory) !== input.workspaceDirectory)) throw new Error("invalid_opencode_proxy_workspace");
