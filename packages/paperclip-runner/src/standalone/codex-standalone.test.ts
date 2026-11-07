@@ -49,7 +49,14 @@ async function fixture(options: { socket?: boolean } = {}): Promise<Fixture> {
       const respond = (result: unknown) =>
         socket.send(JSON.stringify({ id: msg.id, result }));
       if (msg.method === "initialize") return respond({ userAgent: "codex-cli/test" });
-      if (msg.method === "config/read") return respond({ config: { mcp_servers: {} } });
+      if (msg.method === "config/read")
+        return respond({
+          config: {
+            mcp_servers: { example: {} },
+            model: "gpt-5-terra",
+            api_key: "config-secret-value",
+          },
+        });
       if (msg.method === "remoteControl/status/read") return respond({ status: "connected" });
       if (msg.method === "model/list")
         return respond({
@@ -191,9 +198,11 @@ describe("standalone NAR Codex entrypoint", () => {
       effort: "high",
       sandbox: "read-only",
     });
-    // The standalone path must not inherit Paperclip-owned environment values.
+    // The standalone path must not inherit Paperclip-owned environment values,
+    // and config/read contents must never reach the receipt journal.
     expect(journal).not.toContain("must-not-pass");
     expect(journal).not.toContain("/paperclip/owned");
+    expect(journal).not.toContain("config-secret-value");
   });
 
   it("inspects the daemon without starting a thread", async () => {
@@ -210,7 +219,7 @@ describe("standalone NAR Codex entrypoint", () => {
     expect(JSON.parse(String(output))).toMatchObject({
       model: "gpt-5-terra",
       effort: "high",
-      mcpServerNames: [],
+      mcpServerNames: ["example"],
       remoteControl: "connected",
     });
   });
