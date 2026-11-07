@@ -51,10 +51,12 @@ const resumeConfigKeys = new Set([
   "skills.include_instructions", "include_apps_instructions", "include_collaboration_mode_instructions",
   "features.apps", "features.plugins", "features.multi_agent", "features.memories", "features.image_generation",
 ]);
+// Restrictive thread/start extras a resume may repeat, admitted only at these exact values.
+const resumeConfigExact: Record<string, unknown> = { project_doc_max_bytes: 0, web_search: "disabled", "features.hooks": false };
 const resumeKeys = new Set([
   "threadId", "excludeTurns", "cwd", "config", "permissions", "runtimeWorkspaceRoots",
   "baseInstructions", "developerInstructions", "approvalPolicy", "model", "dynamicTools",
-  "conversationMode", "persistExtendedHistory",
+  "conversationMode", "persistExtendedHistory", "sandbox",
 ]);
 const observationalMethods = new Set(["initialize", "collaborationMode/list", "thread/read", "thread/turns/list", "thread/items/list", "thread/goal/get"]);
 
@@ -258,7 +260,7 @@ export class SharedDaemonCodexAppServerTransport implements CodexAppServerTransp
   }
   async request(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
     if (method === "thread/start" && (!this.#newThread || this.#threadStartAttempted)) throw new Error("shared daemon requires exact thread resume");
-    const unboundRead = this.#newThread && (method === "remoteControl/status/read" || method === "thread/list" || method === "config/read" || method === "model/list");
+    const unboundRead = method === "thread/list" || this.#newThread && (method === "remoteControl/status/read" || method === "config/read" || method === "model/list");
     if (method !== "initialize" && method !== "collaborationMode/list" && method !== "thread/start" && !unboundRead &&
         (!this.#identity.threadId || params.threadId !== this.#identity.threadId)) throw new Error("shared daemon thread mismatch");
     if (method === "thread/start" && (params.model !== this.#identity.model || params.cwd !== this.#identity.workspace))
@@ -268,7 +270,7 @@ export class SharedDaemonCodexAppServerTransport implements CodexAppServerTransp
     if ((method === "thread/resume" || method === "turn/start") && params.cwd !== undefined &&
         (typeof params.cwd !== "string" || !isAbsolute(params.cwd) || resolve(params.cwd) !== this.#identity.workspace)) throw new Error("shared daemon workspace mismatch");
     if (method === "thread/resume" && params.config !== undefined &&
-        (!record(params.config) || Object.entries(params.config).some(([key, value]) => !resumeConfigKeys.has(key) || typeof value !== "boolean"))) throw new Error("shared daemon resume config not admitted");
+        (!record(params.config) || Object.entries(params.config).some(([key, value]) => key in resumeConfigExact ? value !== resumeConfigExact[key] : !resumeConfigKeys.has(key) || typeof value !== "boolean"))) throw new Error("shared daemon resume config not admitted");
     if (method === "turn/start" && ((params.model !== undefined && params.model !== this.#identity.model) || (params.effort !== undefined && params.effort !== this.#identity.effort))) throw new Error("shared daemon model or effort mismatch");
     if (this.#gap && !observationalMethods.has(method)) throw new Error("managed writes held pending reconciliation");
     await this.#authorize(method, params); await this.#connect(); await this.#authorize(method, params);

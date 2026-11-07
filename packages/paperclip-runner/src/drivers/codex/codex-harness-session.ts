@@ -262,6 +262,7 @@ export class CodexHarnessSession
         threadId: this.opened.threadId,
         ...(input.reasoningMode === undefined ? {} : { reasoningMode: input.reasoningMode }),
         ...(this.reasoningEffort ? { effort: this.reasoningEffort } : {}),
+        ...(this.turnModel ? { model: this.turnModel } : {}),
         // Codex resolves an unset summary from the model, and current models
         // resolve it to "none": reasoning items then carry no text at all.
         // Request provider-written summaries so the task chat can show them.

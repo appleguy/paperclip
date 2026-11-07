@@ -122,6 +122,14 @@ describe("shared daemon Codex transport", () => {
     const f = await fixture((msg,socket) => socket.send(JSON.stringify({id:msg.id,result:{thread:{id:"other"}}})));
     await expect(f.transport.request("thread/resume",{threadId:"thread-a"})).rejects.toThrow("different thread");
   });
+  it("admits the standalone resume shape and only its exact restrictive extras", async () => {
+    const f = await fixture();
+    const shape = (config: Record<string, unknown>) => ({ threadId: "thread-a", excludeTurns: true, cwd: WORKSPACE, sandbox: "read-only",
+      config: { "features.apps": false, ...config } });
+    await expect(f.transport.request("thread/resume", shape({ project_doc_max_bytes: 0, web_search: "disabled", "features.hooks": false }))).resolves.toBeTruthy();
+    await expect(f.transport.request("thread/resume", shape({ web_search: "live" }))).rejects.toThrow("resume config not admitted");
+    await expect(f.transport.request("thread/resume", shape({ "features.hooks": true }))).rejects.toThrow("resume config not admitted");
+  });
   it("rejects a provider response with a missing or foreign workspace", async () => {
     const f = await fixture((msg,socket) => socket.send(JSON.stringify({id:msg.id,result:{thread:{id:"thread-a",cwd:"/other"}}})));
     await expect(f.transport.request("thread/read",{threadId:"thread-a"})).rejects.toThrow("different workspace");

@@ -24,7 +24,7 @@ export async function standaloneCodexMain(args: string[]): Promise<void> {
   const { values } = parseArgs({ args, options: {
     "codex-home": { type: "string" }, cwd: { type: "string" }, model: { type: "string" },
     effort: { type: "string" }, prompt: { type: "string" }, sandbox: { type: "string" },
-    "receipt-dir": { type: "string" }, "timeout-ms": { type: "string" }, inspect: { type: "boolean" }, name: { type: "string" },
+    "receipt-dir": { type: "string" }, "timeout-ms": { type: "string" }, inspect: { type: "boolean" }, name: { type: "string" }, thread: { type: "string" },
   } });
   const codexHome = resolve(values["codex-home"] ?? process.env.CODEX_HOME ?? join(homedir(), ".codex"));
   const workspace = await realpath(resolve(values.cwd ?? process.cwd()));
@@ -67,8 +67,9 @@ export async function standaloneCodexMain(args: string[]): Promise<void> {
   const remoteControlStates: string[] = [];
   const factory = sharedDaemonTransportFactory({
     identity: { codexHome, socketPath, cliVersion: "not-invoked", appServerVersion: "see-initialize-receipt",
-      processGeneration: generation, threadId: "", workspace, model, effort },
-    newThread: true,
+      processGeneration: generation, threadId: values.thread ?? "", workspace, model, effort },
+    // --thread continues one lane thread (provider prompt cache, one RC entry) instead of starting a new one.
+    newThread: !values.thread,
     admit: async () => {
       const current = await stat(socketPath);
       return current.isSocket() && `${current.dev}:${current.ino}:${current.birthtimeMs}` === generation;
@@ -121,7 +122,13 @@ export async function standaloneCodexMain(args: string[]): Promise<void> {
       environment: { HOME: homedir(), CODEX_HOME: codexHome, PATH: process.env.PATH, LANG: process.env.LANG },
       capabilities: { goals: false, dynamicTools: false },
     });
-    session = await driver.openSession({ runId, normalizedSessionId: runId, workingDirectory: workspace });
+    if (values.thread) {
+      const recovered = await driver.recoverSession({ driverKind: "codex-app-server", driverSessionId: values.thread,
+        runId, normalizedSessionId: runId, workingDirectory: workspace });
+      if (!recovered.recovered) throw new Error(`thread resume refused: ${recovered.reason}`);
+      session = recovered.session;
+      receipt({ phase: "response", method: "thread/resume", threadId: values.thread });
+    } else session = await driver.openSession({ runId, normalizedSessionId: runId, workingDirectory: workspace });
     const threadName = [modelEffortTag(model, effort), (values.name ?? "").replace(/\s+/g, " ").trim().slice(0, 80) || "NAR"]
       .filter(Boolean).join(" ");
     try {

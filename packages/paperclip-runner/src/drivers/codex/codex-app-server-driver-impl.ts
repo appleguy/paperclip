@@ -700,10 +700,15 @@ export class CodexAppServerDriver implements HarnessDriver {
   #resumeThreadParams(threadId: string, workingDirectory: string): Record<string, unknown> {
     return {
       excludeTurns: true, threadId,
-      ...createSecuredCodexThreadParams(workingDirectory,
+      // Shared daemon: resume with the thread/start shape (sandbox + skillless config); the secured profile is rejected there.
+      ...(this.#options.sharedDaemonSandbox ? {
+        cwd: workingDirectory, sandbox: this.#options.sharedDaemonSandbox,
+        config: { ...createSkilllessCodexThreadConfig(workingDirectory, this.#options.environment, false),
+          project_doc_max_bytes: 0, web_search: "disabled", "features.hooks": false },
+      } : createSecuredCodexThreadParams(workingDirectory,
         this.#options.requestedCollaborationMode ?? "default",
         this.#options.includeCollaborationModeInstructions ?? true,
-        this.#options.includeSkillInstructions ?? false, this.#options.environment),
+        this.#options.includeSkillInstructions ?? false, this.#options.environment)),
       ...this.#instructionParams(this.#direct() ? "" : this.#baseInstructions()),
       approvalPolicy: this.#options.approvalPolicy ?? "never",
       ...(this.#options.model ? { model: this.#options.model } : {}),
@@ -1016,6 +1021,7 @@ export class CodexAppServerDriver implements HarnessDriver {
       dynamicTools: this.#providerDynamicTools(),
       skillInputs: this.#options.skillInputs,
       reasoningEffort: this.#options.reasoningEffort,
+      turnModel: this.#options.sharedDaemonSandbox ? this.#options.model : undefined,
       diagnosticEnvironment: this.#options.environment,
       dynamicToolHandler: this.#options.dynamicToolHandler,
       completionFeedback: this.#options.completionFeedback,

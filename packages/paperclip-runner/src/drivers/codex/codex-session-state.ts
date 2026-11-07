@@ -110,6 +110,8 @@ export class CodexSessionState {
   readonly goalReason: string | null;
   readonly skillInputs: NonNullable<CodexAppServerDriverOptions["skillInputs"]>;
   readonly reasoningEffort: string | undefined;
+  // Shared daemon only: a loaded thread ignores the resume model, so each turn names it.
+  readonly turnModel: string | undefined;
   readonly diagnosticEnvironment: NodeJS.ProcessEnv;
   readonly dynamicTools: readonly Readonly<Record<string, unknown>>[];
   readonly completionFeedback: CodexAppServerDriverOptions["completionFeedback"];
@@ -203,6 +205,7 @@ export class CodexSessionState {
     goalReason: string | null;
     skillInputs?: CodexAppServerDriverOptions["skillInputs"];
     reasoningEffort?: string;
+    turnModel?: string;
     diagnosticEnvironment?: NodeJS.ProcessEnv;
     dynamicTools: readonly Readonly<Record<string, unknown>>[];
     completionFeedback?: CodexAppServerDriverOptions["completionFeedback"];
@@ -229,6 +232,7 @@ export class CodexSessionState {
     this.goalReason = input.goalReason;
     this.skillInputs = structuredClone(input.skillInputs ?? []);
     this.reasoningEffort = input.reasoningEffort;
+    this.turnModel = input.turnModel;
     this.diagnosticEnvironment = input.diagnosticEnvironment ?? {};
     this.dynamicTools = input.dynamicTools;
     this.dynamicToolHandler = input.dynamicToolHandler;
