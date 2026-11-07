@@ -149,7 +149,7 @@ summary{cursor:pointer}
 <h2>Usage history and projections</h2>
 <p class="note">Weekly charts use a seven-day quota cycle when the reset clock is trustworthy, otherwise the trailing seven days. Green shows observed capacity remaining, blue shows used quota. Dashed forecasts are estimates, never observed consumption. Short-window charts use their own cadence.</p>
 <div id="charts" class="charts"></div>
-<details id="short-chart-details"><summary>Show five-hour and session history</summary><div id="short-charts" class="charts"></div></details>
+<details id="short-chart-details" class="short-chart-details"><summary>Show five-hour and session history</summary><div id="short-charts" class="charts"></div></details>
 <footer>Read-only. Quota Sentinel samples periodically (currently about every three minutes); this page reloads it each minute. Reload does not initiate a provider check. Unknown readings are never zero. Pace labels describe recent usage rate, not an obligation to spend. Banked Codex resets are displayed only when reported; redemption is always manual. The reader reports only the next banked-credit expiration, not every credit expiration.</footer>
 
 </main>
@@ -157,7 +157,7 @@ summary{cursor:pointer}
 (function(){
 "use strict";
 var labels={antigravity:"Antigravity",codex:"ChatGPT / Codex",claude:"Claude","chatgpt-web":"ChatGPT Web"};
-var pools={"pro:weekly":"Pro power · weekly","3p:5h":"Third-party · 5-hour","3p:weekly":"Third-party · weekly","gemini-argon-wtu:weekly":"Gemini Argon · weekly","gemini:5h":"Gemini / Flash family · 5-hour","gemini:weekly":"Gemini / Flash family · weekly",session:"Session",weekly:"Weekly"};
+var pools={"pro:weekly":"Pro power · weekly","3p:5h":"Third-party · 5-hour","3p:weekly":"Third-party · weekly","gemini-argon-wtu:weekly":"Gemini Argon · weekly","gemini:5h":"Gemini Flash (grouped) · 5-hour","gemini:weekly":"Gemini Flash (grouped) · weekly",session:"Session",weekly:"Weekly"};
 // These labels describe the RECENT rate of quota consumption (up to 48h), not
 // whether cumulative weekly usage is ahead of an even-use schedule.
 var paceLabels={behind_pace:"recent rate below goal",ahead_of_pace:"recent rate above goal",on_pace:"recent rate near goal",need_trend:"recent trend unmeasured",reset_imminent_underused:"reset soon, allowance left",exhausted_early:"allowance exhausted early",target_reached:"target reached",reset_due:"reset due",unknown:"usage or reset unknown"};
@@ -485,7 +485,7 @@ function render(data){
  );
  ["antigravity","codex","claude","chatgpt-web"].forEach(function(provider){
   var section=el("section"),title=el("h2",null,labels[provider]);
-  var subtitle=el("p","note",provider==="antigravity"?"Gemini / Flash is CodexBar's grouped Gemini quota, not a separately verified Flash-only allowance; Argon is tracked independently":provider==="codex"?"ChatGPT subscription quota":provider==="chatgpt-web"?"Pro power dispatches; distinct from Codex":"Claude subscription quota");
+  var subtitle=el("p","note",provider==="antigravity"?"Gemini Flash uses CodexBar's grouped Gemini quota, not a separately verified Flash-only allowance; Argon is tracked independently":provider==="codex"?"ChatGPT subscription quota":provider==="chatgpt-web"?"Pro power dispatches; distinct from Codex":"Claude subscription quota");
   section.append(title,subtitle);
   var found=data.pools.filter(function(v){return v&&v.provider===provider&&!isShort(v)});
   if(!found.length)section.append(el("p","reset","Provider reading unavailable. Remaining quota Unknown."));

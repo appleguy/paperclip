@@ -87,7 +87,7 @@ describe("standalone subscription quotas", () => {
     expect(document.getElementById("cards")?.textContent).toContain("STALE / UNAVAILABLE");
     expect(document.getElementById("cards")?.textContent).toContain("Last trustworthy reading");
     expect(document.getElementById("uncertain-deadlines")?.textContent).toContain("Gemini Argon");
-    expect(document.getElementById("uncertain-deadlines")?.textContent).toContain("Gemini / Flash family · weekly");
+    expect(document.getElementById("uncertain-deadlines")?.textContent).toContain("Gemini Flash (grouped) · weekly");
     expect(document.getElementById("deadlines")?.textContent).not.toContain("Gemini Argon");
     expect(document.body.textContent).not.toContain("45.1% currently reported remaining");
     expect([...document.querySelectorAll("#charts .chart-warning")].length).toBeGreaterThanOrEqual(2);
@@ -109,7 +109,7 @@ describe("standalone subscription quotas", () => {
       [{ provider: "antigravity", pool: "gemini:weekly", points: s }]);
     expect(document.getElementById("cards")?.textContent).toContain("Reset clock moves with each observation");
     expect(document.getElementById("cards")?.textContent).toContain("Remaining: Unknown");
-    expect(document.getElementById("deadlines")?.textContent).not.toContain("Gemini / Flash family · weekly");
+    expect(document.getElementById("deadlines")?.textContent).not.toContain("Gemini Flash (grouped) · weekly");
   });
 
   it("preserves a legitimate true zero and remaining availability when reset is anchored", async () => {
