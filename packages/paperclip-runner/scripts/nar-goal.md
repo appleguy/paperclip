@@ -1,0 +1,8 @@
+# NAR seat goals
+
+`node packages/paperclip-runner/scripts/nar-goal.mjs set|get|clear --seat NAME [--harness codex|claude] [--text TEXT | --file PATH]`.
+The registry is `/Volumes/NVM/Paperclip/workspaces/platform-lead-outside/context/nar-goal-seats.json`; add entries with absolute cwd and goalFile for Claude, or threadId (or a threadFile read at invocation) and optional codexHome for Codex. A UUID with `--harness codex` is also accepted as a thread ID. Goals are single-line; the reserved text `clear` is disallowed.
+
+Codex requests go to the existing app-server control socket, not a new thread or model turn. Native errors and unknown outcomes are surfaced. Do not retry a timed-out write without checking the native goal.
+
+Claude Code 2.1.311 exposes `/goal` to first-prompt dispatch, but the runner's Remote Control code is an observation-only transcript bridge and exposes no supported live send to an arbitrary interactive seat. This command never types in a pane or claims to have changed the live goal. Claude set/clear atomically record **desired** state; get reports only that desired state, never the native goal. Stop the old session yourself, then run `node packages/paperclip-runner/scripts/nar-claude-resume.mjs --seat NAME` to resume with `/goal ...` as the initial prompt. No restart is automatic. The desired operation is reapplied on every such resume; native application is not verified. An ordinary Claude resume that bypasses this launcher does not apply it. Remote Control through the official client may deliver a slash command, but this tool has no authenticated supported programmatic live-delivery binding.
