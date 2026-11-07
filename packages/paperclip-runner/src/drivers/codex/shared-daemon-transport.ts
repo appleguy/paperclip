@@ -18,6 +18,8 @@ export interface SharedDaemonIdentity {
 }
 export interface SharedDaemonTransportOptions {
   identity: SharedDaemonIdentity;
+  /** Standalone only: bind one provider-assigned thread, requiring live RC before every start. */
+  newThread?: boolean;
   /** Must check the live daemon and Paperclip checkout/lease; IDs supplied here do not grant authority. */
   admit: (identity: Readonly<SharedDaemonIdentity>, operation: {method: string; params: Readonly<Record<string, unknown>>}) => Promise<boolean>;
   /** Optional server policy: only this callback may identify an owner intervention. */
@@ -27,6 +29,8 @@ export interface SharedDaemonTransportOptions {
   /** Makes the created instance available to the server reconciliation owner. */
   onTransport?: (transport: SharedDaemonCodexAppServerTransport) => void;
   timeoutMs?: number;
+  /** Synchronous local receipt before sending; never receives configuration/auth responses. */
+  onRequest?: (request: { method: string; params: Readonly<Record<string, unknown>> }) => void;
 }
 export interface SharedDaemonControlGap {
   sequence: number;
@@ -59,7 +63,10 @@ const observationalMethods = new Set(["initialize", "collaborationMode/list", "t
  * Provider-originated writes from other clients require a separate ingress fence.
  */
 export class SharedDaemonCodexAppServerTransport implements CodexAppServerTransport {
-  readonly #identity: Readonly<SharedDaemonIdentity>;
+  #identity: Readonly<SharedDaemonIdentity>;
+  readonly #newThread: boolean;
+  readonly #onRequest: SharedDaemonTransportOptions["onRequest"];
+  #threadStartAttempted = false;
   readonly #admit: SharedDaemonTransportOptions["admit"];
   readonly #timeout: number;
   readonly #classifyIntervention: SharedDaemonTransportOptions["classifyIntervention"];
@@ -86,8 +93,11 @@ export class SharedDaemonCodexAppServerTransport implements CodexAppServerTransp
     const identity = options.identity;
     if (!isAbsolute(identity.codexHome) || !isAbsolute(identity.socketPath) || !isAbsolute(identity.workspace) ||
         ![identity.cliVersion, identity.appServerVersion, identity.processGeneration,
-          identity.threadId, identity.model, identity.effort].every(v => typeof v === "string" && v.trim().length > 0) ||
+          ...(options.newThread ? [] : [identity.threadId]), identity.model, identity.effort].every(v => typeof v === "string" && v.trim().length > 0) ||
         typeof options.admit !== "function") throw new Error("incomplete shared daemon identity or admission");
+    if (options.newThread && identity.threadId !== "") throw new Error("standalone requires an unbound thread identity");
+    this.#newThread = options.newThread === true;
+    this.#onRequest = options.onRequest;
     this.#identity = Object.freeze({ ...identity, workspace: resolve(identity.workspace) });
     this.#admit = options.admit;
     this.#classifyIntervention = options.classifyIntervention;
@@ -152,6 +162,15 @@ export class SharedDaemonCodexAppServerTransport implements CodexAppServerTransp
       this.#pending.delete(msg.id); clearTimeout(pending.timer);
       if (hasError) pending.reject(new CodexRpcError("shared daemon RPC rejected", record(msg.error) && typeof msg.error.code === "number" ? msg.error.code : null));
       else if (record(msg.result)) {
+        if (pending.method === "thread/start") {
+          const thread = msg.result.thread;
+          if (!record(thread) || typeof thread.id !== "string" || !thread.id || this.#identity.threadId ||
+              typeof thread.cwd !== "string" || !isAbsolute(thread.cwd) || resolve(thread.cwd) !== this.#identity.workspace) {
+            const error = new Error("standalone thread identity or workspace mismatch; outcome may be unknown");
+            pending.reject(error); throw error;
+          }
+          this.#identity = Object.freeze({ ...this.#identity, threadId: thread.id });
+        }
         if ((pending.method === "thread/read" || pending.method === "thread/resume") &&
             (!record(msg.result.thread) || msg.result.thread.id !== this.#identity.threadId)) {
           const error = new Error("daemon returned a different thread; outcome may be unknown");
@@ -238,8 +257,12 @@ export class SharedDaemonCodexAppServerTransport implements CodexAppServerTransp
     socket.send(payload, error => { if (error) this.#fail(new Error("daemon send failed; outcome may be unknown")); });
   }
   async request(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
-    if (method === "thread/start") throw new Error("shared daemon requires exact thread resume");
-    if (method !== "initialize" && method !== "collaborationMode/list" && params.threadId !== this.#identity.threadId) throw new Error("shared daemon thread mismatch");
+    if (method === "thread/start" && (!this.#newThread || this.#threadStartAttempted)) throw new Error("shared daemon requires exact thread resume");
+    const unboundRead = this.#newThread && (method === "remoteControl/status/read" || method === "thread/list" || method === "config/read" || method === "model/list");
+    if (method !== "initialize" && method !== "collaborationMode/list" && method !== "thread/start" && !unboundRead &&
+        (!this.#identity.threadId || params.threadId !== this.#identity.threadId)) throw new Error("shared daemon thread mismatch");
+    if (method === "thread/start" && (params.model !== this.#identity.model || params.cwd !== this.#identity.workspace))
+      throw new Error("standalone model or workspace mismatch");
     if (method === "thread/resume" && Object.keys(params).some(key => !resumeKeys.has(key))) throw new Error("shared daemon resume parameter not admitted");
     if (method === "thread/resume" && params.model !== undefined && params.model !== this.#identity.model) throw new Error("shared daemon model mismatch");
     if ((method === "thread/resume" || method === "turn/start") && params.cwd !== undefined &&
@@ -250,12 +273,34 @@ export class SharedDaemonCodexAppServerTransport implements CodexAppServerTransp
     if (this.#gap && !observationalMethods.has(method)) throw new Error("managed writes held pending reconciliation");
     await this.#authorize(method, params); await this.#connect(); await this.#authorize(method, params);
     if (this.#gap && !observationalMethods.has(method)) throw new Error("managed writes held pending reconciliation");
+    if (this.#newThread && method === "thread/start") {
+      // Config values may contain secrets. Read only in memory, project names, never return/log the config.
+      const response = await this.request("config/read", { includeLayers: false, cwd: this.#identity.workspace });
+      if (!record(response.config)) throw new Error("standalone could not inspect configured MCP servers");
+      const servers = response.config.mcp_servers ?? {};
+      if (!record(servers) || Object.keys(servers).some(name => !/^[A-Za-z0-9_-]+$/.test(name)))
+        throw new Error("standalone cannot safely disable configured MCP servers");
+      params = { ...params, config: {
+        ...(record(params.config) ? params.config : {}),
+        ...Object.fromEntries(Object.keys(servers).map(name => [`mcp_servers.${name}.enabled`, false])),
+      } };
+    }
+    if (this.#newThread && (method === "thread/start" || method === "turn/start")) {
+      const status = await this.request("remoteControl/status/read", {});
+      if (status.status !== "connected") throw new Error("Remote Control not connected; standalone start refused");
+      await this.#authorize(method, params);
+      if (this.#gap) throw new Error("managed writes held pending reconciliation");
+      if (method === "thread/start") {
+        if (this.#threadStartAttempted) throw new Error("standalone thread start already attempted");
+        this.#threadStartAttempted = true;
+      }
+    }
     if (this.#pending.size >= MAX_PENDING) throw new Error("daemon pending request limit exceeded");
     const id = ++this.#nextId;
     return new Promise((resolve,reject) => {
       const timer = setTimeout(() => this.#fail(new Error("daemon RPC timeout; outcome may be unknown")), this.#timeout);
       this.#pending.set(id,{method,resolve,reject,timer});
-      try { this.#send({id,method,params}); } catch (error) { this.#pending.delete(id); clearTimeout(timer); reject(error); }
+      try { this.#onRequest?.({method,params}); this.#send({id,method,params}); } catch (error) { this.#pending.delete(id); clearTimeout(timer); reject(error); }
     });
   }
   notify(method: string, params?: Record<string, unknown>): void {
@@ -281,10 +326,12 @@ export class SharedDaemonCodexAppServerTransport implements CodexAppServerTransp
   async close(): Promise<void> { this.#fail(); }
 }
 
-/** Uses the existing Codex driver's transportFactory and refuses new sessions. */
+/** Exact resume by default; standalone explicitly admits one fresh RC-backed thread. */
 export function sharedDaemonTransportFactory(options: SharedDaemonTransportOptions): NonNullable<import("./codex-driver-types.js").CodexAppServerDriverOptions["transportFactory"]> {
   return context => {
-    if (!context?.persistedSession || context.persistedSession.driverSessionId !== options.identity.threadId) throw new Error("shared daemon requires matching persisted session");
+    if (options.newThread) {
+      if (context?.persistedSession) throw new Error("standalone new-thread factory cannot recover a session");
+    } else if (!context?.persistedSession || context.persistedSession.driverSessionId !== options.identity.threadId) throw new Error("shared daemon requires matching persisted session");
     const transport = new SharedDaemonCodexAppServerTransport(options);
     options.onTransport?.(transport);
     return transport;

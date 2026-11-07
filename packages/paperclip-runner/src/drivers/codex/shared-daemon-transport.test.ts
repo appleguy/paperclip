@@ -31,6 +31,50 @@ async function fixture(onRequest: (msg: Record<string, unknown>, socket: WebSock
 }
 
 describe("shared daemon Codex transport", () => {
+  it("opens a standalone direct session only with RC and refuses a disconnected next turn", async () => {
+    let connected = true;
+    const provider = new FakeCodexTransport("thread-a");
+    const f = await fixture((msg, socket) => {
+      const result = msg.method === "remoteControl/status/read"
+        ? Promise.resolve({ status: connected ? "connected" : "disconnected" })
+        : msg.method === "config/read" ? Promise.resolve({ config: { mcp_servers: { example: {} } } })
+        : provider.request(msg.method as string, msg.params as Record<string, unknown>);
+      void result.then(value => socket.send(JSON.stringify({ id: msg.id, result: msg.method === "thread/start" ? { ...value, sandbox: { type: "readOnly" } } : value })));
+    });
+    const factory = sharedDaemonTransportFactory({
+      identity: { ...identity, socketPath: f.path, threadId: "" },
+      newThread: true, admit: async () => true,
+    });
+    const driver = makeDriver([], {
+      transportFactory: factory, conversationMode: "direct", baseInstructions: "",
+      includeSkillInstructions: false, includeCollaborationModeInstructions: false,
+      sharedDaemonSandbox: "read-only", model: "test-model", reasoningEffort: "medium",
+      dynamicTools: [], capabilities: { dynamicTools: false, goals: false },
+    });
+    const session = await driver.openSession({
+      runId: "standalone-test", normalizedSessionId: "standalone-test", workingDirectory: WORKSPACE,
+    });
+    cleanups.push(() => session.close({ reason: "test complete" }));
+    const start = f.messages.find(message => message.method === "thread/start")!;
+    expect(start.params).toMatchObject({
+      cwd: WORKSPACE, sandbox: "read-only", baseInstructions: "", developerInstructions: "",
+      dynamicTools: [], config: { "skills.include_instructions": false, project_doc_max_bytes: 0, "features.hooks": false, "mcp_servers.example.enabled": false },
+    });
+    expect(start.params).not.toHaveProperty("completionContract");
+    expect(start.params).not.toHaveProperty("permissions");
+    expect(f.messages.filter(message => message.method === "remoteControl/status/read")).toHaveLength(1);
+    connected = false;
+    await expect(session.startTurn({ message: { role: "user", text: "Only this text." } }))
+      .rejects.toThrow("Remote Control not connected");
+    expect(f.messages.some(message => message.method === "turn/start")).toBe(false);
+    connected = true;
+    await session.startTurn({ message: { role: "user", text: "Only this text." } });
+    const turn = f.messages.find(message => message.method === "turn/start")!;
+    expect(turn.params).toMatchObject({ threadId: "thread-a", input: [{ type: "text", text: "Only this text." }] });
+    expect(turn.params).not.toHaveProperty("outputSchema");
+    expect(turn.params).not.toHaveProperty("permissions");
+    expect(f.messages.filter(message => message.method === "remoteControl/status/read")).toHaveLength(3);
+  });
   it("uses the opt-in driver factory only for its exact persisted thread", () => {
     const factory = sharedDaemonTransportFactory({identity,admit:async () => true});
     expect(() => factory()).toThrow("matching persisted session");

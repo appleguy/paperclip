@@ -267,11 +267,13 @@ export class CodexHarnessSession
         // Request provider-written summaries so the task chat can show them.
         ...(this.driverKind === "codex_app_server" ? { summary: CODEX_REASONING_SUMMARY } : {}),
         cwd: this.opened.context.workingDirectory,
-        permissions:
-          text(record(record(this.opened.context.sandbox).permissionProfile).id) || (requestedMode === "plan"
-            ? PLANNING_PERMISSION_PROFILE
-            : SKILLLESS_PERMISSION_PROFILE),
-        runtimeWorkspaceRoots: [this.opened.context.workingDirectory],
+        ...(record(this.opened.context.sandbox).nativeSandbox ? {} : {
+          permissions:
+            text(record(record(this.opened.context.sandbox).permissionProfile).id) || (requestedMode === "plan"
+              ? PLANNING_PERMISSION_PROFILE
+              : SKILLLESS_PERMISSION_PROFILE),
+          runtimeWorkspaceRoots: [this.opened.context.workingDirectory],
+        }),
         ...(this.opened.collaborationMode === null
           ? {}
           : { collaborationMode: this.opened.collaborationMode }),

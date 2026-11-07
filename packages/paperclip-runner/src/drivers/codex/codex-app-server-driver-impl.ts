@@ -138,6 +138,9 @@ export class CodexAppServerDriver implements HarnessDriver {
   readonly #persistedProcessIdentities = new WeakMap<object, string>();
 
   constructor(options: CodexAppServerDriverOptions) {
+    if (options.sharedDaemonSandbox && (!options.transportFactory || options.conversationMode !== "direct")) {
+      throw new Error("shared daemon sandbox requires a direct session and explicit transport");
+    }
     this.#options = options;
     this.#caps = {
       resume: true,
@@ -289,7 +292,13 @@ export class CodexAppServerDriver implements HarnessDriver {
       const initialize = await cancellation.wait(this.#initialize(transport));
       const requestedMode =
         this.#options.requestedCollaborationMode ?? "default";
-      const threadParams = createSecuredCodexThreadParams(
+      const threadParams: Record<string, unknown> = this.#options.sharedDaemonSandbox ? {
+        cwd: workingDirectory,
+        sandbox: this.#options.sharedDaemonSandbox,
+        baseInstructions: "", developerInstructions: "",
+        config: { ...createSkilllessCodexThreadConfig(workingDirectory ?? "", this.#options.environment, false),
+          project_doc_max_bytes: 0, web_search: "disabled", "features.hooks": false },
+      } : createSecuredCodexThreadParams(
         workingDirectory ?? "",
         requestedMode,
         this.#options.includeCollaborationModeInstructions ?? true,
@@ -874,13 +883,17 @@ export class CodexAppServerDriver implements HarnessDriver {
       expectedWorkingDirectory,
       this.#options.workingDirectoryAuthority,
     );
+    if (this.#options.sharedDaemonSandbox) {
+      const expected = { "read-only": "readOnly", "workspace-write": "workspaceWrite", "danger-full-access": "dangerFullAccess" }[this.#options.sharedDaemonSandbox];
+      if (record(response.sandbox).type !== expected) throw new Error("Codex thread did not activate the requested native sandbox");
+    }
     const activePermissionProfile = record(thread.activePermissionProfile);
     const permissionProfileId = text(activePermissionProfile.id);
     const requestedMode = this.#options.requestedCollaborationMode ?? "default";
     const requiredPermissionProfile =
-      text(createSecuredCodexThreadParams(workingDirectory, requestedMode, true, false, this.#options.environment).permissions);
+      this.#options.sharedDaemonSandbox ? "" : text(createSecuredCodexThreadParams(workingDirectory, requestedMode, true, false, this.#options.environment).permissions);
     if (
-      permissionProfileId.length > 0 &&
+      !this.#options.sharedDaemonSandbox && permissionProfileId.length > 0 &&
       permissionProfileId !== requiredPermissionProfile
     ) {
       throw new Error(
@@ -912,7 +925,11 @@ export class CodexAppServerDriver implements HarnessDriver {
         ),
         workingDirectory,
         collaborationMode: collaborationMode === null ? "default" : "plan",
-        sandbox: {
+        sandbox: this.#options.sharedDaemonSandbox ? {
+          nativeSandbox: this.#options.sharedDaemonSandbox,
+          legacyPolicy: boundedCodexValue(response.sandbox),
+          permissionProfile: boundedCodexValue(activePermissionProfile),
+        } : {
           permissionProfile: boundedCodexValue(configuredPermissionProfile),
           legacyPolicy: boundedCodexValue(response.sandbox ?? null),
           rootAccess: "none",

@@ -15,6 +15,8 @@ import type { CodexQuestionResponseContext } from "./codex-question-adapter.js";
 
 export interface CodexAppServerDriverOptions {
   taskEnvelope: CodexTaskEnvelope;
+  /** Direct standalone sessions on an existing daemon use its native sandbox, never private permission profiles. */
+  sharedDaemonSandbox?: "read-only" | "workspace-write" | "danger-full-access";
   /** Explicit provider model selected by the persisted native execution. */
   model?: string;
   /** Per-run reasoning effort sent with each Codex turn, including resumed turns. */

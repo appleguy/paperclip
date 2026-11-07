@@ -1,8 +1,45 @@
 # Paperclip Native Agent Runtime (NAR) - specification v0.3
 
-Status: REVISED DRAFT for owner review; target path `doc/spec/native-agent-runtime.md`. Design only: nothing here is implemented, deployed or security-accepted.
+Status: REVISED DRAFT for owner review, except the dated c31 standalone Codex slice below. Other sections remain design only and are not a deployment or security-acceptance claim.
 Date: 2026-11-03. Supersedes v0.1 (836 lines).
 Scope: Claude Code, agy, OpenCode (local lanes: WRX80 DeepSeek :19402, Mac GLM :19403) and Codex. ChatGPT Web is manual Chat-mode copy/paste only and is outside the runtime.
+
+## c31 implementation slice — standalone Codex (2026-11-06 local / 2026-11-07 UTC)
+
+This narrow slice is implemented in `packages/paperclip-runner`; the rest of v0.3 remains a draft. It runs a single direct Codex turn with the existing NAR `CodexAppServerDriver`, without a Paperclip server, database, dispatch, or control-plane credentials. The source-checkout entrypoint is `packages/paperclip-runner/scripts/run-standalone-codex.mjs` (Node 24.11+ and workspace development dependencies). Its resolver prefers tracked TypeScript over generated JavaScript siblings.
+
+```sh
+node packages/paperclip-runner/scripts/run-standalone-codex.mjs \
+  --codex-home /absolute/existing/codex-home --cwd /absolute/workspace \
+  --model <model-id> --effort <effort> --sandbox read-only \
+  --prompt 'Your exact user prompt' --receipt-dir /absolute/new/receipt-directory
+```
+
+`--inspect` is read-only: it reports effective model/effort (falling back to the provider's declared default model), configured MCP server names, and RC status. It never prints full configuration, credential values, URLs, or MCP environment values. `--timeout-ms` bounds the observation period; timeout or disconnect detaches only this client, retains durable identity, and never retries or interrupts a provider turn.
+
+### Admission and context
+
+- The existing transport remains exact-resume-only by default. Explicit `newThread: true` admits one fresh thread, binds the provider-returned thread ID and exact workspace, and refuses a second create attempt. It never invents a persisted identity.
+- Before each `thread/start` and `turn/start`, the same live WebSocket must return `remoteControl/status/read.status = "connected"`. Socket identity is checked on every admitted operation. A missing socket, changed socket generation, failed status RPC, or other RC state fails closed for this client.
+- This is client admission, with a check/send race; it is not an atomic Codex server policy and cannot fence a different client or absolute binary execution. A running turn is not interrupted if RC later disconnects.
+- The direct request has empty base/developer instructions, no Paperclip task envelope, completion contract, dynamic tools, or output schema. Skills/app/collaboration instructions, apps/plugins/memories/multi-agent/image generation, ordinary configurable hooks, project-document bytes, and web search are disabled per thread. Built-in executor hooks are separate native behavior.
+- Effective configuration is read for the exact workspace; each configured MCP name receives an explicit disabled override. Configuration contents are never retained. The standalone path does not write any Codex configuration.
+- Native sandbox policy is selected explicitly and verified against the provider response before a turn. Private NAR permission-profile names are not sent to an existing daemon. The lane launcher preserves its previously authorized `danger-full-access` mode; the canary used `read-only`.
+- The local receipt captures the actual outgoing RPC parameters plus selected responses, not provider-bound model bytes. Stock provider/system behavior and full zero-context at the model boundary remain **unverified** without provider-bound capture.
+
+### Evidence and limits
+
+The focused regression `opens a standalone direct session only with RC and refuses a disconnected next turn` failed before the change with `shared daemon requires matching persisted session`. After the change, all 16 shared-daemon transport tests passed, including the existing exact-resume and foreign-thread cases.
+
+The one live canary on the existing zero-home daemon 0.167.0 returned `C31_NAR_RC_OK`. Thread `01a1b454-63f2-76b3-a274-53aa3563d2b0`, turn `01a1b454-6471-76e3-b0ea-c28476ab1bdc`, completed; RC was connected before both starts, and that daemon's `thread/list` contained the thread. Native `thread/read(includeTurns:true)` contained exactly one user message and one agent message, with no tool items. Receipts, pre-turn identity, and native transcript are in `/Volumes/NVM/AI_Agent_Runtime/tmp/c31/nar/canary/`. The initial optional transcript helper was absent; this was caught during artifact verification and corrected to exact native thread/read, without another model turn.
+
+A credential-free disposable 0.167.0 server with RC `disabled` refused standalone NAR before any `thread/start` or `turn/start` (both counts zero), exit 1: `Remote Control not connected; standalone start refused`. The standalone command and the real lane launcher each passed this live negative probe. Evidence: `/Volumes/NVM/AI_Agent_Runtime/tmp/c31/nar-nonrc/result.json` and `/Volumes/NVM/AI_Agent_Runtime/tmp/c31/nar-nonrc-lane/result.json`. Only the two disposable servers were closed, cleanly by EOF. The final `features.hooks=false` flag was added after the canary based on pinned source review and the focused regression; that added flag is **not live-turn-tested**.
+
+The external `lanes/run-codex.sh` now invokes this one-turn NAR path for subsequent launches. Existing sessions are untouched. The owner's phone visibility and full provider-bound first-turn input are **unverified**; a connected daemon and thread-list presence do not substitute for the owner's phone observation.
+
+This does not globally replace every Codex start. The Paperclip native backend still accepts an optional transport factory and otherwise starts its own process transport. The codex-local legacy `execute.ts`/ACP paths and `quota.ts` app-server probe are unchanged while Paperclip remains paused. Global enforcement and adoption remain open.
+
+Rollback: restore the c31 runner/spec commit's listed paths from its parent; restore the external launcher with `cp -p /Volumes/NVM/Paperclip/workspaces/platform-lead-outside/lanes/run-codex.sh.before-20261106-c31 /Volumes/NVM/Paperclip/workspaces/platform-lead-outside/lanes/run-codex.sh`. This does not close or delete the completed canary thread.
 
 ## Changelog v0.3 (owner, 2026-11-03)
 
