@@ -4,6 +4,10 @@
 set -eu
 home=/Volumes/NVM/Paperclip/workspaces/platform-lead-outside/context/codex-home
 socket="$home/app-server-control/app-server-control.sock"
+if [ "${CODEX_HOME:-}" != "$home" ]; then
+  echo 'codex shim: CODEX_HOME must name the approved zero home' >&2
+  exit 2
+fi
 if [ "$#" -ne 0 ]; then
   echo 'codex shim: only bare interactive codex is supported; use the approved NAR launcher for other work' >&2
   exit 2
