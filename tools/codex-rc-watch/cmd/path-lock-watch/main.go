@@ -123,6 +123,9 @@ func pass(first map[int]proc, uid, approvedPID int, root string, enforce bool, r
 		if protected(p, first, approvedPID, root) {
 			action = "protected"
 		}
+		if action == "protected" && enforce {
+			continue
+		}
 		ev := event{Time: time.Now().UTC().Format(time.RFC3339Nano), Action: action, Process: p, Ancestors: parents, ParentStatus: status}
 		if action == "would_terminate" && enforce {
 			fresh, err := refresh()
