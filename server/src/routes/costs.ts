@@ -359,12 +359,12 @@ export function costRoutes(
     const series = new Map<string, { provider: string; pool: string; points: Point[]; stride: number; count: number }>();
     let observedAt: string | null = null;
     const addPoint = (provider: string, pool: string, t: string, value: any) => {
-      if (typeof value?.used_pct !== "number" || !Number.isFinite(value.used_pct)) return;
+      if (typeof value?.used_pct !== "number" || !Number.isFinite(value.used_pct) || value.used_pct < 0 || value.used_pct > 100) return;
       const reset = typeof value.reset_at === "string" && Number.isFinite(Date.parse(value.reset_at)) ? value.reset_at : null;
       const key = `${provider}/${pool}`;
       let entry = series.get(key);
       if (!entry) { entry = { provider, pool, points: [], stride: 1, count: 0 }; series.set(key, entry); }
-      if (entry.count++ % entry.stride === 0) entry.points.push({ t, usedPercent: Math.max(0, Math.min(100, value.used_pct)), resetsAt: reset });
+      if (entry.count++ % entry.stride === 0) entry.points.push({ t, usedPercent: value.used_pct, resetsAt: reset });
       if (entry.points.length > 2000) { entry.points = entry.points.filter((_point, index) => index % 2 === 0); entry.stride *= 2; }
     };
     const validTime = (t: unknown) => {
@@ -419,7 +419,7 @@ export function costRoutes(
       const raw = JSON.parse(await readFile(snapshotPath, "utf8")) as Record<string, any>;
       const observedAt = typeof raw.observed_at === "string" ? raw.observed_at : null;
       const ageMs = observedAt ? Date.now() - Date.parse(observedAt) : NaN;
-      const pools: Array<{ provider: string; pool: string; usedPercent: number | null; resetsAt: string | null; state: string; requiredPtsPerHour: number | null; requiredPtsPerDay: number | null }> = [];
+      const pools: Array<{ provider: string; pool: string; usedPercent: number | null; resetsAt: string | null; quality: string | null; state: string; requiredPtsPerHour: number | null; requiredPtsPerDay: number | null }> = [];
       for (const provider of ["antigravity", "codex", "claude"]) {
         const forecasts = raw.providers?.[provider]?.forecasts;
         if (!forecasts || typeof forecasts !== "object") continue;
@@ -429,9 +429,10 @@ export function costRoutes(
           pools.push({
             provider,
             pool,
-            usedPercent: typeof item.used_pct === "number" && Number.isFinite(item.used_pct)
-              ? Math.max(0, Math.min(100, item.used_pct)) : null,
-            resetsAt: typeof item.reset_at === "string" ? item.reset_at : null,
+            usedPercent: typeof item.used_pct === "number" && Number.isFinite(item.used_pct) && item.used_pct >= 0 && item.used_pct <= 100
+              ? item.used_pct : null,
+            resetsAt: typeof item.reset_at === "string" && Number.isFinite(Date.parse(item.reset_at)) ? item.reset_at : null,
+            quality: typeof item.quality === "string" ? item.quality : null,
             state: typeof item.state === "string" ? item.state : "unknown",
             requiredPtsPerHour: typeof item.required_pts_per_hour === "number" && Number.isFinite(item.required_pts_per_hour) ? item.required_pts_per_hour : null,
             requiredPtsPerDay: typeof item.required_pts_per_day === "number" && Number.isFinite(item.required_pts_per_day) ? item.required_pts_per_day : null,
@@ -447,9 +448,10 @@ export function costRoutes(
           pools.push({
             provider: "chatgpt-web",
             pool: "pro:weekly",
-            usedPercent: typeof pro.used_pct === "number" && Number.isFinite(pro.used_pct)
-              ? Math.max(0, Math.min(100, pro.used_pct)) : null,
-            resetsAt: typeof pro.next_reset_latest === "string" ? pro.next_reset_latest : null,
+            usedPercent: typeof pro.used_pct === "number" && Number.isFinite(pro.used_pct) && pro.used_pct >= 0 && pro.used_pct <= 100
+              ? pro.used_pct : null,
+            resetsAt: typeof pro.next_reset_latest === "string" && Number.isFinite(Date.parse(pro.next_reset_latest)) ? pro.next_reset_latest : null,
+            quality: "provider_reported",
             state: typeof pro.state === "string" ? pro.state : "unknown",
             requiredPtsPerHour: null,
             requiredPtsPerDay: null,

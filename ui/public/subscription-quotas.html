@@ -28,7 +28,7 @@ button:disabled{opacity:.65;cursor:wait}
 .metric .value{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
 .metric .detail{font-size:12px;color:#b6bfcb}
 .reset{margin:3px 0 0}
-.available{color:#c6d9c3;font-size:12px;margin:2px 0 0}
+.available{color:#9be6c2;font-size:clamp(21px,3vw,27px);font-weight:750;line-height:1.25;letter-spacing:-.025em;margin:7px 0 3px;font-variant-numeric:tabular-nums}.pool-stale .available{color:#dfc79b}.pool-stale{border-left:3px solid #d7ab6f;padding-left:10px}.quota-warning{color:#f0c78e;font-weight:650;font-size:12px}.quota-old-reset{color:#acb8c7;font-size:12px}
 section:hover{border-color:#505968}
 .meter.unknown{background:repeating-linear-gradient(110deg,#3b4048 0,#3b4048 8px,#252932 8px,#252932 16px)}
 .fill.high{background:#edb879}
@@ -97,9 +97,24 @@ details{margin-top:12px;font-size:12px;color:#b8c5d2}
 summary{cursor:pointer}
 .charts{margin-top:20px;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr));gap:14px}
 .chart-card{min-height:0}.chart-card h3{font-size:15px;margin:0 0 6px}.chart-card p{font-size:12px;margin:3px 0;color:#b8c5d2}
-.chart-card svg{display:block;width:100%;height:auto;margin-top:10px;overflow:visible}.chart-grid{stroke:#55606b;stroke-width:1}.chart-reset{stroke:#efc17a;stroke-width:1;stroke-dasharray:3 3}.chart-line{stroke:#7fa8f9;stroke-width:2;fill:none}.chart-trend{stroke:#c7a8ff;stroke-width:2;fill:none;stroke-dasharray:5 4}.chart-label{fill:#b8c5d2;font-size:10px}
+.chart-card svg{display:block;width:100%;height:auto;margin-top:10px;overflow:visible}.chart-grid{stroke:#55606b;stroke-width:1}.chart-reset{stroke:#efc17a;stroke-width:1.5;stroke-dasharray:3 3}.chart-now{stroke:#f6f9ff;stroke-width:1.5;stroke-dasharray:2 5;opacity:.7}.chart-line{stroke:#7fa8f9;stroke-width:1.8;fill:none}.chart-remaining{stroke:#8fdbb4;stroke-width:3;fill:none}.chart-trend{stroke:#c7a8ff;stroke-width:3;fill:none;stroke-dasharray:7 5}.chart-moving{stroke:#f1bd75;stroke-width:2.5;stroke-dasharray:2 5}.chart-label{fill:#b8c5d2;font-size:11px}.chart-card .chart-status{font-size:14px;color:#dff5e9}.chart-card .chart-warning{color:#ebc598}.chart-card .chart-estimate{color:#d6c1ff}.chart-card .chart-legend{padding-top:6px;border-top:1px solid #38414c}
 @media(prefers-color-scheme:light){:root{color-scheme:light;background:#f4f5f7;color:#20242c}section,.metric,.timeline-entry,.short-windows{background:#fff;border-color:#c8ced7}a{color:#244d91}.wordmark,.intro,.note,.reset,.metric .name,.metric .detail,.chart-card p,footer,details,#status,.credit-note{color:#536071}.poolhead span:first-child,.deadline-name,.deadline-stake{color:#20242c}.available{color:#42623e}.chart-label{fill:#536071}.deadline-entry-disclaimer,.deadline-due,.timeline-legend,.deadline-axis{color:#536071}.deadline-marker{border-color:#fff}}
 @media(max-width:520px){main{padding-top:18px}nav{margin-bottom:23px}.intro{margin-bottom:16px}}
+.short-chart-details{margin:20px 0 26px}.short-chart-details summary{font-size:15px;font-weight:700;color:inherit;cursor:pointer;padding:12px 0}
+.deadline-subsection{margin-top:24px;padding-top:14px;border-top:1px solid #343943}
+.deadline-subsection h3{font-size:16px;font-weight:650;margin:2px 0 12px}
+@media(prefers-color-scheme:light){
+ .chart-card .chart-status{color:#265d41}
+ .chart-card .chart-estimate{color:#62408a}
+ .chart-card .chart-warning{color:#895218}
+ .pool-stale .available{color:#87511c}
+ .pool-stale .quota-warning{color:#96571b}
+ .chart-remaining{stroke:#2b855b}
+ .chart-line{stroke:#2769a8}
+ .chart-trend{stroke:#7a4ca2}
+ .chart-moving{stroke:#a5651d}
+ .deadline-subsection{border-color:#c8ced7}
+}
 </style>
 </head>
 <body>
@@ -107,7 +122,7 @@ summary{cursor:pointer}
 <nav><span class="wordmark">SCOTT'S AGENTS · PAPERCLIP</span><a id="costs-link" href="/SCO/activity/costs?tab=providers">Costs &amp; Providers</a></nav>
 <header>
 <h1>Subscription quotas</h1>
-<p class="intro">Antigravity, ChatGPT / Codex and Claude. Provider allowances, remaining capacity and reset countdowns in Pacific time, separate from API spending.</p>
+<p class="intro">Subscription headroom first. Seven-day reset timeline, observed usage, and clearly labeled estimates across Gemini, Codex and Claude. All times Pacific; separate from API spending.</p>
 <div class="actions">
 <button id="refresh" type="button">Reload snapshot</button>
 <a href="/">Paperclip home</a>
@@ -125,67 +140,230 @@ summary{cursor:pointer}
 </div>
 <div id="deadline-axis" class="deadline-axis" role="img" aria-label="Timeline scale from now to future days"></div>
 <ol id="deadlines" class="timeline" aria-live="polite"></ol>
+<div id="beyond-section" class="deadline-subsection" hidden><h3>Beyond seven days</h3><ol id="beyond-deadlines" class="timeline"></ol></div>
+<div id="uncertain-section" class="deadline-subsection" hidden><h3>Reset time unknown or unverified</h3><ol id="uncertain-deadlines" class="timeline"></ol></div>
 <p id="credit-note" class="credit-note"></p>
 </section>
 <div id="cards" aria-live="polite"></div>
 <section id="short-windows" class="short-windows" aria-label="Five hour and session quota windows"></section>
 <h2>Usage history and projections</h2>
-<p class="note">Usage is sampled over the last 14 days. Dashed lines extend the recent average rate to the next reset; actual usage can change.</p>
+<p class="note">Weekly charts use a seven-day quota cycle when the reset clock is trustworthy, otherwise the trailing seven days. Green shows observed capacity remaining, blue shows used quota. Dashed forecasts are estimates, never observed consumption. Short-window charts use their own cadence.</p>
 <div id="charts" class="charts"></div>
-<footer>Read-only. Quota Sentinel collects a snapshot approximately every 30 minutes; this page reloads it each minute. Reload does not initiate a provider check. Unknown readings are never zero. Pace labels describe recent usage rate, not an obligation to spend. Banked Codex resets are displayed only when reported; redemption is always manual. The reader reports only the next banked-credit expiration, not every credit expiration.</footer>
+<details id="short-chart-details"><summary>Show five-hour and session history</summary><div id="short-charts" class="charts"></div></details>
+<footer>Read-only. Quota Sentinel samples periodically (currently about every three minutes); this page reloads it each minute. Reload does not initiate a provider check. Unknown readings are never zero. Pace labels describe recent usage rate, not an obligation to spend. Banked Codex resets are displayed only when reported; redemption is always manual. The reader reports only the next banked-credit expiration, not every credit expiration.</footer>
 
 </main>
 <script>
 (function(){
 "use strict";
 var labels={antigravity:"Antigravity",codex:"ChatGPT / Codex",claude:"Claude","chatgpt-web":"ChatGPT Web"};
-var pools={"pro:weekly":"Pro power · weekly","3p:5h":"Third-party · 5-hour","3p:weekly":"Third-party · weekly","gemini-argon-wtu:weekly":"Gemini Argon · weekly","gemini:5h":"Gemini · 5-hour","gemini:weekly":"Gemini · weekly",session:"Session",weekly:"Weekly"};
+var pools={"pro:weekly":"Pro power · weekly","3p:5h":"Third-party · 5-hour","3p:weekly":"Third-party · weekly","gemini-argon-wtu:weekly":"Gemini Argon · weekly","gemini:5h":"Gemini / Flash family · 5-hour","gemini:weekly":"Gemini / Flash family · weekly",session:"Session",weekly:"Weekly"};
 // These labels describe the RECENT rate of quota consumption (up to 48h), not
 // whether cumulative weekly usage is ahead of an even-use schedule.
 var paceLabels={behind_pace:"recent rate below goal",ahead_of_pace:"recent rate above goal",on_pace:"recent rate near goal",need_trend:"recent trend unmeasured",reset_imminent_underused:"reset soon, allowance left",exhausted_early:"allowance exhausted early",target_reached:"target reached",reset_due:"reset due",unknown:"usage or reset unknown"};
 var zone=new Intl.DateTimeFormat("en-US",{timeZone:"America/Los_Angeles",month:"short",day:"numeric",year:"numeric",hour:"numeric",minute:"2-digit",timeZoneName:"short"});
-var cards=document.getElementById("cards"), overview=document.getElementById("overview"), deadlines=document.getElementById("deadlines"), axis=document.getElementById("deadline-axis"), shorts=document.getElementById("short-windows"), creditNote=document.getElementById("credit-note"), status=document.getElementById("status"), refresh=document.getElementById("refresh"), costs=document.getElementById("costs-link");
+var cards=document.getElementById("cards"), overview=document.getElementById("overview"), deadlines=document.getElementById("deadlines"), beyondDeadlines=document.getElementById("beyond-deadlines"), uncertainDeadlines=document.getElementById("uncertain-deadlines"), axis=document.getElementById("deadline-axis"), shorts=document.getElementById("short-windows"), creditNote=document.getElementById("credit-note"), status=document.getElementById("status"), refresh=document.getElementById("refresh"), costs=document.getElementById("costs-link");
 var busy=false;
-// Small timestamp changes reflect provider clock rounding rather than a new period.
-function resetBetween(a,b){var ar=Date.parse(a.resetsAt||""),br=Date.parse(b.resetsAt||"");return (Number.isFinite(ar)&&Number.isFinite(br)&&Math.abs(br-ar)>300000)||b.usedPercent<a.usedPercent-10}
-function projection(points,item,now){
- var reset=Date.parse(item.resetsAt||"");
- if(!Number.isFinite(reset)||reset<=now||typeof item.usedPercent!=="number")return null;
- var sorted=points.filter(function(p){return Number.isFinite(Date.parse(p.t))&&typeof p.usedPercent==="number"&&Date.parse(p.t)<=now}).slice().sort(function(a,b){return Date.parse(a.t)-Date.parse(b.t)});
- var start=0;for(var i=1;i<sorted.length;i++)if(resetBetween(sorted[i-1],sorted[i]))start=i;
- var period=sorted.slice(start),windowMs=(isShort(item)?3:24)*3600000,cutoff=now-windowMs;
- var recent=period.filter(function(p){return Date.parse(p.t)>=cutoff});
- if(recent.length<2)return null;
- var first=recent[0],last=recent[recent.length-1],hours=(Date.parse(last.t)-Date.parse(first.t))/3600000;
- if(hours<=0)return null;
- var rate=Math.max(0,(last.usedPercent-first.usedPercent)/hours),projected=item.usedPercent+rate*(reset-now)/3600000;
- var exhaustion=rate>0&&item.usedPercent<100?now+(100-item.usedPercent)/rate*3600000:null;
- return {rate:rate,projected:projected,exhaustion:exhaustion!==null&&exhaustion<=reset?exhaustion:null};
+// Keep measurements and inferred values separate. Never turn a reader fallback into quota.
+function dateMs(value){
+ var valueMs=typeof value==="string"?Date.parse(value):NaN;
+ return Number.isFinite(valueMs)?valueMs:NaN;
 }
-function renderCharts(data,history){
- var target=document.getElementById("charts");target.replaceChildren();
+function validPercent(value){return typeof value==="number"&&Number.isFinite(value)&&value>=0&&value<=100}
+function quotaSpan(item){return isShort(item)?5*3600000:7*86400000}
+function placeholder(item,observed){
+ if(!item||item.provider!=="antigravity"||!String(item.pool||"").startsWith("gemini")||item.usedPercent!==0)return false;
+ var t=dateMs(observed),r=dateMs(item.resetsAt);
+ return Number.isFinite(t)&&Number.isFinite(r)&&Math.abs(r-t-quotaSpan(item))<300000;
+}
+function sameClock(a,b){return Number.isFinite(dateMs(a))&&Number.isFinite(dateMs(b))&&Math.abs(dateMs(a)-dateMs(b))<=300000}
+function movingResetPair(a,b){
+ var ta=dateMs(a.t),tb=dateMs(b.t),ra=dateMs(a.resetsAt),rb=dateMs(b.resetsAt),elapsed=tb-ta;
+ return Number.isFinite(ra)&&Number.isFinite(rb)&&elapsed>=30000&&elapsed<=7200000
+  &&ra>ta+3600000&&Math.abs((rb-ra)-elapsed)<=120000&&rb>ra+30000;
+}
+function trustedHistory(item,history,now){
+ var series=history&&Array.isArray(history.series)?history.series.find(function(s){return s.provider===item.provider&&s.pool===item.pool}):null;
+ var raw=series&&Array.isArray(series.points)?series.points.filter(function(p){
+  return p&&validPercent(p.usedPercent)&&Number.isFinite(dateMs(p.t))&&dateMs(p.t)<=now+60000&&dateMs(p.t)>=now-30*86400000;
+ }).slice().sort(function(a,b){return dateMs(a.t)-dateMs(b.t)}):[];
+ // Three successively advancing reset clocks cannot establish an anchored deadline.
+ var moving=new Set();
+ for(var i=2;i<raw.length;i++){
+  if(movingResetPair(raw[i-2],raw[i-1])&&movingResetPair(raw[i-1],raw[i])){
+   moving.add(i-2);moving.add(i-1);moving.add(i);
+  }
+ }
+ for(var j=3;j<raw.length;j++)if(moving.has(j-1)&&movingResetPair(raw[j-1],raw[j]))moving.add(j);
+ var accepted=[];
+ raw.forEach(function(p,index){
+  if(moving.has(index)||placeholder(Object.assign({},item,p),p.t))return;
+  var earlier=accepted.length?accepted[accepted.length-1]:null;
+  // An abrupt counter drop or moving/reset-changing clock before the due
+  // time is not proof of a fresh quota period. Keep the older measurement.
+  if(earlier&&dateMs(earlier.resetsAt)>dateMs(p.t)+300000){
+   if(validPercent(p.usedPercent)&&earlier.usedPercent-p.usedPercent>10)return;
+   if(Number.isFinite(dateMs(earlier.resetsAt))&&Number.isFinite(dateMs(p.resetsAt))
+      &&!sameClock(earlier.resetsAt,p.resetsAt))return;
+  }
+  accepted.push({t:p.t,usedPercent:p.usedPercent,resetsAt:Number.isFinite(dateMs(p.resetsAt))?p.resetsAt:null});
+ });
+ return accepted;
+}
+function latestClockDrifts(item,history){
+ var series=history&&Array.isArray(history.series)?history.series.find(function(s){return s.provider===item.provider&&s.pool===item.pool}):null;
+ var pts=series&&Array.isArray(series.points)?series.points.filter(function(p){return p&&validPercent(p.usedPercent)&&Number.isFinite(dateMs(p.t))&&Number.isFinite(dateMs(p.resetsAt))}).slice().sort(function(a,b){return dateMs(a.t)-dateMs(b.t)}):[];
+ var n=pts.length;
+ return n>=3&&sameClock(pts[n-1].resetsAt,item.resetsAt)
+  &&movingResetPair(pts[n-3],pts[n-2])&&movingResetPair(pts[n-2],pts[n-1]);
+}
+function recoverReadings(data,history){
+ if(!Array.isArray(data.pools))data.pools=[];
+ // The provider may omit a whole family; retain a clearly unknown entry.
+ ["gemini:weekly","gemini-argon-wtu:weekly"].forEach(function(pool){
+  if(!data.pools.some(function(p){return p&&p.provider==="antigravity"&&p.pool===pool}))
+   data.pools.push({provider:"antigravity",pool:pool,usedPercent:null,resetsAt:null,state:"unknown",quality:"missing"});
+ });
+ var now=Date.now(),observed=dateMs(data.observedAt),stale=!!data.stale||!Number.isFinite(observed)||observed>now+300000||now-observed>3900000;
+ data._trustedSeries={};
+ data.pools=data.pools.map(function(item){
+  var key=item.provider+"/"+item.pool,points=trustedHistory(item,history,now);
+  data._trustedSeries[key]=points;
+  var last=points.length?points[points.length-1]:null;
+  var movingClock=latestClockDrifts(item,history);
+  var invalid=!validPercent(item.usedPercent)||placeholder(item,data.observedAt)||movingClock||
+   item.quality==="moving_zero_unverified"||item.quality==="unverified"||item.quality==="missing";
+  var changed=false;
+  if(!invalid&&last&&Number.isFinite(dateMs(item.resetsAt))&&Number.isFinite(dateMs(last.resetsAt))
+     &&dateMs(last.t)<=observed&&dateMs(last.resetsAt)>observed+300000
+     &&!sameClock(last.resetsAt,item.resetsAt))changed=true;
+  // Stable usage observations with an absent reset remain useful balances.
+  var unverified=invalid||stale||changed;
+  if(unverified){
+   var historical=last&&dateMs(last.t)<=now?last:null;
+   var oldUsed=validPercent(item.usedPercent)?item.usedPercent:null;
+   return Object.assign({},item,{
+    usedPercent:historical?historical.usedPercent:!invalid?oldUsed:null,
+    resetsAt:null,lastReliableResetAt:historical?historical.resetsAt:!invalid?item.resetsAt:null,
+    lastReliableAt:historical?historical.t:!invalid?data.observedAt:null,
+    sourceUncertain:true,readQuality:movingClock?"Reset clock moves with each observation":changed?"Reset clock changed before the earlier deadline":stale?"Snapshot stale":invalid?"Provider reading missing or unverified":"Unverified"
+   });
+  }
+  return Object.assign({},item,{resetsAt:Number.isFinite(dateMs(item.resetsAt))?item.resetsAt:null,
+   lastReliableAt:data.observedAt,sourceUncertain:false,readQuality:"Current snapshot"});
+ });
+ var order={"antigravity/gemini:weekly":0,"antigravity/gemini-argon-wtu:weekly":1,
+  "antigravity/3p:weekly":2,"codex/weekly":3,"claude/weekly":4,
+  "chatgpt-web/pro:weekly":5};
+ data.pools.sort(function(a,b){
+  var ak=a.provider+"/"+a.pool,bk=b.provider+"/"+b.pool;
+  return (order[ak]===undefined?50+(isShort(a)?50:0):order[ak])-(order[bk]===undefined?50+(isShort(b)?50:0):order[bk]);
+ });
+ return data;
+}
+function resetBetween(a,b){
+ var ar=dateMs(a.resetsAt),br=dateMs(b.resetsAt);
+ return Number.isFinite(ar)&&Number.isFinite(br)&&Math.abs(br-ar)>300000||b.usedPercent<a.usedPercent-10;
+}
+function projection(points,item,now){
+ var reset=dateMs(item.resetsAt);
+ if(item.sourceUncertain||!Number.isFinite(reset)||reset<=now||reset-now>quotaSpan(item)
+    ||!validPercent(item.usedPercent))return null;
+ var period=points.filter(function(p){
+  return sameClock(p.resetsAt,item.resetsAt)&&dateMs(p.t)<=now&&dateMs(p.t)>=reset-quotaSpan(item);
+ }).slice().sort(function(a,b){return dateMs(a.t)-dateMs(b.t)});
+ if(period.length<3)return null;
+ var last=period[period.length-1],first=period[0],hours=(dateMs(last.t)-dateMs(first.t))/3600000;
+ if(hours<1.5||now-dateMs(last.t)>4500000||period.some(function(p,i){
+  return i>0&&period[i-1].usedPercent-p.usedPercent>2;
+ }))return null;
+ function estimate(start,end){
+  var span=(dateMs(end.t)-dateMs(start.t))/3600000;
+  var rate=Math.max(0,(end.usedPercent-start.usedPercent)/span);
+  var expected=item.usedPercent+rate*(reset-now)/3600000;
+  return {rate:rate,usedAtReset:expected,remainingAtReset:Math.max(0,100-expected),
+   exhaustion:rate>0&&item.usedPercent<100?now+(100-item.usedPercent)/rate*3600000:null};
+ }
+ var straight=estimate(first,last);
+ if(straight.exhaustion===null||straight.exhaustion>reset)straight.exhaustion=null;
+ var moving=null,recent=period.filter(function(p){return dateMs(p.t)>=dateMs(last.t)-12*3600000});
+ if(!isShort(item)&&recent.length>=8&&(dateMs(recent[recent.length-1].t)-dateMs(recent[0].t))>=10*3600000){
+  moving=estimate(recent[0],recent[recent.length-1]);
+  if(moving.exhaustion===null||moving.exhaustion>reset)moving.exhaustion=null;
+ }
+ return {straight:straight,moving:moving,count:period.length,spanHours:hours};
+}
+function renderCharts(data){
+ var target=document.getElementById("charts"),shortTarget=document.getElementById("short-charts");
+ target.replaceChildren();shortTarget.replaceChildren();
  data.pools.forEach(function(item){
-  var series=history&&Array.isArray(history.series)?history.series.find(function(s){return s.provider===item.provider&&s.pool===item.pool}):null;
-  // Short windows show the last day; weekly windows the full history.
-  var now=Date.now(),from=now-(isShort(item)?24:336)*3600000;
-  var points=series&&Array.isArray(series.points)?series.points.filter(function(p){return Date.parse(p.t)>=from}).sort(function(a,b){return Date.parse(a.t)-Date.parse(b.t)}):[];
-  var forecast=projection(points,item,now),card=el("section","chart-card"),name=(labels[item.provider]||item.provider)+" · "+(pools[item.pool]||item.pool);
-  card.append(el("h3",null,name),el("p",null,"Current: "+usedPct(item.usedPercent)+" used · resets "+when(item.resetsAt)));
-  card.append(el("p",null,forecast?"Projected at reset: "+forecast.projected.toFixed(1)+"% · "+forecast.rate.toFixed(2)+" pts/h"+(forecast.exhaustion?" · exhausts at "+when(new Date(forecast.exhaustion).toISOString()):""):"Projection unavailable: not enough current-period history."));
-  if(!points.length){card.append(el("p",null,"No history available for this pool."));target.append(card);return}
-  var ns="http://www.w3.org/2000/svg",svg=document.createElementNS(ns,"svg"),reset=Date.parse(item.resetsAt||""),start=Date.parse(points[0].t),end=Math.max(now,Number.isFinite(reset)?reset:now),span=Math.max(1,end-start);
-  svg.setAttribute("viewBox","0 0 400 150");svg.setAttribute("role","img");svg.setAttribute("aria-label",name+" usage history, reset markers and projected trend");
-  function x(t){return 30+(t-start)/span*360}function y(v){return 125-Math.max(0,Math.min(100,v))*1.05}
-  function line(x1,y1,x2,y2,cls){var n=document.createElementNS(ns,"line");n.setAttribute("x1",x1);n.setAttribute("y1",y1);n.setAttribute("x2",x2);n.setAttribute("y2",y2);n.setAttribute("class",cls);svg.append(n)}
-  [0,50,100].forEach(function(v){line(30,y(v),390,y(v),"chart-grid");var label=document.createElementNS(ns,"text");label.setAttribute("x","0");label.setAttribute("y",y(v)+3);label.setAttribute("class","chart-label");label.textContent=v+"%";svg.append(label)});
-  var segments=[],segment=[];points.forEach(function(p,i){if(i&&resetBetween(points[i-1],p)){segments.push(segment);segment=[];line(x(Date.parse(p.t)),20,x(Date.parse(p.t)),125,"chart-reset")}segment.push(x(Date.parse(p.t))+","+y(p.usedPercent))});segments.push(segment);
-  segments.forEach(function(s){var n=document.createElementNS(ns,"polyline");n.setAttribute("points",s.join(" "));n.setAttribute("class","chart-line");svg.append(n)});
-  if(Number.isFinite(reset)&&reset>now){line(x(reset),20,x(reset),125,"chart-reset");if(forecast){var tx=x(forecast.exhaustion||reset),ty=y(forecast.exhaustion?100:forecast.projected),tag=document.createElementNS(ns,"text");line(x(now),y(item.usedPercent),tx,ty,"chart-trend");tag.setAttribute("x",tx-3);tag.setAttribute("y",Math.max(12,ty-5));tag.setAttribute("text-anchor","end");tag.setAttribute("class","chart-label");tag.textContent=forecast.exhaustion?"100% before reset":Math.min(100,forecast.projected).toFixed(0)+"% at reset";svg.append(tag)}}
-  var firstLabel=document.createElementNS(ns,"text");firstLabel.setAttribute("x","30");firstLabel.setAttribute("y","145");firstLabel.setAttribute("class","chart-label");firstLabel.textContent=new Date(start).toLocaleDateString();svg.append(firstLabel);
-  var endLabel=document.createElementNS(ns,"text");endLabel.setAttribute("x","390");endLabel.setAttribute("y","145");endLabel.setAttribute("text-anchor","end");endLabel.setAttribute("class","chart-label");endLabel.textContent=Number.isFinite(reset)&&reset>now?"Reset":"Now";svg.append(endLabel);
-  card.append(svg,el("p",null,"Blue: usage · purple dashed: projection · gold: reset"));target.append(card);
+  var destination=isShort(item)?shortTarget:target;
+  var now=Date.now(),name=(labels[item.provider]||item.provider)+" · "+(pools[item.pool]||item.pool);
+  var card=el("section","chart-card"),points=(data._trustedSeries||{})[item.provider+"/"+item.pool]||[];
+  var reset=dateMs(item.resetsAt),duration=quotaSpan(item),anchored=Number.isFinite(reset)&&reset>now&&reset-now<=duration&&!item.sourceUncertain;
+  var from=anchored?reset-duration:now-duration,to=anchored?reset:now;
+  var valid=points.filter(function(p){return dateMs(p.t)>=from&&dateMs(p.t)<=Math.min(now,to)});
+  var forecast=projection(points,item,now),status=item.sourceUncertain?
+   "Historical: "+usedPct(item.usedPercent)+" used · last trustworthy "+(item.lastReliableAt?when(item.lastReliableAt):"Unknown"):
+   "Current: "+usedPct(item.usedPercent)+" used · "+remainingPct(item.usedPercent)+" remaining";
+  card.append(el("h3",null,name),el("p","chart-status",status));
+  card.append(el("p",null,anchored?(isShort(item)?"Five-hour quota cycle to ":"Seven-day quota cycle to ")+when(item.resetsAt):
+   (isShort(item)?"Five-hour observation window":"Trailing seven days")+" · reset "+(item.sourceUncertain?"unverified":"unknown")));
+  if(item.sourceUncertain)card.append(el("p","chart-warning","Current source unavailable or unverified. No projection."));
+  if(forecast){
+   var straight=forecast.straight;
+   card.append(el("p","chart-estimate","Straight-line estimate: "+straight.remainingAtReset.toFixed(1)+"% remaining at reset ("+straight.rate.toFixed(2)+" percentage points/hour used)"+(straight.exhaustion?" · possible exhaustion "+when(new Date(straight.exhaustion).toISOString()):"")));
+   if(forecast.moving)card.append(el("p","chart-estimate","12-hour moving-average estimate: "+forecast.moving.remainingAtReset.toFixed(1)+"% remaining at reset"));
+  }else card.append(el("p","chart-noestimate","Estimate unavailable: insufficient trustworthy same-cycle history or unverified reset."));
+  if(!valid.length){card.append(el("p",null,"No trustworthy observations in this window."));destination.append(card);return}
+  var ns="http://www.w3.org/2000/svg",svg=document.createElementNS(ns,"svg"),span=Math.max(1,to-from);
+  svg.setAttribute("viewBox","0 0 540 186");svg.setAttribute("role","img");
+  svg.setAttribute("aria-label",name+"; observed quota remaining and usage, dashed forecasts are estimates, seven-day window");
+  var title=document.createElementNS(ns,"title");title.textContent=name+" quota trend";svg.append(title);
+  function x(t){return 42+(t-from)/span*484}
+  function y(v){return 144-Math.max(0,Math.min(100,v))*1.18}
+  function line(x1,y1,x2,y2,cls){
+   var n=document.createElementNS(ns,"line");n.setAttribute("x1",x1);n.setAttribute("y1",y1);n.setAttribute("x2",x2);n.setAttribute("y2",y2);n.setAttribute("class",cls);svg.append(n);
+  }
+  [0,50,100].forEach(function(v){
+   line(42,y(v),526,y(v),"chart-grid");
+   var label=document.createElementNS(ns,"text");label.setAttribute("x","2");label.setAttribute("y",y(v)+4);
+   label.setAttribute("class","chart-label");label.textContent=v+"%";svg.append(label);
+  });
+  function polyline(pts,cls){
+   if(!pts.length)return;
+   var n=document.createElementNS(ns,"polyline");n.setAttribute("points",pts.join(" "));n.setAttribute("class",cls);svg.append(n);
+  }
+  var segments=[],part=[];
+  valid.forEach(function(p,i){
+   if(i&&resetBetween(valid[i-1],p)){segments.push(part);part=[];}
+   part.push(p);
+  });segments.push(part);
+  segments.forEach(function(seg){
+   polyline(seg.map(function(p){return x(dateMs(p.t))+","+y(100-p.usedPercent)}),"chart-remaining");
+   polyline(seg.map(function(p){return x(dateMs(p.t))+","+y(p.usedPercent)}),"chart-line");
+  });
+  if(anchored){
+   line(x(now),19,x(now),144,"chart-now");
+   line(x(reset),18,x(reset),144,"chart-reset");
+  }
+  if(forecast){
+   var beginRemaining=100-item.usedPercent;
+   line(x(now),y(beginRemaining),x(reset),y(forecast.straight.remainingAtReset),"chart-trend");
+   if(forecast.moving)line(x(now),y(beginRemaining),x(reset),y(forecast.moving.remainingAtReset),"chart-moving");
+  }
+  function axisLabel(pos,str,anchor){
+   var n=document.createElementNS(ns,"text");n.setAttribute("x",String(pos));n.setAttribute("y","170");
+   n.setAttribute("text-anchor",anchor);n.setAttribute("class","chart-label");n.textContent=str;svg.append(n);
+  }
+  axisLabel(42,new Date(from).toLocaleDateString("en-US",{month:"short",day:"numeric"}),"start");
+  axisLabel(526,anchored?"RESET":"NOW","end");
+  if(anchored&&x(now)>95&&x(now)<475)axisLabel(x(now),"NOW","middle");
+  card.append(svg,el("p","chart-legend","Green solid: remaining observed · Blue solid: used observed"+(forecast?" · Purple dashed: straight-line estimate":"")+(forecast&&forecast.moving?" · Gold dotted: 12h moving-average estimate":"")));
+  destination.append(card);
  });
 }
+
 function when(value){if(typeof value!=="string")return "unknown";var d=new Date(value);return Number.isNaN(d.getTime())?"unknown":zone.format(d)}
 function usedPct(v){return typeof v==="number"&&Number.isFinite(v)?(v>0&&v<0.1?v.toFixed(3):v.toFixed(1))+"%":"Unknown"}
 function remainingPct(v){return typeof v==="number"&&Number.isFinite(v)?(100-v).toFixed(v>0&&v<0.1?3:1)+"%":"Unknown"}
@@ -205,11 +383,7 @@ function eventPosition(at, now, horizon){
 }
 function timeScale(events,now){
  var DAY=86400000;
- var latest=events.reduce(function(value,item){return Math.max(value,item.at-now)},0);
- // Linear, whole-day ticks. Never switch individual events to different scales.
- var days=Math.max(7,Math.ceil(latest/DAY));
- // Keep the scale linear even when a distant promotional credit appears.
- var tickStep=days<=10?1:days<=42?7:Math.ceil(days/8);
+ var days=7,tickStep=1;
  return {horizon:days*DAY,days:days,tickStep:tickStep};
 }
 function renderAxis(scale){
@@ -227,60 +401,57 @@ function renderAxis(scale){
  });
 }
 function buildTimeline(data){
- var now=Date.now(),events=[],observed=Date.parse(data.observedAt||"");
+ var now=Date.now(),events=[],uncertain=[],sevenDays=7*86400000;
+ deadlines.replaceChildren();beyondDeadlines.replaceChildren();uncertainDeadlines.replaceChildren();
  data.pools.filter(function(item){return item&&!isShort(item)}).forEach(function(item){
-  var whenMs=Date.parse(item.resetsAt||"");
-  if(!Number.isFinite(whenMs)||whenMs<=now)return;
-  // Untouched first-use quota clocks drift forward with observation; not deadlines.
-  if(item.provider==="antigravity"&&item.pool==="gemini:weekly"&&item.usedPercent===0&&Number.isFinite(observed)&&Math.abs(whenMs-observed-7*86400000)<300000)return;
-  var left=typeof item.usedPercent==="number"?remainingPct(item.usedPercent)+" allowance unused":"Remaining allowance unknown";
-  events.push({at:whenMs,name:(labels[item.provider]||item.provider)+" · "+(pools[item.pool]||item.pool),
-    stake:left,type:"reset",source:"Account quota observation"});
+  var title=(labels[item.provider]||item.provider)+" · "+(pools[item.pool]||item.pool);
+  var reset=dateMs(item.resetsAt),used=validPercent(item.usedPercent)?item.usedPercent:null;
+  var headroom=used===null?"Remaining allowance Unknown":remainingPct(used)+(item.sourceUncertain?" last observed":" currently reported")+" remaining";
+  if(item.sourceUncertain||!Number.isFinite(reset)||reset<=now){
+   var label=item.sourceUncertain?"Source stale or unavailable":"Reset clock not reported or already elapsed";
+   var prior=item.lastReliableAt?" · observed "+when(item.lastReliableAt):"";
+   var lastReset=item.lastReliableResetAt?" · historical reset reported "+when(item.lastReliableResetAt):"";
+   uncertain.push({name:title,stake:headroom,source:label+prior+lastReset});
+  }else events.push({at:reset,name:title,stake:headroom,type:"reset",source:"Provider-reported clock; observed "+when(data.observedAt)});
  });
  (Array.isArray(data.creditOffers)?data.creditOffers:[]).forEach(function(item){
-  if(!item||item.status==="spent"||item.status==="invalidated"||item.balanceLastReportedUsd===0)return;
-  var at=Date.parse(item.expiresAt||"");
+  if(!item||item.status==="spent"||item.status==="invalidated"||item.status==="exhausted"||item.balanceLastReportedUsd===0)return;
+  var at=dateMs(item.expiresAt);
   if(!Number.isFinite(at)||at<=now)return;
-  var balance=typeof item.balanceLastReportedUsd==="number"?"Up to $"+item.balanceLastReportedUsd.toFixed(2)+" last reported":"Remaining balance unknown";
+  var balance=typeof item.balanceLastReportedUsd==="number"?"Up to $"+item.balanceLastReportedUsd.toFixed(2)+" last reported":"Balance unknown";
   events.push({at:at,name:item.label||"Cloud credits",stake:balance,type:"credit",exclusive:true,
-    source:(item.source||"Unknown source")+"; live balance unverified"});
+   source:(item.source||"Unknown source")+"; live balance unverified"});
  });
- function addManual(deadline,expiry,bank,source){
-  if(Number.isFinite(deadline)&&deadline>now){
-   events.push({at:deadline,name:"Codex · manual redemption deadline",
-     stake:bank&&Number.isInteger(bank.available)?bank.available+" reset(s) source-reported; redeem manually":"Banked count not available in this view",
-     type:"manual",source:source});
-  }
-  if(Number.isFinite(expiry)&&expiry>now){
-   events.push({at:expiry,name:"Codex · next banked reset expiry",
-     stake:bank&&Number.isInteger(bank.available)?bank.available+" reset(s) available in total; only the next expiry is known":"Reset balance unknown; verify in pcq",
-     type:"manual",source:source});
-  }
+ function manual(at,name,stake,source){
+  if(Number.isFinite(at)&&at>now)events.push({at:at,name:name,stake:stake,type:"manual",source:source});
  }
- if(data.bankedReset&&Number.isFinite(Date.parse(data.bankedReset.expiresAt||""))){
-  var b=data.bankedReset,expiry=Date.parse(b.expiresAt),manual=Date.parse(b.redeemNoLaterThan||"");
-  var dispute=data.bankedResetDispute&&b.available!==data.bankedResetDispute.ownerExpected;
-  var origin=dispute?"DISPUTED account count; owner expects "+data.bankedResetDispute.ownerExpected:"Account reader (next expiry only); redemption is never automatic";
-  addManual(manual,expiry,b,origin);
- }else{
-  // Last observed bank deadline, no public balance/count. Fail visibly provisional.
-  addManual(Date.parse("2026-11-06T21:04:58Z"),Date.parse("2026-11-06T23:04:58Z"),null,
-    "Last observed Nov 1; unverified until authenticated API cutover");
+ if(data.bankedReset){
+  var b=data.bankedReset,dispute=data.bankedResetDispute&&b.available!==data.bankedResetDispute.ownerExpected;
+  var stake=Number.isInteger(b.available)?b.available+" reset(s) source-reported":"Banked reset count unknown";
+  var source=dispute?"DISPUTED: source count differs from owner's reported count":"Account reader; redemption not automatic";
+  manual(dateMs(b.redeemNoLaterThan),"Codex · manual redemption deadline",stake,source);
+  manual(dateMs(b.expiresAt),"Codex · next banked reset expiry",stake,source+"; only the next expiry is known");
  }
  events.sort(function(a,b){return a.at-b.at});
- var scale=timeScale(events,now);
- renderAxis(scale);
- events.slice(0,18).forEach(function(item){
-  var position=eventPosition(item.at,now,scale.horizon);
-  var li=el("li","timeline-entry "+item.type);
+ var scale=timeScale(events,now);renderAxis(scale);
+ function simple(container,event,due){
+  var li=el("li","timeline-entry "+(event.type||"reset"));
+  li.append(el("div","deadline-name",event.name),
+   el("div","deadline-stake",event.stake),
+   el("div","deadline-due",due),
+   el("div","deadline-entry-disclaimer",event.source));
+  container.append(li);
+ }
+ var distant=events.filter(function(item){return item.at>now+sevenDays});
+ events.filter(function(item){return item.at<=now+sevenDays}).forEach(function(item){
+  var position=eventPosition(item.at,now,scale.horizon),li=el("li","timeline-entry "+item.type);
   var head=el("div","deadline-head"),name=el("div","deadline-name",item.name);
-  var eta=el("div","deadline-eta",timeLeft(new Date(item.at).toISOString()).replace(" remaining",""));
-  head.append(name,eta);
+  head.append(name,el("div","deadline-eta",timeLeft(new Date(item.at).toISOString()).replace(" remaining","")));
   var track=el("div","deadline-track");
   track.style.setProperty("--tick-step",(100*scale.tickStep/scale.days)+"%");
   track.style.setProperty("--position",position+"%");
   track.setAttribute("role","img");
-  track.setAttribute("aria-label",item.name+" is "+(position.toFixed(1))+"% across the "+scale.days+" day scale; due "+when(new Date(item.at).toISOString()));
+  track.setAttribute("aria-label",item.name+" at "+position.toFixed(1)+"% across seven days; due "+when(new Date(item.at).toISOString()));
   var fill=el("div","deadline-fill"),marker=el("div","deadline-marker");
   fill.style.width=position+"%";marker.style.left=position+"%";
   track.append(fill,marker);
@@ -290,53 +461,77 @@ function buildTimeline(data){
   li.append(head,track,foot,el("div","deadline-entry-disclaimer",item.source));
   deadlines.append(li);
  });
- if(!events.length)deadlines.append(el("li","timeline-empty","No currently known deadlines. Missing account data is not zero."));
+ if(!deadlines.children.length)deadlines.append(el("li","timeline-empty","No verified upcoming deadlines inside seven days. Missing quota data is not zero."));
+ distant.forEach(function(item){simple(beyondDeadlines,item,"Beyond seven days · "+when(new Date(item.at).toISOString()))});
+ uncertain.forEach(function(item){simple(uncertainDeadlines,item,"Reset Unknown / unverified")});
+ document.getElementById("beyond-section").hidden=!distant.length;
+ document.getElementById("uncertain-section").hidden=!uncertain.length;
  var activeCredits=(Array.isArray(data.creditOffers)?data.creditOffers:[]).filter(function(c){return c&&c.status!=="spent"&&c.status!=="invalidated"&&c.balanceLastReportedUsd!==0});
  creditNote.replaceChildren();
  if(activeCredits.length)creditNote.append(el("span",null,"Credit amounts are last-reported and not live-verified."));
 }
 function render(data){
  if(!data||data.source!=="quota-sentinel"||!Array.isArray(data.pools))throw new Error("Quota snapshot has an unexpected format.");
- cards.replaceChildren();overview.replaceChildren();deadlines.replaceChildren();shorts.replaceChildren();
- var known=data.pools.filter(function(p){return p&&typeof p.usedPercent==="number"&&Number.isFinite(p.usedPercent)});
- var unknownCount=data.pools.length-known.length;
- var resets=data.pools.filter(function(p){return p&&!isShort(p)&&p.resetsAt&&Number.isFinite(new Date(p.resetsAt).getTime())&&new Date(p.resetsAt).getTime()>Date.now()}).sort(function(a,b){return new Date(a.resetsAt)-new Date(b.resetsAt)});
- var age=data.observedAt?Math.floor((Date.now()-new Date(data.observedAt).getTime())/60000):null;
+ cards.replaceChildren();overview.replaceChildren();shorts.replaceChildren();
+ var known=data.pools.filter(function(p){return p&&!p.sourceUncertain&&validPercent(p.usedPercent)}),
+     historic=data.pools.filter(function(p){return p&&p.sourceUncertain&&validPercent(p.usedPercent)});
+ var resets=known.filter(function(p){return !isShort(p)&&Number.isFinite(dateMs(p.resetsAt))&&dateMs(p.resetsAt)>Date.now()}).sort(function(a,b){return dateMs(a.resetsAt)-dateMs(b.resetsAt)});
+ var age=Number.isFinite(dateMs(data.observedAt))?Math.floor((Date.now()-dateMs(data.observedAt))/60000):null;
  overview.append(
-   metric("Observed windows",String(known.length),"of "+data.pools.length+" windows have usage readings"),
-   metric("Next known reset",resets.length?timeLeft(resets[0].resetsAt).replace(" remaining",""):"Unknown",resets.length?(labels[resets[0].provider]||resets[0].provider)+" · "+(pools[resets[0].pool]||resets[0].pool):"No reset clock observed"),
-   metric("Snapshot",data.stale?"Stale":age!=null&&age>=0?age+"m old":"Unknown",unknownCount+" windows with unknown usage"),
-   metric("Codex banked resets",data.bankedReset&&Number.isInteger(data.bankedReset.available)?data.bankedResetDispute&&Number.isInteger(data.bankedResetDispute.ownerExpected)&&data.bankedReset.available!==data.bankedResetDispute.ownerExpected?"Disputed":String(data.bankedReset.available):"Unknown",data.bankedReset&&data.bankedReset.expiresAt?"Reader "+data.bankedReset.available+(data.bankedResetDispute?" · owner expects "+data.bankedResetDispute.ownerExpected:"")+" · next expiry "+when(data.bankedReset.expiresAt):"Not reported by current API")
+  metric("Current readings",String(known.length),"of "+data.pools.length+" quota windows are measured"),
+  metric("Next reported reset",resets.length?timeLeft(resets[0].resetsAt).replace(" remaining",""):"Unknown",resets.length?(labels[resets[0].provider]||resets[0].provider)+" · "+(pools[resets[0].pool]||resets[0].pool):"No usable current reset"),
+  metric("Historical only",String(historic.length),data.pools.length-known.length-historic.length+" windows Unknown · "+(age===null?"snapshot age Unknown":age+"m snapshot age")),
+  metric("Codex banked resets",data.bankedReset&&Number.isInteger(data.bankedReset.available)?data.bankedResetDispute&&Number.isInteger(data.bankedResetDispute.ownerExpected)&&data.bankedReset.available!==data.bankedResetDispute.ownerExpected?"Disputed":String(data.bankedReset.available):"Unknown",data.bankedReset&&data.bankedReset.expiresAt?"Next reported expiry "+when(data.bankedReset.expiresAt):"Not reported by current API")
  );
  ["antigravity","codex","claude","chatgpt-web"].forEach(function(provider){
-  var section=el("section"),title=el("h2",null,labels[provider]),subtitle=el("p","note",provider==="antigravity"?"Gemini and third-party allowances":provider==="codex"?"ChatGPT subscription quota":provider==="chatgpt-web"?"Pro power dispatches by the fleet runner; separate weekly reset from Codex":"Claude subscription quota");
+  var section=el("section"),title=el("h2",null,labels[provider]);
+  var subtitle=el("p","note",provider==="antigravity"?"Gemini / Flash is CodexBar's grouped Gemini quota, not a separately verified Flash-only allowance; Argon is tracked independently":provider==="codex"?"ChatGPT subscription quota":provider==="chatgpt-web"?"Pro power dispatches; distinct from Codex":"Claude subscription quota");
   section.append(title,subtitle);
   var found=data.pools.filter(function(v){return v&&v.provider===provider&&!isShort(v)});
-  if(found.length===0)section.append(el("p","reset","Provider reading unavailable."));
+  if(!found.length)section.append(el("p","reset","Provider reading unavailable. Remaining quota Unknown."));
   found.forEach(function(item){
-   var pool=el("div","pool"),head=el("div","poolhead");
-   head.append(el("span",null,pools[item.pool]||item.pool||"Other"),el("strong",null,typeof item.usedPercent==="number"&&Number.isFinite(item.usedPercent)?usedPct(item.usedPercent)+" used":"Unknown"));
-   var meter=el("div","meter"),used=typeof item.usedPercent==="number"&&Number.isFinite(item.usedPercent)?Math.min(100,Math.max(0,item.usedPercent)):null;
-   meter.setAttribute("role","progressbar");meter.setAttribute("aria-label",labels[provider]+" "+(pools[item.pool]||item.pool||"Other"));meter.setAttribute("aria-valuemin","0");meter.setAttribute("aria-valuemax","100");
-   if(used!=null){meter.setAttribute("aria-valuenow",String(used));var fill=el("div","fill");fill.style.width=used+"%";if(used>=90)fill.className+=" high";meter.append(fill)}
-   else{meter.className+=" unknown";meter.setAttribute("aria-valuetext","Usage unknown")}
-   pool.append(head,meter,el("p","available",used==null?"Available allowance: unknown":remainingPct(used)+" remaining"),el("p","reset","Resets "+when(item.resetsAt)+" · "+timeLeft(item.resetsAt)+(item.state?" · "+(paceLabels[item.state]||String(item.state).replaceAll("_"," ")):"")+(typeof item.requiredPtsPerHour==="number"?" · "+item.requiredPtsPerHour.toFixed(1)+" pts/h to target":typeof item.requiredPtsPerDay==="number"?" · "+item.requiredPtsPerDay.toFixed(1)+" pts/day to target":"")));
+   var pool=el("div","pool"+(item.sourceUncertain?" pool-stale":"")),head=el("div","poolhead");
+   var used=validPercent(item.usedPercent)?item.usedPercent:null;
+   head.append(el("span",null,pools[item.pool]||item.pool||"Other"),
+    el("strong",null,used===null?"Unknown":usedPct(used)+" used"+(item.sourceUncertain?" (historical)":"")));
+   var meter=el("div","meter"),available=used===null?null:Math.min(100,Math.max(0,100-used));
+   meter.setAttribute("role","progressbar");meter.setAttribute("aria-label",labels[provider]+" "+(pools[item.pool]||item.pool||"Other")+" remaining quota");
+   meter.setAttribute("aria-valuemin","0");meter.setAttribute("aria-valuemax","100");
+   if(available!==null){
+    meter.setAttribute("aria-valuenow",String(available));
+    var fill=el("div","fill");fill.style.width=available+"%";
+    if(available<=10)fill.className+=" high";
+    meter.append(fill);
+   }else{meter.className+=" unknown";meter.setAttribute("aria-valuetext","Remaining quota unknown")}
+   var availableText=available===null?"Remaining: Unknown":remainingPct(used)+" remaining"+(item.sourceUncertain?" · LAST KNOWN":"");
+   pool.append(head,el("p","available",availableText),meter);
+   if(item.sourceUncertain){
+    pool.append(el("p","quota-warning","STALE / UNAVAILABLE · "+item.readQuality),
+     el("p","reset",item.lastReliableAt?"Last trustworthy reading: "+when(item.lastReliableAt):"No trustworthy historical reading"),
+     el("p","quota-old-reset",item.lastReliableResetAt?"Historical reset reported: "+when(item.lastReliableResetAt)+" · not verified now":"Reset: Unknown / unverified"));
+   }else{
+    pool.append(el("p","reset","Reset: "+(item.resetsAt?when(item.resetsAt)+" · "+timeLeft(item.resetsAt):"Unknown")+
+     (item.state&&item.state!=="unknown"?" · "+(paceLabels[item.state]||String(item.state).replaceAll("_"," ")):"")+
+     (typeof item.requiredPtsPerHour==="number"?" · "+item.requiredPtsPerHour.toFixed(1)+" pts/h to target":typeof item.requiredPtsPerDay==="number"?" · "+item.requiredPtsPerDay.toFixed(1)+" pts/day to target":"")));
+   }
    section.append(pool);
   });
   cards.append(section);
  });
  buildTimeline(data);
  var shortItems=data.pools.filter(isShort);
- shorts.append(el("h2",null,"5-hour and session windows"),el("p","note","Short rolling limits, intentionally separated from weekly deadlines."));
+ shorts.append(el("h2",null,"5-hour and session windows"),el("p","note","Short rolling limits; independent of weekly quota cycles."));
  if(!shortItems.length)shorts.append(el("p","reset","No short-window readings."));
  shortItems.forEach(function(item){
-  var row=el("div","short-row");
+  var row=el("div","short-row"),value=validPercent(item.usedPercent)?remainingPct(item.usedPercent)+" remaining":"Unknown";
   row.append(el("span",null,(labels[item.provider]||item.provider)+" · "+(pools[item.pool]||item.pool)),
-             el("span",null,(typeof item.usedPercent==="number"?usedPct(item.usedPercent)+" used":"Unknown")+" · "+timeLeft(item.resetsAt)));
+   el("span",null,value+(item.sourceUncertain?" · historical "+when(item.lastReliableAt):item.resetsAt?" · "+timeLeft(item.resetsAt):" · reset unknown")));
   shorts.append(row);
  });
- resultText("Quota Sentinel · observed "+when(data.observedAt)+(data.stale?" · STALE reading":" · last recorded snapshot (not a live provider request)"),!!data.stale);
+ var anyUncertain=data.pools.some(function(item){return item.sourceUncertain});
+ resultText("Quota Sentinel · snapshot "+when(data.observedAt)+(data.stale?" · STALE":anyUncertain?" · some provider readings unavailable; historical values labeled":" · provider observations (not a live check)"),!!data.stale||anyUncertain);
 }
+
 async function update(){
  if(busy)return;busy=true;refresh.disabled=true;refresh.textContent="Refreshing…";
  try{
@@ -346,8 +541,8 @@ async function update(){
   if(!company||typeof company.id!=="string")throw new Error("Paperclip company identity unavailable.");
   costs.href="/"+encodeURIComponent(company.issuePrefix||"SCO")+"/activity/costs?tab=providers";
   var data=await json("/api/companies/"+encodeURIComponent(company.id)+"/costs/quota-sentinel");
-  render(data);
-  try{renderCharts(data,await json("/api/companies/"+encodeURIComponent(company.id)+"/costs/quota-sentinel/history"))}catch(_err){renderCharts(data,null)}
+  var history=null;try{history=await json("/api/companies/"+encodeURIComponent(company.id)+"/costs/quota-sentinel/history")}catch(_err){}
+  recoverReadings(data,history);render(data);renderCharts(data);
  }catch(err){
   resultText((err&&err.message)||"Unable to load quota.",true);
   if(!cards.children.length)cards.append(el("section",null,"Quota information cannot be displayed. You may need to sign in to Paperclip first."));
