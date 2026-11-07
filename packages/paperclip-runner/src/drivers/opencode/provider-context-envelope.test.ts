@@ -29,6 +29,8 @@ const FOLLOWUP = "ENVELOPE_ALLOWED_FOLLOWUP_50bb";
 const TOOL_RESULT = "ENVELOPE_ALLOWED_TOOL_RESULT_f823";
 const FIRST_FINAL = "ENVELOPE_FIRST_COMPLETE_9d2a";
 const SECOND_FINAL = "ENVELOPE_SECOND_COMPLETE_6ec4";
+const RESUMED = "ENVELOPE_ALLOWED_RESUMED_f1b8";
+const RESUMED_FINAL = "ENVELOPE_RESUMED_COMPLETE_a28c";
 const FORBIDDEN = ["ENVELOPE_FORBIDDEN_HOME_8ab1", "ENVELOPE_FORBIDDEN_PROJECT_4aa2",
   "ENVELOPE_FORBIDDEN_SKILL_7cc3", "ENVELOPE_FORBIDDEN_CONFIG_2dd4"];
 const ALLOWED_TOOLS: Record<Version, readonly string[]> = {
@@ -55,7 +57,14 @@ async function stopOwnedChild(child: ChildProcess | undefined) {
   try { await exited; } finally { clearTimeout(deadline); }
 }
 
-it.runIf(process.env.PAPERCLIP_OPENCODE_QUALIFY === "1").each<Version>(["v1", "v2"])("captures isolated native OpenCode %s first, tool, and second-turn envelopes", async version => {
+it.runIf(process.env.PAPERCLIP_OPENCODE_QUALIFY === "1").each<Version>(["v1", "v2"])(
+  "captures isolated native OpenCode %s first, tool, and second-turn envelopes",
+  version => qualifyNativeEnvelope(version), 60_000);
+it.runIf(process.env.PAPERCLIP_OPENCODE_QUALIFY === "1")(
+  "captures isolated native OpenCode v2 same-session history after native server restart",
+  () => qualifyNativeEnvelope("v2", true), 60_000);
+
+async function qualifyNativeEnvelope(version: Version, restart = false) {
   const executable = version === "v1" ? resolve("node_modules/opencode-ai/bin/opencode.exe") : "/opt/homebrew/bin/opencode";
   const root = await mkdtemp(join(tmpdir(), "opencode-context-envelope-"));
   const workspace = join(root, "workspace");
@@ -77,6 +86,9 @@ it.runIf(process.env.PAPERCLIP_OPENCODE_QUALIFY === "1").each<Version>(["v1", "v
   let nativeSessionId: string | undefined;
   let nativeVersion: string | undefined;
   let child: ChildProcess | undefined;
+  const children: ChildProcess[] = [];
+  let restartEvidence: { previousPid: number; resumedPid: number; nativeSessionId: string;
+    messageCount: number; beforeSha256: string; afterSha256: string } | undefined;
   let engine: Server | undefined;
   let proxy: Awaited<ReturnType<typeof startOpenCodeProviderProxy>> | undefined;
   try {
@@ -113,14 +125,15 @@ it.runIf(process.env.PAPERCLIP_OPENCODE_QUALIFY === "1").each<Version>(["v1", "v
         const raw = Buffer.concat(chunks).toString("utf8");
         rawRequests.push(raw);
         const data = JSON.parse(raw) as RequestBody;
+        const resumed = data.messages.some(message => message.role === "user" && textOf(message.content).includes(RESUMED));
         const second = data.messages.some(message => message.role === "user" && textOf(message.content).includes(FOLLOWUP));
         const afterTool = data.messages.some(message => message.role === "tool");
         const chunk = (delta: object, finish_reason: string | null) =>
           response.write(`data: ${JSON.stringify({ id: "chatcmpl-envelope-fixture", object: "chat.completion.chunk",
             created: 1, model: "qualification", choices: [{ index: 0, delta, finish_reason }] })}\n\n`);
         response.writeHead(200, { "content-type": "text/event-stream" });
-        if (second || afterTool) {
-          chunk({ role: "assistant", content: second ? SECOND_FINAL : FIRST_FINAL }, null);
+        if (resumed || second || afterTool) {
+          chunk({ role: "assistant", content: resumed ? RESUMED_FINAL : second ? SECOND_FINAL : FIRST_FINAL }, null);
           chunk({}, "stop");
         } else {
           const read = data.tools.find(tool => tool.function.name === "read");
@@ -167,21 +180,25 @@ it.runIf(process.env.PAPERCLIP_OPENCODE_QUALIFY === "1").each<Version>(["v1", "v
     env.PAPERCLIP_PROVIDER_TOKEN = proxy.token;
     if (version === "v2") env.OPENCODE_CONFIG_CONTENT = JSON.stringify(v2config);
 
-    child = spawn(executable, ["serve", "--hostname", "127.0.0.1", "--port", "0"],
-      { cwd: workspace, env, stdio: ["ignore", "pipe", "pipe"], detached: true });
-    let output = "";
-    const origin = await new Promise<string>((resolve, reject) => {
-      const deadline = setTimeout(() => reject(new Error(`OpenCode startup timed out: ${output}`)), 15_000);
-      const observe = (chunk: Buffer) => {
-        output = (output + chunk).slice(-8_192);
-        const url = output.match(/http:\/\/127\.0\.0\.1:\d+/)?.[0];
-        if (url) { clearTimeout(deadline); resolve(url); }
-      };
-      child!.stdout!.on("data", observe);
-      child!.stderr!.on("data", observe);
-      child!.once("error", error => { clearTimeout(deadline); reject(error); });
-      child!.once("exit", (code, signal) => { clearTimeout(deadline); reject(new Error(`OpenCode exited ${code}/${signal}: ${output}`)); });
-    });
+    const startNativeServer = async () => {
+      child = spawn(executable, ["serve", "--hostname", "127.0.0.1", "--port", "0"],
+        { cwd: workspace, env, stdio: ["ignore", "pipe", "pipe"], detached: true });
+      children.push(child);
+      let output = "";
+      return await new Promise<string>((resolve, reject) => {
+        const deadline = setTimeout(() => reject(new Error(`OpenCode startup timed out: ${output}`)), 15_000);
+        const observe = (chunk: Buffer) => {
+          output = (output + chunk).slice(-8_192);
+          const url = output.match(/http:\/\/127\.0\.0\.1:\d+/)?.[0];
+          if (url) { clearTimeout(deadline); resolve(url); }
+        };
+        child!.stdout!.on("data", observe);
+        child!.stderr!.on("data", observe);
+        child!.once("error", error => { clearTimeout(deadline); reject(error); });
+        child!.once("exit", (code, signal) => { clearTimeout(deadline); reject(new Error(`OpenCode exited ${code}/${signal}: ${output}`)); });
+      });
+    };
+    let origin = await startNativeServer();
     const headers = { authorization: `Basic ${Buffer.from(`${version === "v1" ? "paperclip" : "opencode"}:fixture`).toString("base64")}`,
       "content-type": "application/json" };
     const api = async (path: string, init: RequestInit = {}) => {
@@ -217,12 +234,31 @@ it.runIf(process.env.PAPERCLIP_OPENCODE_QUALIFY === "1").each<Version>(["v1", "v
     };
     const firstText = `Issue: a-provider-capture\n\nDescription: ${TASK}\n\nAttachment:\n${ATTACHMENT}\n\nRead fixture.txt.`;
     const secondText = `Follow-up: ${FOLLOWUP}\nUse the already-read fixture result.`;
+    const resumedText = `After native restart: ${RESUMED}\nUse the preserved task, tool result, and completed turns.`;
     await prompt("msg_envelope_first", firstText);
     await waitForFinal(FIRST_FINAL);
     expect(rawRequests).toHaveLength(2);
     await prompt("msg_envelope_second", secondText);
     await waitForFinal(SECOND_FINAL);
     expect(rawRequests).toHaveLength(3);
+    if (restart) {
+      expect(version).toBe("v2");
+      const before = (await (await api(`${prefix}/message`)).json()).data;
+      const previous = child!;
+      await stopOwnedChild(previous);
+      expect(previous.exitCode !== null || previous.signalCode !== null).toBe(true);
+      // Reuse only this fixture's HOME/XDG/config/workspace. No session create
+      // follows the restart: both reads and the new prompt use the original ID.
+      origin = await startNativeServer();
+      expect(child!.pid).not.toBe(previous.pid);
+      const after = (await (await api(`${prefix}/message`)).json()).data;
+      expect(after).toEqual(before);
+      restartEvidence = { previousPid: previous.pid!, resumedPid: child!.pid!, nativeSessionId: session.id,
+        messageCount: before.length, beforeSha256: digest(before), afterSha256: digest(after) };
+      await prompt("msg_envelope_resumed", resumedText);
+      await waitForFinal(RESUMED_FINAL);
+      expect(rawRequests).toHaveLength(4);
+    }
     expect(unexpectedPaths).toEqual([]);
 
     const bodies = rawRequests.map(raw => JSON.parse(raw) as RequestBody);
@@ -264,27 +300,41 @@ it.runIf(process.env.PAPERCLIP_OPENCODE_QUALIFY === "1").each<Version>(["v1", "v
     expect(count(rawRequests[2]!, TOOL_RESULT)).toBe(1);
     expect(count(rawRequests[2]!, FIRST_FINAL)).toBe(1);
     expect(count(rawRequests[2]!, FOLLOWUP)).toBe(1);
+    if (restart) {
+      const resumed = bodies[3]!;
+      // Exact equality covers the original system, task and attachment, read
+      // tool call/result, first assistant response and second user turn.
+      expect(resumed.messages).toEqual([...second,
+        { role: "assistant", content: SECOND_FINAL }, { role: "user", content: resumedText }]);
+      for (const marker of [TOOL_RESULT, FIRST_FINAL, FOLLOWUP, SECOND_FINAL, RESUMED]) {
+        expect(count(rawRequests[3]!, marker), `resumed history duplicated/lost ${marker}`).toBe(1);
+      }
+    }
   } finally {
-    await stopOwnedChild(child);
+    for (const owned of children) await stopOwnedChild(owned);
     await proxy?.close();
     await closeServer(engine);
     await rm(root, { recursive: true, force: true });
     // Optional synthetic wire evidence for review; never includes HTTP headers.
-    const receipts = process.env.PAPERCLIP_OPENCODE_ENVELOPE_RECEIPT_DIR;
+    let receipts = process.env.PAPERCLIP_OPENCODE_ENVELOPE_RECEIPT_DIR;
     if (receipts) {
       await mkdir(receipts, { recursive: true });
+      // Each restart qualification retains its own captures, including failures.
+      if (restart) receipts = await mkdtemp(join(receipts, "v2-restart-"));
       for (const [index, raw] of rawRequests.entries()) await writeFile(join(receipts, `${version}-request-${index + 1}.json`), raw);
       const summary = rawRequests.map((raw, index) => {
         const body = JSON.parse(raw) as RequestBody;
         return { request: index + 1, sha256: digest(raw), roles: body.messages.map(message => message.role),
           tools: body.tools.map(tool => tool.function.name),
           forbidden: [...FORBIDDEN, "<available_skills>", "customize-opencode"].filter(marker => raw.includes(marker)),
-          occurrences: Object.fromEntries([TASK, ATTACHMENT, FOLLOWUP, TOOL_RESULT, FIRST_FINAL].map(marker => [marker, count(raw, marker)])) };
+          occurrences: Object.fromEntries([TASK, ATTACHMENT, FOLLOWUP, TOOL_RESULT, FIRST_FINAL, SECOND_FINAL, RESUMED].map(marker => [marker, count(raw, marker)])) };
       });
-      await writeFile(join(receipts, `${version}-summary.json`), JSON.stringify({ version, nativeVersion, nativeSessionId, requests: summary, unexpectedPaths,
+      await writeFile(join(receipts, `${version}-summary.json`), JSON.stringify({ version, nativeVersion, nativeSessionId, restartEvidence, requests: summary, unexpectedPaths,
         provider: "loopback synthetic SSE; no real inference", configDirectory: "explicit temporary OPENCODE_CONFIG_DIR",
-        cleanup: { nativeProcessExited: child?.exitCode !== null || child?.signalCode !== null, temporaryRootRemoved: true },
+        cleanup: { nativeProcessExited: children.length > 0 && children.every(owned => owned.exitCode !== null || owned.signalCode !== null),
+          nativeProcesses: children.map(owned => ({ pid: owned.pid, exitCode: owned.exitCode, signalCode: owned.signalCode })),
+          temporaryRootRemoved: true },
         retention: "Retain until a-provider-capture acceptance archives the evidence, then remove scratch captures." }, null, 2));
     }
   }
-}, 60_000);
+}
