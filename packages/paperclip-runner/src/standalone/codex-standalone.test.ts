@@ -1,3 +1,5 @@
+// @ts-expect-error JS shared helper
+import { assembleGuidance } from "../../scripts/nar-guidance.mjs";
 import { createServer, type Server } from "node:http";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -152,6 +154,7 @@ describe("standalone NAR Codex entrypoint", () => {
         "--sandbox", "read-only",
         "--timeout-ms", "30000",
         "--name", "  lane   d32  ",
+        "--class", "research", "--compact-limit", "12345", "--compact-prompt-file", "/tmp/compact.txt",
       ]);
     } finally {
       if (previous.apiKey === undefined) delete process.env.PAPERCLIP_API_KEY;
@@ -178,6 +181,10 @@ describe("standalone NAR Codex entrypoint", () => {
     expect(f.messages.find(message => message.method === "thread/name/set")?.params)
       .toMatchObject({ threadId: THREAD, name: "T@H lane d32" });
 
+    const start = f.messages.find(message => message.method === "thread/start")!.params;
+    expect(start.developerInstructions).toBe(assembleGuidance("research"));
+    expect(start.baseInstructions).toBe("");
+    expect(start.config).toMatchObject({ model_auto_compact_token_limit: 12345, experimental_compact_prompt_file: "/tmp/compact.txt", project_doc_max_bytes: 0 });
     const identity = JSON.parse(
       await readFile(join(receiptDir, "identity.json"), "utf8"),
     ) as Record<string, unknown>;
@@ -191,7 +198,7 @@ describe("standalone NAR Codex entrypoint", () => {
     const manifest = journalLines(journal).find(line => line.phase === "manifest");
     expect(manifest).toMatchObject({
       paperclipServer: false,
-      injectedContext: "none",
+      injectedContext: "guidance",
       providerBoundCapture: "unverified",
       prompt: "Only this text.",
       model: "gpt-5-terra",

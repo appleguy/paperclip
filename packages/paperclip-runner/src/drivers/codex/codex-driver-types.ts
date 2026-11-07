@@ -19,6 +19,9 @@ export interface CodexAppServerDriverOptions {
   sharedDaemonSandbox?: "read-only" | "workspace-write" | "danger-full-access";
   /** Shared daemon only: research lanes opt in to live web search; default disabled. */
   sharedDaemonWebSearch?: "disabled" | "live";
+  /** Shared daemon only, new threads: per-thread compaction overrides (the daemon config.toml is shared by every thread). */
+  sharedDaemonDeveloperInstructions?: string;
+  sharedDaemonCompaction?: { autoCompactTokenLimit?: number; compactPromptFile?: string };
   /** Explicit provider model selected by the persisted native execution. */
   model?: string;
   /** Per-run reasoning effort sent with each Codex turn, including resumed turns. */

@@ -1,3 +1,5 @@
+// @ts-expect-error standalone JS helper is shared with the Claude launcher
+import { assembleGuidance } from "../../scripts/nar-guidance.mjs";
 import { randomUUID } from "node:crypto";
 import { appendFileSync, closeSync, fsyncSync, mkdirSync, openSync, writeFileSync } from "node:fs";
 import { realpath, stat } from "node:fs/promises";
@@ -24,7 +26,7 @@ export async function standaloneCodexMain(args: string[]): Promise<void> {
   const { values } = parseArgs({ args, options: {
     "codex-home": { type: "string" }, cwd: { type: "string" }, model: { type: "string" },
     effort: { type: "string" }, prompt: { type: "string" }, sandbox: { type: "string" },
-    "receipt-dir": { type: "string" }, "timeout-ms": { type: "string" }, inspect: { type: "boolean" }, name: { type: "string" }, thread: { type: "string" }, "web-search": { type: "string" },
+    "receipt-dir": { type: "string" }, "timeout-ms": { type: "string" }, inspect: { type: "boolean" }, name: { type: "string" }, thread: { type: "string" }, "web-search": { type: "string" }, class: { type: "string" }, project: { type: "string" }, "compact-limit": { type: "string" }, "compact-prompt-file": { type: "string" },
   } });
   const codexHome = resolve(values["codex-home"] ?? process.env.CODEX_HOME ?? join(homedir(), ".codex"));
   const workspace = await realpath(resolve(values.cwd ?? process.cwd()));
@@ -43,6 +45,10 @@ export async function standaloneCodexMain(args: string[]): Promise<void> {
   if (!values.inspect && (!values.model?.trim() || !values.prompt?.trim() || !values["receipt-dir"]))
     throw new Error("--model, --prompt and --receipt-dir are required");
 
+  const compactLimit = values["compact-limit"] === undefined ? undefined : Number(values["compact-limit"]);
+  if (compactLimit !== undefined && (!Number.isSafeInteger(compactLimit) || compactLimit <= 0)) throw new Error("invalid compaction limit");
+  if (values.thread && (values.class || values.project || compactLimit !== undefined || values["compact-prompt-file"])) throw new Error("guidance and compaction options apply only to new threads");
+  const guidance = !values.inspect && !values.thread ? assembleGuidance(values.class, values.project) as string : undefined;
   const runId = `nar-${randomUUID()}`;
   const receiptDir = values["receipt-dir"] ? resolve(values["receipt-dir"]) : null;
   if (receiptDir && !isAbsolute(receiptDir)) throw new Error("receipt directory must be absolute");
@@ -114,7 +120,7 @@ export async function standaloneCodexMain(args: string[]): Promise<void> {
       return;
     }
     receipt({ phase: "manifest", runId, codexHome, socketPath, socketGeneration: generation, workspace,
-      model, effort, sandbox, webSearch, paperclipServer: false, injectedContext: "none",
+      model, effort, sandbox, webSearch, paperclipServer: false, injectedContext: values.thread ? "resumed" : "guidance",
       providerBoundCapture: "unverified", prompt: values.prompt });
     const driver = new CodexAppServerDriver({
       taskEnvelope: createCodexTaskEnvelope({ objective: "", criteria: [], constraints: [] }),
@@ -122,6 +128,8 @@ export async function standaloneCodexMain(args: string[]): Promise<void> {
       includeCollaborationModeInstructions: false, dynamicTools: [], model, reasoningEffort: effort,
       sharedDaemonSandbox: sandbox as "read-only" | "workspace-write" | "danger-full-access",
       sharedDaemonWebSearch: webSearch,
+      sharedDaemonDeveloperInstructions: guidance,
+      sharedDaemonCompaction: { autoCompactTokenLimit: compactLimit, compactPromptFile: values["compact-prompt-file"] ? resolve(values["compact-prompt-file"]) : undefined },
       approvalPolicy: "never", transportFactory: factory,
       environment: { HOME: homedir(), CODEX_HOME: codexHome, PATH: process.env.PATH, LANG: process.env.LANG },
       capabilities: { goals: false, dynamicTools: false },

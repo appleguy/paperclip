@@ -295,9 +295,10 @@ export class CodexAppServerDriver implements HarnessDriver {
       const threadParams: Record<string, unknown> = this.#options.sharedDaemonSandbox ? {
         cwd: workingDirectory,
         sandbox: this.#options.sharedDaemonSandbox,
-        baseInstructions: "", developerInstructions: "",
+        baseInstructions: "", developerInstructions: this.#options.sharedDaemonDeveloperInstructions ?? "",
         config: { ...createSkilllessCodexThreadConfig(workingDirectory ?? "", this.#options.environment, false),
-          project_doc_max_bytes: 0, web_search: this.#options.sharedDaemonWebSearch ?? "disabled", "features.hooks": false },
+          project_doc_max_bytes: 0, web_search: this.#options.sharedDaemonWebSearch ?? "disabled", "features.hooks": false,
+          ...sharedDaemonCompactionConfig(this.#options.sharedDaemonCompaction) },
       } : createSecuredCodexThreadParams(
         workingDirectory ?? "",
         requestedMode,
@@ -1027,4 +1028,12 @@ export class CodexAppServerDriver implements HarnessDriver {
       completionFeedback: this.#options.completionFeedback,
     });
   }
+}
+
+/** Native Codex keys for a per-thread compaction trigger and summary prompt; omitted keys keep the daemon defaults. */
+export function sharedDaemonCompactionConfig(compaction: { autoCompactTokenLimit?: number; compactPromptFile?: string } | undefined): Record<string, unknown> {
+  return {
+    ...(compaction?.autoCompactTokenLimit !== undefined ? { model_auto_compact_token_limit: compaction.autoCompactTokenLimit } : {}),
+    ...(compaction?.compactPromptFile !== undefined ? { experimental_compact_prompt_file: compaction.compactPromptFile } : {}),
+  };
 }
