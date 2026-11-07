@@ -3,7 +3,12 @@ import { dirname } from "node:path";
 import { parse } from "smol-toml";
 
 /** Config keys a shared-daemon `thread/start.config` may carry; everything else in the launch arguments stays launch-only. */
-const THREAD_CONFIG_KEYS = new Set(["permissions", "shell_environment_policy", "web_search", "mcp_servers"]);
+const THREAD_CONFIG_KEYS = new Set(["permissions", "shell_environment_policy", "web_search", "mcp_servers", "project_doc_max_bytes", "features", "skills"]);
+export const SHARED_ZERO_CONTEXT = Object.freeze({
+  project_doc_max_bytes: 0,
+  features: { apps: false, plugins: false, multi_agent: false, memories: false, skip_host_skill_discovery: true, skill_search: false },
+  skills: { include_instructions: false, bundled: { enabled: false } },
+});
 export const SHARED_MCP_NAME = /^[A-Za-z0-9_-]{1,128}$/;
 /** A trailing "!" in PAPERCLIP_CODEX_SHARED_DISABLE_MCP marks a server the daemon only accepts overriding with a stub command. */
 export const SHARED_MCP_STUB_COMMAND = "/usr/bin/false";
@@ -60,6 +65,15 @@ const SHELL_POLICY_KEYS = new Set(["inherit", "ignore_default_excludes", "includ
 export function sharedThreadConfigViolation(config: unknown, policy: { cwd: string; readOnly: boolean; disableWebSearch: boolean }): string | null {
   if (!isRecord(config)) return "config_missing";
   if (Object.keys(config).some((key) => !THREAD_CONFIG_KEYS.has(key))) return "config_key_unknown";
+  const hasZeroConfig = ["project_doc_max_bytes", "features", "skills"].some((key) => Object.hasOwn(config, key));
+  if (hasZeroConfig) {
+    const features = config.features, skills = config.skills;
+    if (config.project_doc_max_bytes !== 0 || !isRecord(features) ||
+        Object.keys(features).length !== Object.keys(SHARED_ZERO_CONTEXT.features).length ||
+        Object.entries(SHARED_ZERO_CONTEXT.features).some(([key, value]) => features[key] !== value) ||
+        !isRecord(skills) || Object.keys(skills).length !== 2 || skills.include_instructions !== false ||
+        !isRecord(skills.bundled) || Object.keys(skills.bundled).length !== 1 || skills.bundled.enabled !== false) return "zero_context_invalid";
+  }
   if (config.mcp_servers !== undefined && (!isRecord(config.mcp_servers) || Object.keys(config.mcp_servers).length > 256 || Object.entries(config.mcp_servers).some(([name, entry]) => !SHARED_MCP_NAME.test(name) || !isRecord(entry) || !(Object.keys(entry).length === 1 && entry.enabled === false || Object.keys(entry).length === 2 && entry.enabled === false && entry.command === SHARED_MCP_STUB_COMMAND)))) return "mcp_servers_invalid";
   if (config.web_search !== undefined && config.web_search !== "disabled") return "web_search_widened";
   if (policy.disableWebSearch && config.web_search !== "disabled") return "web_search_not_disabled";

@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
 import { createRunnerdCodexAppServerArgs, trustedRuntimeReadOnlyRoots } from "./runner-provider-launch.js";
-import { SHARED_MCP_STUB_COMMAND, parseSharedDisabledMcp, sharedDaemonExecutableReadRoots, sharedThreadConfigFromArgs, sharedThreadConfigViolation } from "./shared-codex-thread-config.js";
+import { SHARED_MCP_STUB_COMMAND, SHARED_ZERO_CONTEXT, parseSharedDisabledMcp, sharedDaemonExecutableReadRoots, sharedThreadConfigFromArgs, sharedThreadConfigViolation } from "./shared-codex-thread-config.js";
 
 export type SharedCodexThreadConfigPolicy = Readonly<{
   /** Execution workspace; the only writable root of the writable profile. */
@@ -20,6 +20,8 @@ export type SharedCodexThreadConfigPolicy = Readonly<{
   instructionWorkingCopyRoot?: string;
   runtimeReadRoots?: readonly string[];
   disabledMcp?: string;
+  /** Suppresses selected ambient sources; this alone does not establish a clean first turn. */
+  suppressAmbientContext?: boolean;
 }>;
 
 /**
@@ -45,6 +47,7 @@ export function createSharedCodexThreadConfig(policy: SharedCodexThreadConfigPol
     ],
   }))));
   if (policy.agentHome) config.shell_environment_policy.set.AGENT_HOME = policy.agentHome;
+  if (policy.suppressAmbientContext) Object.assign(config, structuredClone(SHARED_ZERO_CONTEXT));
   const disabledMcp = parseSharedDisabledMcp(policy.disabledMcp);
   if (disabledMcp.length) config.mcp_servers = Object.fromEntries(disabledMcp.map((name) => name.endsWith("!") ? [name.slice(0, -1), { enabled: false, command: SHARED_MCP_STUB_COMMAND }] : [name, { enabled: false }]));
   // The launch environment flag would also switch the shell policy to inherit everything, so the admitted network setting is

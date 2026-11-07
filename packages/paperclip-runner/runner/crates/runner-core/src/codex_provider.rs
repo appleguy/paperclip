@@ -499,7 +499,11 @@ impl SharedDaemonWriter {
         };
         if config
             .keys()
-            .any(|k| k != "permissions" && k != "web_search" && k != "shell_environment_policy" && k != "mcp_servers")
+            .any(|k| !matches!(k.as_str(), "permissions" | "web_search" | "shell_environment_policy" | "mcp_servers" | "project_doc_max_bytes" | "features" | "skills"))
+            || (["project_doc_max_bytes", "features", "skills"].iter().any(|key| config.contains_key(*key))
+                && (config.get("project_doc_max_bytes") != Some(&json!(0))
+                    || config.get("features") != Some(&json!({"apps":false,"plugins":false,"multi_agent":false,"memories":false,"skip_host_skill_discovery":true,"skill_search":false}))
+                    || config.get("skills") != Some(&json!({"include_instructions":false,"bundled":{"enabled":false}}))))
             || config.get("mcp_servers").is_some_and(|v| !v.as_object().is_some_and(|servers| servers.len() <= 256 && servers.iter().all(|(name, entry)| {
                 !name.is_empty() && name.len() <= 128 && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
                     && entry.as_object().is_some_and(|entry| entry.get("enabled") == Some(&json!(false)) && (entry.len() == 1 || entry.len() == 2 && entry.get("command") == Some(&json!("/usr/bin/false"))))
@@ -5129,6 +5133,16 @@ mod tests {
             SHARED_READ_ONLY_PROFILE: {"filesystem":{":root":"none",":minimal":"read",":tmpdir":"none",":workspace_roots":{".":"read"}},"network":{"enabled":false}}
         }, "web_search":"disabled", "shell_environment_policy": {"inherit":"none","ignore_default_excludes":false,"include_only":["PATH"],"set":{"PATH":"/usr/bin:/bin"}}});
         assert!(make(config.clone()).thread_config_valid("/workspace", false));
+        let mut zero = config.clone();
+        zero["project_doc_max_bytes"] = json!(0);
+        zero["features"] = json!({"apps":false,"plugins":false,"multi_agent":false,"memories":false,"skip_host_skill_discovery":true,"skill_search":false});
+        zero["skills"] = json!({"include_instructions":false,"bundled":{"enabled":false}});
+        assert!(make(zero.clone()).thread_config_valid("/workspace", false));
+        let mut incomplete_zero = zero.clone();
+        incomplete_zero.as_object_mut().unwrap().remove("skills");
+        assert!(!make(incomplete_zero).thread_config_valid("/workspace", false));
+        zero["features"]["multi_agent"] = json!(true);
+        assert!(!make(zero).thread_config_valid("/workspace", false));
         let mut with_mcp = config.clone();
         with_mcp["mcp_servers"] = json!({"fixture-server": {"enabled": false}});
         assert!(make(with_mcp.clone()).thread_config_valid("/workspace", false));
