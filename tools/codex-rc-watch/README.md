@@ -160,3 +160,72 @@ Live disabled recovery is **unverified**: no live daemon was disabled or
 restarted to manufacture a failure, and this implementation agent never sent
 a live enable request. Thread-list/phone visibility proof belongs to the
 coordinator's NAR verification; this checker does not query or expose threads.
+
+## c34 Codex path lock (best effort)
+
+The lead accepted the same-user bypasses and races: this is not an exec security
+boundary. The PATH shim only permits a zero-home interactive attach; the linked
+Homebrew cask binary and selected `~/.codex/packages/**/bin/codex` files have
+execute bits removed. The approved copy is directly executable and can itself
+be bypassed. A 500 ms polling watcher logs newly observed Codex processes and
+available ancestor chains, and SIGTERMs identified unapproved app-servers.
+It misses fast, renamed and otherwise unidentifiable launches and cannot recover
+an ancestor which exited before the snapshot. It does not interrupt turns.
+
+Installed user LaunchAgents: `local.scott.codex-path-lock` (watcher),
+`local.scott.codex-path-lock-files` (package modes), and
+`local.scott.codex-path-lock-brew` (Homebrew reapply). Logs and inode-checked
+journals are under `/Volumes/NVM/Paperclip/workspaces/platform-lead-outside/lanes/c34-codex-path-lock`.
+To roll back, stop all three first, then restore recorded modes and the shim:
+
+```sh
+launchctl bootout gui/501/local.scott.codex-path-lock
+launchctl bootout gui/501/local.scott.codex-path-lock-files
+launchctl bootout gui/501/local.scott.codex-path-lock-brew
+cd /Volumes/NVM/Paperclip/master/tools/codex-rc-watch
+L=/Volumes/NVM/Paperclip/workspaces/platform-lead-outside/lanes/c34-codex-path-lock
+go run ./cmd/path-lock-files --restore --journal "$L/brew-modes.jsonl"
+go run ./cmd/path-lock-files --restore --journal "$L/package-auto-modes.jsonl"
+go run ./cmd/path-lock-files --restore --journal "$L/package-modes.jsonl"
+cp -p codex-shim.sh.before-20261106-c34 codex-shim.sh
+```
+
+Restore stops on missing or changed inodes: inspect the journal and current
+files, do not force a restore onto a different file. Preserve all backups. A
+previous c33 LaunchAgent (`local.scott.codex-rc-watch`) is separate; do not
+stop it as part of this rollback.
+
+### Maintenance-window real cask test (not yet run)
+
+Only after an explicit maintenance window and with active work protected:
+record `brew list --cask --versions codex`, `readlink /opt/homebrew/bin/codex`,
+and `stat` of its target, the approved copy version, and A PID/version. Stop
+only the brew reapply agent, and restore its original mode using the exact
+inode-checked brew journal command above; **stop on an inode mismatch** and
+inspect rather than forcing. Then run `brew reinstall --cask codex` (or, when
+actually outdated, `brew upgrade --cask codex`), retaining its output and
+exit status. Cask completion generation may need the executable during this
+operation; the guard's brew detection and relink checks have races.
+
+After brew finishes, record the new link, target mode and version. Bootstrap
+`~/Library/LaunchAgents/local.scott.codex-path-lock-brew.plist` in `gui/501`,
+wait at least 10 seconds, inspect `brew-errors.log` and `brew-modes.jsonl`,
+then verify the direct Homebrew path returns permission denied and the approved
+copy reports the new version. Verify A is still running and no unapproved
+app-server remains. If brew or reapply fails, boot out the brew agent and
+restore the current target's recorded pre-lock mode only after checking its
+current device/inode against its journal entry; old journal entries may refer
+to replaced cask files, so the bulk restore can stop before reaching the new
+entry. Preserve logs and report failure. To abandon the test entirely, use the
+full rollback above, resolving replaced inodes manually first.
+
+### Manual A repin after an upgrade
+
+Do **not** automatically restart, update, repin or interrupt A or its threads.
+During a separately authorized maintenance window, with all work checkpointed
+and an explicit decision that interruption is acceptable, the operator can
+review `codex-approved-c34 app-server daemon update --help` and run
+`CODEX_HOME=/Volumes/NVM/Paperclip/workspaces/platform-lead-outside/context/codex-home /Volumes/NVM/AI_Agent_Runtime/bin/codex-approved-c34 app-server daemon update --from-cli`
+using the reviewed Homebrew-derived approved copy. This may interrupt work;
+verify A's version and remote-control status afterwards. No such update or
+restart was performed by c34.

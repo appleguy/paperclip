@@ -46,3 +46,24 @@ func TestParse(t *testing.T) {
 		t.Fatalf("%+v", p)
 	}
 }
+
+func TestObserveNewRedactedAndDeduplicated(t *testing.T) {
+	p := proc{11, 10, 501, "a", "/tmp/codex", []string{"secret"}}
+	m := map[int]proc{10: {PID: 10, PPID: 1, Executable: "/bin/launcher"}, 1: {PID: 1}, 11: p}
+	var b bytes.Buffer
+	seen, err := observeNew(m, 501, nil, json.NewEncoder(&b))
+	if err != nil || !strings.Contains(b.String(), "observed_codex") || !strings.Contains(b.String(), "/bin/launcher") || strings.Contains(b.String(), "secret") {
+		t.Fatal(err, b.String())
+	}
+	b.Reset()
+	_, err = observeNew(m, 501, seen, json.NewEncoder(&b))
+	if err != nil || b.Len() != 0 {
+		t.Fatal(err, b.String())
+	}
+	p.Start = "b"
+	m[11] = p
+	_, err = observeNew(m, 501, seen, json.NewEncoder(&b))
+	if err != nil || !strings.Contains(b.String(), "observed_codex") {
+		t.Fatal(err, b.String())
+	}
+}

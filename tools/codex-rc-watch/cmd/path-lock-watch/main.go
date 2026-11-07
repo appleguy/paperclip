@@ -135,6 +135,30 @@ func pass(first map[int]proc, uid, approvedPID int, root string, enforce bool, r
 	}
 	return nil
 }
+
+// observeNew records each newly observed Codex process and its current ancestry.
+// Arguments are never serialized; very short-lived or reparented processes can
+// still be missed. The bounded seen set is replaced on each snapshot.
+func observeNew(m map[int]proc, uid int, seen map[int]proc, out *json.Encoder) (map[int]proc, error) {
+	next := map[int]proc{}
+	for _, p := range m {
+		name := filepath.Base(p.Executable)
+		if p.UID != uid || (name != "codex" && name != "codex-approved-c34") {
+			continue
+		}
+		next[p.PID] = p
+		if old, ok := seen[p.PID]; ok && same(old, p) {
+			continue
+		}
+		parents, status := chain(p, m)
+		ev := event{Time: time.Now().UTC().Format(time.RFC3339Nano), Action: "observed_codex", Process: p, Ancestors: parents, ParentStatus: status}
+		if err := out.Encode(ev); err != nil {
+			return nil, err
+		}
+	}
+	return next, nil
+}
+
 func run() error {
 	pid := flag.Int("approved-pid", 0, "protected daemon PID")
 	root := flag.String("approved-root", "", "protected daemon home")
@@ -146,9 +170,13 @@ func run() error {
 		return errors.New("approved-pid, absolute non-root approved-root and interval >=250ms required")
 	}
 	enc := json.NewEncoder(os.Stdout)
+	seen := map[int]proc{}
 	for {
 		m, e := snapshot()
 		if e != nil {
+			return e
+		}
+		if seen, e = observeNew(m, os.Getuid(), seen, enc); e != nil {
 			return e
 		}
 		if e = pass(m, os.Getuid(), *pid, *root, *enforce, snapshot, func(pid int) error { return syscall.Kill(pid, syscall.SIGTERM) }, enc); e != nil {
