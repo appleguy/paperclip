@@ -88,46 +88,104 @@ describe("OpenCode host recovery", () => {
 
 describeEmbeddedPostgres("OpenCode host recovery lease transaction", () => {
   const ctx = useEmbeddedPostgres("paperclip-opencode-recovery-");
-  it("retains a reservation when native ownership changes after the send check", async () => {
+  it.each(["takeover_before_send", "takeover_during_receipt", "lost_ack", "response_timeout", "attestation_timeout", "lease_margin"] as const)(
+    "fences managed prompt delivery: %s", async scenario => {
     const companyId = randomUUID(), projectId = randomUUID(), issueId = randomUUID(), agentId = randomUUID(), runId = randomUUID(), taskSessionId = randomUUID(), normalizedSessionId = randomUUID(), runnerInstanceId = randomUUID();
     const b: OpenCodeSharedBinding = { ...binding, companyId, projectId, issueId, agentId, runId, taskSessionId, normalizedSessionId, runnerInstanceId };
-    await ctx.db.insert(companies).values({ id: companyId, name: "Recovery", issuePrefix: "OCRR" });
+    await ctx.db.insert(companies).values({ id: companyId, name: "Recovery", issuePrefix: "OCRR" + companyId.replaceAll("-", "") });
     await ctx.db.insert(agents).values({ id: agentId, companyId, name: "Agent", role: "engineer", adapterType: "paperclip_runner" });
     await ctx.db.insert(projects).values({ id: projectId, companyId, name: "Project" });
     await ctx.db.insert(issues).values({ id: issueId, companyId, projectId, title: "Issue" });
     await ctx.db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, nativeIssueId: issueId, nativeSessionId: normalizedSessionId, runnerInstanceId, status: "running", runtimeMode: "native" });
     await ctx.db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
     await ctx.db.insert(agentTaskSessions).values({ id: taskSessionId, companyId, agentId, adapterType: "paperclip_runner", taskKey: "task", lastRunId: runId, sessionParamsJson: { opencodeSharedV2: { ...b, cursor: null } } });
-    await ctx.db.insert(nativeRunFinalizations).values({ runId, companyId, issueId, phase: "running", leaseOwner: b.leaseOwner, attempt: b.leaseAttempt, leaseExpiresAt: new Date(Date.now() + 60_000), controllerBootId: b.controllerBootId, controllerPid: b.controllerPid, controllerProcessStartedAt: b.controllerProcessStartedAt, controllerGeneration: b.controllerGeneration });
-    let posts = 0;
+    await ctx.db.insert(nativeRunFinalizations).values({ runId, companyId, issueId, phase: "running", leaseOwner: b.leaseOwner, attempt: b.leaseAttempt, leaseExpiresAt: new Date(Date.now() + (scenario === "lease_margin" ? 2_000 : 60_000)), controllerBootId: b.controllerBootId, controllerPid: b.controllerPid, controllerProcessStartedAt: b.controllerProcessStartedAt, controllerGeneration: b.controllerGeneration });
+    const latch = () => { let resolve!: () => void; const promise = new Promise<void>(done => { resolve = done; }); return { promise, resolve }; };
+    const postSeen = latch(), receiptBody = latch(), attestSeen = latch(), lateAttestation = latch();
+    let posts = 0, fetches = 0, attestations = 0;
+    let dispatched: Promise<{ value?: unknown; error?: unknown }> | undefined;
     const messageIds: string[] = [];
     const server = createServer((req, res) => {
       if (req.method !== "POST") { res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ data: { id: b.providerSessionId } })); return; }
       posts++;
-      let body = ""; req.on("data", chunk => { body += chunk; }); req.on("end", () => { const parsed = JSON.parse(body); messageIds.push(parsed.id); res.setHeader("content-type", "application/json"); res.end(JSON.stringify({ data: { id: parsed.id, sessionID: b.providerSessionId, type: "user" } })); });
+      let body = "";
+      req.on("data", chunk => { body += chunk; });
+      req.on("end", () => {
+        const parsed = JSON.parse(body);
+        messageIds.push(parsed.id);
+        if (scenario === "lost_ack") { req.socket.destroy(); postSeen.resolve(); return; }
+        res.setHeader("content-type", "application/json");
+        const receipt = JSON.stringify({ id: parsed.id, sessionID: b.providerSessionId, type: "user" });
+        if (scenario === "takeover_during_receipt" || scenario === "response_timeout") {
+          // The headers and partial body arrive, but there is no usable ACK yet.
+          res.write('{"data":');
+          postSeen.resolve();
+          void receiptBody.promise.then(() => { if (!res.destroyed) res.end(receipt + "}"); });
+        } else { res.end(`{"data":${receipt}}`); postSeen.resolve(); }
+      });
     });
     await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
     try {
       const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-      const controlledFetch: typeof fetch = async (resource, init) => {
-        if (init?.method === "POST") {
-          await ctx.db.update(nativeRunFinalizations).set({ leaseOwner: "successor" }).where(eq(nativeRunFinalizations.runId, runId));
-        }
-        return fetch(resource, init);
-      };
-      const managed = createOpenCodeManagedMutation(ctx.db, { binding: b, fetch: controlledFetch, admission: { baseUrl, authorization: "Basic fixture", attest: async () => {} } });
-      await expect(managed.dispatch({ id: "msg_race", text: "fixture" })).rejects.toThrow("lease_lost");
-      // Known gap: send already passed its transaction before the successor took ownership.
-      expect(posts).toBe(1);
-      const [lease] = await ctx.db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId));
+      const controlledFetch: typeof fetch = async (resource, init) => { fetches++; return fetch(resource, init); };
+      const managed = createOpenCodeManagedMutation(ctx.db, { binding: b, fetch: controlledFetch, deliveryTimeoutMs: 500,
+        admission: { baseUrl, authorization: "Basic fixture", async attest() {
+          attestations++;
+          if (scenario === "takeover_before_send" && attestations === 2)
+            await ctx.db.update(nativeRunFinalizations).set({ leaseOwner: "successor" }).where(eq(nativeRunFinalizations.runId, runId));
+          if (scenario === "attestation_timeout" && attestations === 3) {
+            attestSeen.resolve();
+            await lateAttestation.promise;
+          }
+        } },
+      });
+      dispatched = managed.dispatch({ id: "msg_race", text: "fixture" }).then(value => ({ value }), error => ({ error }));
+      if (scenario === "takeover_during_receipt" || scenario === "response_timeout" || scenario === "attestation_timeout") {
+        await (scenario === "attestation_timeout" ? attestSeen.promise : postSeen.promise);
+        const takeoverError = await ctx.db.transaction(async tx => {
+          await tx.execute(sql`set local lock_timeout = '100ms'`);
+          await tx.update(nativeRunFinalizations).set({ leaseOwner: "successor" }).where(eq(nativeRunFinalizations.runId, runId));
+        }).then(() => null, error => error);
+        expect(takeoverError?.cause?.code ?? takeoverError?.code).toBe("55P03");
+        const [owned] = await ctx.db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId));
+        expect(owned.leaseOwner).toBe(b.leaseOwner);
+        if (scenario === "takeover_during_receipt") receiptBody.resolve();
+      }
+      const outcome = await dispatched;
+      if (scenario === "takeover_during_receipt") {
+        expect(outcome).toEqual({ value: { delivery: "acknowledged", taskCompletion: "unproven" } });
+      } else {
+        expect(outcome.error).toBeInstanceOf(Error);
+        if (scenario === "takeover_before_send") expect(String(outcome.error)).toContain("lease_lost");
+        if (scenario === "lease_margin") expect(String(outcome.error)).toContain("lease_margin_insufficient");
+        if (scenario === "attestation_timeout") expect(String(outcome.error)).toContain("delivery_timeout");
+      }
+      const expectedPosts = ["takeover_before_send", "attestation_timeout", "lease_margin"].includes(scenario) ? 0 : 1;
+      expect(posts).toBe(expectedPosts);
       const [session] = await ctx.db.select().from(agentTaskSessions).where(eq(agentTaskSessions.id, taskSessionId));
-      expect(lease.leaseOwner).toBe("successor");
-      expect(session.sessionParamsJson).toMatchObject({ opencodeSharedV2: { mutations: [{ id: "msg_race", state: "reserved" }] } });
-      const successor = createOpenCodeManagedMutation(ctx.db, { binding: { ...b, leaseOwner: "successor" }, admission: { baseUrl, authorization: "Basic fixture", attest: async () => {} } });
-      await expect(successor.dispatch({ id: "msg_next", text: "fixture" })).rejects.toThrow("outcome_unknown");
-      expect(posts).toBe(1);
-      expect(messageIds).toEqual(["msg_race"]);
-    } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+      expect(session.sessionParamsJson).toMatchObject({ opencodeSharedV2: { mutations: [{ id: "msg_race",
+        state: scenario === "takeover_during_receipt" ? "acknowledged" : "reserved" }] } });
+      // Transfer is possible only after delivery/abort settled and locks released.
+      await ctx.db.update(nativeRunFinalizations).set({ leaseOwner: "successor" }).where(eq(nativeRunFinalizations.runId, runId));
+      if (scenario === "attestation_timeout") {
+        lateAttestation.resolve();
+        await new Promise<void>(resolve => setImmediate(resolve));
+        expect(fetches).toBe(0);
+        expect(posts).toBe(0);
+      }
+      const successor = createOpenCodeManagedMutation(ctx.db, { binding: { ...b, leaseOwner: "successor" },
+        admission: { baseUrl, authorization: "Basic fixture", attest: async () => {} } });
+      await expect(successor.dispatch({ id: scenario === "takeover_during_receipt" ? "msg_race" : "msg_next", text: "fixture" }))
+        .rejects.toThrow(scenario === "takeover_during_receipt" ? "already_recorded" : "outcome_unknown");
+      expect(posts).toBe(expectedPosts);
+      expect(messageIds).toEqual(expectedPosts ? ["msg_race"] : []);
+    } finally {
+      receiptBody.resolve();
+      lateAttestation.resolve();
+      server.closeAllConnections();
+      await dispatched;
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
   });
   it("persists under the real exact lease and rejects a stale lease after recovery", async () => {
     const companyId = randomUUID(), projectId = randomUUID(), issueId = randomUUID(), agentId = randomUUID(), runId = randomUUID(), taskSessionId = randomUUID(), normalizedSessionId = randomUUID(), runnerInstanceId = randomUUID();
