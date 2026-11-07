@@ -12,11 +12,19 @@ import type { HarnessSession } from "../contracts/harness-driver.js";
 const object = (value: unknown): Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 
+// Readable thread title: compact model@effort tag (T@H = Terra@High) leads, mirroring server model-effort-name.ts.
+export function modelEffortTag(model: string, effort: string): string {
+  const family = [[/\bsol\b/i, "S"], [/\bterra\b/i, "T"], [/\bluna\b/i, "L"], [/\bastra\b/i, "A"]]
+    .find(([pattern]) => (pattern as RegExp).test(model))?.[1] ?? "";
+  const level = ({ low: "L", medium: "M", high: "H", xhigh: "X", max: "Mx" } as Record<string, string>)[effort.toLowerCase()] ?? "";
+  return family && level ? `${family}@${level}` : family || level;
+}
+
 export async function standaloneCodexMain(args: string[]): Promise<void> {
   const { values } = parseArgs({ args, options: {
     "codex-home": { type: "string" }, cwd: { type: "string" }, model: { type: "string" },
     effort: { type: "string" }, prompt: { type: "string" }, sandbox: { type: "string" },
-    "receipt-dir": { type: "string" }, "timeout-ms": { type: "string" }, inspect: { type: "boolean" },
+    "receipt-dir": { type: "string" }, "timeout-ms": { type: "string" }, inspect: { type: "boolean" }, name: { type: "string" },
   } });
   const codexHome = resolve(values["codex-home"] ?? process.env.CODEX_HOME ?? join(homedir(), ".codex"));
   const workspace = await realpath(resolve(values.cwd ?? process.cwd()));
@@ -114,6 +122,14 @@ export async function standaloneCodexMain(args: string[]): Promise<void> {
       capabilities: { goals: false, dynamicTools: false },
     });
     session = await driver.openSession({ runId, normalizedSessionId: runId, workingDirectory: workspace });
+    const threadName = [modelEffortTag(model, effort), (values.name ?? "").replace(/\s+/g, " ").trim().slice(0, 80) || "NAR"]
+      .filter(Boolean).join(" ");
+    try {
+      await transport!.request("thread/name/set", { threadId: session.ids().driverSessionId, name: threadName });
+      receipt({ phase: "response", method: "thread/name/set", name: threadName });
+    } catch (error) {
+      receipt({ phase: "warning", method: "thread/name/set", message: error instanceof Error ? error.message : "name failed" });
+    }
     save("identity.json", { runId, codexHome, socketPath, socketGeneration: generation, workspace,
       model, effort, ...session.ids(), snapshot: await session.snapshot() });
     let terminalType = "";
