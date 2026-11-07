@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 
 const root = '/Volumes/NVM/Guidance';
-const classes = new Set(['coordinator', 'coding', 'research', 'review', 'web', 'local']);
+const classes = new Set(['coordinator', 'coding', 'research', 'web', 'local']);
 /** Only the explicit Guidance rewrite is admitted; never discover harness instructions. */
 export function assembleGuidance(klass, project) {
   if (!klass) {

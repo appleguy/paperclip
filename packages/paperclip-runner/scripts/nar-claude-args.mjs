@@ -6,3 +6,11 @@ export function claudeResumeArgs(sessionId, extraGuidance, prompt) {
     '--system-prompt-snapshot', 'off', ...(extraGuidance ? ['--append-system-prompt', extraGuidance] : []),
     '--resume', sessionId, ...(prompt ? [prompt] : [])];
 }
+
+/** Fresh NAR Claude seat: same zero settings/MCP as resume, a fixed session id so the seat can be resumed, Remote Control on. */
+export function claudeStartArgs({ sessionId, name, model, effort, extraGuidance, prompt }) {
+  return ['--setting-sources', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
+    '--system-prompt-snapshot', 'off', ...(extraGuidance ? ['--append-system-prompt', extraGuidance] : []),
+    '--session-id', sessionId, '--remote-control', name, '--name', name, '--model', model, '--effort', effort,
+    '--dangerously-skip-permissions', prompt];
+}
