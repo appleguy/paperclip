@@ -305,7 +305,7 @@ const server = createServer(async (request, response) => {
   if (request.headers.authorization !== expectedAuth)
     return json(response, 401, { error: "unauthorized" });
   if (request.url === "/global/health")
-    return json(response, 200, { healthy: true, version: "1.18.34" });
+    return json(response, 200, { healthy: true, version: "2.2.5" });
   if (request.url === "/event") {
     eventConnections += 1;
     response.writeHead(200, {

@@ -597,7 +597,7 @@ describe("native backend factory", () => {
     await expect(backend.descriptor()).resolves.toMatchObject({
       kind: "runner",
       name: "opencode_server",
-      version: "1.18.34",
+      version: "2.2.5",
       capabilities: {
         resume: true,
         interruption: true,

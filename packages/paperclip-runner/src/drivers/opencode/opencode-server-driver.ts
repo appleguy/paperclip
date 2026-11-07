@@ -1,10 +1,9 @@
 import { isOpenRouterUrl, OPENROUTER_ATTRIBUTION_HEADERS } from "../openrouter-attribution.js";
 import { OpenCodeProviderBoundary } from "./provider-boundary.js";
-import { spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { resolveCompletionContinuation } from "../completion-continuation.js";
 import { createHash, randomBytes } from "node:crypto";
-import { accessSync, constants, readFileSync, realpathSync, statSync } from "node:fs";
-import { createRequire } from "node:module";
+import { accessSync, constants, realpathSync, statSync } from "node:fs";
 import {
   chmod,
   lstat,
@@ -22,7 +21,7 @@ import { Agent as HttpAgent, createServer as createHttpServer, request as reques
 import { Agent as HttpsAgent, request as requestHttps } from "node:https";
 import { getCACertificates } from "node:tls";
 import { pipeline } from "node:stream/promises";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import { parseOpenCodeReasoningMode, type OpenCodeReasoningMode } from "./reasoning-mode.js";
 import { openCodeProviderFailure } from "./provider-failure.js";
@@ -99,68 +98,66 @@ import {
 } from "../runtime-context-materializer.js";
 
 export const OPENCODE_SERVER_DRIVER_KIND = "opencode_server" as const;
-export const QUALIFIED_OPENCODE_VERSION = "1.18.34" as const;
+/** The Homebrew build Paperclip qualifies against; the resolver accepts any 2.x. */
+export const QUALIFIED_OPENCODE_VERSION = "2.2.5" as const;
+export const QUALIFIED_OPENCODE_MAJOR = 2 as const;
+export const HOMEBREW_OPENCODE_COMMAND = "/opt/homebrew/bin/opencode" as const;
 export const QUALIFIED_OPENCODE_MODEL =
   "openrouter/deepseek/deepseek-v4-flash-0731" as const;
 
-/** Resolve a declared, pinned native dependency without PATH or install fallback. */
+const OPENCODE_VERSION_PATTERN = /(?:^|\s)v?(\d+)\.(\d+)\.(\d+)(?:\s|$)/;
+
+export interface ResolveOpenCodeCommandOptions {
+  /** Absolute executable path. Defaults to the Homebrew 2.x binding. */
+  command?: string;
+  /** Test seam for the `opencode --version` probe; production reads the binary. */
+  probeVersion?: (command: string) => string;
+}
+
+function probeOpenCodeVersion(command: string): string {
+  return execFileSync(command, ["--version"], {
+    encoding: "utf8",
+    timeout: 5_000,
+    maxBuffer: 4_096,
+    stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+}
+
+/**
+ * Resolve the Homebrew OpenCode 2.x executable without PATH or package fallback.
+ * The version probe is the authority: a missing binary, unreadable output, or a
+ * 1.x build fails closed instead of silently launching an unqualified runtime.
+ */
 export function resolvePinnedOpenCodeCommand(
-  issuer: string | URL = import.meta.url,
-  target: { platform?: string; architecture?: string } = {},
+  options: ResolveOpenCodeCommandOptions = {},
 ): string {
+  const command = options.command ?? HOMEBREW_OPENCODE_COMMAND;
   try {
-    const platform = target.platform ?? process.platform;
-    const architecture = target.architecture ?? process.arch;
-    const packageNames: Record<string, string[]> = {
-      "linux-x64": ["opencode-linux-x64-baseline"],
-      "darwin-arm64": ["opencode-darwin-arm64"],
-      "darwin-x64": ["opencode-darwin-x64-baseline"],
-    };
-    const candidates = packageNames[`${platform}-${architecture}`];
-    if (!candidates) {
-      throw new Error("OpenCode native target is not qualified");
+    if (!isAbsolute(command)) {
+      throw new Error("OpenCode executable path must be absolute");
     }
-    const manifestPath = realpathSync(createRequire(issuer).resolve("opencode-ai/package.json"));
-    const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-    if (manifest.name !== "opencode-ai" || manifest.version !== QUALIFIED_OPENCODE_VERSION) {
-      throw new Error(`OpenCode package version mismatch: expected opencode-ai@${QUALIFIED_OPENCODE_VERSION}`);
+    const executable = realpathSync(command);
+    if (!statSync(executable).isFile()) {
+      throw new Error("OpenCode executable is not a regular file");
     }
-    const dependencyRequire = createRequire(manifestPath);
-    for (const name of candidates) {
-      if (manifest.optionalDependencies?.[name] !== QUALIFIED_OPENCODE_VERSION) {
-        throw new Error("OpenCode platform dependency does not match its qualified version");
-      }
-      let platformManifest: string;
-      try {
-        platformManifest = realpathSync(dependencyRequire.resolve(`${name}/package.json`));
-      } catch (error) {
-        if (["MODULE_NOT_FOUND", "ENOENT"].includes((error as NodeJS.ErrnoException).code ?? "")) {
-          continue;
-        }
-        throw error;
-      }
-      const metadata = JSON.parse(readFileSync(platformManifest, "utf8"));
-      if (metadata.name !== name || metadata.version !== QUALIFIED_OPENCODE_VERSION
-        || !Array.isArray(metadata.os) || !metadata.os.includes(platform)
-        || !Array.isArray(metadata.cpu) || !metadata.cpu.includes(architecture)) {
-        throw new Error("OpenCode installed platform artifact identity mismatch");
-      }
-      const root = dirname(platformManifest);
-      const executable = realpathSync(resolve(root, "bin/opencode"));
-      const inside = relative(root, executable);
-      if (!inside || inside === ".." || inside.startsWith(`..${sep}`) || isAbsolute(inside)) {
-        throw new Error("OpenCode executable escapes its qualified platform package");
-      }
-      if (!statSync(executable).isFile()) {
-        throw new Error("OpenCode executable is not a regular file");
-      }
-      accessSync(executable, constants.X_OK);
-      return executable;
+    accessSync(executable, constants.X_OK);
+    const output = (options.probeVersion ?? probeOpenCodeVersion)(executable).trim();
+    const match = OPENCODE_VERSION_PATTERN.exec(output);
+    if (!match) {
+      throw new Error(
+        `OpenCode version probe did not report a semantic version: ${output || "<empty>"}`,
+      );
     }
-    throw new Error("OpenCode qualified platform dependency is missing");
+    const version = `${match[1]}.${match[2]}.${match[3]}`;
+    if (Number(match[1]) !== QUALIFIED_OPENCODE_MAJOR) {
+      throw new Error(
+        `OpenCode ${version} is not a qualified ${QUALIFIED_OPENCODE_MAJOR}.x runtime`,
+      );
+    }
+    return executable;
   } catch (error) {
     throw new Error(
-      `Pinned OpenCode runtime unavailable: ${(error as Error).message}. Restore Paperclip's runtime dependencies.`,
+      `Pinned OpenCode runtime unavailable: ${(error as Error).message}. Install Homebrew OpenCode ${QUALIFIED_OPENCODE_MAJOR}.x at ${HOMEBREW_OPENCODE_COMMAND}.`,
       { cause: error },
     );
   }
@@ -2721,13 +2718,9 @@ async function startRuntime(input: {
     const version = text(record(health).version);
     if (!/^\d+\.\d+\.\d+$/.test(version))
       throw new Error("OpenCode health response omitted a semantic version");
-    const qualifiedComparison = compareVersion(
-      version,
-      QUALIFIED_OPENCODE_VERSION,
-    );
-    if (qualifiedComparison !== 0) {
+    if (Number(version.split(".")[0]) !== QUALIFIED_OPENCODE_MAJOR) {
       throw new Error(
-        `OpenCode ${version} is not the question-conformance-qualified ${QUALIFIED_OPENCODE_VERSION}`,
+        `OpenCode ${version} is not a qualified ${QUALIFIED_OPENCODE_MAJOR}.x runtime`,
       );
     }
     return {
@@ -3210,15 +3203,6 @@ function validateWorkspace(value: string): string {
 function validModel(value: string): boolean {
   const slash = value.indexOf("/");
   return slash > 0 && slash < value.length - 1;
-}
-
-function compareVersion(left: string, right: string): number {
-  const a = left.split(".").map(Number);
-  const b = right.split(".").map(Number);
-  for (let index = 0; index < 3; index += 1) {
-    if (a[index] !== b[index]) return (a[index] ?? 0) - (b[index] ?? 0);
-  }
-  return 0;
 }
 
 function bounded(value: unknown): Record<string, unknown> {
