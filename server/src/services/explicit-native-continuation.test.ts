@@ -1,3 +1,15 @@
+import { createServer } from "node:http";
+import { runningProcesses } from "../adapters/index.js";
+import { DurablePrpControlPlane, spawnRunner } from "../../../packages/paperclip-runner/src/control-plane/durable-prp-control-plane.js";
+import { readRunnerdArtifactBinding } from "../../../packages/paperclip-runner/src/live/runnerd-codex-transport.js";
+import { registerRunnerPrpAuthority, runnerPrpWebSocketInternals, setupRunnerPrpWebSocketServer } from "../realtime/runner-prp-ws.js";
+import { runnerGoalService } from "./runner-goals.js";
+import { PaperclipControlPlanePort } from "./native-runtime/paperclip-control-plane-port.js";
+import { CONTROL_PLANE_CONFORMANCE_RESULT, CONTROL_PLANE_CONFORMANCE_TERMINAL } from "../vendor/paperclip-runner/testing.js";
+import { workspaceOperationService } from "./workspace-operations.js";
+import { createHeartbeatRunPreparation } from "./heartbeat/run-preparation.js";
+import { prepareHeartbeatTaskContext } from "./heartbeat/task-context.js";
+import { issueService } from "./issues.js";
 import { legacyControllerBootId } from "./legacy-controller-lease.js";
 import { execFile } from "node:child_process";
 import os from "node:os";
@@ -17,7 +29,7 @@ import { and, eq, sql } from "drizzle-orm";
 import { beforeAll, afterAll, describe, it, expect, vi } from "vitest";
 import {
   applyPendingMigrations, approvals, issueApprovals, issueThreadInteractions, chatConversations, chatEndpoints, toolApplications, toolConnections,
-  agentWakeupRequests, agents, companies, createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions,
+  agentWakeupRequests, agentTaskSessions, agents, companies, createDb, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions,
   issues, nativeRunFinalizations, nativeRunResults, completionContracts, environmentLeases, environments, issueRelations, issueTreeHolds, issueTreeHoldMembers, type Db,
 } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase, getEmbeddedPostgresTestSupport } from "../__tests__/helpers/embedded-postgres.js";
@@ -29,7 +41,7 @@ import { buildExecutionContinuation } from "./execution-continuation.js";
 import { heartbeatService, persistHeartbeatRunProcessMetadata, type HeartbeatEnvironmentRuntime } from "./heartbeat.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
 import { createDurableChatWakeupRequest } from "./durable-chat-wakeup.js";
-import { recordNativeFinalizationFailure } from "./native-runtime/native-run-finalizer.js";
+import { finalizeNativeRun, recordNativeFinalizationFailure } from "./native-runtime/native-run-finalizer.js";
 const externalUrl = resolveExternalTestDatabaseUrl("PAPERCLIP_CONTINUATION_TEST_DATABASE_URL");
 const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTestSupport();
 (support.supported ? describe : describe.skip)("explicit native conversation continuation", () => {
@@ -65,6 +77,170 @@ const support = externalUrl ? { supported: true } : await getEmbeddedPostgresTes
       actorType: "user", actorId: "board", reason: "issue_commented" };
   }
   type Fixture = Awaited<ReturnType<typeof seed>>;
+
+  // Native protocol qualification is opt-in; the regular DB suite needs no host-specific binary.
+  // Supply AGY_TEST_RUNNER_BINARY to the existing isolated runnerd fixture when qualifying this case.
+  it.runIf(Boolean(process.env.AGY_TEST_RUNNER_BINARY))("delivers a comment once after an authenticated working native goal finalizes", async () => {
+    const f = await seed(), contractId = randomUUID(), runnerInstanceId = randomUUID();
+    const commentBody = "After this turn, verify the preserved owner artifact.";
+    // Reuse the database fixture, without its failed-run recovery history.
+    await db.delete(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, f.sourceRunId));
+    await db.delete(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    await db.delete(issueComments).where(eq(issueComments.id, f.commentId));
+    await db.insert(completionContracts).values({ id: contractId, companyId: f.companyId, issueId: f.issueId, revision: 1,
+      schemaVersion: "paperclip.completion-contract.v1", policyVersion: "busy-turn-test", risk: "standard",
+      completionAuthority: "server_arbiter", incompleteCriteriaPolicy: "preserve_non_terminal",
+      contractJson: { revision: "standalone-v1", objective: "Finish", criteria: [{ id: "objective", requirement: "Complete the task" }] },
+      canonicalSha256: contractId, createdByActorType: "system", createdByActorId: "test" });
+    await db.update(heartbeatRuns).set({ status: "running", finishedAt: null, startedAt: new Date(),
+      processPid: null, nativeSessionId: f.sourceRunId, runnerInstanceId, completionContractId: contractId,
+      completionContractSha256: contractId }).where(eq(heartbeatRuns.id, f.sourceRunId));
+    await db.update(issues).set({ status: "in_progress", executionRunId: f.sourceRunId })
+      .where(eq(issues.id, f.issueId));
+    await db.insert(agentTaskSessions).values({ companyId: f.companyId, agentId: f.agentId, adapterType: "paperclip_runner",
+      taskKey: f.issueId, goalJson: { objective: "Finish", status: "active", workingNow: true },
+      goalSourceId: `${runnerInstanceId}:${f.sourceRunId}`, goalObservedAt: new Date() });
+
+    // This is the authenticated loopback runner fixture used by runner-goals.test.ts.
+    // It runs the protocol only: no provider, model, shared session, or server.
+    const root = await mkdtemp(join(tmpdir(), "busy-native-comment-"));
+    const binary = process.env.AGY_TEST_RUNNER_BINARY!;
+    const artifact = readRunnerdArtifactBinding(binary);
+    const identity = { runnerInstanceId, environmentLeaseId: "lease", runId: f.sourceRunId,
+      normalizedSessionId: f.sourceRunId, turnId: "turn", itemId: "item" };
+    const core = new DurablePrpControlPlane({ stateDirectory: join(root, "core"), identity,
+      expectedRunnerVersion: artifact.version, expectedRunnerDigest: artifact.digest });
+    const server = createServer();
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Missing isolated runner listener");
+    setupRunnerPrpWebSocketServer(server, { apiUrl: `http://127.0.0.1:${address.port}` });
+    let child: ReturnType<typeof spawnRunner> | undefined;
+    let registration: Awaited<ReturnType<typeof registerRunnerPrpAuthority>> | undefined;
+    const priorLogs = process.env.WORKSPACE_OPERATION_LOG_BASE_PATH;
+    process.env.WORKSPACE_OPERATION_LOG_BASE_PATH = join(root, "workspace-logs");
+    try {
+      const projection = () => runnerGoalService(db).projection(f.companyId, f.issueId);
+      expect(await projection()).toMatchObject({ workingNow: false });
+      await core.start();
+      registration = await registerRunnerPrpAuthority({ companyId: f.companyId, agentId: f.agentId,
+        issueId: f.issueId, runId: f.sourceRunId, authority: core });
+      const ticket = core.issueBootstrapTicket(60_000);
+      await core.flushCheckpoint();
+      child = spawnRunner({ connectUrl: registration.connectUrl, stateDirectory: join(root, "runner"), identity, ticket,
+        runnerBinaryPath: binary, runnerVersion: artifact.version, runnerDigest: artifact.digest,
+        maxOutboxBytes: 1024 * 1024, p0ReserveBytes: 64 * 1024, maxRuntimeMs: 0,
+        environment: { PATH: process.env.PATH } });
+      await vi.waitFor(() => expect(core.activeRunnerConnectionCount()).toBe(1), { timeout: 10_000, interval: 25 });
+      // Register the actual child with the scheduler, as managed execution does.
+      runningProcesses.set(f.sourceRunId, { child: child.child, graceSec: 1, processGroupId: child.processGroupId ?? null });
+      const source = await persistHeartbeatRunProcessMetadata(db, f.sourceRunId, {
+        pid: child.child.pid!, processGroupId: child.processGroupId ?? null,
+        startedAt: new Date().toISOString(), targetKind: "local",
+      });
+      expect(source).not.toBeNull();
+      expect(await projection()).toMatchObject({ workingNow: true, activeRunId: f.sourceRunId,
+        goal: { status: "active", workingNow: true } });
+      expect(await recordNativeLocalProcessStop(db, source!)).toBe(false);
+
+      await db.insert(issueComments).values({ id: f.commentId, companyId: f.companyId, issueId: f.issueId,
+        authorType: "user", authorUserId: "board", body: commentBody });
+      const heartbeat = heartbeatService(db);
+      const successors = () => db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "queued")));
+      expect(await heartbeat.wakeup(f.agentId, { source: "automation", triggerDetail: "system", reason: "issue_commented",
+        requestedByActorType: "user", requestedByActorId: "board", payload: { issueId: f.issueId, commentId: f.commentId },
+        contextSnapshot: { source: "issue.comment", issueId: f.issueId, wakeCommentId: f.commentId },
+      })).toBeNull();
+      const [waiting] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+      expect(waiting).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      expect(await successors()).toHaveLength(0);
+      expect(await projection()).toMatchObject({ workingNow: true });
+
+      // Occupy the agent's slot so the real successor is observable without launching a provider.
+      await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+      const port = new PaperclipControlPlanePort(db, { companyId: f.companyId, issueId: f.issueId,
+        runId: f.sourceRunId, agentId: f.agentId, sessionId: f.sourceRunId,
+        completionContractId: contractId, completionContractSha256: contractId,
+        sourceInstanceId: runnerInstanceId, controlPlaneSourceInstanceId: "busy-turn-test" });
+      await port.completeRun({ result: CONTROL_PLANE_CONFORMANCE_RESULT, terminal: CONTROL_PLANE_CONFORMANCE_TERMINAL,
+        callerResultId: `${f.sourceRunId}:result` });
+      const release = createReleaseIssueExecution({
+        issueLock: createPostgresWakeQueueAdapter(db, {
+          resolveResponsibleUserId: async () => "board",
+          getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+          resolveSessionBeforeForWakeup: async () => null,
+        }),
+        recovery: { escalateStrandedAssignedIssue: async () => {}, escalateStrandedRecoveryIssueInPlace: async () => {} },
+      });
+      const drain = () => release({ companyId: f.companyId, runId: f.sourceRunId, now: new Date(),
+        suppressImmediateRecovery: true, resumeStrandedQueue: true });
+      await drain();
+      expect(await successors()).toHaveLength(0);
+
+      // Stop only this fixture's process, and use the server's OS-verified cleanup receipt.
+      child.child.kill("SIGTERM");
+      await child.completion;
+      runningProcesses.delete(f.sourceRunId);
+      await registration.release();
+      registration = undefined;
+      await db.transaction(async tx => {
+        expect(await recordNativeLocalProcessStop(tx as unknown as Db, source!)).toBe(true);
+        await tx.update(heartbeatRuns).set({ processPid: null, processGroupId: null, processStartedAt: null })
+          .where(eq(heartbeatRuns.id, f.sourceRunId));
+      });
+      expect(await hasNativeLocalProcessStop(db, f.companyId, f.sourceRunId)).toBe(true);
+      expect(await projection()).toMatchObject({ workingNow: false });
+      await workspaceOperationService(db).createRecorder({ companyId: f.companyId, issueId: f.issueId,
+        heartbeatRunId: f.sourceRunId }).recordOperation({ phase: "workspace_finalize", cwd: root,
+        run: async () => ({ status: "succeeded", exitCode: 0 }) });
+      const finalized = await finalizeNativeRun({ db, runId: f.sourceRunId, workspaceFinalizeStatus: "succeeded",
+        projectRunStatus: true });
+      expect(finalized).toMatchObject({ phase: "committed" });
+      const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.sourceRunId));
+      expect(finished).toMatchObject({ status: "succeeded", nativePhase: "committed" });
+      expect(finished.finishedAt).not.toBeNull();
+
+      // Finalization and recovery may race/replay; the real issue lock must deliver once.
+      await Promise.all([drain(), drain()]);
+      const admitted = await successors();
+      expect(admitted).toHaveLength(1);
+      expect(admitted[0].contextSnapshot).toMatchObject({ issueId: f.issueId, wakeCommentId: f.commentId,
+        wakeCommentIds: [f.commentId] });
+      const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, waiting.id));
+      expect(receipt.runId).toBe(admitted[0].id);
+      expect(["queued", "coalesced"]).toContain(receipt.status);
+      await drain();
+      expect((await successors()).map(run => run.id)).toEqual([admitted[0].id]);
+
+      // Assert the actual task-context preparation reads the saved body exactly once.
+      // This proves prepared successor input, not provider HTTP receipt or the send-race fence.
+      const preparation = createHeartbeatRunPreparation(db);
+      const issueContext = await preparation.getIssueExecutionContext(f.companyId, f.issueId);
+      const [agent] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+      const context: Record<string, unknown> = { ...admitted[0].contextSnapshot };
+      const prepared = await prepareHeartbeatTaskContext(db, {
+        run: admitted[0], agent,
+        task: { issueRef: issueContext, issueContext, context, taskSession: { lastRunId: f.sourceRunId } },
+        policy: { trustPreset: { kind: "standard" }, experimentalInstanceSettings: {} },
+        services: { issuesSvc: issueService(db), getPinnedSkillTestContext: preparation.getPinnedSkillTestContext },
+      });
+      expect(prepared.safeWakeComments).toEqual([{ id: f.commentId, body: commentBody, attachments: [] }]);
+      expect(prepared.paperclipWakePayload?.comments).toEqual([expect.objectContaining({ id: f.commentId, body: commentBody })]);
+      expect(context.paperclipTurnContext).toMatchObject({ events: { comments: [{ id: f.commentId, revision: createHash("sha256").update(commentBody).digest("hex") }] } });
+    } finally {
+      runningProcesses.delete(f.sourceRunId);
+      await registration?.release();
+      if (child) { child.child.kill("SIGTERM"); await child.completion.catch(() => {}); }
+      await core.stop();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      runnerPrpWebSocketInternals.resetForTests();
+      if (priorLogs === undefined) delete process.env.WORKSPACE_OPERATION_LOG_BASE_PATH;
+      else process.env.WORKSPACE_OPERATION_LOG_BASE_PATH = priorLogs;
+      await rm(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   async function readAdmission(f: Fixture, full: boolean) {
     const reads: Array<Array<Record<string, unknown>>> = [];
     const recorded = new Proxy(db, { get(target, key) {
