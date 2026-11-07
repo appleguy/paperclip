@@ -17,6 +17,8 @@ export interface CodexAppServerDriverOptions {
   taskEnvelope: CodexTaskEnvelope;
   /** Direct standalone sessions on an existing daemon use its native sandbox, never private permission profiles. */
   sharedDaemonSandbox?: "read-only" | "workspace-write" | "danger-full-access";
+  /** Shared daemon only: research lanes opt in to live web search; default disabled. */
+  sharedDaemonWebSearch?: "disabled" | "live";
   /** Explicit provider model selected by the persisted native execution. */
   model?: string;
   /** Per-run reasoning effort sent with each Codex turn, including resumed turns. */

@@ -24,7 +24,7 @@ export async function standaloneCodexMain(args: string[]): Promise<void> {
   const { values } = parseArgs({ args, options: {
     "codex-home": { type: "string" }, cwd: { type: "string" }, model: { type: "string" },
     effort: { type: "string" }, prompt: { type: "string" }, sandbox: { type: "string" },
-    "receipt-dir": { type: "string" }, "timeout-ms": { type: "string" }, inspect: { type: "boolean" }, name: { type: "string" }, thread: { type: "string" },
+    "receipt-dir": { type: "string" }, "timeout-ms": { type: "string" }, inspect: { type: "boolean" }, name: { type: "string" }, thread: { type: "string" }, "web-search": { type: "string" },
   } });
   const codexHome = resolve(values["codex-home"] ?? process.env.CODEX_HOME ?? join(homedir(), ".codex"));
   const workspace = await realpath(resolve(values.cwd ?? process.cwd()));
@@ -36,6 +36,8 @@ export async function standaloneCodexMain(args: string[]): Promise<void> {
   const effort = values.effort ?? "medium";
   const sandbox = values.sandbox ?? "read-only";
   if (!["read-only", "workspace-write", "danger-full-access"].includes(sandbox)) throw new Error("invalid native sandbox");
+  const webSearch = values["web-search"] ?? "disabled";
+  if (webSearch !== "disabled" && webSearch !== "live") throw new Error("invalid web search mode");
   const timeoutMs = Number(values["timeout-ms"] ?? "300000");
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > 86400000) throw new Error("invalid turn deadline");
   if (!values.inspect && (!values.model?.trim() || !values.prompt?.trim() || !values["receipt-dir"]))
@@ -70,6 +72,7 @@ export async function standaloneCodexMain(args: string[]): Promise<void> {
       processGeneration: generation, threadId: values.thread ?? "", workspace, model, effort },
     // --thread continues one lane thread (provider prompt cache, one RC entry) instead of starting a new one.
     newThread: !values.thread,
+    webSearch,
     admit: async () => {
       const current = await stat(socketPath);
       return current.isSocket() && `${current.dev}:${current.ino}:${current.birthtimeMs}` === generation;
@@ -111,13 +114,14 @@ export async function standaloneCodexMain(args: string[]): Promise<void> {
       return;
     }
     receipt({ phase: "manifest", runId, codexHome, socketPath, socketGeneration: generation, workspace,
-      model, effort, sandbox, paperclipServer: false, injectedContext: "none",
+      model, effort, sandbox, webSearch, paperclipServer: false, injectedContext: "none",
       providerBoundCapture: "unverified", prompt: values.prompt });
     const driver = new CodexAppServerDriver({
       taskEnvelope: createCodexTaskEnvelope({ objective: "", criteria: [], constraints: [] }),
       conversationMode: "direct", baseInstructions: "", includeSkillInstructions: false,
       includeCollaborationModeInstructions: false, dynamicTools: [], model, reasoningEffort: effort,
       sharedDaemonSandbox: sandbox as "read-only" | "workspace-write" | "danger-full-access",
+      sharedDaemonWebSearch: webSearch,
       approvalPolicy: "never", transportFactory: factory,
       environment: { HOME: homedir(), CODEX_HOME: codexHome, PATH: process.env.PATH, LANG: process.env.LANG },
       capabilities: { goals: false, dynamicTools: false },

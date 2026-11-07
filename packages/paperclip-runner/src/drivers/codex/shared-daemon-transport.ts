@@ -20,6 +20,8 @@ export interface SharedDaemonTransportOptions {
   identity: SharedDaemonIdentity;
   /** Standalone only: bind one provider-assigned thread, requiring live RC before every start. */
   newThread?: boolean;
+  /** Web search mode the lane was admitted with; a resume must repeat exactly this value. */
+  webSearch?: "disabled" | "live";
   /** Must check the live daemon and Paperclip checkout/lease; IDs supplied here do not grant authority. */
   admit: (identity: Readonly<SharedDaemonIdentity>, operation: {method: string; params: Readonly<Record<string, unknown>>}) => Promise<boolean>;
   /** Optional server policy: only this callback may identify an owner intervention. */
@@ -52,7 +54,7 @@ const resumeConfigKeys = new Set([
   "features.apps", "features.plugins", "features.multi_agent", "features.memories", "features.image_generation",
 ]);
 // Restrictive thread/start extras a resume may repeat, admitted only at these exact values.
-const resumeConfigExact: Record<string, unknown> = { project_doc_max_bytes: 0, web_search: "disabled", "features.hooks": false };
+const resumeConfigExact: Record<string, unknown> = { project_doc_max_bytes: 0, "features.hooks": false };
 const resumeKeys = new Set([
   "threadId", "excludeTurns", "cwd", "config", "permissions", "runtimeWorkspaceRoots",
   "baseInstructions", "developerInstructions", "approvalPolicy", "model", "dynamicTools",
@@ -67,6 +69,7 @@ const observationalMethods = new Set(["initialize", "collaborationMode/list", "t
 export class SharedDaemonCodexAppServerTransport implements CodexAppServerTransport {
   #identity: Readonly<SharedDaemonIdentity>;
   readonly #newThread: boolean;
+  readonly #webSearch: "disabled" | "live";
   readonly #onRequest: SharedDaemonTransportOptions["onRequest"];
   #threadStartAttempted = false;
   readonly #admit: SharedDaemonTransportOptions["admit"];
@@ -99,6 +102,7 @@ export class SharedDaemonCodexAppServerTransport implements CodexAppServerTransp
         typeof options.admit !== "function") throw new Error("incomplete shared daemon identity or admission");
     if (options.newThread && identity.threadId !== "") throw new Error("standalone requires an unbound thread identity");
     this.#newThread = options.newThread === true;
+    this.#webSearch = options.webSearch ?? "disabled";
     this.#onRequest = options.onRequest;
     this.#identity = Object.freeze({ ...identity, workspace: resolve(identity.workspace) });
     this.#admit = options.admit;
@@ -270,7 +274,7 @@ export class SharedDaemonCodexAppServerTransport implements CodexAppServerTransp
     if ((method === "thread/resume" || method === "turn/start") && params.cwd !== undefined &&
         (typeof params.cwd !== "string" || !isAbsolute(params.cwd) || resolve(params.cwd) !== this.#identity.workspace)) throw new Error("shared daemon workspace mismatch");
     if (method === "thread/resume" && params.config !== undefined &&
-        (!record(params.config) || Object.entries(params.config).some(([key, value]) => key in resumeConfigExact ? value !== resumeConfigExact[key] : !resumeConfigKeys.has(key) || typeof value !== "boolean"))) throw new Error("shared daemon resume config not admitted");
+        (!record(params.config) || Object.entries(params.config).some(([key, value]) => key === "web_search" ? value !== this.#webSearch : key in resumeConfigExact ? value !== resumeConfigExact[key] : !resumeConfigKeys.has(key) || typeof value !== "boolean"))) throw new Error("shared daemon resume config not admitted");
     if (method === "turn/start" && ((params.model !== undefined && params.model !== this.#identity.model) || (params.effort !== undefined && params.effort !== this.#identity.effort))) throw new Error("shared daemon model or effort mismatch");
     if (this.#gap && !observationalMethods.has(method)) throw new Error("managed writes held pending reconciliation");
     await this.#authorize(method, params); await this.#connect(); await this.#authorize(method, params);

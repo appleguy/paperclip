@@ -297,7 +297,7 @@ export class CodexAppServerDriver implements HarnessDriver {
         sandbox: this.#options.sharedDaemonSandbox,
         baseInstructions: "", developerInstructions: "",
         config: { ...createSkilllessCodexThreadConfig(workingDirectory ?? "", this.#options.environment, false),
-          project_doc_max_bytes: 0, web_search: "disabled", "features.hooks": false },
+          project_doc_max_bytes: 0, web_search: this.#options.sharedDaemonWebSearch ?? "disabled", "features.hooks": false },
       } : createSecuredCodexThreadParams(
         workingDirectory ?? "",
         requestedMode,
@@ -704,7 +704,7 @@ export class CodexAppServerDriver implements HarnessDriver {
       ...(this.#options.sharedDaemonSandbox ? {
         cwd: workingDirectory, sandbox: this.#options.sharedDaemonSandbox,
         config: { ...createSkilllessCodexThreadConfig(workingDirectory, this.#options.environment, false),
-          project_doc_max_bytes: 0, web_search: "disabled", "features.hooks": false },
+          project_doc_max_bytes: 0, web_search: this.#options.sharedDaemonWebSearch ?? "disabled", "features.hooks": false },
       } : createSecuredCodexThreadParams(workingDirectory,
         this.#options.requestedCollaborationMode ?? "default",
         this.#options.includeCollaborationModeInstructions ?? true,
