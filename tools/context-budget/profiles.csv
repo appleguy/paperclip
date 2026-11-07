@@ -1,0 +1,8 @@
+agent,harness,profile,model,effective_context,model_max_output
+zero-codex,codex,codex-home,gpt-6-luna,200000,0
+claude-code-proposal,claude-code,not-owned,claude-sonnet-5-5,200000,128000
+deepseek,opencode,deepseek,wrx80/deepseek-v4.1-flash-maya-s-4090,200000,0
+glm-mac,opencode,glm-mac,glm-5.3-flash-maya-l,131072,0
+qwen-3090,opencode,qwen,wrx80/qwen3.8-27b-3090,85504,0
+qwen-4090,opencode,qwen,wrx80/qwen3.8-27b-4090,81920,0
+qwen-pool,opencode,qwen,qwen,81920,0
