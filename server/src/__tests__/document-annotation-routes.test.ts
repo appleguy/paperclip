@@ -45,6 +45,13 @@ const mockIssueThreadInteractionService = vi.hoisted(() => ({
   expireStaleRequestConfirmationsForIssueDocument: vi.fn(async (): Promise<Array<{ id: string; kind: string; status: string }>> => []),
 }));
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
+const mockDatabase = vi.hoisted(() => {
+  const transaction = {};
+  return {
+    transaction: vi.fn(async (callback: (tx: unknown) => unknown) => callback(transaction)),
+    transactionHandle: transaction,
+  };
+});
 
 const documentPayload = {
   id: "document-1",
@@ -155,6 +162,13 @@ function registerModuleMocks() {
     routineService: () => ({ syncRunStatusForIssue: vi.fn(async () => undefined) }),
     workProductService: () => ({}),
   }));
+  vi.doMock("../services/external-objects.js", () => ({
+    externalObjectService: () => ({
+      syncCommentSafely: vi.fn(async () => undefined),
+      syncDocumentSafely: vi.fn(async () => undefined),
+      syncIssueSafely: vi.fn(async () => undefined),
+    }),
+  }));
 }
 
 async function createApp(actor: "board" | "agent" = "board", actorCompanyId = companyId) {
@@ -181,7 +195,7 @@ async function createApp(actor: "board" | "agent" = "board", actorCompanyId = co
       };
     next();
   });
-  app.use("/api", issueRoutes({} as any, {} as any));
+  app.use("/api", issueRoutes(mockDatabase as any, {} as any));
   app.use(errorHandler);
   return app;
 }
@@ -354,14 +368,15 @@ describe("document annotation routes", () => {
       .expect(201);
 
     expect(res.body.id).toBe(annotationThread.id);
-    expect(mockIssueReferenceService.syncAnnotationComment).toHaveBeenCalledWith(annotationComment.id);
-    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+    expect(mockDatabase.transaction).toHaveBeenCalledTimes(1);
+    expect(mockIssueReferenceService.syncAnnotationComment).toHaveBeenCalledWith(annotationComment.id, mockDatabase.transactionHandle);
+    expect(mockLogActivity).toHaveBeenCalledWith(mockDatabase.transactionHandle, expect.objectContaining({
       action: "issue.document_annotation_thread_created",
       details: expect.objectContaining({
         key: "plan",
         documentKey: "plan",
       }),
-    }));
+    }), expect.any(Array));
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 
@@ -384,14 +399,15 @@ describe("document annotation routes", () => {
       .post(`/api/issues/${issueId}/documents/plan/annotations/${annotationThread.id}/comments`)
       .send({ body: "Reply with PAP-2" })
       .expect(201);
-    expect(mockIssueReferenceService.syncAnnotationComment).toHaveBeenCalledWith(annotationComment.id);
-    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+    expect(mockDatabase.transaction).toHaveBeenCalledTimes(1);
+    expect(mockIssueReferenceService.syncAnnotationComment).toHaveBeenCalledWith(annotationComment.id, mockDatabase.transactionHandle);
+    expect(mockLogActivity).toHaveBeenCalledWith(mockDatabase.transactionHandle, expect.objectContaining({
       action: "issue.document_annotation_comment_added",
       details: expect.objectContaining({
         key: "plan",
         documentKey: "plan",
       }),
-    }));
+    }), expect.any(Array));
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
 
     const resolved = await request(await createApp())
@@ -399,13 +415,33 @@ describe("document annotation routes", () => {
       .send({ status: "resolved" })
       .expect(200);
     expect(resolved.body.status).toBe("resolved");
-    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+    expect(mockDatabase.transaction).toHaveBeenCalledTimes(2);
+    expect(mockLogActivity).toHaveBeenCalledWith(mockDatabase.transactionHandle, expect.objectContaining({
       action: "issue.document_annotation_thread_resolved",
       details: expect.objectContaining({
         key: "plan",
         documentKey: "plan",
       }),
-    }));
+    }), expect.any(Array));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+
+    mockAnnotationService.getThreadForIssueDocument.mockResolvedValue({ ...annotationThread, status: "resolved" });
+    mockAnnotationService.updateThread.mockResolvedValue({ ...annotationThread, status: "open" });
+    const reopened = await request(await createApp())
+      .patch(`/api/issues/${issueId}/documents/plan/annotations/${annotationThread.id}`)
+      .send({ status: "open" })
+      .expect(200);
+    expect(reopened.body.status).toBe("open");
+    expect(mockDatabase.transaction).toHaveBeenCalledTimes(3);
+    expect(mockLogActivity).toHaveBeenCalledWith(mockDatabase.transactionHandle, expect.objectContaining({
+      action: "issue.document_annotation_thread_reopened",
+      details: expect.objectContaining({
+        key: "plan",
+        documentKey: "plan",
+        status: "open",
+        reopenedAt: expect.any(String),
+      }),
+    }), expect.any(Array));
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
 });

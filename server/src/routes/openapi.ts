@@ -1616,6 +1616,7 @@ const CREATED_OPERATIONS = new Set([
   "POST /api/issues/{id}/children",
   "POST /api/issues/{id}/interactions",
   "POST /api/issues/{id}/comments",
+  "POST /api/issues/{id}/owner-comment-intake/{sourceKind}/{sourceId}/disposition",
   "POST /api/companies/{companyId}/issues/{issueId}/attachments",
   "POST /api/companies/{companyId}/projects",
   "POST /api/projects/{id}/access-members",
@@ -4678,6 +4679,26 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "post",
+  path: "/api/issues/{id}/owner-comment-intake/{sourceKind}/{sourceId}/disposition",
+  tags: ["issues"],
+  summary: "Record a linked owner-comment intake receipt",
+  description: "Records an actual start, completion, or exact blocker only after verifying that the responding actor posted a receipt in the source annotation thread or linked the issue comment, document, or artifact. Task creation remains an agent decision and must include the linked issue.",
+  request: {
+    params: z.object({ id: z.string(), sourceKind: z.string(), sourceId: z.string() }),
+    body: jsonBody(z.object({
+      stage: z.enum(["started", "completed", "blocked"]),
+      disposition: z.enum(["existing_work", "inline_change", "task_created", "informational", "not_actionable", "blocked"]),
+      summary: z.string().trim().min(1).max(4_000),
+      receiptCommentId: z.string().uuid(),
+      linkedIssueId: z.string().uuid().nullable().optional(),
+      blocker: z.string().trim().min(1).max(4_000).nullable().optional(),
+    })),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+registry.registerPath({
   method: "delete",
   path: "/api/issues/{id}/comments/{commentId}",
   tags: ["issues"],
@@ -5870,6 +5891,7 @@ const costReportQuerySchema = z.object({
 
 const costSummaryPaths = [
   "summary",
+  "run-ledger",
   "by-agent",
   "by-user",
   "by-agent-model",

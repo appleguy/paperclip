@@ -16,7 +16,7 @@ const object = (value: unknown): Record<string, unknown> =>
 
 // Readable thread title: compact model@effort tag (T@H = Terra@High) leads, mirroring server model-effort-name.ts.
 export function modelEffortTag(model: string, effort: string): string {
-  const family = [[/\bsol\b/i, "S"], [/\bterra\b/i, "T"], [/\bluna\b/i, "L"], [/\bastra\b/i, "A"]]
+  const family = ([[/\bsol\b/i, "S"], [/\bterra\b/i, "T"], [/\bluna\b/i, "L"], [/\bastra\b/i, "A"]] as [RegExp, string][])
     .find(([pattern]) => (pattern as RegExp).test(model))?.[1] ?? "";
   const level = ({ low: "L", medium: "M", high: "H", xhigh: "X", max: "Mx" } as Record<string, string>)[effort.toLowerCase()] ?? "";
   return family && level ? `${family}@${level}` : family || level;
@@ -141,6 +141,7 @@ export async function standaloneCodexMain(args: string[]): Promise<void> {
       session = recovered.session;
       receipt({ phase: "response", method: "thread/resume", threadId: values.thread });
     } else session = await driver.openSession({ runId, normalizedSessionId: runId, workingDirectory: workspace });
+    if (!session) throw new Error("session recovery returned no session");
     const threadName = [modelEffortTag(model, effort), (values.name ?? "").replace(/\s+/g, " ").trim().slice(0, 80) || "NAR"]
       .filter(Boolean).join(" ");
     try {

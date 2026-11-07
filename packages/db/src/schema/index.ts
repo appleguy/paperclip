@@ -279,3 +279,4 @@ export { issueThreadInteractionIdempotencyKeys } from "./issue_thread_interactio
 export { projectTaskExecutionPolicies, executionAdmissions, executionAdmissionProjectCharges } from "./execution_admissions.js";
 export { budgetEvaluationWork } from "./budget_evaluation_work.js";
 export { issueIdentifierAliases } from "./issue_identifier_aliases.js";
+export { nativeSessionAuthorities, nativeSessionAuthorityEvents } from "./native_session_authorities.js";

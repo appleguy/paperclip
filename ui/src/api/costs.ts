@@ -13,6 +13,7 @@ import type {
   FinanceByKind,
   FinanceEvent,
   ProviderQuotaResult,
+  RunLedgerDailyReport,
 } from "@paperclipai/shared";
 import { api } from "./client";
 
@@ -32,6 +33,8 @@ export const costsApi = {
     api.post<{ accounted: boolean }>(`/companies/${companyId}/costs/retry-accounting`, { runId }),
   summary: (companyId: string, from?: string, to?: string) =>
     api.get<CostSummary>(`/companies/${companyId}/costs/summary${dateParams(from, to)}`),
+  runLedger: (companyId: string, from?: string, to?: string) =>
+    api.get<RunLedgerDailyReport>(`/companies/${companyId}/costs/run-ledger${dateParams(from, to)}`),
   byUser: (companyId: string, from?: string, to?: string) =>
     api.get<CostByUserReport>(`/companies/${companyId}/costs/by-user${dateParams(from, to)}`),
   byAgent: (companyId: string, from?: string, to?: string) =>

@@ -233,6 +233,13 @@ export function costRoutes(
     res.json(summary);
   });
 
+  router.get("/companies/:companyId/costs/run-ledger", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    if (!(await assertCompanyCostReadAllowed(req, res, companyId))) return;
+    res.json(await costs.runLedgerDaily(companyId, parseCostDateRange(req.query)));
+  });
+
   router.get("/issues/:id/cost-summary", async (req, res) => {
     const rawId = req.params.id as string;
     const issue = await getAccessibleResource(req, res, resolveIssueByRef(rawId), "Issue not found");
