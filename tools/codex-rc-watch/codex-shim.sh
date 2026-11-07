@@ -20,4 +20,4 @@ target=$(/usr/bin/readlink "$socket") || { echo 'codex shim: socket link unavail
 case "$target" in /*) ;; *) echo 'codex shim: invalid socket target' >&2; exit 1 ;; esac
 [ -S "$target" ] || { echo 'codex shim: socket target unavailable' >&2; exit 1; }
 export CODEX_HOME="$home"
-exec /opt/homebrew/bin/codex --remote "unix://$target"
+exec /Volumes/NVM/AI_Agent_Runtime/bin/codex-approved-c34 --remote "unix://$target"
