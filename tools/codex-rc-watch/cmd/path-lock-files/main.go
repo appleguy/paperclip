@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -19,6 +20,31 @@ type record struct {
 	Mode   uint32 `json:"mode"`
 	Device uint64 `json:"device"`
 	Inode  uint64 `json:"inode"`
+}
+
+// backup preserves the exact bytes before changing mode, without creating an
+// executable backup. A pre-existing backup is never overwritten.
+func backup(fd int, path string, inode uint64) error {
+	name := path + ".before-20261106-c34"
+	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if os.IsExist(err) {
+		name = fmt.Sprintf("%s.%d", name, inode)
+		f, err = os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	}
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	dup, err := syscall.Dup(fd)
+	if err != nil {
+		return err
+	}
+	src := os.NewFile(uintptr(dup), path)
+	defer src.Close()
+	if _, err = io.Copy(f, src); err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
 // selectFiles never follows directory symlinks, including the root itself.
@@ -83,6 +109,10 @@ func lock(root string, apply bool, journal *os.File, out *json.Encoder) error {
 				syscall.Close(fd)
 				return errors.New("journal required")
 			}
+			if err = backup(fd, path, r.Inode); err != nil {
+				syscall.Close(fd)
+				return err
+			}
 			if err = json.NewEncoder(journal).Encode(r); err == nil {
 				err = journal.Sync()
 			}
@@ -138,10 +168,11 @@ func run() error {
 	root := flag.String("root", "", "absolute package tree to inspect")
 	apply := flag.Bool("apply", false, "remove execute bits; write-ahead journal required")
 	journal := flag.String("journal", "", "new journal file for --apply, or existing journal for --restore")
+	appendJournal := flag.Bool("append-journal", false, "append to a shared journal under an exclusive lock")
 	rollback := flag.Bool("restore", false, "restore recorded modes, only if inode and device still match")
 	flag.Parse()
 	if *rollback {
-		if *root != "" || *apply || *journal == "" {
+		if *root != "" || *apply || *journal == "" || *appendJournal {
 			return errors.New("restore requires only --journal")
 		}
 		return restore(*journal)
@@ -155,12 +186,21 @@ func run() error {
 			return errors.New("--apply requires --journal")
 		}
 		var err error
-		f, err = os.OpenFile(*journal, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if *appendJournal {
+			var fd int
+			fd, err = syscall.Open(*journal, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_APPEND|syscall.O_NOFOLLOW, 0600)
+			if err == nil {
+				f = os.NewFile(uintptr(fd), *journal)
+				err = syscall.Flock(fd, syscall.LOCK_EX)
+			}
+		} else {
+			f, err = os.OpenFile(*journal, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		}
 		if err != nil {
 			return err
 		}
 		defer f.Close()
-	} else if *journal != "" {
+	} else if *journal != "" || *appendJournal {
 		return errors.New("--journal requires --apply or --restore")
 	}
 	return lock(*root, *apply, f, json.NewEncoder(os.Stdout))

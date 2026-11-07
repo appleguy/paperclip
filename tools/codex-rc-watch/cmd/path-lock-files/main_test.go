@@ -106,3 +106,21 @@ func TestNewReleaseReapply(t *testing.T) {
 		t.Fatal("reapply failed")
 	}
 }
+
+func TestBackupsAreNonExecutable(t *testing.T) {
+	root := t.TempDir()
+	p := makeBin(t, root)
+	journal, e := os.Create(filepath.Join(t.TempDir(), "journal"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer journal.Close()
+	if e = lock(root, true, journal, json.NewEncoder(&bytes.Buffer{})); e != nil {
+		t.Fatal(e)
+	}
+	backup := p + ".before-20261106-c34"
+	b, e := os.ReadFile(backup)
+	if e != nil || string(b) != "canary" || mode(t, backup) != 0600 {
+		t.Fatalf("backup=%q mode=%o err=%v", b, mode(t, backup), e)
+	}
+}
