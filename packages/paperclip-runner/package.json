@@ -185,7 +185,6 @@
     "ajv": "^8.20.0",
     "json-schema-to-ts": "^3.1.1",
     "node-pty": "1.2.0-beta.18",
-    "opencode-ai": "1.18.34",
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1",
     "smol-toml": "^1.9.1",
