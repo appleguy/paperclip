@@ -22,7 +22,7 @@ const prompt = (await readFile(values['prompt-file'], 'utf8')).trim();
 const ownerRules = (await readFile('/Volumes/NVM/Guidance/owner-rules.md', 'utf8')).trim();
 const extraGuidance = assembleGuidance(values.class, values.project).replace(ownerRules, '').trim();
 const sessionId = randomUUID();
-registry[values.seat] = { harness: 'claude', sessionId, cwd: values.cwd, goalFile: `${goalDir}/${values.seat}.json` };
+registry[values.seat] = { harness: 'claude', sessionId, cwd: values.cwd, goalFile: `${goalDir}/${values.seat}.json`, model: values.model, effort: values.effort };
 await writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`);
 const args = claudeStartArgs({ sessionId, name: values.seat, model: values.model, effort: values.effort, extraGuidance, prompt });
 const child = spawn('claude', args, { cwd: values.cwd, stdio: 'inherit', env: { ...process.env, PAPERCLIP_NAR_LAUNCH: '1' } });

@@ -1,9 +1,12 @@
 // Subscription auth: no --bare (it requires an API key). The CLAUDE.md chain already carries the Guidance owner rules,
 // so only class layers are appended. /goal is a slash command, so commands stay enabled when a goal is queued.
-export function claudeResumeArgs(sessionId, extraGuidance, prompt) {
+// A named seat resumes with Remote Control and skip-permissions (owner rule for every seat), plus its registered model/effort.
+export function claudeResumeArgs(sessionId, extraGuidance, prompt, seat = {}) {
   return ['--setting-sources', '', ...(prompt ? [] : ['--disable-slash-commands']),
     '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
     '--system-prompt-snapshot', 'off', ...(extraGuidance ? ['--append-system-prompt', extraGuidance] : []),
+    ...(seat.name ? ['--remote-control', seat.name, '--name', seat.name, '--dangerously-skip-permissions'] : []),
+    ...(seat.model ? ['--model', seat.model] : []), ...(seat.effort ? ['--effort', seat.effort] : []),
     '--resume', sessionId, ...(prompt ? [prompt] : [])];
 }
 
