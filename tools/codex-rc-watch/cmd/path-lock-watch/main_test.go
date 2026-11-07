@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"strings"
 	"testing"
 )
@@ -18,14 +17,18 @@ func TestGuardAndRevalidate(t *testing.T) {
 	var killed []int
 	f := func() (map[int]proc, error) { return m, nil }
 	err := pass(m, 501, 10, root, true, f, func(i int) error { killed = append(killed, i); return nil }, json.NewEncoder(&buf))
-	if err != nil || len(killed) != 1 || killed[0] != 11 {
+	got := map[int]bool{}
+	for _, pid := range killed {
+		got[pid] = true
+	}
+	if err != nil || len(killed) != 2 || !got[11] || !got[12] || got[10] {
 		t.Fatalf("%v %v %s", err, killed, buf.String())
 	}
 	if strings.Contains(buf.String(), "hidden") {
 		t.Fatal("argument leaked")
 	}
 }
-func TestChangedIdentityAndMissingParentFailClosed(t *testing.T) {
+func TestChangedIdentityFailsClosed(t *testing.T) {
 	p := proc{11, 1, 501, "a", "/tmp/codex", []string{"app-server"}}
 	m := map[int]proc{11: p}
 	q := p
@@ -36,11 +39,6 @@ func TestChangedIdentityAndMissingParentFailClosed(t *testing.T) {
 	if err != nil || k || !strings.Contains(b.String(), "identity_or_ancestry_changed") {
 		t.Fatalf("%v %v %s", err, k, b.String())
 	}
-	p.PPID = 99
-	if !protected(p, m, 10, "/zero") {
-		t.Fatal("missing ancestry not protected")
-	}
-	_ = errors.New("")
 }
 func TestParse(t *testing.T) {
 	p, ok := parse("85406 1 501 Fri Nov 6 21:51:59 2026 /tmp/codex app-server --managed-daemon")

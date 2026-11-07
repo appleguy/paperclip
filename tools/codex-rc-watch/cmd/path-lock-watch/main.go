@@ -69,23 +69,10 @@ func under(path, root string) bool {
 	rel, e := filepath.Rel(root, path)
 	return e == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
 }
-func protected(p proc, m map[int]proc, approvedPID int, approvedRoot string) bool {
-	seen := map[int]bool{}
-	for p.PID > 0 && !seen[p.PID] {
-		if p.PID == approvedPID || (filepath.IsAbs(p.Executable) && under(p.Executable, approvedRoot)) {
-			return true
-		}
-		seen[p.PID] = true
-		if p.PPID <= 1 {
-			return false
-		}
-		v, ok := m[p.PPID]
-		if !ok {
-			return true
-		}
-		p = v
-	}
-	return true
+func protected(p proc, _ map[int]proc, approvedPID int, approvedRoot string) bool {
+	// Protect the approved daemon itself and the approved home's executables,
+	// but not a distinct unapproved app-server merely because a thread started it.
+	return p.PID == approvedPID || (filepath.IsAbs(p.Executable) && under(p.Executable, approvedRoot))
 }
 func chain(p proc, m map[int]proc) ([]proc, string) {
 	var out []proc
