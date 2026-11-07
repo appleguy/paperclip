@@ -1,0 +1,11 @@
+{
+  "homes": [
+    "/Users/tech/.codex",
+    "/Volumes/NVM/Paperclip/workspaces/platform-lead-outside/context/codex-home",
+    "/Volumes/NVM/Paperclip/instances/main/companies/55cef09f-ec08-4e71-8e7f-2afb4a912ce8/codex-home"
+  ],
+  "interval_seconds": 15,
+  "timeout_seconds": 3,
+  "log_path": "/Volumes/NVM/AI_Agent_Runtime/codex-rc-watch/exceptions.jsonl",
+  "log_max_bytes": 1048576
+}

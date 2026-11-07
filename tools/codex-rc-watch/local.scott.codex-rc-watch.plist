@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>local.scott.codex-rc-watch</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Volumes/NVM/AI_Agent_Runtime/bin/codex-rc-watch</string>
+    <string>--config</string>
+    <string>/Volumes/NVM/AI_Agent_Runtime/codex-rc-watch/config.json</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Volumes/NVM/AI_Agent_Runtime/codex-rc-watch</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>60</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>/dev/null</string>
+  <key>StandardErrorPath</key><string>/Volumes/NVM/AI_Agent_Runtime/codex-rc-watch/launchd-errors.log</string>
+</dict>
+</plist>
