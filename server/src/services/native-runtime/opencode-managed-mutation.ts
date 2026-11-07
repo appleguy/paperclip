@@ -20,7 +20,7 @@ async function serialize<T>(key: string, operation: () => Promise<T>): Promise<T
 /** Controller-internal dispatch. The caller must supply host-owned admission;
  * native owner/external clients are not fenced by this automation queue. */
 export function createOpenCodeManagedMutation(db: Db, input: {
-  binding: OpenCodeSharedBinding; admission: OpenCodeObserverAdmission; fetch?: typeof fetch;
+  binding: OpenCodeSharedBinding; admission: OpenCodeObserverAdmission; fetch?: typeof globalThis.fetch;
   /** Tests may shorten the deadline; callers cannot extend the production bound. */
   deliveryTimeoutMs?: number;
 }) {

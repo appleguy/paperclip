@@ -14,7 +14,7 @@ import { visibleIssueCondition } from "./issue-visibility.js";
 import { resolveCostDateRange, type CostDateRange } from "./cost-date-range.js";
 export type { CostDateRange } from "./cost-date-range.js";
 
-interface RunLedgerGroupRow {
+interface RunLedgerGroupRow extends Record<string, unknown> {
   date: string;
   agentId: string;
   agentName: string;
