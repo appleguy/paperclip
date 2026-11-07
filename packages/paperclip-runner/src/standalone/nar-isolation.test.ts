@@ -16,7 +16,8 @@ describe('standalone isolation', () => {
     expect(() => assembleGuidance(undefined, '/tmp')).toThrow();
   });
   it('locks down Claude CLI sources', () => {
-    expect(claudeResumeArgs('id', 'clean', '/goal x')).toEqual(['--bare', '--setting-sources', '', '--disable-slash-commands', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--system-prompt-snapshot', 'off', '--append-system-prompt', 'clean', '--resume', 'id', '/goal x']);
+    expect(claudeResumeArgs('id', 'clean', '/goal x')).toEqual(['--setting-sources', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--system-prompt-snapshot', 'off', '--append-system-prompt', 'clean', '--resume', 'id', '/goal x']);
+    expect(claudeResumeArgs('id', '', undefined)).toEqual(['--setting-sources', '', '--disable-slash-commands', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--system-prompt-snapshot', 'off', '--resume', 'id']);
   });
   it('has no forbidden dependency anywhere in the local import graph', () => {
     const pending = ['scripts/run-standalone-codex.mjs', 'scripts/nar-goal.mjs', 'scripts/nar-claude-resume.mjs'].map(p => resolve(root, p));
