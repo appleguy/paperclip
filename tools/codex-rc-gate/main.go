@@ -19,6 +19,7 @@ func classify(args []string) (bool, []string, error) {
 	valueFlags := map[string]bool{"-c": true, "--config": true, "-m": true, "--model": true, "--enable": true, "--disable": true, "-C": true, "--cd": true, "--add-dir": true, "-i": true, "--image": true, "--sandbox": true, "-s": true, "--ask-for-approval": true, "-a": true, "--profile": true, "-p": true}
 	boolFlags := map[string]bool{"--dangerously-bypass-approvals-and-sandbox": true, "--dangerously-bypass-hook-trust": true, "--full-auto": true, "--search": true, "--no-alt-screen": true, "--oss": true, "--strict-config": true}
 	remote := false
+	serverRC := false
 	command := ""
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -48,6 +49,9 @@ func classify(args []string) (bool, []string, error) {
 			continue
 		}
 		if strings.HasPrefix(a, "-") {
+			if command == "app-server" && a == "--remote-control" {
+				serverRC = true
+			}
 			if command == "" && !boolFlags[a] && !strings.HasPrefix(a, "--config=") && !strings.HasPrefix(a, "--model=") {
 				return false, nil, errors.New("unsupported option")
 			}
@@ -61,10 +65,8 @@ func classify(args []string) (bool, []string, error) {
 	case "login", "logout", "completion", "features", "doctor", "mcp", "plugin", "app", "remote-control", "help":
 		return false, args, nil
 	case "app-server":
-		for _, a := range args {
-			if a == "--remote-control" {
-				return false, args, nil
-			}
+		if serverRC {
+			return false, args, nil
 		}
 		return false, nil, errors.New("app-server without --remote-control is forbidden")
 	case "exec", "e", "review", "exec-server", "sandbox", "debug", "queue", "cloud":

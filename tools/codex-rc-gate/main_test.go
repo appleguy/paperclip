@@ -19,6 +19,7 @@ func TestClassify(t *testing.T) {
 		{"foreign after resume", []string{"resume", "id", "--remote", "unix:///tmp/no"}, false, nil, true},
 		{"exec", []string{"-m", "gpt-6", "exec", "hello"}, false, nil, true},
 		{"server", []string{"app-server"}, false, nil, true},
+		{"server flag as value", []string{"app-server", "-c", "--remote-control"}, false, nil, true},
 		{"server rc", []string{"app-server", "--remote-control"}, false, []string{"app-server", "--remote-control"}, false},
 		{"login", []string{"login"}, false, []string{"login"}, false},
 		{"unknown option", []string{"--bad", "exec"}, false, nil, true},
