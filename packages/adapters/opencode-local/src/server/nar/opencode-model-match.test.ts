@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { fileURLToPath } from "node:url";
-import { OpenCodeHttpDriver } from "./opencode-http-driver.ts";
+import { OpenCodeHttpDriver } from "./opencode-http-driver.js";
 
-const host = { provider: "opencode" as const, hostEpoch: 1, attested: true };
+const host = { provider: "opencode" as const, hostEpoch: 1, attested: true, detail: null };
 const fence = { runId: "run-test", leaseGeneration: 1, hostEpoch: 1 };
 const scope = { agentId: "qwen", issueId: "test", cwd: "/tmp", model: "native-fleet/qwen" };
 function driver(variant: string | undefined, model = "qwen", providerID = "native-fleet") {
