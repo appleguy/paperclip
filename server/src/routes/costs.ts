@@ -42,6 +42,52 @@ import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
 const reportDateSchema = z.union([z.iso.datetime({ offset: true }), z.iso.date()]);
 
+// ChatGPT Web dispatch records (b-web-stats) are local activity events, never a
+// vendor quota. Each distinct dispatch is counted once; a missing or unreadable
+// feed is reported as no source instead of a manufactured zero.
+const WEB_DISPATCH_OPS = new Set(["send", "follow-up", "new-thread"]);
+
+async function readWebDispatchCounts(): Promise<{
+  source: "b-web-stats";
+  observedAt: string;
+  counts: { "5m": number; "1h": number; "24h": number };
+} | null> {
+  const sources = [
+    process.env.PAPERCLIP_WEB_STATS_EVENTS_PATH
+      ?? "/Volumes/NVM/AI_Agent_Runtime/state/web-stats/events.jsonl",
+    process.env.PAPERCLIP_WEB_STATS_FALLBACK_PATH
+      ?? "/Volumes/NVM/AI_Agent_Runtime/state/chatgpt-web/pro-events.jsonl",
+  ];
+  for (const path of sources) {
+    try {
+      const input = createReadStream(path, { encoding: "utf8" });
+      const seen = new Set<string>();
+      const now = Date.now();
+      const counts = { "5m": 0, "1h": 0, "24h": 0 };
+      for await (const line of createInterface({ input, crlfDelay: Infinity })) {
+        let event: any;
+        try { event = JSON.parse(line); } catch { continue; }
+        const op = typeof event?.op === "string" ? event.op : typeof event?.kind === "string" ? event.kind : null;
+        if (!op || !WEB_DISPATCH_OPS.has(op)) continue;
+        const rawTime = typeof event.ts === "string" ? event.ts : typeof event.at === "string" ? event.at : null;
+        const time = rawTime === null ? NaN : Date.parse(rawTime);
+        if (!Number.isFinite(time) || time > now) continue;
+        // One dispatch can be logged more than once; count each identity once.
+        const identity = `${op}|${rawTime}|${typeof event.url === "string" ? event.url : ""}`;
+        if (seen.has(identity)) continue;
+        seen.add(identity);
+        if (time > now - 300_000) counts["5m"] += 1;
+        if (time > now - 3_600_000) counts["1h"] += 1;
+        if (time > now - 86_400_000) counts["24h"] += 1;
+      }
+      return { source: "b-web-stats", observedAt: new Date(now).toISOString(), counts };
+    } catch {
+      // Missing or unreadable source: try the next one, then report no source.
+    }
+  }
+  return null;
+}
+
 export function parseCostDateRange(query: Record<string, unknown>) {
   if (query.period !== undefined && query.period !== "all" && query.period !== "month") throw badRequest("invalid 'period'");
   if (query.period === "all") {
@@ -510,9 +556,10 @@ export function costRoutes(
       } catch {
         // The credit source may not be configured. Do not invent balances.
       }
+      const webDispatches = await readWebDispatchCounts();
       res.setHeader("Cache-Control", "private, no-store");
       res.json({ source: "quota-sentinel", observedAt, stale: !Number.isFinite(ageMs) || ageMs < 0 || ageMs > 3_900_000,
-        pools, bankedReset, bankedResetDispute, creditOffers });
+        pools, bankedReset, bankedResetDispute, creditOffers, webDispatches });
     } catch {
       res.status(503).json({ error: "Quota Sentinel snapshot unavailable" });
     }
