@@ -184,7 +184,7 @@ export class OpenCodeHttpDriver implements ProviderDriver {
     if (cwd !== s.cwd) throw new OpenCodeHttpError("mismatch", `session cwd ${String(cwd)} != ${s.cwd}`);
     await this.retitle(id, info?.title, s);
     const model = info?.model ? `${info.model.providerID}/${info.model.id}${info.model.variant ? `#${info.model.variant}` : ""}` : undefined;
-    if (s.model && model && model !== s.model) throw new OpenCodeHttpError("mismatch", `session model ${model} != ${s.model}`);
+    if (s.model && model && !sameModelRef(s.model, model)) throw new OpenCodeHttpError("mismatch", `session model ${model} != ${s.model}`);
     return { conversationId: id, cwd, model };
   }
 
@@ -471,6 +471,13 @@ export class OpenCodeHttpDriver implements ProviderDriver {
 }
 
 const TERMINAL = new Set(["session.execution.succeeded", "session.execution.failed", "session.execution.interrupted"]);
+
+/** OpenCode normalizes an omitted variant to the literal `default` on session readback. */
+export function sameModelRef(expected: string, actual: string): boolean {
+  const a = parseModelRef(expected);
+  const b = parseModelRef(actual);
+  return a.providerID === b.providerID && a.id === b.id && (a.variant ?? "default") === (b.variant ?? "default");
+}
 
 export function parseModelRef(input: string): { providerID: string; id: string; variant?: string } {
   const p = input.indexOf("/");

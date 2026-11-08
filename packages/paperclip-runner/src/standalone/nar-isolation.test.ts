@@ -5,20 +5,35 @@ import { describe, it, expect } from 'vitest';
 // @ts-expect-error JS shared helper
 import { assembleGuidance } from '../../scripts/nar-guidance.mjs';
 // @ts-expect-error JS shared helper
-import { claudeResumeArgs } from '../../scripts/nar-claude-args.mjs';
+import { claudeResumeArgs, claudeStartArgs } from '../../scripts/nar-claude-args.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 describe('standalone isolation', () => {
   it('assembles exactly owner-only or the selected class, and rejects unknown classes', () => {
     expect(assembleGuidance()).toBe(readFileSync('/Volumes/NVM/Guidance/owner-rules.md', 'utf8'));
-    expect(assembleGuidance('research')).toContain(readFileSync('/Volumes/NVM/Guidance/owner-rules.md', 'utf8').trim());
+    // Worker classes carry the lean worker layer; only coordinators carry the whole owner-rules file.
+    expect(assembleGuidance('research')).toContain('# Worker rules');
+    expect(assembleGuidance('research')).not.toContain(readFileSync('/Volumes/NVM/Guidance/owner-rules.md', 'utf8').trim());
+    expect(assembleGuidance('coordinator')).toContain(readFileSync('/Volumes/NVM/Guidance/owner-rules.md', 'utf8').trim());
     expect(() => assembleGuidance('bogus')).toThrow();
     expect(() => assembleGuidance(undefined, '/tmp')).toThrow();
   });
   it('locks down Claude CLI sources', () => {
-    expect(claudeResumeArgs('id', 'clean', '/goal x')).toEqual(['--setting-sources', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--system-prompt-snapshot', 'off', '--append-system-prompt', 'clean', '--resume', 'id', '/goal x']);
-    expect(claudeResumeArgs('id', '', undefined)).toEqual(['--setting-sources', '', '--disable-slash-commands', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--system-prompt-snapshot', 'off', '--resume', 'id']);
-    expect(claudeResumeArgs('id', '', '/goal x', { name: 'w1', model: 'sonnet', effort: 'medium' })).toEqual(['--setting-sources', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--system-prompt-snapshot', 'off', '--remote-control', 'w1', '--name', 'w1', '--dangerously-skip-permissions', '--model', 'sonnet', '--effort', 'medium', '--resume', 'id', '/goal x']);
+    const after = (a: string[], flag: string) => a[a.indexOf(flag) + 1];
+    const worker = claudeResumeArgs('id', 'clean', '/goal x', { name: 'w1', model: 'sonnet', effort: 'medium' });
+    expect(worker.slice(0, 2)).toEqual(['--setting-sources', '']);
+    expect(after(worker, '--mcp-config')).toBe('{"mcpServers":{}}');
+    expect(worker).not.toContain('--disable-slash-commands');
+    expect(after(worker, '--disallowedTools').split(',')).toEqual(expect.arrayContaining(['Agent', 'SendMessage', 'CronCreate', 'ToolSearch']));
+    expect(worker.slice(-3)).toEqual(['--resume', 'id', '/goal x']);
+    expect(after(worker, '--remote-control')).toBe('w1');
+    expect(claudeResumeArgs('id', '', undefined)).toContain('--disable-slash-commands');
+    const lead = claudeStartArgs({ sessionId: 's', name: 'lead', model: 'opus', effort: 'high', extraGuidance: 'g', prompt: 'p', klass: 'coordinator' });
+    const leadDenied = after(lead, '--disallowedTools').split(',');
+    expect(leadDenied).toContain('Agent');
+    expect(leadDenied).not.toContain('CronCreate');
+    expect(leadDenied).not.toContain('SendMessage');
+    expect(after(lead, '--session-id')).toBe('s');
   });
   it('has no forbidden dependency anywhere in the local import graph', () => {
     const pending = ['scripts/run-standalone-codex.mjs', 'scripts/nar-goal.mjs', 'scripts/nar-claude-resume.mjs'].map(p => resolve(root, p));

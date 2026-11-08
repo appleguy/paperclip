@@ -141,20 +141,41 @@ export async function standaloneCodexMain(args: string[]): Promise<void> {
       session = recovered.session;
       receipt({ phase: "response", method: "thread/resume", threadId: values.thread });
     } else session = await driver.openSession({ runId, normalizedSessionId: runId, workingDirectory: workspace });
-    if (!session) throw new Error("session recovery returned no session");
+    if (!session) throw new Error("standalone session was not opened");
+    const activeSession = session;
     const threadName = [modelEffortTag(model, effort), (values.name ?? "").replace(/\s+/g, " ").trim().slice(0, 80) || "NAR"]
       .filter(Boolean).join(" ");
     try {
-      await transport!.request("thread/name/set", { threadId: session.ids().driverSessionId, name: threadName });
+      await transport!.request("thread/name/set", { threadId: activeSession.ids().driverSessionId, name: threadName });
       receipt({ phase: "response", method: "thread/name/set", name: threadName });
     } catch (error) {
       receipt({ phase: "warning", method: "thread/name/set", message: error instanceof Error ? error.message : "name failed" });
     }
+    // A single bounded visibility probe is diagnostic only. Do it before the
+    // turn, while no provider turn-start reconciliation is in flight.
+    // Once a terminal notification is journaled we make no more daemon RPCs.
+    let listed: boolean | null = null;
+    const observationWarnings: Array<{ method: string; message: string }> = [];
+    const warn = (method: string, message: string) => {
+      const warning = { method, message };
+      observationWarnings.push(warning);
+      receipt({ phase: "warning", ...warning });
+    };
+    try {
+      const listing = await transport!.request("thread/list", { limit: 100 });
+      if (!Array.isArray(listing.data)) warn("thread/list", "thread list omitted data");
+      else {
+        listed = listing.data.some(value => object(value).id === activeSession.ids().driverSessionId);
+        if (!listed) warn("thread/list", "thread absent from first 100 list entries");
+      }
+    } catch (error) {
+      warn("thread/list", error instanceof Error ? error.message : "thread listing failed");
+    }
     save("identity.json", { runId, codexHome, socketPath, socketGeneration: generation, workspace,
-      model, effort, ...session.ids(), snapshot: await session.snapshot() });
+      model, effort, ...activeSession.ids(), snapshot: await activeSession.snapshot() });
     let terminalType = "";
     const completed = (async () => {
-      for await (const event of session!.events()) {
+      for await (const event of activeSession.events()) {
         receipt({ phase: "event", event });
         if (["turn.completed", "turn.failed", "turn.interrupted", "turn.cancelled"].includes(event.eventType)) {
           terminalType = event.eventType;
@@ -168,26 +189,27 @@ export async function standaloneCodexMain(args: string[]): Promise<void> {
     });
     // Attach both rejection handlers before awaiting either bootstrap or event completion.
     const execution = Promise.all([
-      session.startTurn({ message: { role: "user", text: values.prompt! } }).then(turn => {
-        receipt({ phase: "turn-accepted", threadId: session!.ids().driverSessionId, turnId: turn.turnId });
+      activeSession.startTurn({ message: { role: "user", text: values.prompt! } }).then(turn => {
+        receipt({ phase: "turn-accepted", threadId: activeSession.ids().driverSessionId, turnId: turn.turnId });
         return turn;
       }),
       completed,
     ]);
     const [turn] = await Promise.race([execution, timed]);
     if (deadline) clearTimeout(deadline);
-    save("transcript.json", await transport!.request("thread/read", {
-      threadId: session.ids().driverSessionId, includeTurns: true,
-    }));
-    const listing = await transport!.request("thread/list", { limit: 100 });
-    const threadId = session.ids().driverSessionId;
-    const listed = Array.isArray(listing.data) && listing.data.some(value => object(value).id === threadId);
+    const threadId = activeSession.ids().driverSessionId;
+    // The terminal event is already bound to this turn by the driver and journaled above.
+    // Never hydrate a long thread just to establish the outcome: thread/read with
+    // includeTurns=true can exceed the shared socket's bounded message size.
+    save("transcript.json", { threadId, turnId: turn.turnId, terminal: terminalType,
+      eventsFile: "receipt.jsonl", historyIncluded: false });
     const summary = { runId, threadId, turnId: turn.turnId, terminal: terminalType,
-      remoteControlStates, threadListContainsThread: listed, receiptDir, providerBoundCapture: "unverified" };
+      remoteControlStates, threadListContainsThread: listed, observationWarnings,
+      receiptDir, providerBoundCapture: "unverified" };
     save("result.json", summary);
     receipt({ phase: "completed", ...summary });
     console.log(JSON.stringify(summary));
-    if (terminalType !== "turn.completed" || !listed) throw new Error("standalone proof incomplete; inspect receipt");
+    if (terminalType !== "turn.completed") throw new Error(`standalone turn ${terminalType}; inspect receipt`);
   } catch (error) {
     receipt({ phase: "error", message: error instanceof Error ? error.message : "standalone failure",
       threadId: session?.ids().driverSessionId ?? null, replayed: false });

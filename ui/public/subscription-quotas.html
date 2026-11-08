@@ -21,6 +21,8 @@ button{font:inherit;font-weight:600;cursor:pointer;border:1px solid #55606b;bord
 button:disabled{opacity:.65;cursor:wait}
 #status{font-size:13px;color:#b8c5d2;min-height:22px}
 #status.fail{color:#ffc7a3}
+.stale-banner{margin:5px 0 18px;border:1px solid #d7ab6f;border-radius:10px;padding:11px 14px;background:#382b1b;color:#ffe0ac;font-size:13px;font-weight:650}
+.stale-banner[hidden]{display:none}
 #cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,255px),1fr));gap:14px;margin-top:20px}
 .summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-top:22px}
 .metric{border:1px solid #343943;border-radius:13px;padding:12px 15px;background:#20242c}
@@ -97,7 +99,7 @@ details{margin-top:12px;font-size:12px;color:#b8c5d2}
 summary{cursor:pointer}
 .charts{margin-top:20px;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,360px),1fr));gap:14px}
 .chart-card{min-height:0}.chart-card h3{font-size:15px;margin:0 0 6px}.chart-card p{font-size:12px;margin:3px 0;color:#b8c5d2}
-.chart-card svg{display:block;width:100%;height:auto;margin-top:10px;overflow:visible}.chart-grid{stroke:#55606b;stroke-width:1}.chart-reset{stroke:#efc17a;stroke-width:1.5;stroke-dasharray:3 3}.chart-now{stroke:#f6f9ff;stroke-width:1.5;stroke-dasharray:2 5;opacity:.7}.chart-line{stroke:#7fa8f9;stroke-width:1.8;fill:none}.chart-remaining{stroke:#8fdbb4;stroke-width:3;fill:none}.chart-trend{stroke:#c7a8ff;stroke-width:3;fill:none;stroke-dasharray:7 5}.chart-moving{stroke:#f1bd75;stroke-width:2.5;stroke-dasharray:2 5}.chart-label{fill:#b8c5d2;font-size:11px}.chart-card .chart-status{font-size:14px;color:#dff5e9}.chart-card .chart-warning{color:#ebc598}.chart-card .chart-estimate{color:#d6c1ff}.chart-card .chart-legend{padding-top:6px;border-top:1px solid #38414c}
+.chart-card svg{display:block;width:100%;height:auto;margin-top:10px;overflow:visible}.chart-grid{stroke:#55606b;stroke-width:1}.chart-reset{stroke:#efc17a;stroke-width:1.5;stroke-dasharray:3 3}.chart-now{stroke:#f6f9ff;stroke-width:1.5;stroke-dasharray:2 5;opacity:.7}.chart-line{stroke:#7fa8f9;stroke-width:1.8;fill:none}.chart-remaining{stroke:#8fdbb4;stroke-width:3;fill:none}.chart-even-pace{stroke:#b6bac6;stroke-width:1.6;fill:none;stroke-dasharray:4 5;opacity:.8}.chart-observed-marker{fill:#7fa8f9;stroke:#171a20;stroke-width:1.5}.chart-trend{stroke:#c7a8ff;stroke-width:3;fill:none;stroke-dasharray:7 5}.chart-moving{stroke:#f1bd75;stroke-width:2.5;stroke-dasharray:2 5}.chart-projection-marker{fill:#c7a8ff;stroke:#171a20;stroke-width:2}.chart-moving-marker{fill:#f1bd75;stroke:#171a20;stroke-width:2}.chart-label{fill:#b8c5d2;font-size:11px}.chart-card .chart-status{font-size:14px;color:#dff5e9}.chart-card .chart-warning{color:#ebc598}.chart-card .chart-estimate{color:#d6c1ff}.chart-card .chart-legend{padding-top:6px;border-top:1px solid #38414c}
 @media(prefers-color-scheme:light){:root{color-scheme:light;background:#f4f5f7;color:#20242c}section,.metric,.timeline-entry,.short-windows{background:#fff;border-color:#c8ced7}a{color:#244d91}.wordmark,.intro,.note,.reset,.metric .name,.metric .detail,.chart-card p,footer,details,#status,.credit-note{color:#536071}.poolhead span:first-child,.deadline-name,.deadline-stake{color:#20242c}.available{color:#42623e}.chart-label{fill:#536071}.deadline-entry-disclaimer,.deadline-due,.timeline-legend,.deadline-axis{color:#536071}.deadline-marker{border-color:#fff}}
 @media(max-width:520px){main{padding-top:18px}nav{margin-bottom:23px}.intro{margin-bottom:16px}}
 .short-chart-details{margin:20px 0 26px}.short-chart-details summary{font-size:15px;font-weight:700;color:inherit;cursor:pointer;padding:12px 0}
@@ -113,6 +115,8 @@ summary{cursor:pointer}
  .chart-line{stroke:#2769a8}
  .chart-trend{stroke:#7a4ca2}
  .chart-moving{stroke:#a5651d}
+ .chart-even-pace{stroke:#666d78}
+ .stale-banner{background:#fff2dc;color:#81500f;border-color:#bd8c42}
  .deadline-subsection{border-color:#c8ced7}
 }
 </style>
@@ -122,12 +126,13 @@ summary{cursor:pointer}
 <nav><span class="wordmark">SCOTT'S AGENTS · PAPERCLIP</span><a id="costs-link" href="/SCO/activity/costs?tab=providers">Costs &amp; Providers</a></nav>
 <header>
 <h1>Subscription quotas</h1>
-<p class="intro">Subscription headroom first. Seven-day reset timeline, observed usage, and clearly labeled estimates across Gemini, Codex and Claude. All times Pacific; separate from API spending.</p>
+<p class="intro">Subscription headroom, observed use and even-use pace across Gemini, Codex and Claude. ChatGPT Web shows dispatch counts only, never a fabricated vendor quota. All times Pacific; separate from API spending.</p>
 <div class="actions">
 <button id="refresh" type="button">Reload snapshot</button>
 <a href="/">Paperclip home</a>
 </div>
 <p id="status" role="status" aria-live="polite">Checking your subscription usage…</p>
+<div id="stale-banner" class="stale-banner" role="alert" hidden></div>
 </header>
 <div id="overview" class="summary" aria-label="Quota overview"></div>
 <section class="timeline-section" aria-label="Upcoming quota deadlines">
@@ -147,10 +152,10 @@ summary{cursor:pointer}
 <div id="cards" aria-live="polite"></div>
 <section id="short-windows" class="short-windows" aria-label="Five hour and session quota windows"></section>
 <h2>Usage history and projections</h2>
-<p class="note">Weekly charts use a seven-day quota cycle when the reset clock is trustworthy, otherwise the trailing seven days. Green shows observed capacity remaining, blue shows used quota. Dashed forecasts are estimates, never observed consumption. Short-window charts use their own cadence.</p>
+<p class="note">Solid blue is actual reported use; green is capacity remaining. Gray dashed is the even-use reference from cycle start to reset, not an observation. Purple estimates consumption at the recent straight-line rate; gold appears only with enough data for a moving-average rate. Dots at reset mark projections, never measured use. Short windows use their own cadence.</p>
 <div id="charts" class="charts"></div>
 <details id="short-chart-details" class="short-chart-details"><summary>Show five-hour and session history</summary><div id="short-charts" class="charts"></div></details>
-<footer>Read-only. Quota Sentinel samples periodically (currently about every three minutes); this page reloads it each minute. Reload does not initiate a provider check. Unknown readings are never zero. Pace labels describe recent usage rate, not an obligation to spend. Banked Codex resets are displayed only when reported; redemption is always manual. The reader reports only the next banked-credit expiration, not every credit expiration.</footer>
+<footer>Read-only. Quota Sentinel samples periodically (currently about every three minutes); this page reloads it each minute. Reload does not initiate a provider check. Snapshots older than 10 minutes are marked stale. Unknown readings are never zero. An even-use pace is a reference, not an obligation to spend. Web dispatch counts require the separate b-web-stats feed and are never vendor quota. Banked Codex resets are displayed only when reported; redemption is always manual. The reader reports only the next banked-credit expiration, not every credit expiration.</footer>
 
 </main>
 <script>
@@ -162,7 +167,7 @@ var pools={"pro:weekly":"Pro power · weekly","3p:5h":"Third-party · 5-hour","3
 // whether cumulative weekly usage is ahead of an even-use schedule.
 var paceLabels={behind_pace:"recent rate below goal",ahead_of_pace:"recent rate above goal",on_pace:"recent rate near goal",need_trend:"recent trend unmeasured",reset_imminent_underused:"reset soon, allowance left",exhausted_early:"allowance exhausted early",target_reached:"target reached",reset_due:"reset due",unknown:"usage or reset unknown"};
 var zone=new Intl.DateTimeFormat("en-US",{timeZone:"America/Los_Angeles",month:"short",day:"numeric",year:"numeric",hour:"numeric",minute:"2-digit",timeZoneName:"short"});
-var cards=document.getElementById("cards"), overview=document.getElementById("overview"), deadlines=document.getElementById("deadlines"), beyondDeadlines=document.getElementById("beyond-deadlines"), uncertainDeadlines=document.getElementById("uncertain-deadlines"), axis=document.getElementById("deadline-axis"), shorts=document.getElementById("short-windows"), creditNote=document.getElementById("credit-note"), status=document.getElementById("status"), refresh=document.getElementById("refresh"), costs=document.getElementById("costs-link");
+var cards=document.getElementById("cards"), overview=document.getElementById("overview"), deadlines=document.getElementById("deadlines"), beyondDeadlines=document.getElementById("beyond-deadlines"), uncertainDeadlines=document.getElementById("uncertain-deadlines"), axis=document.getElementById("deadline-axis"), shorts=document.getElementById("short-windows"), creditNote=document.getElementById("credit-note"), status=document.getElementById("status"), staleBanner=document.getElementById("stale-banner"), refresh=document.getElementById("refresh"), costs=document.getElementById("costs-link");
 var busy=false;
 // Keep measurements and inferred values separate. Never turn a reader fallback into quota.
 function dateMs(value){
@@ -170,6 +175,20 @@ function dateMs(value){
  return Number.isFinite(valueMs)?valueMs:NaN;
 }
 function validPercent(value){return typeof value==="number"&&Number.isFinite(value)&&value>=0&&value<=100}
+function snapshotStale(data,now){
+ var observed=dateMs(data&&data.observedAt);
+ return !!(data&&data.stale)||!Number.isFinite(observed)||observed>now+60000||now-observed>600000;
+}
+// b-web-stats request-event counts are not a subscription allowance. The server
+// must explicitly expose this allowlisted summary; a missing source is not zero.
+function webDispatchSample(data,now){
+ var sample=data&&data.webDispatches,counts=sample&&sample.counts;
+ if(!sample||sample.source!=="b-web-stats"||!counts||!Number.isFinite(dateMs(sample.observedAt)))return null;
+ function count(key){var n=counts[key];return Number.isSafeInteger(n)&&n>=0?n:null}
+ var count24h=count("24h");if(count24h===null)return null;
+ return {observedAt:sample.observedAt,count24h:count24h,count1h:count("1h"),count5m:count("5m"),
+  stale:dateMs(sample.observedAt)>now+60000||now-dateMs(sample.observedAt)>600000};
+}
 function quotaSpan(item){return isShort(item)?5*3600000:7*86400000}
 function placeholder(item,observed){
  if(!item||item.provider!=="antigravity"||!String(item.pool||"").startsWith("gemini")||item.usedPercent!==0)return false;
@@ -219,12 +238,15 @@ function latestClockDrifts(item,history){
 }
 function recoverReadings(data,history){
  if(!Array.isArray(data.pools))data.pools=[];
+ // Web activity belongs to b-web-stats, not a made-up percent-based vendor quota.
+ data.pools=data.pools.filter(function(p){return p&&p.provider!=="chatgpt-web"});
  // The provider may omit a whole family; retain a clearly unknown entry.
  ["gemini:weekly","gemini-argon-wtu:weekly"].forEach(function(pool){
   if(!data.pools.some(function(p){return p&&p.provider==="antigravity"&&p.pool===pool}))
    data.pools.push({provider:"antigravity",pool:pool,usedPercent:null,resetsAt:null,state:"unknown",quality:"missing"});
  });
- var now=Date.now(),observed=dateMs(data.observedAt),stale=!!data.stale||!Number.isFinite(observed)||observed>now+300000||now-observed>3900000;
+ var now=Date.now(),observed=dateMs(data.observedAt),stale=snapshotStale(data,now);
+ data._staleSnapshot=stale;
  data._trustedSeries={};
  data.pools=data.pools.map(function(item){
   var key=item.provider+"/"+item.pool,points=trustedHistory(item,history,now);
@@ -274,7 +296,7 @@ function projection(points,item,now){
  }).slice().sort(function(a,b){return dateMs(a.t)-dateMs(b.t)});
  if(period.length<3)return null;
  var last=period[period.length-1],first=period[0],hours=(dateMs(last.t)-dateMs(first.t))/3600000;
- if(hours<1.5||now-dateMs(last.t)>4500000||period.some(function(p,i){
+ if(hours<(isShort(item)?1:1.5)||now-dateMs(last.t)>4500000||period.some(function(p,i){
   return i>0&&period[i-1].usedPercent-p.usedPercent>2;
  }))return null;
  function estimate(start,end){
@@ -286,8 +308,9 @@ function projection(points,item,now){
  }
  var straight=estimate(first,last);
  if(straight.exhaustion===null||straight.exhaustion>reset)straight.exhaustion=null;
- var moving=null,recent=period.filter(function(p){return dateMs(p.t)>=dateMs(last.t)-12*3600000});
- if(!isShort(item)&&recent.length>=8&&(dateMs(recent[recent.length-1].t)-dateMs(recent[0].t))>=10*3600000){
+ var moving=null,shortWindow=isShort(item),lookback=shortWindow?2.5*3600000:12*3600000;
+ var recent=period.filter(function(p){return dateMs(p.t)>=dateMs(last.t)-lookback});
+ if(recent.length>=(shortWindow?5:8)&&(dateMs(recent[recent.length-1].t)-dateMs(recent[0].t))>=(shortWindow?1:10)*3600000){
   moving=estimate(recent[0],recent[recent.length-1]);
   if(moving.exhaustion===null||moving.exhaustion>reset)moving.exhaustion=null;
  }
@@ -303,6 +326,12 @@ function renderCharts(data){
   var reset=dateMs(item.resetsAt),duration=quotaSpan(item),anchored=Number.isFinite(reset)&&reset>now&&reset-now<=duration&&!item.sourceUncertain;
   var from=anchored?reset-duration:now-duration,to=anchored?reset:now;
   var valid=points.filter(function(p){return dateMs(p.t)>=from&&dateMs(p.t)<=Math.min(now,to)});
+  // A trustworthy current snapshot is itself an observation, even without history.
+  var currentAt=dateMs(data.observedAt);
+  if(!item.sourceUncertain&&validPercent(item.usedPercent)&&Number.isFinite(currentAt)&&currentAt>=from&&currentAt<=Math.min(now,to)
+     &&!valid.some(function(p){return Math.abs(dateMs(p.t)-currentAt)<30000}))
+   valid.push({t:data.observedAt,usedPercent:item.usedPercent,resetsAt:item.resetsAt});
+  valid.sort(function(a,b){return dateMs(a.t)-dateMs(b.t)});
   var forecast=projection(points,item,now),status=item.sourceUncertain?
    "Historical: "+usedPct(item.usedPercent)+" used · last trustworthy "+(item.lastReliableAt?when(item.lastReliableAt):"Unknown"):
    "Current: "+usedPct(item.usedPercent)+" used · "+remainingPct(item.usedPercent)+" remaining";
@@ -310,15 +339,16 @@ function renderCharts(data){
   card.append(el("p",null,anchored?(isShort(item)?"Five-hour quota cycle to ":"Seven-day quota cycle to ")+when(item.resetsAt):
    (isShort(item)?"Five-hour observation window":"Trailing seven days")+" · reset "+(item.sourceUncertain?"unverified":"unknown")));
   if(item.sourceUncertain)card.append(el("p","chart-warning","Current source unavailable or unverified. No projection."));
+  if(anchored)card.append(el("p",null,"Even-use pace by now: "+((now-from)/duration*100).toFixed(1)+"% used · actual "+usedPct(item.usedPercent)));
   if(forecast){
    var straight=forecast.straight;
-   card.append(el("p","chart-estimate","Straight-line estimate: "+straight.remainingAtReset.toFixed(1)+"% remaining at reset ("+straight.rate.toFixed(2)+" percentage points/hour used)"+(straight.exhaustion?" · possible exhaustion "+when(new Date(straight.exhaustion).toISOString()):"")));
-   if(forecast.moving)card.append(el("p","chart-estimate","12-hour moving-average estimate: "+forecast.moving.remainingAtReset.toFixed(1)+"% remaining at reset"));
+   card.append(el("p","chart-estimate","Straight-line estimate · projected at reset: "+straight.remainingAtReset.toFixed(1)+"% remaining ("+straight.rate.toFixed(2)+" percentage points/hour used)"+(straight.exhaustion?" · possible exhaustion "+when(new Date(straight.exhaustion).toISOString()):"")));
+   if(forecast.moving)card.append(el("p","chart-estimate",(isShort(item)?"2.5-hour":"12-hour")+" moving-average · projected at reset: "+forecast.moving.remainingAtReset.toFixed(1)+"% remaining"));
   }else card.append(el("p","chart-noestimate","Estimate unavailable: insufficient trustworthy same-cycle history or unverified reset."));
   if(!valid.length){card.append(el("p",null,"No trustworthy observations in this window."));destination.append(card);return}
   var ns="http://www.w3.org/2000/svg",svg=document.createElementNS(ns,"svg"),span=Math.max(1,to-from);
   svg.setAttribute("viewBox","0 0 540 186");svg.setAttribute("role","img");
-  svg.setAttribute("aria-label",name+"; observed quota remaining and usage, dashed forecasts are estimates, seven-day window");
+  svg.setAttribute("aria-label",name+"; actual use and remaining, gray even-use pace when reset verified, forecast lines and projected-at-reset dots are estimates");
   var title=document.createElementNS(ns,"title");title.textContent=name+" quota trend";svg.append(title);
   function x(t){return 42+(t-from)/span*484}
   function y(v){return 144-Math.max(0,Math.min(100,v))*1.18}
@@ -334,6 +364,12 @@ function renderCharts(data){
    if(!pts.length)return;
    var n=document.createElementNS(ns,"polyline");n.setAttribute("points",pts.join(" "));n.setAttribute("class",cls);svg.append(n);
   }
+  function marker(at,value,cls,description){
+   var dot=document.createElementNS(ns,"circle");dot.setAttribute("cx",String(x(at)));dot.setAttribute("cy",String(y(value)));
+   dot.setAttribute("r","5");dot.setAttribute("class",cls);
+   var title=document.createElementNS(ns,"title");title.textContent=description;dot.append(title);svg.append(dot);
+  }
+  if(anchored)line(x(from),y(0),x(reset),y(100),"chart-even-pace");
   var segments=[],part=[];
   valid.forEach(function(p,i){
    if(i&&resetBetween(valid[i-1],p)){segments.push(part);part=[];}
@@ -347,10 +383,13 @@ function renderCharts(data){
    line(x(now),19,x(now),144,"chart-now");
    line(x(reset),18,x(reset),144,"chart-reset");
   }
+  if(!item.sourceUncertain&&validPercent(item.usedPercent)&&Number.isFinite(currentAt)&&currentAt>=from&&currentAt<=Math.min(now,to))
+   marker(currentAt,item.usedPercent,"chart-observed-marker","Actual used "+usedPct(item.usedPercent)+" at "+when(data.observedAt));
   if(forecast){
-   var beginRemaining=100-item.usedPercent;
-   line(x(now),y(beginRemaining),x(reset),y(forecast.straight.remainingAtReset),"chart-trend");
-   if(forecast.moving)line(x(now),y(beginRemaining),x(reset),y(forecast.moving.remainingAtReset),"chart-moving");
+   line(x(now),y(item.usedPercent),x(reset),y(forecast.straight.usedAtReset),"chart-trend");
+   if(forecast.moving)line(x(now),y(item.usedPercent),x(reset),y(forecast.moving.usedAtReset),"chart-moving");
+   marker(reset,forecast.straight.usedAtReset,"chart-projection-marker","Straight-line projected used at reset: "+usedPct(forecast.straight.usedAtReset));
+   if(forecast.moving)marker(reset,forecast.moving.usedAtReset,"chart-moving-marker","Moving-average projected used at reset: "+usedPct(forecast.moving.usedAtReset));
   }
   function axisLabel(pos,str,anchor){
    var n=document.createElementNS(ns,"text");n.setAttribute("x",String(pos));n.setAttribute("y","170");
@@ -359,7 +398,7 @@ function renderCharts(data){
   axisLabel(42,new Date(from).toLocaleDateString("en-US",{month:"short",day:"numeric"}),"start");
   axisLabel(526,anchored?"RESET":"NOW","end");
   if(anchored&&x(now)>95&&x(now)<475)axisLabel(x(now),"NOW","middle");
-  card.append(svg,el("p","chart-legend","Green solid: remaining observed · Blue solid: used observed"+(forecast?" · Purple dashed: straight-line estimate":"")+(forecast&&forecast.moving?" · Gold dotted: 12h moving-average estimate":"")));
+  card.append(svg,el("p","chart-legend","Blue solid + dot: actual used · Green solid: observed remaining"+(anchored?" · Gray dashed: even-use pace (0–100% by reset)":"")+(forecast?" · Purple dashed + reset dot: straight-line projection":"")+(forecast&&forecast.moving?" · Gold dotted + reset dot: moving-average projection":"")));
   destination.append(card);
  });
 }
@@ -473,6 +512,10 @@ function buildTimeline(data){
 function render(data){
  if(!data||data.source!=="quota-sentinel"||!Array.isArray(data.pools))throw new Error("Quota snapshot has an unexpected format.");
  cards.replaceChildren();overview.replaceChildren();shorts.replaceChildren();
+ var stale=!!data._staleSnapshot,observed=dateMs(data.observedAt),ageMs=Date.now()-observed;
+ staleBanner.hidden=!stale;
+ staleBanner.textContent=stale?(!Number.isFinite(observed)?"STALE QUOTA DATA · No timestamped sample is available.":
+  "STALE QUOTA DATA · Most recent quota snapshot "+when(data.observedAt)+(ageMs>=0?" ("+Math.floor(ageMs/60000)+" minutes old)":" (future timestamp)")+". Current balances are not verified."): "";
  var known=data.pools.filter(function(p){return p&&!p.sourceUncertain&&validPercent(p.usedPercent)}),
      historic=data.pools.filter(function(p){return p&&p.sourceUncertain&&validPercent(p.usedPercent)});
  var resets=known.filter(function(p){return !isShort(p)&&Number.isFinite(dateMs(p.resetsAt))&&dateMs(p.resetsAt)>Date.now()}).sort(function(a,b){return dateMs(a.resetsAt)-dateMs(b.resetsAt)});
@@ -485,10 +528,20 @@ function render(data){
  );
  ["antigravity","codex","claude","chatgpt-web"].forEach(function(provider){
   var section=el("section"),title=el("h2",null,labels[provider]);
-  var subtitle=el("p","note",provider==="antigravity"?"Gemini Flash uses CodexBar's grouped Gemini quota, not a separately verified Flash-only allowance; Argon is tracked independently":provider==="codex"?"ChatGPT subscription quota":provider==="chatgpt-web"?"Pro power dispatches; distinct from Codex":"Claude subscription quota");
+  var subtitle=el("p","note",provider==="antigravity"?"Gemini Flash uses CodexBar's grouped Gemini quota, not a separately verified Flash-only allowance; Argon is tracked independently":provider==="codex"?"ChatGPT subscription quota":provider==="chatgpt-web"?"Local b-web-stats dispatch events, not a vendor quota or Codex usage":"Claude subscription quota");
   section.append(title,subtitle);
+  if(provider==="chatgpt-web"){
+   var web=webDispatchSample(data,Date.now());
+   if(web){
+    section.append(el("p","available",web.count24h+" dispatches / 24h"),
+     el("p","reset","Past 5m: "+(web.count5m===null?"Unknown":web.count5m)+" · past 1h: "+(web.count1h===null?"Unknown":web.count1h)),
+     el("p",web.stale?"quota-warning":"quota-old-reset",(web.stale?"STALE · ":"")+"b-web-stats observed "+when(web.observedAt)));
+   }else section.append(el("p","available","Dispatch count: No source"),el("p","quota-warning","No b-web-stats dispatch count is exposed by the quota API."));
+   section.append(el("p","quota-old-reset","Vendor quota: Not available. No percentage, remaining balance or reset inferred."));
+   cards.append(section);return;
+  }
   var found=data.pools.filter(function(v){return v&&v.provider===provider&&!isShort(v)});
-  if(!found.length)section.append(el("p","reset","Provider reading unavailable. Remaining quota Unknown."));
+  if(!found.length)section.append(el("p","quota-warning","NO SOURCE · Provider reading unavailable. Remaining quota Unknown."));
   found.forEach(function(item){
    var pool=el("div","pool"+(item.sourceUncertain?" pool-stale":"")),head=el("div","poolhead");
    var used=validPercent(item.usedPercent)?item.usedPercent:null;
@@ -505,6 +558,7 @@ function render(data){
    }else{meter.className+=" unknown";meter.setAttribute("aria-valuetext","Remaining quota unknown")}
    var availableText=available===null?"Remaining: Unknown":remainingPct(used)+" remaining"+(item.sourceUncertain?" · LAST KNOWN":"");
    pool.append(head,el("p","available",availableText),meter);
+   if(item.sourceUncertain&&!item.lastReliableAt)pool.append(el("p","quota-warning","NO SOURCE · No verified quota observation is available."));
    if(item.sourceUncertain){
     pool.append(el("p","quota-warning","STALE / UNAVAILABLE · "+item.readQuality),
      el("p","reset",item.lastReliableAt?"Last trustworthy reading: "+when(item.lastReliableAt):"No trustworthy historical reading"),
@@ -529,7 +583,7 @@ function render(data){
   shorts.append(row);
  });
  var anyUncertain=data.pools.some(function(item){return item.sourceUncertain});
- resultText("Quota Sentinel · snapshot "+when(data.observedAt)+(data.stale?" · STALE":anyUncertain?" · some provider readings unavailable; historical values labeled":" · provider observations (not a live check)"),!!data.stale||anyUncertain);
+ resultText("Quota Sentinel · snapshot "+when(data.observedAt)+(stale?" · STALE":anyUncertain?" · some provider readings unavailable; historical values labeled":" · provider observations (not a live check)"),stale||anyUncertain);
 }
 
 async function update(){
@@ -544,6 +598,8 @@ async function update(){
   var history=null;try{history=await json("/api/companies/"+encodeURIComponent(company.id)+"/costs/quota-sentinel/history")}catch(_err){}
   recoverReadings(data,history);render(data);renderCharts(data);
  }catch(err){
+  staleBanner.hidden=false;
+  staleBanner.textContent="QUOTA SOURCE UNAVAILABLE · Cannot verify a fresh quota sample. Existing figures, if shown, are historical.";
   resultText((err&&err.message)||"Unable to load quota.",true);
   if(!cards.children.length)cards.append(el("section",null,"Quota information cannot be displayed. You may need to sign in to Paperclip first."));
  }finally{busy=false;refresh.disabled=false;refresh.textContent="Reload snapshot"}
