@@ -25,7 +25,13 @@ interface Fixture {
   messages: Array<{ method: string; params: Record<string, unknown> }>;
 }
 
-async function fixture(options: { socket?: boolean } = {}): Promise<Fixture> {
+async function fixture(options: {
+  socket?: boolean;
+  longThread?: boolean;
+  terminalStatus?: "completed" | "failed";
+  visibilityListError?: boolean;
+  missingFromList?: boolean;
+} = {}): Promise<Fixture> {
   const dir = await mkdtemp(join(TMP, "d32-"));
   const codexHome = join(dir, "h");
   const control = join(codexHome, "app-server-control");
@@ -71,13 +77,17 @@ async function fixture(options: { socket?: boolean } = {}): Promise<Fixture> {
             },
           ],
         });
-      if (msg.method === "thread/start")
+      if (msg.method === "thread/start" || msg.method === "thread/resume")
         return respond({
           thread: { id: THREAD, cwd: WORKSPACE },
           model: "gpt-5-terra",
           sandbox: { type: "readOnly" },
           approvalPolicy: "never",
         });
+      if (msg.method === "thread/turns/list") return respond({
+        data: [{ id: "prior-turn", status: "completed" }],
+        nextCursor: null,
+      });
       if (msg.method === "thread/name/set") return respond({});
       if (msg.method === "turn/start") {
         respond({ turn: { id: TURN, status: "inProgress", items: [] } });
@@ -87,19 +97,28 @@ async function fixture(options: { socket?: boolean } = {}): Promise<Fixture> {
         }));
         socket.send(JSON.stringify({
           method: "turn/completed",
-          params: { threadId: THREAD, turn: { id: TURN, status: "completed", items: [] } },
+          params: { threadId: THREAD, turn: {
+            id: TURN, status: options.terminalStatus ?? "completed", items: [],
+          } },
         }));
         return;
       }
-      if (msg.method === "thread/read")
-        return respond({
-          thread: {
-            id: THREAD,
-            cwd: WORKSPACE,
+      if (msg.method === "thread/read") {
+        // The old post-turn full-history read would exceed the 1 MiB socket frame cap.
+        if (options.longThread && msg.params?.includeTurns !== false)
+          return respond({ thread: { id: THREAD, cwd: WORKSPACE,
+            turns: [{ id: TURN, items: [{ text: "x".repeat(1_200_000) }] }] } });
+        return respond({ thread: { id: THREAD, cwd: WORKSPACE,
+          ...(msg.params?.includeTurns === false ? {} : {
             turns: [{ id: TURN, status: "completed", items: [] }],
-          },
-        });
-      if (msg.method === "thread/list") return respond({ data: [{ id: THREAD }] });
+          }) } });
+      }
+      if (msg.method === "thread/list") {
+        if (options.visibilityListError)
+          return socket.send(JSON.stringify({ id: msg.id,
+            error: { code: -32000, message: "visibility observation unavailable" } }));
+        return respond({ data: options.missingFromList ? [] : [{ id: THREAD }] });
+      }
       return respond({});
     });
   });
@@ -139,7 +158,7 @@ describe("standalone NAR Codex entrypoint", () => {
   });
 
   it("admits one clean standalone turn, names the thread, and records receipts", async () => {
-    const f = await fixture();
+    const f = await fixture({ longThread: true });
     const receiptDir = join(f.dir, "receipts");
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
     const previous = {
@@ -172,8 +191,13 @@ describe("standalone NAR Codex entrypoint", () => {
       turnId: TURN,
       terminal: "turn.completed",
       threadListContainsThread: true,
+      observationWarnings: [],
       providerBoundCapture: "unverified",
     });
+    expect(f.messages.some(message => message.method === "thread/read")).toBe(false);
+    expect(JSON.parse(await readFile(join(receiptDir, "transcript.json"), "utf8")))
+      .toMatchObject({ threadId: THREAD, turnId: TURN, terminal: "turn.completed",
+        historyIncluded: false, eventsFile: "receipt.jsonl" });
     const states = result.remoteControlStates as string[];
     expect(states.length).toBeGreaterThanOrEqual(2);
     expect(states.every(state => state === "connected")).toBe(true);
@@ -210,6 +234,74 @@ describe("standalone NAR Codex entrypoint", () => {
     expect(journal).not.toContain("must-not-pass");
     expect(journal).not.toContain("/paperclip/owned");
     expect(journal).not.toContain("config-secret-value");
+  });
+
+  it("resumes a long thread without a post-turn full-history read", async () => {
+    const f = await fixture({ longThread: true });
+    const receiptDir = join(f.dir, "receipts");
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await standaloneCodexMain([...baseArgs(f, receiptDir), "--thread", THREAD]);
+    } finally {
+      log.mockRestore();
+    }
+    expect(f.messages.some(message => message.method === "thread/resume")).toBe(true);
+    expect(f.messages.some(message => message.method === "thread/start")).toBe(false);
+    const reads = f.messages.filter(message => message.method === "thread/read");
+    expect(reads).toHaveLength(1); // Recovery only, no redundant post-turn read.
+    expect(reads[0]?.params.includeTurns).toBe(false);
+    expect(JSON.parse(await readFile(join(receiptDir, "result.json"), "utf8")))
+      .toMatchObject({ threadId: THREAD, turnId: TURN, terminal: "turn.completed",
+        threadListContainsThread: true, observationWarnings: [] });
+  });
+
+  it("preserves observed completion when visibility listing fails", async () => {
+    const f = await fixture({ visibilityListError: true });
+    const receiptDir = join(f.dir, "receipts");
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await standaloneCodexMain(baseArgs(f, receiptDir));
+    } finally {
+      log.mockRestore();
+    }
+    const result = JSON.parse(await readFile(join(receiptDir, "result.json"), "utf8"));
+    expect(result).toMatchObject({ terminal: "turn.completed",
+      threadListContainsThread: null,
+      observationWarnings: [{ method: "thread/list" }] });
+    const journal = journalLines(await readFile(join(receiptDir, "receipt.jsonl"), "utf8"));
+    expect(journal.some(line => line.phase === "warning" && line.method === "thread/list")).toBe(true);
+  });
+
+  it("does not turn an absent thread-list entry into a failed turn", async () => {
+    const f = await fixture({ missingFromList: true });
+    const receiptDir = join(f.dir, "receipts");
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await standaloneCodexMain(baseArgs(f, receiptDir));
+    } finally {
+      log.mockRestore();
+    }
+    expect(JSON.parse(await readFile(join(receiptDir, "result.json"), "utf8")))
+      .toMatchObject({ terminal: "turn.completed", threadListContainsThread: false,
+        observationWarnings: [{ method: "thread/list",
+          message: "thread absent from first 100 list entries" }] });
+  });
+
+  it("does not promote a failed provider turn into success", async () => {
+    const f = await fixture({ terminalStatus: "failed" });
+    const receiptDir = join(f.dir, "receipts");
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await expect(standaloneCodexMain(baseArgs(f, receiptDir)))
+        .rejects.toThrow("standalone turn turn.failed");
+    } finally {
+      log.mockRestore();
+    }
+    const result = JSON.parse(await readFile(join(receiptDir, "result.json"), "utf8"));
+    expect(result).toMatchObject({ terminal: "turn.failed", threadListContainsThread: true });
+    const journal = journalLines(await readFile(join(receiptDir, "receipt.jsonl"), "utf8"));
+    expect(journal.some(line => line.phase === "event" &&
+      (line.event as Record<string, unknown>)?.eventType === "turn.failed")).toBe(true);
   });
 
   it("inspects the daemon without starting a thread", async () => {
