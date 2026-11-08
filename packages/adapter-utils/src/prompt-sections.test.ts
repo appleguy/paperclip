@@ -1,8 +1,26 @@
 import { describe, expect, it } from "vitest";
-import { selectPaperclipPromptSections as selectSections } from "./server-utils.js";
+import { renderPaperclipWakePrompt, selectPaperclipPromptSections as selectSections } from "./server-utils.js";
 import { createPromptContextFixture } from "./test-fixtures/prompt-context.js";
 
 describe("task and event section ownership", () => {
+  it("keeps the issue title in assignment context and saves its duplicate wake bytes", () => {
+    const context = createPromptContextFixture();
+    context.paperclipTaskMarkdownAssignmentCompact += '\n- Title: "Release ledger"';
+    const selected = selectSections(context, { resumedSession: true });
+    const withDuplicate = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: true });
+    const deduplicated = renderPaperclipWakePrompt(context.paperclipWake, {
+      resumedSession: true,
+      suppressIssueDescription: true,
+    });
+
+    expect(selected.taskContextNote).toContain('Title: "Release ledger"');
+    expect(selected.wakePrompt).toContain("- issue: PAP-1");
+    expect(selected.wakePrompt).not.toContain("- issue: PAP-1 Release ledger");
+    expect(Buffer.byteLength(withDuplicate) - Buffer.byteLength(deduplicated)).toBe(
+      Buffer.byteLength(" Release ledger"),
+    );
+  });
+
   it("preserves resumed wake data without reintroducing generic procedures", () => {
     const context = createPromptContextFixture();
     for (const includeExecutionContract of [undefined, false, true]) {

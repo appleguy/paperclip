@@ -2511,7 +2511,14 @@ function renderPaperclipWakePromptBody(
       : [];
   const wakeSummaryLines = [
     `- reason: ${normalized.reason ?? "unknown"}`,
-    `- issue: ${normalized.issue?.identifier ?? normalized.issue?.id ?? "unknown"}${normalized.issue?.title ? ` ${normalized.issue.title}` : ""}`,
+    // Assignment Markdown already carries the issue title (including in its
+    // compact resume form). Keep the stable issue identifier in the wake, but
+    // avoid sending that title a second time in the same provider prompt.
+    `- issue: ${normalized.issue?.identifier ?? normalized.issue?.id ?? "unknown"}${
+      options.suppressIssueDescription === true || !normalized.issue?.title
+        ? ""
+        : ` ${normalized.issue.title}`
+    }`,
     ...(hasWakeCommentBatch
       ? [
           `- pending comments: ${normalized.includedCount}/${normalized.requestedCount}`,
