@@ -21,14 +21,13 @@ if (/opus/i.test(values.model) && !values['allow-opus']) throw new Error('Opus i
 const registry = JSON.parse(await readFile(registryPath, 'utf8'));
 if (Object.hasOwn(registry, values.seat) && !values.replace) throw new Error(`seat ${values.seat} exists; use nar-claude-resume.mjs, or --replace for a fresh session under the same name`);
 const prompt = (await readFile(values['prompt-file'], 'utf8')).trim();
-const ownerRules = (await readFile('/Volumes/NVM/Guidance/owner-rules.md', 'utf8')).trim();
 // A seat always gets a class assembly (default coding); no class used to mean the whole owner-rules file.
 const klass = values.class ?? 'coding';
-const extraGuidance = assembleGuidance(klass, values.project).replace(ownerRules, '').trim();
+const extraGuidance = assembleGuidance(klass, values.project).trim();
 const sessionId = randomUUID();
 registry[values.seat] = { harness: 'claude', sessionId, cwd: values.cwd, goalFile: `${goalDir}/${values.seat}.json`, model: values.model, effort: values.effort, class: klass, ...(values.project ? { project: values.project } : {}) };
 await writeFile(registryPath, `${JSON.stringify(registry, null, 2)}\n`);
-const args = claudeStartArgs({ sessionId, name: values.seat, model: values.model, effort: values.effort, extraGuidance, prompt });
+const args = claudeStartArgs({ sessionId, name: values.seat, model: values.model, effort: values.effort, extraGuidance, prompt, klass });
 const child = spawn('claude', args, { cwd: values.cwd, stdio: 'inherit', env: { ...process.env, PAPERCLIP_NAR_LAUNCH: '1' } });
 child.on('error', e => { console.error(e.message); process.exitCode = 1; });
 child.on('exit', (code, signal) => { process.exitCode = code ?? (signal ? 1 : 0); });
