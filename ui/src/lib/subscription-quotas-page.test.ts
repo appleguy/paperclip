@@ -25,9 +25,9 @@ describe("standalone subscription quotas", () => {
     vi.unstubAllGlobals();
   });
 
-  async function render(pools: ReturnType<typeof windowRow>[], series: unknown[] = [], options: { stale?: boolean; observedAt?: string; bankedReset?: unknown } = {}) {
+  async function render(pools: ReturnType<typeof windowRow>[], series: unknown[] = [], options: { stale?: boolean; observedAt?: string; bankedReset?: unknown; webDispatches?: unknown } = {}) {
     const calls: string[] = [];
-    const data = { source: "quota-sentinel", observedAt: options.observedAt || iso(Date.now()), stale: !!options.stale, pools, bankedReset: options.bankedReset };
+    const data = { source: "quota-sentinel", observedAt: options.observedAt || iso(Date.now()), stale: !!options.stale, pools, bankedReset: options.bankedReset, webDispatches: options.webDispatches };
     vi.stubGlobal("fetch", vi.fn(async (path: string, opts: RequestInit) => {
       calls.push(path);
       expect(opts.credentials).toBe("same-origin");
@@ -51,7 +51,7 @@ describe("standalone subscription quotas", () => {
       { provider: "codex", pool: "weekly", points: [sample(now - 3 * HOUR, 12, reset), sample(now - 2 * HOUR, 15, reset), sample(now - HOUR, 18, reset)] },
     ]);
     expect(calls).toEqual(["/api/companies", "/api/companies/company-123/costs/quota-sentinel", "/api/companies/company-123/costs/quota-sentinel/history"]);
-    expect(document.querySelectorAll("#charts section")).toHaveLength(6);
+    expect(document.querySelectorAll("#charts section")).toHaveLength(5);
     expect(document.querySelectorAll("#short-charts section")).toHaveLength(1);
     expect(document.getElementById("short-chart-details")).not.toBeNull();
     expect(document.querySelectorAll("#cards section")).toHaveLength(4);
@@ -62,8 +62,58 @@ describe("standalone subscription quotas", () => {
     expect(document.getElementById("deadline-axis")?.textContent).toContain("+7d");
     const codexChart = [...document.querySelectorAll("#charts section")].find((section) => section.textContent?.includes("ChatGPT / Codex · Weekly"));
     expect(codexChart?.querySelector(".chart-trend")).toBeTruthy();
+    expect(codexChart?.querySelector(".chart-even-pace")).toBeTruthy();
+    expect(codexChart?.querySelector(".chart-observed-marker")).toBeTruthy();
+    expect(codexChart?.querySelector(".chart-projection-marker")).toBeTruthy();
+    expect(codexChart?.querySelector(".chart-moving-marker")).toBeNull();
     expect(codexChart?.textContent).toContain("Straight-line estimate");
+    expect(document.getElementById("cards")?.textContent).toContain("Dispatch count: No source");
+    expect(document.body.textContent).not.toContain("4.0% used");
     expect(document.body.textContent).toContain("No trustworthy observations");
+  });
+
+  it("marks snapshots stale after 10 minutes even if the server has not flagged them", async () => {
+    const now = Date.now(), reset = iso(now + DAY);
+    await render([windowRow("codex", "weekly", 40, reset)], [], { observedAt: iso(now - 11 * 60000) });
+    expect(document.getElementById("stale-banner")?.hidden).toBe(false);
+    expect(document.getElementById("stale-banner")?.textContent).toContain("11 minutes old");
+    expect(document.getElementById("status")?.textContent).toContain("STALE");
+    expect(document.getElementById("cards")?.textContent).toContain("40.0% used (historical)");
+    expect(document.querySelectorAll("#charts .chart-projection-marker")).toHaveLength(0);
+  });
+
+  it("keeps a fresh snapshot as an actual point without requiring history for the even-use reference", async () => {
+    const now = Date.now(), reset = iso(now + DAY);
+    await render([windowRow("codex", "weekly", 29, reset)], [], { observedAt: iso(now - 9 * 60000) });
+    expect(document.getElementById("stale-banner")?.hidden).toBe(true);
+    const chart = [...document.querySelectorAll("#charts section")].find((node) => node.textContent?.includes("ChatGPT / Codex · Weekly"));
+    expect(chart?.querySelector(".chart-even-pace")).toBeTruthy();
+    expect(chart?.querySelector(".chart-observed-marker")).toBeTruthy();
+    expect(chart?.querySelector(".chart-projection-marker")).toBeNull();
+    expect(chart?.textContent).toContain("Even-use pace by now");
+    expect(chart?.textContent).toContain("insufficient trustworthy");
+  });
+
+  it("shows verified b-web-stats event counts without interpreting a legacy Web percent as vendor quota", async () => {
+    const now = Date.now(), reset = iso(now + DAY);
+    await render([windowRow("chatgpt-web", "pro:weekly", 33, reset)], [], {
+      webDispatches: { source: "b-web-stats", observedAt: iso(now - 60000), counts: { "5m": 0, "1h": 4, "24h": 17 } },
+    });
+    const section = [...document.querySelectorAll("#cards section")].find((node) => node.querySelector("h2")?.textContent === "ChatGPT Web");
+    expect(section?.textContent).toContain("17 dispatches / 24h");
+    expect(section?.textContent).toContain("Past 5m: 0 · past 1h: 4");
+    expect(section?.textContent).toContain("Vendor quota: Not available");
+    expect(section?.querySelector("[role=progressbar]")).toBeNull();
+    expect(section?.textContent).not.toContain("33.0%");
+    expect(document.getElementById("deadlines")?.textContent).not.toContain("ChatGPT Web");
+    expect(document.querySelectorAll("#charts section").length).toBe(2);
+  });
+
+  it("does not manufacture zero Web dispatches from an invalid or missing count source", async () => {
+    await render([], [], { webDispatches: { source: "b-web-stats", observedAt: iso(Date.now()), counts: { "24h": -1 } } });
+    const section = [...document.querySelectorAll("#cards section")].find((node) => node.querySelector("h2")?.textContent === "ChatGPT Web");
+    expect(section?.textContent).toContain("Dispatch count: No source");
+    expect(section?.textContent).not.toContain("0 dispatches");
   });
 
   it("shows sign-in guidance rather than a manufactured zero quota", async () => {
@@ -186,6 +236,15 @@ describe("quota projections and quality gates", () => {
     const many = Array.from({ length: 13 }, (_, i) => point(13 - i, 10 + 2.5 * i));
     expect(methods.projection(many, { ...item, usedPercent: 42 }, now)?.moving).toBeTruthy();
     expect(methods.projection(many.slice(-5), { ...item, usedPercent: 42 }, now)?.moving).toBeNull();
+  });
+
+  it("allows a short-window moving average only after enough same-cycle samples", () => {
+    const shortReset = iso(now + 2 * HOUR);
+    const short = { ...item, pool: "session", usedPercent: 28, resetsAt: shortReset };
+    const points = Array.from({ length: 7 }, (_, i) => sample(now - (2 - i / 4) * HOUR, 10 + 3 * i, shortReset));
+    expect(methods.projection(points, short, now)?.moving).toBeTruthy();
+    expect(methods.projection(points.slice(-5), short, now)?.moving).toBeTruthy();
+    expect(methods.projection(points.filter((_, i) => i % 2 === 0), short, now)?.moving).toBeNull();
   });
 
   it("requires fresh, trustworthy same-period observations before projecting", () => {
