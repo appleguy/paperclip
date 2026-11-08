@@ -16,7 +16,7 @@ do not add action definitions to them. See
 Sources: `src/protocol-actions/`, `src/catalog/canonical-operations.ts`,
 `src/tools/capability-semantic-tool-catalog.ts`,
 `src/tools/capability-semantic-tool-types.ts`, `src/tools/capability-tool-bindings.ts`,
-barrel `src/tools/index.ts`.
+`src/tools/capability-semantic-tool-runtime.ts`.
 
 ## Two dispositions, plus a separate control-plane list
 
