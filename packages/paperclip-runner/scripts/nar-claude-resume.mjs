@@ -19,7 +19,8 @@ else if (desired?.action === 'set' && typeof desired.text === 'string' && desire
 else if (desired) throw new Error('invalid desired goal file');
 console.error('Resume only after stopping the existing Claude session; prior conversation history may contain old guidance.');
 const ownerRules = (await readFile('/Volumes/NVM/Guidance/owner-rules.md', 'utf8')).trim();
-const guidance = assembleGuidance(values.class, values.project).replace(ownerRules, '').trim();
+// Resume re-injects the seat's registered class assembly (default coding), never the whole owner-rules file.
+const guidance = assembleGuidance(values.class ?? seat.class ?? 'coding', values.project ?? seat.project).replace(ownerRules, '').trim();
 const child = spawn('claude', claudeResumeArgs(seat.sessionId, guidance, prompt, { name: values.seat, model: seat.model, effort: seat.effort }), { cwd: seat.cwd, stdio: 'inherit', env: { ...process.env, PAPERCLIP_NAR_LAUNCH: '1' } });
 child.on('error', e => { console.error(e.message); process.exitCode = 1; });
 child.on('exit', (code, signal) => { process.exitCode = code ?? (signal ? 1 : 0); });
