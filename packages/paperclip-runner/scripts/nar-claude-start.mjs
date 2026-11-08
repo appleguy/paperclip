@@ -12,12 +12,14 @@ const goalDir = '/Volumes/NVM/Paperclip/workspaces/platform-lead-outside/context
 const { values } = parseArgs({ args: process.argv.slice(2), options: {
   seat: { type: 'string' }, cwd: { type: 'string' }, 'prompt-file': { type: 'string' },
   model: { type: 'string', default: 'sonnet' }, effort: { type: 'string', default: 'medium' },
-  class: { type: 'string' }, project: { type: 'string' } } });
+  class: { type: 'string' }, project: { type: 'string' },
+  replace: { type: 'boolean' }, 'allow-opus': { type: 'boolean' } } });
 if (!values.seat || !/^[a-z0-9][a-z0-9-]*$/.test(values.seat) || !values.cwd?.startsWith('/') || !values['prompt-file'])
-  throw new Error('usage: nar-claude-start.mjs --seat NAME --cwd ABS --prompt-file FILE [--model sonnet] [--effort medium] [--class C] [--project P]');
-if (/opus/i.test(values.model)) throw new Error('Opus is not allowed for worker seats');
+  throw new Error('usage: nar-claude-start.mjs --seat NAME --cwd ABS --prompt-file FILE [--model sonnet] [--effort medium] [--class C] [--project P] [--replace] [--allow-opus]');
+// --allow-opus is only for relaunching a lead that already runs Opus (zagent_relaunch_lead.py); workers never get it.
+if (/opus/i.test(values.model) && !values['allow-opus']) throw new Error('Opus is not allowed for worker seats');
 const registry = JSON.parse(await readFile(registryPath, 'utf8'));
-if (Object.hasOwn(registry, values.seat)) throw new Error(`seat ${values.seat} exists; use nar-claude-resume.mjs`);
+if (Object.hasOwn(registry, values.seat) && !values.replace) throw new Error(`seat ${values.seat} exists; use nar-claude-resume.mjs, or --replace for a fresh session under the same name`);
 const prompt = (await readFile(values['prompt-file'], 'utf8')).trim();
 const ownerRules = (await readFile('/Volumes/NVM/Guidance/owner-rules.md', 'utf8')).trim();
 const extraGuidance = assembleGuidance(values.class, values.project).replace(ownerRules, '').trim();
